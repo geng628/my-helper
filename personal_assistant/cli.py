@@ -1,4 +1,4 @@
-"""Minimal terminal REPL entrypoint for testing the ReAct loop."""
+"""Minimal terminal REPL entrypoint for testing the ReAct loop and allowlisted tools."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.tools import Tool, ToolRegistry, ToolsConfig
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -41,6 +41,15 @@ def build_demo_tools() -> ToolRegistry:
     )
 
 
+def build_repl_tools(config_path: Path | None = None) -> ToolRegistry:
+    cfg_path = config_path or Path("config/tools.json")
+    demo = list(build_demo_tools())
+    if cfg_path.is_file():
+        cfg = ToolsConfig.load(cfg_path, project_root=cfg_path.resolve().parent.parent)
+        return cfg.build_registry(extra_tools=demo)
+    return ToolRegistry(*demo)
+
+
 def _print_step(name: str, args: str, observation: str) -> None:
     print(f"  [Act] {name}({args})")
     print(f"  [Observe] {observation}")
@@ -48,9 +57,9 @@ def _print_step(name: str, args: str, observation: str) -> None:
 
 def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) -> None:
     client = llm or from_env()
-    registry = tools or build_demo_tools()
+    registry = tools or build_repl_tools()
     messages: list[dict[str, object]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    print("My Helper v2 ReAct REPL（输入 exit/quit 退出）")
+    print(f"My Helper v2 ReAct REPL（可用工具：{', '.join(registry.names)}；输入 exit/quit 退出）")
 
     while True:
         try:

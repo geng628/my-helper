@@ -1,0 +1,39 @@
+{
+  "enabled_tools": [
+    "list_files",
+    "search_markdown",
+    "read_markdown",
+    "write_file",
+    "remember_fact",
+    "propose_rule"
+  ],
+  "files": {
+    "read_roots": ["data/knowledge", "data/memory", "docs", "data/workspace"],
+    "write_root": "data/workspace",
+    "max_read_bytes": 65536,
+    "max_write_bytes": 65536,
+    "max_lines": 400,
+    "max_results": 100,
+    "reject_segments": [".env", ".git", "state", ".ssh", "uploads"]
+  },
+  "commands": [
+    {
+      "name": "git_status",
+      "description": "查看项目仓库的未提交改动。",
+      "enabled": true,
+      "argv": ["git", "status", "--short"],
+      "cwd": ".",
+      "timeout": 10,
+      "max_output_bytes": 8192
+    },
+    {
+      "name": "disk_usage",
+      "description": "查看磁盘空间占用。",
+      "enabled": true,
+      "argv": ["df", "-h"],
+      "cwd": ".",
+      "timeout": 10,
+      "max_output_bytes": 8192
+    }
+  ]
+}
