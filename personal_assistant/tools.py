@@ -26,6 +26,9 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def __iter__(self):
+        return iter(self._tools.values())
+
     def definitions(self) -> list[dict[str, object]]:
         return [
             {

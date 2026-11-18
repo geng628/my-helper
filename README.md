@@ -23,9 +23,13 @@ uv sync
 # 2. 运行单元测试（验证 ReAct 核心循环，不消耗 API Token）
 uv run pytest -v
 
-# 3. 配置环境变量并启动终端交互 REPL
+# 3. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
+uv run python scripts/demo.py --show-messages
+
+# 4. 配置环境变量并启动真实对话（单次测试或终端交互 REPL）
 cp .env.example .env
 # 编辑 .env，设置 LLM_MODE=on、LLM_API_KEY、LLM_BASE_URL 与 LLM_MODEL
+uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant chat
 ```
 
