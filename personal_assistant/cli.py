@@ -7,9 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from personal_assistant.commands import ToolsConfig
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import Tool, ToolRegistry, ToolsConfig
+from personal_assistant.tools import Tool, ToolRegistry
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:

@@ -45,7 +45,8 @@ my_helper_v2/
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
 │   ├── llm.py                     # 零依赖 OpenAI 兼容客户端
-│   ├── tools.py                   # ToolRegistry 白名单过滤与固定 argv 命令执行器
+│   ├── tools.py                   # Tool 与 ToolRegistry 白名单注册表
+│   ├── commands.py                # 固定 argv 命令模板加载与安全执行器
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（加载白名单工具）
 ├── scripts/
@@ -62,7 +63,7 @@ my_helper_v2/
 ## 开发路线图
 
 - [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
-- [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`）
+- [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`）
 - [ ] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
 - [ ] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
 - [ ] **Step 5**：纯 Python Telegram Long Polling 与轻量 HTTP 服务（`telegram_bot.py`, `server.py`）

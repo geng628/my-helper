@@ -53,7 +53,8 @@ my_helper_v2/
 │   ├── react.py                   # 极简 ReAct 核心循环（最多 4 轮原生工具调用） (~70 行)
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib） (~100 行)
 │   ├── memory.py                  # Markdown 直读、关键词搜索、按行读取、记忆/规则写入 (~260 行)
-│   ├── tools.py                   # ToolRegistry + 工具白名单 + 固定 argv 命令执行器 (~250 行)
+│   ├── tools.py                   # Tool 与 ToolRegistry 白名单注册表 (~110 行)
+│   ├── commands.py                # 固定 argv 命令模板加载与安全执行器 (~240 行)
 │   ├── db.py                      # SQLite 连接与极简表结构（messages） (~60 行)
 │   ├── telegram_bot.py            # 纯 Python Telegram Long Polling 与斜杠命令处理 (~150 行)
 │   └── server.py                  # 轻量本地 HTTP API (/health, /status, /chat) (~90 行)
@@ -251,7 +252,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 1. **Step 1 — 最小 ReAct 核心循环（`personal_assistant/llm.py`, `personal_assistant/tools.py`, `personal_assistant/react.py`, `personal_assistant/cli.py`）**
    - 实现无第三方依赖的 OpenAI 兼容客户端、`Tool` / `ToolRegistry` 最小执行接口，以及清晰直观的 `Reason -> Act -> Observe` 多轮循环（最多 4 轮），支持本地终端 REPL 实时打印工具调用轨迹。
-2. **Step 2 — 白名单工具与命令执行器（`config/tools.json`, `personal_assistant/tools.py`）**
+2. **Step 2 — 白名单工具与命令执行器（`config/tools.json`, `personal_assistant/tools.py`, `personal_assistant/commands.py`）**
    - 接入 `enabled_tools` 白名单过滤与 `config/tools.json` 固定 `argv` 命令模板（`shell=False`、环境变量白名单、参数校验、输出截断）。
 3. **Step 3 — 纯 Markdown 记忆与知识模块（`personal_assistant/memory.py`）**
    - 直读 `MEMORY.md` 与 `rules/*.md` 注入系统提示词，提供目录白名单内的 Markdown 列表、检索、按行读取与安全写入。
