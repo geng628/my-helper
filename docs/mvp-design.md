@@ -50,7 +50,7 @@ my_helper_v2/
 │   ├── __main__.py                # 启动入口
 │   ├── cli.py                     # 命令行入口：serve / telegram / chat (终端交互)
 │   ├── app.py                     # AssistantApp：装配、会话历史、待确认动作闭环 (~180 行)
-│   ├── chat.py                    # PromptBuilder + ToolLoop（最多 4 轮原生工具调用） (~140 行)
+│   ├── react.py                   # 极简 ReAct 核心循环 + 提示词拼装 (~80 行)
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib） (~90 行)
 │   ├── memory.py                  # Markdown 直读、关键词搜索、按行读取、记忆/规则写入 (~180 行)
 │   ├── tools.py                   # ToolRegistry + 内置工具白名单 + 固定 argv 命令执行器 (~240 行)
@@ -269,8 +269,8 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 
 ## 4. 代码实现步骤（确认本设计文档后按序执行）
 
-1. **Step 1 — 最小 ReAct 核心循环（`personal_assistant/llm.py`, `personal_assistant/chat.py`, `personal_assistant/cli.py`）**
-   - 实现无第三方依赖的 OpenAI 兼容客户端、`Tool` / `ToolRegistry` 最小执行接口，以及 `Reason -> Act -> Observe` 多轮循环（最多 4 轮），支持本地终端 REPL 实时打印工具调用轨迹。
+1. **Step 1 — 最小 ReAct 核心循环（`personal_assistant/llm.py`, `personal_assistant/tools.py`, `personal_assistant/react.py`, `personal_assistant/cli.py`）**
+   - 实现无第三方依赖的 OpenAI 兼容客户端、`Tool` / `ToolRegistry` 最小执行接口，以及清晰直观的 `Reason -> Act -> Observe` 多轮循环（最多 4 轮），支持本地终端 REPL 实时打印工具调用轨迹。
 2. **Step 2 — 白名单工具与命令执行器（`config/tools.json`, `personal_assistant/tools.py`）**
    - 接入工具开关白名单、目录读写白名单与固定 `argv` 命令模板。
 3. **Step 3 — 纯 Markdown 记忆与知识模块（`personal_assistant/memory.py`）**

@@ -7,8 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.chat import SYSTEM_PROMPT, StepTrace, Tool, ToolRegistry, run_react_loop
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.react import SYSTEM_PROMPT, run_react
+from personal_assistant.tools import Tool, ToolRegistry
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -40,9 +41,9 @@ def build_demo_tools() -> ToolRegistry:
     )
 
 
-def _print_step(step: StepTrace) -> None:
-    tag = "Error" if step.is_error else "Observe"
-    print(f"  [Round {step.round}][Act] {step.tool}({step.arguments}) -> [{tag}] {step.observation}")
+def _print_step(name: str, args: str, observation: str) -> None:
+    print(f"  [Act] {name}({args})")
+    print(f"  [Observe] {observation}")
 
 
 def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) -> None:
@@ -62,14 +63,14 @@ def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) ->
         if user_text.lower() in {"exit", "quit", "/quit"}:
             break
 
-        turn_messages = [*messages, {"role": "user", "content": user_text}]
+        messages.append({"role": "user", "content": user_text})
         try:
-            result = run_react_loop(client, turn_messages, registry, on_step=_print_step)
+            reply = run_react(client, messages, registry, on_step=_print_step)
         except LLMNotConfigured as error:
+            messages.pop()
             print(f"助手> {error}")
             continue
-        messages = result.messages
-        print(f"助手> {result.reply}")
+        print(f"助手> {reply}")
 
 
 def main(argv: list[str] | None = None) -> None:

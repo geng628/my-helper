@@ -1,11 +1,10 @@
-"""Unit tests for Step 1: minimal ReAct loop and LLM client."""
+"""Unit tests for Step 1: minimal ReAct loop, ToolRegistry, and LLM client."""
 from __future__ import annotations
 
 import json
 
 import pytest
 
-from personal_assistant.chat import StepTrace, Tool, ToolRegistry, run_react_loop
 from personal_assistant.cli import build_demo_tools
 from personal_assistant.llm import (
     LLMClient,
@@ -14,10 +13,12 @@ from personal_assistant.llm import (
     OpenAICompatibleLLM,
     from_env,
 )
+from personal_assistant.react import run_react
+from personal_assistant.tools import Tool, ToolRegistry
 
 
 class ScriptedLLM(LLMClient):
-    """Deterministic fake LLM that records every request and replays scripted replies."""
+    """Deterministic fake LLM that snapshots every request and replays scripted replies."""
 
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = list(responses)
@@ -28,7 +29,6 @@ class ScriptedLLM(LLMClient):
         messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
-        # Snapshot messages so later mutations do not alter recorded call history.
         self.requests.append(([dict(msg) for msg in messages], tools))
         if not self._responses:
             raise AssertionError("ScriptedLLM ran out of scripted responses")
@@ -45,23 +45,18 @@ def _tool_call(call_id: str, name: str, arguments: str) -> dict[str, object]:
 
 def test_direct_answer_without_tool_calls() -> None:
     llm = ScriptedLLM([{"role": "assistant", "content": "你好，有什么可以帮你？"}])
-    tools = build_demo_tools()
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "你好"}]
 
-    result = run_react_loop(
-        llm,
-        [{"role": "system", "content": "sys"}, {"role": "user", "content": "你好"}],
-        tools,
-    )
+    reply = run_react(llm, messages, build_demo_tools())
 
-    assert result.reply == "你好，有什么可以帮你？"
-    assert result.traces == []
+    assert reply == "你好，有什么可以帮你？"
     assert len(llm.requests) == 1
     assert llm.requests[0][1] is not None
-    assert result.messages[-1] == {"role": "assistant", "content": "你好，有什么可以帮你？"}
+    assert messages[-1] == {"role": "assistant", "content": "你好，有什么可以帮你？"}
 
 
 def test_single_step_react_loop() -> None:
-    steps: list[StepTrace] = []
+    steps: list[tuple[str, str, str]] = []
     tools = ToolRegistry(
         Tool(
             name="lookup_weather",
@@ -80,24 +75,17 @@ def test_single_step_react_loop() -> None:
             {"role": "assistant", "content": "上海今天晴，气温 22°C。"},
         ]
     )
+    messages: list[dict[str, object]] = [{"role": "user", "content": "上海今天天气怎么样？"}]
 
-    result = run_react_loop(
+    reply = run_react(
         llm,
-        [{"role": "user", "content": "上海今天天气怎么样？"}],
+        messages,
         tools,
-        on_step=steps.append,
+        on_step=lambda name, args, obs: steps.append((name, args, obs)),
     )
 
-    assert result.reply == "上海今天晴，气温 22°C。"
-    assert len(steps) == 1
-    assert steps[0] == StepTrace(
-        round=1,
-        tool="lookup_weather",
-        arguments='{"city": "上海"}',
-        observation="上海：晴，22°C",
-        is_error=False,
-    )
-    # Second LLM call must receive the tool observation message.
+    assert reply == "上海今天晴，气温 22°C。"
+    assert steps == [("lookup_weather", '{"city": "上海"}', "上海：晴，22°C")]
     second_msgs = llm.requests[1][0]
     assert second_msgs[-1] == {
         "role": "tool",
@@ -107,6 +95,7 @@ def test_single_step_react_loop() -> None:
 
 
 def test_multi_step_chained_react_loop() -> None:
+    steps: list[tuple[str, str, str]] = []
     tools = ToolRegistry(
         Tool(
             name="find_note",
@@ -136,16 +125,22 @@ def test_multi_step_chained_react_loop() -> None:
             {"role": "assistant", "content": "根据 notes/spinlock.md，持有自旋锁时禁止 sleep。"},
         ]
     )
+    messages: list[dict[str, object]] = [{"role": "user", "content": "自旋锁能 sleep 吗？"}]
 
-    result = run_react_loop(llm, [{"role": "user", "content": "自旋锁能 sleep 吗？"}], tools)
+    reply = run_react(
+        llm,
+        messages,
+        tools,
+        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+    )
 
-    assert "禁止 sleep" in result.reply
-    assert [t.tool for t in result.traces] == ["find_note", "read_file"]
-    assert [t.round for t in result.traces] == [1, 2]
+    assert "禁止 sleep" in reply
+    assert [name for name, _, _ in steps] == ["find_note", "read_file"]
     assert len(llm.requests) == 3
 
 
 def test_tool_error_as_observation_self_healing() -> None:
+    steps: list[tuple[str, str, str]] = []
     tools = ToolRegistry(
         Tool(
             name="add_numbers",
@@ -156,7 +151,6 @@ def test_tool_error_as_observation_self_healing() -> None:
     )
     llm = ScriptedLLM(
         [
-            # Round 1: unknown tool + malformed JSON
             {
                 "role": "assistant",
                 "content": None,
@@ -165,7 +159,6 @@ def test_tool_error_as_observation_self_healing() -> None:
                     _tool_call("bad_json", "add_numbers", "{not-json"),
                 ],
             },
-            # Round 2: model corrects itself based on error observations
             {
                 "role": "assistant",
                 "content": None,
@@ -174,17 +167,23 @@ def test_tool_error_as_observation_self_healing() -> None:
             {"role": "assistant", "content": "19 + 23 = 42。"},
         ]
     )
+    messages: list[dict[str, object]] = [{"role": "user", "content": "算一下 19 加 23"}]
 
-    result = run_react_loop(llm, [{"role": "user", "content": "算一下 19 加 23"}], tools)
+    reply = run_react(
+        llm,
+        messages,
+        tools,
+        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+    )
 
-    assert result.reply == "19 + 23 = 42。"
-    assert [t.is_error for t in result.traces] == [True, True, False]
-    assert "未知工具" in result.traces[0].observation
-    assert "JSON 无效" in result.traces[1].observation
-    assert result.traces[2].observation == "42"
+    assert reply == "19 + 23 = 42。"
+    assert "未知工具" in steps[0][2]
+    assert "JSON 解析失败" in steps[1][2]
+    assert steps[2][2] == "42"
 
 
 def test_max_rounds_limit_enforced() -> None:
+    steps: list[tuple[str, str, str]] = []
     tools = ToolRegistry(
         Tool(
             name="ping",
@@ -202,16 +201,21 @@ def test_max_rounds_limit_enforced() -> None:
             {"role": "assistant", "content": "已完成 4 轮探测，总结如下。"},
         ]
     )
+    messages: list[dict[str, object]] = [{"role": "user", "content": "一直探测"}]
 
-    result = run_react_loop(llm, [{"role": "user", "content": "一直探测"}], tools, max_rounds=4)
+    reply = run_react(
+        llm,
+        messages,
+        tools,
+        max_rounds=4,
+        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+    )
 
-    assert result.reply == "已完成 4 轮探测，总结如下。"
-    assert len(result.traces) == 4
+    assert reply == "已完成 4 轮探测，总结如下。"
+    assert len(steps) == 4
     assert len(llm.requests) == 5
-    # Rounds 1..4 receive tool definitions; round 5 (turn == max_rounds) receives tools=None.
     assert all(llm.requests[i][1] is not None for i in range(4))
     assert llm.requests[4][1] is None
-    # The 4th round's last tool message includes the convergence system hint.
     last_tool_msg = llm.requests[4][0][-1]
     assert last_tool_msg["role"] == "tool"
     assert "已达到工具调用轮次上限" in str(last_tool_msg["content"])

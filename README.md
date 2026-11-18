@@ -39,7 +39,8 @@ my_helper_v2/
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
 │   ├── llm.py                     # 零依赖 OpenAI 兼容客户端
-│   ├── chat.py                    # 最小 ToolRegistry 与 ReAct 核心循环
+│   ├── tools.py                   # 最小 Tool 与 ToolRegistry
+│   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（含演示工具 get_current_time）
 ├── tests/
 │   └── test_step1_react.py        # ReAct 循环与客户端单元测试
@@ -51,7 +52,7 @@ my_helper_v2/
 
 ## 开发路线图
 
-- [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `chat.py`, `cli.py`）与终端 REPL
+- [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
 - [ ] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`）
 - [ ] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
 - [ ] **Step 4**：SQLite 状态存储与写操作 `/yes`・`/no` 确认闭环（`db.py`, `app.py`）
