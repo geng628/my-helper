@@ -5,9 +5,6 @@ description = "Minimal personal agent MVP with plain Markdown memory and allowli
 requires-python = ">=3.12"
 dependencies = []
 
-[project.scripts]
-my-helper = "personal_assistant.cli:main"
-
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
