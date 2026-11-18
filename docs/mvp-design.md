@@ -128,7 +128,7 @@ data/
     "read_markdown",
     "write_file",
     "remember_fact",
-    "propose_rule"
+    "save_rule"
   ],
   "files": {
     "read_roots": ["data/knowledge", "data/memory", "docs", "data/workspace"],
@@ -171,7 +171,7 @@ data/
 | `read_markdown` | `path`, `start_line`, `end_line` | 按行号读取允许目录下的文本/Markdown 文件 |
 | `write_file` | `path`, `content`, `mode` (`create`/`overwrite`) | 仅限写入 `data/workspace/`（覆盖前自动备份到 `.backups/`） |
 | `remember_fact` | `{}` (无参数) | 仅在用户明确要求记住信息时调用，程序将本轮用户原话追加至 `data/memory/MEMORY.md` |
-| `propose_rule` | `statement` | 将用户要求遵守的行为规则写入 `data/memory/rules/`（可由 `enabled_tools` 随时开关） |
+| `save_rule` | `statement` | 将用户要求遵守的行为规则写入 `data/memory/rules/`（可由 `enabled_tools` 随时开关） |
 | `cmd_<name>` | 配置文件声明的 `params` | 执行 `config/tools.json` 中 `enabled: true` 的固定 `argv` 命令模板，`shell=False` |
 
 #### `ToolRegistry` 纯白名单执行机制

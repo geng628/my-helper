@@ -5,7 +5,7 @@
     "read_markdown",
     "write_file",
     "remember_fact",
-    "propose_rule"
+    "save_rule"
   ],
   "files": {
     "read_roots": ["data/knowledge", "data/memory", "docs", "data/workspace"],

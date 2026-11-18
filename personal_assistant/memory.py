@@ -1,0 +1,597 @@
+"""Plain Markdown memory, rules, and allowlisted knowledge file tools."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import tempfile
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from personal_assistant.commands import truncate_utf8
+from personal_assistant.tools import Tool
+
+DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads")
+MAX_SEARCH_FILE_BYTES = 1024 * 1024
+
+
+def _positive_int(value: object, default: int, name: str) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} 必须是正整数。")
+    return value
+
+
+def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | None) -> Path:
+    if not isinstance(entry, str) or not entry.strip():
+        raise ValueError("目录配置必须是非空字符串。")
+    rel = Path(entry.strip())
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"目录配置必须是相对路径且不能包含 ..：{entry}")
+    if data_root is not None and rel.parts and rel.parts[0] == "data":
+        resolved_data = data_root.resolve()
+        sub = Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path(".")
+        target = resolved_data / sub
+        if not target.resolve().is_relative_to(resolved_data):
+            raise ValueError(f"目录配置超出 data_root 范围：{entry}")
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    target = project_root / rel
+    if not target.resolve().is_relative_to(project_root.resolve()):
+        raise ValueError(f"目录配置超出项目范围：{entry}")
+    return target
+
+
+@dataclass(frozen=True)
+class FilesPolicy:
+    project_root: Path
+    read_roots: tuple[Path, ...]
+    write_root: Path
+    max_read_bytes: int = 65536
+    max_write_bytes: int = 65536
+    max_lines: int = 400
+    max_results: int = 100
+    reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: dict[str, object] | None,
+        project_root: Path,
+        data_root: Path | None = None,
+    ) -> "FilesPolicy":
+        root = project_root.resolve()
+        cfg = raw or {}
+        if not isinstance(cfg, dict):
+            raise ValueError("files 配置必须是 JSON 对象。")
+        raw_reads = cfg.get("read_roots", ["data/knowledge", "data/memory", "docs", "data/workspace"])
+        if not isinstance(raw_reads, list) or not raw_reads:
+            raise ValueError("files.read_roots 必须是非空数组。")
+        read_roots = tuple(_resolve_config_dir(item, root, data_root) for item in raw_reads)
+        write_root = _resolve_config_dir(cfg.get("write_root", "data/workspace"), root, data_root)
+        raw_rejects = cfg.get("reject_segments", list(DEFAULT_REJECT_SEGMENTS))
+        if not isinstance(raw_rejects, list) or not all(isinstance(x, str) and x for x in raw_rejects):
+            raise ValueError("files.reject_segments 必须是字符串数组。")
+        return cls(
+            project_root=root,
+            read_roots=read_roots,
+            write_root=write_root,
+            max_read_bytes=_positive_int(cfg.get("max_read_bytes"), 65536, "max_read_bytes"),
+            max_write_bytes=_positive_int(cfg.get("max_write_bytes"), 65536, "max_write_bytes"),
+            max_lines=_positive_int(cfg.get("max_lines"), 400, "max_lines"),
+            max_results=_positive_int(cfg.get("max_results"), 100, "max_results"),
+            reject_segments=tuple(raw_rejects),
+        )
+
+
+def _atomic_write(target: Path, content: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _extract_terms(query: str) -> tuple[list[str], list[str]]:
+    normalized = " ".join(query.strip().lower().split())
+    if not normalized:
+        return [], []
+    primary = list(dict.fromkeys(normalized.split(" ")))
+    for token in re.findall(r"[a-z0-9_+-]+", normalized):
+        if len(token) >= 2 and token not in primary:
+            primary.append(token)
+    secondary: list[str] = []
+    for run in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        if len(run) >= 2 and run not in primary:
+            primary.append(run)
+        if len(run) >= 4:
+            for idx in range(len(run) - 1):
+                bg = run[idx : idx + 2]
+                if bg not in primary and bg not in secondary:
+                    secondary.append(bg)
+    return primary, secondary
+
+
+class MemoryStore:
+    """Direct Markdown memory, rule storage, and allowlisted file operations."""
+
+    def __init__(self, data_root: Path | str, policy: FilesPolicy | None = None) -> None:
+        self.data_root = Path(data_root).resolve()
+        if policy is None:
+            proj = self.data_root.parent
+            self.policy = FilesPolicy(
+                project_root=proj,
+                read_roots=(
+                    self.data_root / "knowledge",
+                    self.data_root / "memory",
+                    proj / "docs",
+                    self.data_root / "workspace",
+                ),
+                write_root=self.data_root / "workspace",
+            )
+        else:
+            self.policy = policy
+        self.project_root = self.policy.project_root.resolve()
+        self.memory_dir = self.data_root / "memory"
+        self.memory_file = self.memory_dir / "MEMORY.md"
+        self.rules_dir = self.memory_dir / "rules"
+        self.audit_path = self.memory_dir / "audit.jsonl"
+        self.knowledge_dir = self.data_root / "knowledge"
+        self.inbox_dir = self.knowledge_dir / "inbox"
+        self.workspace_dir = self.policy.write_root
+
+        for directory in (
+            self.rules_dir,
+            self.inbox_dir,
+            self.workspace_dir,
+            self.workspace_dir / ".backups",
+            self.workspace_dir / ".tmp",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        self._roots = self._build_roots()
+
+    def _build_roots(self) -> list[tuple[Path, Path, str, str]]:
+        seen: set[Path] = set()
+        entries: list[tuple[Path, Path, str, str]] = []
+        for raw in (*self.policy.read_roots, self.policy.write_root):
+            resolved = raw.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            entries.append((raw, resolved, *self._root_labels(raw)))
+        return entries
+
+    def _root_labels(self, raw_root: Path) -> tuple[str, str]:
+        for base, prefix in ((self.data_root, "data"), (self.project_root, "")):
+            try:
+                rel = raw_root.relative_to(base)
+                if prefix:
+                    display = ("data" / rel).as_posix() if rel.parts else "data"
+                    alias = rel.as_posix() if rel.parts else ""
+                    return display, alias
+                display = rel.as_posix() if rel.parts else "."
+                return display, display
+            except ValueError:
+                continue
+        return raw_root.name, raw_root.name
+
+    def _to_display_path(self, resolved: Path) -> str:
+        for _, root_resolved, display_prefix, _ in self._roots:
+            if resolved.is_relative_to(root_resolved):
+                rel = resolved.relative_to(root_resolved)
+                return f"{display_prefix}/{rel.as_posix()}" if rel.parts else display_prefix
+        if resolved.is_relative_to(self.data_root):
+            return ("data" / resolved.relative_to(self.data_root)).as_posix()
+        return resolved.name
+
+    def _check_segments(self, parts: tuple[str, ...]) -> None:
+        for part in parts:
+            if part in self.policy.reject_segments:
+                raise ValueError(f"禁止访问受保护路径：{part}")
+
+    def resolve_path(self, rel_path: str, *, write: bool = False) -> Path:
+        """Resolve a relative path safely within allowlisted read/write roots."""
+        if not isinstance(rel_path, str) or not rel_path.strip() or "\x00" in rel_path:
+            raise ValueError("路径必须是非空字符串。")
+        rel = Path(rel_path.strip().replace("\\", "/"))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError("路径必须是项目内相对路径，且不能包含 ..。")
+        self._check_segments(rel.parts)
+
+        if write:
+            return self._resolve_write_path(rel)
+
+        unresolved = self._map_read_candidate(rel)
+        resolved = unresolved.resolve(strict=False)
+        for raw_root in self.policy.read_roots:
+            root_resolved = raw_root.resolve()
+            if resolved.is_relative_to(root_resolved):
+                self._check_segments(resolved.relative_to(root_resolved).parts)
+                return resolved
+        allowed = "、".join(self._root_labels(r)[0] for r in self.policy.read_roots)
+        raise ValueError(f"路径不在允许读取的目录内；允许范围：{allowed}")
+
+    def _resolve_write_path(self, rel: Path) -> Path:
+        parts = rel.parts
+        write_root = self.policy.write_root
+        write_resolved = write_root.resolve()
+        write_display, write_alias = self._root_labels(write_root)
+        display_parts = Path(write_display).parts
+
+        if parts[: len(display_parts)] == display_parts:
+            unresolved = write_root / Path(*parts[len(display_parts) :])
+        elif write_alias and parts[0] == write_alias:
+            unresolved = write_root / Path(*parts[1:])
+        elif self._matches_other_root(parts):
+            raise ValueError(f"只能写入 {write_display} 目录。")
+        else:
+            unresolved = write_root / rel
+
+        current = write_root
+        for part in unresolved.relative_to(write_root).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("写入路径不能包含符号链接。")
+        resolved = unresolved.resolve(strict=False)
+        if not resolved.is_relative_to(write_resolved):
+            raise ValueError(f"只能写入 {write_display} 目录。")
+        self._check_segments(resolved.relative_to(write_resolved).parts)
+        return resolved
+
+    def _matches_other_root(self, parts: tuple[str, ...]) -> bool:
+        if not parts:
+            return False
+        if parts[0] == "data":
+            return True
+        for raw_root in self.policy.read_roots:
+            display, alias = self._root_labels(raw_root)
+            d_parts = Path(display).parts
+            if parts[: len(d_parts)] == d_parts or (alias and parts[0] == Path(alias).parts[0]):
+                return True
+        return False
+
+    def _map_read_candidate(self, rel: Path) -> Path:
+        parts = rel.parts
+        for raw_root, _, display_prefix, short_alias in self._roots:
+            d_parts = Path(display_prefix).parts
+            if parts[: len(d_parts)] == d_parts:
+                return raw_root / Path(*parts[len(d_parts) :])
+            if short_alias:
+                a_parts = Path(short_alias).parts
+                if parts[: len(a_parts)] == a_parts:
+                    return raw_root / Path(*parts[len(a_parts) :])
+        if parts and parts[0] == "data":
+            return self.data_root / Path(*parts[1:])
+        return self.project_root / rel
+
+    # ---- Always-in-Prompt core memory & rules ----
+
+    def read_core_memory(self, max_chars: int = 4000) -> str:
+        if not self.memory_file.is_file():
+            return ""
+        text = self.memory_file.read_text(encoding="utf-8").strip()
+        if not text or len(text) <= max_chars:
+            return text
+        header = text.splitlines()[0] if text.startswith("#") else "# 长期记忆 (MEMORY.md)"
+        tail = text[-max(200, max_chars - len(header) - 80) :]
+        if "\n" in tail:
+            tail = tail.split("\n", 1)[1]
+        return f'{header}\n（仅展示最近 {len(tail)} 字符；完整记录请调用 read_markdown("data/memory/MEMORY.md", ...)）\n{tail}'
+
+    def read_rules_summary(self, limit: int = 30) -> str:
+        if not self.rules_dir.is_dir():
+            return ""
+        rules = sorted(self.rules_dir.glob("*.md"), reverse=True)
+        if not rules:
+            return ""
+        lines = [f"- data/memory/rules/{r.name} — {self._rule_statement(r)}" for r in rules[:limit]]
+        if len(rules) > limit:
+            lines.append(f"- 另有 {len(rules) - limit} 条较早规则，可用 search_markdown 查看 data/memory/rules。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _rule_statement(rule: Path) -> str:
+        content = rule.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if line.startswith("- Statement:"):
+                return line.removeprefix("- Statement:").strip()
+        for line in content.splitlines():
+            if line.strip():
+                return line.strip().lstrip("# ").removeprefix("Rule:").strip() or "（无标题）"
+        return "（空规则文件）"
+
+    # ---- On-demand Markdown browsing & search ----
+
+    def _safe_files(self, target: Path, iterator) -> list[Path]:
+        files: list[Path] = []
+        for item in sorted(iterator):
+            if not item.is_file():
+                continue
+            try:
+                resolved = item.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(target):
+                continue
+            parts = resolved.relative_to(target).parts
+            if any(p in self.policy.reject_segments or p.startswith(".") for p in parts):
+                continue
+            files.append(resolved)
+        return files
+
+    def list_files(self, root: str = "data/knowledge", pattern: str = "*.md") -> str:
+        if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 200:
+            raise ValueError("pattern 必须是 200 字符以内的 glob，例如 *.md。")
+        if ".." in pattern or "\x00" in pattern:
+            raise ValueError("pattern 不能包含 .. 或 NUL。")
+        target = self.resolve_path(root, write=False)
+        if not target.is_dir():
+            raise ValueError(f"目录不存在：{root}")
+        pat = pattern.strip()
+        iterator = target.glob(pat) if ("/" in pat or "**" in pat) else target.rglob(pat)
+        found = [self._to_display_path(p) for p in self._safe_files(target, iterator)[: self.policy.max_results]]
+        if not found:
+            return "没有匹配的文件。"
+        suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
+        return "\n".join(found) + suffix
+
+    def search_markdown(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
+        primary, secondary = _extract_terms(query)
+        if not primary and not secondary:
+            raise ValueError("搜索关键词不能为空。")
+        target = self.resolve_path(root, write=False)
+        if not target.is_dir():
+            raise ValueError(f"目录不存在：{root}")
+
+        candidates: list[tuple[float, str, int, str, str]] = []
+        for resolved in self._safe_files(target, target.rglob("*")):
+            if resolved.suffix.lower() not in {".md", ".txt"}:
+                continue
+            try:
+                if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                    continue
+                text = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            candidates.extend(self._score_file(self._to_display_path(resolved), text, primary, secondary))
+
+        if not candidates:
+            return f"未在 {root} 下找到匹配「{query}」的笔记内容。"
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return "\n\n".join(
+            f"{path}:{line_no} [章节: {section or '正文'}]\n{snippet}"
+            for _, path, line_no, section, snippet in candidates[:limit]
+        )
+
+    def _score_file(
+        self, display_path: str, text: str, primary: list[str], secondary: list[str]
+    ) -> list[tuple[float, str, int, str, str]]:
+        lines = text.splitlines()
+        if not lines:
+            return []
+        path_bonus = sum(4.0 for t in primary if t in display_path.lower())
+        section = ""
+        hits: list[tuple[float, int, str]] = []
+        for idx, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                section = stripped.lstrip("# ").strip() or section
+            line_lower, sec_lower = line.lower(), section.lower()
+            score, matched = 0.0, 0
+            for term in primary:
+                if term in line_lower:
+                    score += 5.0 if stripped.startswith("#") else 3.0
+                    matched += 1
+                elif term in sec_lower:
+                    score += 0.6
+            if score == 0.0 and secondary:
+                sec_hits = sum(1 for t in secondary if t in line_lower)
+                if sec_hits >= 2 or (len(secondary) == 1 and sec_hits == 1):
+                    score += sec_hits * 0.9
+            if score > 0.0:
+                hits.append((score + max(0, matched - 1) * 2.0 + (path_bonus * 0.5 if matched else 0.0), idx, section))
+        if not hits and path_bonus > 0.0:
+            hits.append((path_bonus, 1, ""))
+        hits.sort(key=lambda item: (-item[0], item[1]))
+
+        picked: list[tuple[float, str, int, str, str]] = []
+        used: list[int] = []
+        for score, line_no, sec in hits:
+            if any(abs(line_no - prev) <= 4 for prev in used):
+                continue
+            used.append(line_no)
+            snippet = "\n".join(
+                f"  {n}: {lines[n - 1]}" for n in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1)
+            )
+            picked.append((score, display_path, line_no, sec, snippet))
+            if len(picked) >= 3:
+                break
+        return picked
+
+    def read_markdown(self, path: str, start_line: int = 1, end_line: int = 120) -> str:
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("行号范围无效：start_line >= 1 且 end_line >= start_line。")
+        if end_line - start_line + 1 > self.policy.max_lines:
+            raise ValueError(f"单次最多读取 {self.policy.max_lines} 行。")
+        target = self.resolve_path(path, write=False)
+        if not target.is_file():
+            raise ValueError(f"文件不存在：{path}")
+        try:
+            lines = target.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError("目标文件不是有效的 UTF-8 文本。") from error
+        display_path, total = self._to_display_path(target), len(lines)
+        if total == 0:
+            return f"文件：{display_path}（空文件，共 0 行）"
+        if start_line > total:
+            return f"文件：{display_path} 共 {total} 行，没有第 {start_line} 行。"
+        actual_end = min(total, end_line)
+        body = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start_line, actual_end + 1))
+        return truncate_utf8(f"文件：{display_path}（共 {total} 行，显示第 {start_line}-{actual_end} 行）\n{body}", self.policy.max_read_bytes)
+
+    # ---- Allowlisted Writes (workspace / MEMORY.md / rules) ----
+
+    def write_workspace_file(self, path: str, content: str, mode: str = "create") -> str:
+        if mode not in {"create", "overwrite"}:
+            raise ValueError("mode 只能是 create 或 overwrite。")
+        if not isinstance(content, str) or "\x00" in content:
+            raise ValueError("内容必须是有效文本且不能包含 NUL。")
+        if len(content.encode("utf-8")) > self.policy.max_write_bytes:
+            raise ValueError(f"内容超过 {self.policy.max_write_bytes} 字节写入上限。")
+        target = self.resolve_path(path, write=True)
+        if target.exists() and target.is_dir():
+            raise ValueError("目标路径是目录，不能写入文件。")
+        if mode == "create" and target.exists():
+            raise ValueError("目标文件已存在；create 模式不会覆盖，请换路径或使用 overwrite。")
+
+        backup_rel: str | None = None
+        if mode == "overwrite" and target.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = self.workspace_dir / ".backups" / f"{stamp}-{target.name}"
+            counter = 2
+            while backup.exists():
+                backup = self.workspace_dir / ".backups" / f"{stamp}-{counter}-{target.name}"
+                counter += 1
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+            backup_rel = self._to_display_path(backup)
+
+        _atomic_write(target, content)
+        rel_path = self._to_display_path(target)
+        self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
+        return rel_path
+
+    def remember_user_statement(self, user_text: str, message_id: int | None = None) -> str:
+        clean = " ".join(user_text.split())
+        if not clean:
+            raise ValueError("要记住的内容不能为空。")
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        existing = self.memory_file.read_text(encoding="utf-8") if self.memory_file.is_file() else "# 长期记忆 (MEMORY.md)\n\n"
+        if message_id is not None and f"(msg#{message_id})" in existing:
+            return "data/memory/MEMORY.md"
+        stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+        tag = f" (msg#{message_id})" if message_id is not None else ""
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        _atomic_write(self.memory_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
+        self.record_audit(action="remember_fact", actor="user", target="data/memory/MEMORY.md", old_value=None, new_value=clean)
+        return "data/memory/MEMORY.md"
+
+    def save_rule(self, statement: str, source: str = "agent") -> Path:
+        clean = " ".join(statement.split())
+        if not clean:
+            raise ValueError("规则内容不能为空。")
+        self.rules_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        slug = re.sub(r"[^\w]+", "-", clean).strip("-").lower() or "rule"
+        path = self.rules_dir / f"{timestamp}-{slug[:40]}.md"
+        counter = 2
+        while path.exists():
+            path = self.rules_dir / f"{timestamp}-{slug[:36]}-{counter}.md"
+            counter += 1
+        body = f"# Rule: {clean}\n\n- Statement: {clean}\n- Source: {source}\n- Created: {datetime.now(UTC).isoformat()}\n"
+        _atomic_write(path, body)
+        self.record_audit(action="save_rule", actor=source, target=f"data/memory/rules/{path.name}", old_value=None, new_value=clean)
+        return path
+
+    def record_audit(
+        self, *, action: str, actor: str, target: str, old_value: str | None, new_value: str | None
+    ) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "trace_id": uuid.uuid4().hex[:16],
+            "actor": actor,
+            "action": action,
+            "target": target,
+            "old_value": old_value,
+            "new_value": new_value,
+        }
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry
+
+    def audit_entries(self, limit: int = 50) -> list[dict[str, object]]:
+        if not self.audit_path.is_file():
+            return []
+        lines = [line for line in self.audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [json.loads(line) for line in lines[-limit:]]
+
+
+def memory_tools(
+    memory: MemoryStore,
+    get_user_message: Callable[[], tuple[str, int | None]] | None = None,
+) -> list[Tool]:
+    """Expose MemoryStore operations as pure allowlist-ready Tools."""
+
+    def read_markdown(path: str, start_line: str, end_line: str) -> str:
+        try:
+            start, end = int(start_line), int(end_line)
+        except ValueError as error:
+            raise ValueError("start_line 和 end_line 必须是整数。") from error
+        return memory.read_markdown(path, start, end)
+
+    def write_file(path: str, content: str, mode: str) -> str:
+        saved = memory.write_workspace_file(path, content, mode=mode)
+        return f"已写入：{saved}"
+
+    def remember_fact() -> str:
+        if get_user_message is None:
+            raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
+        user_text, message_id = get_user_message()
+        target = memory.remember_user_statement(user_text, message_id=message_id)
+        return f"已记录用户原话到 {target}"
+
+    def save_rule(statement: str) -> str:
+        path = memory.save_rule(statement, source="agent")
+        return f"已保存行为规则：data/memory/rules/{path.name}"
+
+    return [
+        Tool(
+            "list_files",
+            "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
+            {"root": "目录起点，如 data/knowledge、data/memory、docs", "pattern": "glob 模式，如 *.md"},
+            memory.list_files,
+        ),
+        Tool(
+            "search_markdown",
+            "按关键词搜索个人笔记或规则中的 Markdown 文件名、标题与正文上下文。",
+            {"query": "搜索关键词", "root": "搜索目录，通常为 data/knowledge"},
+            memory.search_markdown,
+        ),
+        Tool(
+            "read_markdown",
+            "按路径和行号读取允许目录内的 Markdown/文本文件。",
+            {"path": "相对路径，如 data/knowledge/ostep/28.锁.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
+            read_markdown,
+        ),
+        Tool(
+            "write_file",
+            "在 data/workspace 目录内创建或覆盖文本文件（覆盖前自动备份）。",
+            {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
+            write_file,
+            param_enums={"mode": ("create", "overwrite")},
+        ),
+        Tool(
+            "remember_fact",
+            "仅在用户明确要求记住信息时调用，保存当前用户原话到 data/memory/MEMORY.md。",
+            {},
+            remember_fact,
+        ),
+        Tool(
+            "save_rule",
+            "将用户要求遵守的行为规则保存到 data/memory/rules/。",
+            {"statement": "规则内容"},
+            save_rule,
+        ),
+    ]

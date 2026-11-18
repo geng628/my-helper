@@ -33,7 +33,7 @@ uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant chat
 ```
 
-## 当前项目结构（Step 2）
+## 当前项目结构（Step 3）
 
 ```text
 my_helper_v2/
@@ -47,13 +47,15 @@ my_helper_v2/
 │   ├── llm.py                     # 零依赖 OpenAI 兼容客户端
 │   ├── tools.py                   # Tool 与 ToolRegistry 白名单注册表
 │   ├── commands.py                # 固定 argv 命令模板加载与安全执行器
+│   ├── memory.py                  # 纯 Markdown 记忆直读、笔记搜索/分页读取与白名单写入
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
-│   └── cli.py                     # 终端交互 REPL（加载白名单工具）
+│   └── cli.py                     # 终端交互 REPL（加载白名单工具与 Markdown 记忆）
 ├── scripts/
 │   └── demo.py                    # 离线演示与单句实测脚本
 ├── tests/
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
-│   └── test_step2_tools.py        # 工具白名单与命令执行器单元测试
+│   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
+│   └── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
 ├── .env.example
 ├── .gitignore
 ├── LICENSE
@@ -64,7 +66,7 @@ my_helper_v2/
 
 - [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
 - [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`）
-- [ ] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
+- [x] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
 - [ ] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
 - [ ] **Step 5**：纯 Python Telegram Long Polling 与轻量 HTTP 服务（`telegram_bot.py`, `server.py`）
 
