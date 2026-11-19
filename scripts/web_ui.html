@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>My Helper — 本地网页对话</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #171a23;
+      --panel-2: #1f2430;
+      --border: #2a3142;
+      --text: #e6ebf5;
+      --muted: #9aa4b8;
+      --accent: #5b8cff;
+      --accent-soft: rgba(91, 140, 255, 0.14);
+      --user-bg: #253b6e;
+      --ok: #3ecf8e;
+      --warn: #f5b942;
+      --err: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--warn);
+    }
+    .dot.ok { background: var(--ok); }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .pill {
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    button {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 11px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    button:hover { border-color: var(--accent); background: #262d3d; }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      padding: 8px 16px;
+      font-size: 13px;
+    }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      max-width: 920px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .empty {
+      margin: auto;
+      text-align: center;
+      color: var(--muted);
+      max-width: 520px;
+      line-height: 1.7;
+    }
+    .msg {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-width: 84%;
+    }
+    .msg.user { align-self: flex-end; align-items: flex-end; }
+    .msg.assistant { align-self: flex-start; align-items: flex-start; }
+    .bubble {
+      padding: 11px 14px;
+      border-radius: 12px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--border);
+      background: var(--panel);
+    }
+    .msg.user .bubble {
+      background: var(--user-bg);
+      border-color: #365499;
+    }
+    .msg.error .bubble {
+      border-color: var(--err);
+      color: #ffc2c2;
+    }
+    .bubble code {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px;
+    }
+    .bubble pre {
+      background: #0b0d12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      margin: 8px 0 4px;
+    }
+    .bubble pre code {
+      background: none;
+      padding: 0;
+    }
+    details.tools {
+      width: 100%;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    details.tools summary {
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 500;
+    }
+    .tool-item {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .tool-name { color: #8cb4ff; font-weight: 600; }
+    .submeta {
+      font-size: 11.5px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .badge-mem { color: var(--ok); }
+
+    footer {
+      border-top: 1px solid var(--border);
+      background: var(--panel);
+      padding: 12px 16px;
+    }
+    .composer {
+      max-width: 920px;
+      margin: 0 auto;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    textarea {
+      flex: 1;
+      resize: none;
+      min-height: 44px;
+      max-height: 160px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+      outline: none;
+    }
+    textarea:focus { border-color: var(--accent); }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 20;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: min(760px, 100%);
+      max-height: 82vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .modal-body {
+      padding: 14px 16px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span id="statusDot" class="dot"></span>
+      <span>My Helper 本地对话</span>
+      <span id="sessionPill" class="pill">会话: web</span>
+    </div>
+    <div class="meta">
+      <span id="toolCount" class="pill">工具: -</span>
+      <span id="cachePill" class="pill">KV 缓存: 待统计</span>
+    </div>
+    <div class="actions">
+      <button id="btnMemory">查看记忆</button>
+      <button id="btnRefresh">刷新索引</button>
+      <button id="btnNewSession">新会话</button>
+    </div>
+  </header>
+
+  <main id="chat">
+    <div class="empty" id="emptyState">
+      已连接本地 My Helper（零第三方依赖）。<br />
+      试试问它：“现在几点了？”、“帮我看看最近 3 条 git 提交”、“记住我偏好简洁中文回答”。<br />
+      按 <code>Enter</code> 发送，<code>Shift + Enter</code> 换行。
+    </div>
+  </main>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="btnSend" class="primary">发送</button>
+    </div>
+  </footer>
+
+  <div id="modal" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="modalTitle">记忆与状态</span>
+        <button id="btnCloseModal">关闭</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script>
+    const chatEl = document.getElementById("chat");
+    const emptyEl = document.getElementById("emptyState");
+    const inputEl = document.getElementById("input");
+    const sendBtn = document.getElementById("btnSend");
+    const statusDot = document.getElementById("statusDot");
+    const sessionPill = document.getElementById("sessionPill");
+    const toolCount = document.getElementById("toolCount");
+    const cachePill = document.getElementById("cachePill");
+    const modal = document.getElementById("modal");
+    const modalTitle = document.getElementById("modalTitle");
+    const modalBody = document.getElementById("modalBody");
+
+    let chatId = localStorage.getItem("my_helper_chat_id") || "web";
+    let busy = false;
+
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderMarkdownLite(text) {
+      const escaped = escapeHtml(text);
+      const withBlocks = escaped.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, (_, code) => {
+        return `<pre><code>${code}</code></pre>`;
+      });
+      return withBlocks
+        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    }
+
+    function formatCacheLine(cache) {
+      if (!cache || !cache.llm_calls) return "";
+      const parts = [];
+      if (cache.prompt_tokens > 0 && cache.server_cache_hit_rate != null) {
+        parts.push(`服务端缓存 ${cache.cached_tokens}/${cache.prompt_tokens} (${(cache.server_cache_hit_rate * 100).toFixed(1)}%)`);
+      }
+      if (cache.mean_prefix_reuse_rate != null) {
+        parts.push(`前缀复用 ${(cache.mean_prefix_reuse_rate * 100).toFixed(1)}%`);
+      }
+      parts.push(`调用 ${cache.llm_calls} 次`);
+      return parts.join(" · ");
+    }
+
+    function appendMessage(role, content, extra = {}) {
+      if (emptyEl) emptyEl.style.display = "none";
+      const wrap = document.createElement("div");
+      wrap.className = `msg ${role}${extra.error ? " error" : ""}`;
+
+      if (extra.toolCalls && extra.toolCalls.length > 0) {
+        const details = document.createElement("details");
+        details.className = "tools";
+        const summary = document.createElement("summary");
+        summary.textContent = `🔧 工具调用轨迹（${extra.toolCalls.length} 步）`;
+        details.appendChild(summary);
+        for (const step of extra.toolCalls) {
+          const item = document.createElement("div");
+          item.className = "tool-item";
+          const obs = String(step.observation || "");
+          const preview = obs.length > 600 ? obs.slice(0, 600) + "\n…（已折叠）" : obs;
+          item.innerHTML =
+            `<span class="tool-name">[Act] ${escapeHtml(step.tool)}</span>(${escapeHtml(step.arguments)})\n` +
+            `[Observe] ${escapeHtml(preview)}`;
+          details.appendChild(item);
+        }
+        wrap.appendChild(details);
+      }
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = role === "assistant" ? renderMarkdownLite(content) : escapeHtml(content);
+      wrap.appendChild(bubble);
+
+      const metaBits = [];
+      const cacheText = formatCacheLine(extra.cache);
+      if (cacheText) metaBits.push(`<span>⚡ ${escapeHtml(cacheText)}</span>`);
+      if (extra.consolidationScheduled) {
+        metaBits.push(`<span class="badge-mem">🧠 已达阈值，后台正在自动沉淀记忆并压缩上下文</span>`);
+      }
+      if (metaBits.length > 0) {
+        const sub = document.createElement("div");
+        sub.className = "submeta";
+        sub.innerHTML = metaBits.join("");
+        wrap.appendChild(sub);
+      }
+
+      chatEl.appendChild(wrap);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      return wrap;
+    }
+
+    async function refreshStatus() {
+      sessionPill.textContent = `会话: ${chatId}`;
+      try {
+        const res = await fetch("/api/status");
+        const data = await res.json();
+        statusDot.classList.toggle("ok", Boolean(data.llm_configured));
+        statusDot.title = data.llm_configured ? "LLM 已就绪" : "LLM 未配置";
+        toolCount.textContent = `工具: ${(data.tools || []).length} 个`;
+        toolCount.title = (data.tools || []).join(", ");
+        const c = data.cache || {};
+        if (c.prompt_tokens > 0 && c.server_cache_hit_rate != null) {
+          cachePill.textContent = `累计缓存: ${(c.server_cache_hit_rate * 100).toFixed(1)}% (${c.cached_tokens}/${c.prompt_tokens})`;
+        } else if (c.mean_prefix_reuse_rate != null) {
+          cachePill.textContent = `前缀复用: ${(c.mean_prefix_reuse_rate * 100).toFixed(1)}%`;
+        }
+      } catch (_) {}
+    }
+
+    async function loadHistory() {
+      chatEl.innerHTML = "";
+      chatEl.appendChild(emptyEl);
+      emptyEl.style.display = "block";
+      try {
+        const res = await fetch(`/api/history?chat_id=${encodeURIComponent(chatId)}`);
+        const data = await res.json();
+        if (data.summary) {
+          appendMessage("assistant", `【前情摘要】\n${data.summary}`);
+        }
+        for (const msg of data.messages || []) {
+          appendMessage(msg.role === "user" ? "user" : "assistant", msg.content);
+        }
+      } catch (_) {}
+    }
+
+    async function sendMessage() {
+      const text = inputEl.value.trim();
+      if (!text || busy) return;
+      busy = true;
+      sendBtn.disabled = true;
+      inputEl.value = "";
+      inputEl.style.height = "44px";
+
+      appendMessage("user", text);
+      const pending = appendMessage("assistant", "思考与执行工具中…");
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, chat_id: chatId }),
+        });
+        const data = await res.json();
+        pending.remove();
+        if (!res.ok) {
+          appendMessage("assistant", data.error || `请求失败（HTTP ${res.status}）`, { error: true });
+        } else {
+          appendMessage("assistant", data.reply, {
+            toolCalls: data.tool_calls,
+            cache: data.cache,
+            consolidationScheduled: data.consolidation_scheduled,
+          });
+        }
+      } catch (err) {
+        pending.remove();
+        appendMessage("assistant", `网络异常：${err}`, { error: true });
+      } finally {
+        busy = false;
+        sendBtn.disabled = false;
+        inputEl.focus();
+        refreshStatus();
+      }
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+    inputEl.addEventListener("input", () => {
+      inputEl.style.height = "44px";
+      inputEl.style.height = Math.min(160, inputEl.scrollHeight) + "px";
+    });
+
+    document.getElementById("btnMemory").addEventListener("click", async () => {
+      modalTitle.textContent = "长期记忆、规则与事实备忘";
+      modalBody.textContent = "加载中…";
+      modal.classList.add("open");
+      try {
+        const [memRes, stRes] = await Promise.all([fetch("/api/memory"), fetch("/api/status")]);
+        const mem = await memRes.json();
+        const st = await stRes.json();
+        modalBody.textContent =
+          `${mem.overview}\n\n【已启用工具 (${(st.tools || []).length})】\n${(st.tools || []).join(", ")}\n\n` +
+          `【后台沉淀状态】\n${JSON.stringify(st.consolidation || {}, null, 2)}`;
+      } catch (err) {
+        modalBody.textContent = `读取失败：${err}`;
+      }
+    });
+
+    document.getElementById("btnRefresh").addEventListener("click", async () => {
+      await fetch("/api/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId }),
+      });
+      appendMessage("assistant", "已刷新当前会话的系统提示词缓存，下一轮将加载最新规则与 MEMORY.md 索引。");
+    });
+
+    document.getElementById("btnNewSession").addEventListener("click", () => {
+      const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, "");
+      chatId = `web-${stamp}`;
+      localStorage.setItem("my_helper_chat_id", chatId);
+      refreshStatus();
+      loadHistory();
+    });
+
+    document.getElementById("btnCloseModal").addEventListener("click", () => modal.classList.remove("open"));
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) modal.classList.remove("open");
+    });
+
+    refreshStatus();
+    loadHistory();
+    inputEl.focus();
+  </script>
+</body>
+</html>

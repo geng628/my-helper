@@ -36,6 +36,8 @@ uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
 uv run python -m personal_assistant chat
+# 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
+uv run python scripts/web_chat.py --open
 ```
 
 ## 当前项目结构（Step 4）
@@ -70,7 +72,9 @@ my_helper_v2/
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
-│   └── demo.py                    # 离线演示与单句实测脚本
+│   ├── demo.py                    # 离线演示与单句实测脚本
+│   ├── web_chat.py                # 零依赖本地网页对话服务（标准库 ThreadingHTTPServer）
+│   └── web_ui.html                # 纯 HTML/JS 极简本地对话页面（含工具轨迹与 KV 缓存显示）
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
@@ -82,7 +86,8 @@ my_helper_v2/
 │   ├── test_consolidator.py       # 自动阈值沉淀与后台上下文压缩单元测试
 │   ├── test_memory_lifecycle.py   # 记忆冲突替换与临时事实过期归档单元测试
 │   ├── test_eval.py               # 检索与单轮 Agent 评测器单元测试
-│   └── test_memory_eval.py        # 多轮记忆与生命周期评测器单元测试
+│   ├── test_memory_eval.py        # 多轮记忆与生命周期评测器单元测试
+│   └── test_web_chat.py           # 本地网页对话服务接口单元测试
 ├── .env.example
 ├── .gitignore
 ├── LICENSE
