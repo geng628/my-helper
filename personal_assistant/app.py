@@ -21,7 +21,7 @@ MAX_HISTORY_ITEM_CHARS = 600
 MAX_NOTE_BYTES = 2 * 1024 * 1024
 
 
-# 统一编排层：供 CLI、HTTP 服务和 Telegram 接入层共同调用
+# 统一编排层：供终端 CLI 与本地 HTTP 接口共同调用
 class AssistantApp:
     # 装配数据目录、工具白名单配置、Markdown 记忆库、SQLite 历史与大模型客户端
     def __init__(

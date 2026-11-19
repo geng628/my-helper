@@ -16,9 +16,9 @@
    - 所有工具由宿主机纯 Python 原生实现，并通过唯一的配置文件 `config/tools.json` 进行**三级白名单管控**（工具名称白名单、文件读写目录白名单、固定 `argv` 命令模板白名单）。
    - 不设繁琐的二次确认弹窗：凡在白名单且满足目录/参数约束的工具直接执行，白名单外的一切操作直接拒绝。
 4. **纯 Python 单服务架构**：
-   - 核心聚焦在：对话循环 + Markdown 记忆/知识库 + 本地文件与命令白名单。
-   - 使用 Python 标准库实现轻量 Telegram Long Polling 接入层与本地 CLI / HTTP API，单进程即可运行。
-   - 后续若需从 v1 迁移课表、论文阅读等能力，只需作为独立白名单工具按需挂载。
+   - 核心聚焦在：ReAct 对话循环 + Markdown 记忆/知识库 + 白名单工具与插件机制。
+   - 仅依赖 Python 标准库，直接通过终端 CLI 交互运行（可选暴露轻量本地 HTTP API）。
+   - 后续需要任何业务能力，只需往 `plugins/` 写一个带 `@tool` 的函数并在 `config/tools.json` 白名单勾选即可挂载。
 
 ---
 
@@ -28,7 +28,7 @@
 
 ```mermaid
 flowchart TD
-    User["用户 (Telegram / CLI / HTTP)"] --> Entry["接入层 (telegram_bot.py / cli.py / server.py)"]
+    User["用户 (CLI / HTTP)"] --> Entry["接入层 (cli.py / server.py)"]
     Entry --> App["核心编排 AssistantApp (app.py)"]
     App --> State["状态存储 StateStore (db.py)\nchat_history.sqlite3\n- messages (对话历史)"]
     App --> Mem["Markdown 记忆与笔记 MemoryStore (memory.py)\n- 直读 data/memory/MEMORY.md\n- 直读 data/memory/rules/*.md\n- 搜索/按行读取 data/knowledge/**/*.md"]
@@ -50,17 +50,17 @@ my_helper_v2/
 ├── personal_assistant/
 │   ├── __init__.py
 │   ├── __main__.py                # 启动入口
-│   ├── cli.py                     # 命令行入口：serve / telegram / chat (终端交互)
-│   ├── app.py                     # AssistantApp：装配、提示词上下文与会话历史 (~120 行)
+│   ├── cli.py                     # 命令行入口：chat (终端交互) / serve (可选 HTTP)
+│   ├── app.py                     # AssistantApp：装配、提示词上下文与会话历史 (~260 行)
 │   ├── react.py                   # 极简 ReAct 核心循环（最多 4 轮原生工具调用） (~70 行)
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib） (~100 行)
-│   ├── memory.py                  # 核心内置 Markdown 记忆与知识工具 (~590 行)
+│   ├── memory.py                  # 核心内置 Markdown 记忆与知识工具 (~600 行)
 │   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表 (~130 行)
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具 (~85 行)
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig (~260 行)
-│   ├── db.py                      # SQLite 连接与极简表结构（messages） (~60 行)
-│   ├── telegram_bot.py            # 纯 Python Telegram Long Polling 与斜杠命令处理 (~150 行)
-│   └── server.py                  # 轻量本地 HTTP API (/health, /status, /chat) (~90 行)
+│   ├── db.py                      # SQLite 连接与极简表结构（messages） (~95 行)
+│   ├── eval/                      # 离线检索评测与端到端 Agent 评测包
+│   └── server.py                  # 可选轻量本地 HTTP API (/health, /status, /chat) (~90 行)
 ├── tests/                         # 面向 MVP 核心闭环的单元测试
 ├── .env.example
 ├── .gitignore
@@ -79,8 +79,7 @@ data/
 ├── knowledge/                     # 用户的原始 Markdown 笔记目录（可软链接至 v1 的 data/knowledge）
 ├── workspace/                     # write_file 唯一允许写入的工作目录（覆盖时自动备份至 .backups/）
 └── state/
-    ├── chat_history.sqlite3       # 对话历史表 messages
-    └── telegram-offset            # Telegram getUpdates 轮询游标
+    └── chat_history.sqlite3       # 对话历史表 messages
 ```
 
 ---
@@ -231,23 +230,12 @@ CREATE TABLE IF NOT EXISTS messages (
 
 ---
 
-### 3.5 纯 Python 接入层（`telegram_bot.py` / `cli.py` / `server.py`）
+### 3.5 本地接入层（`cli.py` / 可选 `server.py`）
 
-1. **Telegram Bot（`personal_assistant/telegram_bot.py`）**：
-   - 使用标准库 `urllib.request` 直接请求 `https://api.telegram.org/bot<TOKEN>/getUpdates` 与 `sendMessage` / `getFile`（自动继承环境变量 `HTTPS_PROXY` / `HTTP_PROXY`）。
-   - 仅响应 `str(message.chat.id) == TELEGRAM_CHAT_ID` 的消息。
-   - 支持接收用户直接发送的 `.md` / `.txt` 文档附件，调用 `app.ingest_note(filename, content)` 存入 `data/knowledge/inbox/`。
-   - 支持斜杠命令：
-     - `/start`, `/help`：显示简洁帮助
-     - `/status`：显示 LLM 状态、笔记文件数、记忆条数、已启用白名单工具列表
-     - `/memory`：显示 `MEMORY.md` 内容与当前规则列表
-     - `/search <关键词>`：不经过 LLM，直接调用 `memory.search_markdown(query)` 返回匹配结果（`LLM_MODE=off` 时依然可用）
-   - 普通文本消息直接调用 `app.chat(text, chat_id)`。
-
-2. **统一启动方式（`personal_assistant/cli.py`）**：
-   - `uv run python -m personal_assistant serve [--host 127.0.0.1] [--port 8765] [--with-telegram]`：启动 HTTP 服务（可选同进程后台线程跑 Telegram 轮询）。
-   - `uv run python -m personal_assistant telegram`：单独在前台运行纯 Python Telegram 轮询。
-   - `uv run python -m personal_assistant chat`：在本地终端直接进入 REPL 与助手对话，方便日常调试。
+1. **终端交互（`personal_assistant/cli.py`）**：
+   - `uv run python -m personal_assistant chat`：直接进入终端 REPL 与助手对话，支持 `/status`、`/memory`、`/search <关键词>` 离线快捷命令。
+2. **轻量本地 HTTP API（可选 `personal_assistant/server.py`）**：
+   - `uv run python -m personal_assistant serve [--host 127.0.0.1] [--port 8765]`：暴露 `/health`、`/status`、`/search`、`/chat`、`/knowledge/notes` 等 JSON 接口，方便接任意前端或脚本调用。
 
 ---
 
@@ -255,11 +243,13 @@ CREATE TABLE IF NOT EXISTS messages (
 
 1. **Step 1 — 最小 ReAct 核心循环（`personal_assistant/llm.py`, `personal_assistant/tools.py`, `personal_assistant/react.py`, `personal_assistant/cli.py`）**
    - 实现无第三方依赖的 OpenAI 兼容客户端、`Tool` / `ToolRegistry` 最小执行接口，以及清晰直观的 `Reason -> Act -> Observe` 多轮循环（最多 4 轮），支持本地终端 REPL 实时打印工具调用轨迹。
-2. **Step 2 — 白名单工具与命令执行器（`config/tools.json`, `personal_assistant/tools.py`, `personal_assistant/commands.py`）**
-   - 接入 `enabled_tools` 白名单过滤与 `config/tools.json` 固定 `argv` 命令模板（`shell=False`、环境变量白名单、参数校验、输出截断）。
+2. **Step 2 — 白名单工具、插件与命令执行器（`config/tools.json`, `personal_assistant/tools.py`, `personal_assistant/plugins.py`, `personal_assistant/commands.py`, `plugins/`）**
+   - 接入 `enabled_tools` 白名单过滤、可编辑 Python 插件文件（`@tool` 装饰器）与固定 `argv` 命令模板。
 3. **Step 3 — 纯 Markdown 记忆与知识模块（`personal_assistant/memory.py`）**
    - 直读 `MEMORY.md` 与 `rules/*.md` 注入系统提示词，提供目录白名单内的 Markdown 列表、检索、按行读取与安全写入。
-4. **Step 4 — 状态存储与核心编排（`personal_assistant/db.py`, `personal_assistant/app.py`）**
+4. **Eval — 离线检索与端到端 Agent 评测（`personal_assistant/eval/`）**
+   - 拆分 `common.py` / `search_eval.py` / `agent_eval.py` / `cli.py`，支持零 Token 检索评测与隔离环境下的 Agent 评测。
+5. **Step 4 — 状态存储与核心编排（`personal_assistant/db.py`, `personal_assistant/app.py`）**
    - 接入 SQLite 会话历史 `messages` 与 `AssistantApp` 装配。
-5. **Step 5 — 纯 Python 接入层与完整测试（`personal_assistant/telegram_bot.py`, `personal_assistant/server.py`, `tests/`）**
-   - 接入 Telegram Long Polling、轻量本地 HTTP API 与端到端测试。
+6. **Step 5 — 可选轻量本地 HTTP 服务（`personal_assistant/server.py`）**
+   - 按需提供本地 JSON API 与端到端接口测试。

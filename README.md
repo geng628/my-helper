@@ -1,6 +1,6 @@
 # My Helper v2
 
-一个**零第三方运行依赖**的纯 Python 个人 AI Agent 最小 MVP。不套用黑盒框架，从最基础的 ReAct 循环开始，一步步搭起白名单工具沙箱、纯 Markdown 记忆系统与本地/Telegram 接入层。
+一个**零第三方运行依赖**的纯 Python 个人 AI Agent 最小 MVP。不套用黑盒框架，从最基础的 ReAct 循环开始，一步步搭起白名单工具沙箱、插件加载器、纯 Markdown 记忆系统与轻量评测模块。
 
 > 详细架构与演进规划见 [docs/mvp-design.md](docs/mvp-design.md)。
 
@@ -85,7 +85,7 @@ my_helper_v2/
 - [x] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
 - [x] **Eval**：离线检索与端到端 Agent 评测包（`eval/`）
 - [x] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
-- [ ] **Step 5**：纯 Python Telegram Long Polling 与轻量 HTTP 服务（`telegram_bot.py`, `server.py`）
+- [ ] **Step 5**：轻量本地 HTTP API 服务（`server.py`，可选）
 
 ## License
 
