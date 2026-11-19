@@ -1,4 +1,4 @@
-"""Zero-dependency OpenAI-compatible Chat Completions client."""
+"""零第三方依赖的 OpenAI 兼容大模型客户端。"""
 from __future__ import annotations
 
 import json
@@ -9,13 +9,15 @@ from dataclasses import dataclass
 from urllib.request import Request, urlopen
 
 
+# 当未配置 LLM_MODE=on 或缺少 API Key 时抛出的异常
 class LLMNotConfigured(RuntimeError):
-    """Raised when an LLM call is requested but LLM_MODE/LLM_API_KEY is not set."""
+    """未配置大模型参数时抛出。"""
 
 
 PostJson = Callable[[str, dict[str, object], dict[str, str]], dict[str, object]]
 
 
+# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求并解析返回体
 def default_post_json(
     url: str, payload: dict[str, object], headers: dict[str, str]
 ) -> dict[str, object]:
@@ -33,9 +35,9 @@ def default_post_json(
         return json.loads(response.read().decode("utf-8"))
 
 
+# 大模型客户端抽象基类，供 ReAct 循环调用
 class LLMClient(ABC):
-    """Minimal chat-completions interface used by the ReAct loop."""
-
+    # 发送对话历史与工具定义，返回模型本轮的 assistant 消息（含纯文本或 tool_calls）
     @abstractmethod
     def respond(
         self,
@@ -44,9 +46,9 @@ class LLMClient(ABC):
     ) -> dict[str, object]: ...
 
 
+# 占位客户端：未启用模型时给出友好提示，避免程序崩溃
 class NoopLLMClient(LLMClient):
-    """Fallback client when LLM_MODE is off or API key is missing."""
-
+    # 直接抛出未配置异常，提示用户设置环境变量
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -57,6 +59,7 @@ class NoopLLMClient(LLMClient):
         )
 
 
+# OpenAI 兼容 Chat Completions 客户端（支持 DeepSeek / OpenAI / 通义千问等）
 @dataclass(frozen=True)
 class OpenAICompatibleLLM(LLMClient):
     api_key: str
@@ -65,6 +68,7 @@ class OpenAICompatibleLLM(LLMClient):
     temperature: float = 0.2
     post_json: PostJson = default_post_json
 
+    # 组装 OpenAI 格式请求体调用 /chat/completions，原样返回首条 assistant 消息
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -88,6 +92,7 @@ class OpenAICompatibleLLM(LLMClient):
         return dict(response["choices"][0]["message"])
 
 
+# 从环境变量读取配置，返回可用的 LLM 客户端（未开启则返回 NoopLLMClient）
 def from_env() -> LLMClient:
     mode = os.getenv("LLM_MODE", "off").strip().lower() or "off"
     api_key = os.getenv("LLM_API_KEY", "").strip()

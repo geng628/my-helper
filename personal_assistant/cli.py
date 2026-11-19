@@ -1,4 +1,4 @@
-"""Minimal terminal REPL entrypoint for the ReAct agent."""
+"""最小终端交互（REPL）入口，用于本地测试 ReAct 循环与记忆工具。"""
 from __future__ import annotations
 
 import argparse
@@ -17,6 +17,7 @@ from personal_assistant.tools import ToolRegistry
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# 读取本地 .env 文件并将未设置的 KEY=VALUE 注入当前进程环境变量
 def load_dotenv(path: Path = Path(".env")) -> None:
     if not path.is_file():
         return
@@ -31,12 +32,13 @@ def load_dotenv(path: Path = Path(".env")) -> None:
             os.environ.setdefault(key, value)
 
 
+# 从可编辑插件文件加载演示用时间工具（不硬编码工具实现）
 def build_demo_tools() -> ToolRegistry:
-    """Load the demo time tool from the editable plugin file (no hardcoded tools)."""
     plugin_tools = load_plugin_tools(["plugins/custom_tools.py"], REPO_ROOT)
     return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
+# 根据 config/tools.json 装配终端 REPL 使用的白名单工具注册表与 Markdown 记忆库
 def build_repl_tools(
     config_path: Path | None = None,
     data_root: Path | None = None,
@@ -57,6 +59,7 @@ def build_repl_tools(
     return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message)), memory
 
 
+# 组装每轮系统提示词：拼接基础人设、当前日期、行为规则与 MEMORY.md 核心记忆
 def format_system_prompt(memory: MemoryStore) -> str:
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     parts = [SYSTEM_PROMPT, f"今天是 {today}（北京时间）。"]
@@ -69,11 +72,13 @@ def format_system_prompt(memory: MemoryStore) -> str:
     return "\n\n".join(parts)
 
 
+# 终端回调函数：实时打印每一步工具调用（Act）与观察结果（Observe）
 def _print_step(name: str, args: str, observation: str) -> None:
     print(f"  [Act] {name}({args})")
     print(f"  [Observe] {observation}")
 
 
+# 启动交互式终端对话循环，持续读取用户输入并驱动 ReAct 执行
 def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) -> None:
     client = llm or from_env()
     current_user: list[tuple[str, int | None]] = [("", None)]
@@ -114,6 +119,7 @@ def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) ->
         print(f"助手> {reply}")
 
 
+# 命令行总入口：加载 .env 并解析子命令（默认进入 chat 交互模式）
 def main(argv: list[str] | None = None) -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="my-helper")

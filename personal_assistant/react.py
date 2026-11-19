@@ -1,4 +1,4 @@
-"""Minimal ReAct loop (Reason -> Act -> Observe)."""
+"""最小 ReAct 循环（Reason 推理 -> Act 调用工具 -> Observe 观察结果）。"""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -15,11 +15,13 @@ SYSTEM_PROMPT = (
 )
 
 
+# 从模型返回的消息字典中提取纯文本回复，为空时使用兜底文案
 def _extract_reply(message: dict[str, object], fallback: str = "模型没有返回回复，请重试。") -> str:
     content = str(message.get("content") or "").strip()
     return content or fallback
 
 
+# 执行有轮次上限的 ReAct 主循环：原地追加对话与工具消息，并返回最终自然语言回答
 def run_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
@@ -28,11 +30,10 @@ def run_react(
     max_rounds: int = MAX_TOOL_ROUNDS,
     on_step: Callable[[str, str, str], None] | None = None,
 ) -> str:
-    """Run a bounded Reason -> Act -> Observe loop, mutating `messages` in place."""
     tool_defs = tools.definitions() if tools.names else None
 
     for _ in range(max_rounds):
-        # 1. Reason: let the model decide whether to call tools or answer directly.
+        # 1. Reason：让模型决定直接回答，还是发起 tool_calls
         assistant_msg = llm.respond(messages, tool_defs)
         tool_calls = assistant_msg.get("tool_calls") or []
         if not tool_calls:
@@ -40,7 +41,7 @@ def run_react(
             messages.append({"role": "assistant", "content": reply})
             return reply
 
-        # 2. Act & Observe: run requested tools and append observations to context.
+        # 2. Act & Observe：依次执行模型请求的工具，并将结果作为 tool 消息写回上下文
         messages.append(assistant_msg)
         for call in tool_calls:
             fn = call.get("function") or {}
@@ -57,7 +58,7 @@ def run_react(
                 }
             )
 
-    # 3. Max rounds reached: drop tools and force the model to summarize and stop.
+    # 3. 达到工具调用轮次上限：不再提供工具，强制模型基于已有观察总结作答
     if messages and messages[-1].get("role") == "tool":
         messages[-1]["content"] = (
             str(messages[-1]["content"])

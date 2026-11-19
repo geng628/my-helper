@@ -1,4 +1,4 @@
-"""Dynamic plugin loader for user-editable Python tool files."""
+"""动态插件加载器：扫描项目内用户可编辑的 Python 工具文件。"""
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +9,7 @@ from pathlib import Path
 from personal_assistant.tools import Tool
 
 
+# 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
 def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[Path]:
     root = project_root.resolve()
     files: list[Path] = []
@@ -41,6 +42,7 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
+# 动态导入单个插件 .py 文件，收集其中的 TOOLS 列表以及被 @tool 装饰的函数
 def _load_module_tools(file_path: Path) -> list[Tool]:
     digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
     module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
@@ -73,8 +75,8 @@ def _load_module_tools(file_path: Path) -> list[Tool]:
     return found
 
 
+# 批量加载配置声明的全部插件工具，并禁止跨文件重名
 def load_plugin_tools(entries: Iterable[str], project_root: Path) -> list[Tool]:
-    """Load `@tool`-decorated functions and `TOOLS` lists from project plugin files."""
     loaded: list[Tool] = []
     seen_names: set[str] = set()
     for file_path in _resolve_plugin_targets(entries, project_root):

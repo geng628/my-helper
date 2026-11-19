@@ -1,4 +1,4 @@
-"""Allowlisted fixed-argv command loader and subprocess runner."""
+"""固定 argv 白名单命令加载器、子进程执行器与总配置解析。"""
 from __future__ import annotations
 
 import json
@@ -17,6 +17,7 @@ PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
 FORBIDDEN_CHARS_RE = re.compile(r"[\x00\r\n]")
 
 
+# 按 UTF-8 字节上限安全截断长文本，避免单次工具输出撑爆上下文
 def truncate_utf8(text: str, max_bytes: int) -> str:
     data = text.encode("utf-8")
     if len(data) <= max_bytes:
@@ -24,12 +25,14 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
     return data[:max_bytes].decode("utf-8", errors="ignore") + "\n…（输出已截断）"
 
 
+# 固定命令模板中单个占位符参数的约束规则（描述、枚举白名单、正则格式）
 @dataclass(frozen=True)
 class ParamSpec:
     description: str
     enum: tuple[str, ...] = ()
     pattern: str = ""
 
+    # 校验并清洗模型传入的参数值，拦截换行/NUL/非法枚举及不匹配正则的输入
     def validate(self, value: str) -> str:
         text = value.strip()
         if not text or FORBIDDEN_CHARS_RE.search(text):
@@ -41,6 +44,7 @@ class ParamSpec:
         return text
 
 
+# 一条白名单外部命令的完整规格（固定 argv 模板、工作目录、超时与输出上限）
 @dataclass(frozen=True)
 class CommandSpec:
     name: str
@@ -51,10 +55,12 @@ class CommandSpec:
     timeout: float = 10.0
     max_output_bytes: int = 8192
 
+    # 返回注册到工具表中的统一名称（带 cmd_ 前缀）
     @property
     def tool_name(self) -> str:
         return f"cmd_{self.name}"
 
+    # 用校验通过的参数值填充 argv 占位符，生成最终可执行参数数组
     def build_argv(self, values: dict[str, str]) -> tuple[str, ...]:
         if set(values) != set(self.params):
             raise ValueError(f"参数必须正好是：{', '.join(self.params) or '（无）'}")
@@ -65,6 +71,7 @@ class CommandSpec:
             final.append(resolved[match.group(1)] if match else part)
         return tuple(final)
 
+    # 以 shell=False 和精简环境变量白名单安全执行命令，返回退出码与截断输出
     def run(self, **values: str) -> str:
         try:
             argv = self.build_argv(values)
@@ -107,6 +114,7 @@ class CommandSpec:
             lines.append(f"stderr:\n{err}")
         return "\n".join(lines)
 
+    # 将当前命令规格转换成可供 ToolRegistry 注册的 Tool 对象
     def to_tool(self) -> Tool:
         param_desc = {name: spec.description for name, spec in self.params.items()}
         param_enums = {name: spec.enum for name, spec in self.params.items() if spec.enum}
@@ -120,6 +128,7 @@ class CommandSpec:
         )
 
 
+# 解析并严格校验 tools.json 中 commands 数组里的单条命令配置
 def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, bool]:
     if not isinstance(raw, dict):
         raise ValueError("commands 项必须是对象。")
@@ -194,6 +203,7 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     return spec, enabled
 
 
+# config/tools.json 的完整配置对象（管理白名单、插件、文件策略与固定命令）
 @dataclass(frozen=True)
 class ToolsConfig:
     enabled_tools: tuple[str, ...]
@@ -202,6 +212,7 @@ class ToolsConfig:
     plugins: tuple[str, ...] = ()
     plugin_tools: tuple[Tool, ...] = ()
 
+    # 从 tools.json 读取并校验白名单配置，同时自动扫描加载 plugins 目录中的插件工具
     @classmethod
     def load(cls, config_path: Path, project_root: Path | None = None) -> "ToolsConfig":
         resolved_cfg = config_path.resolve()
@@ -246,15 +257,16 @@ class ToolsConfig:
             plugin_tools=loaded_plugins,
         )
 
+    # 将全部已启用的固定命令转换为 Tool 列表
     def command_tools(self) -> list[Tool]:
         return [spec.to_tool() for spec in self.commands]
 
+    # 按 enabled_tools 白名单过滤内置工具与插件工具，再挂载启用的固定命令并生成注册表
     def build_registry(
         self,
         *builtin_tools: Tool,
         extra_tools: Iterable[Tool] = (),
     ) -> ToolRegistry:
-        """Filter built-in & plugin tools by `enabled_tools`, then mount enabled commands & extras."""
         allowset = set(self.enabled_tools)
         selected = [tool for tool in (*builtin_tools, *self.plugin_tools) if tool.name in allowset]
         return ToolRegistry(*selected, *self.command_tools(), *extra_tools)

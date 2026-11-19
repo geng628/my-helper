@@ -1,4 +1,4 @@
-"""Convenient script to run and inspect the minimal ReAct loop (offline demo or live LLM)."""
+"""便捷测试与演示脚本：支持离线零 Token 演示与真实模型单句实测。"""
 from __future__ import annotations
 
 import argparse
@@ -17,12 +17,13 @@ from personal_assistant.react import SYSTEM_PROMPT, run_react
 from personal_assistant.tools import ToolRegistry
 
 
+# 离线脚本化模拟模型：按预设顺序返回回复，用于零成本演示 ReAct 循环
 class DemoScriptedLLM(LLMClient):
-    """Offline mock LLM so you can watch the full ReAct loop without an API key."""
-
+    # 保存预设回复队列
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = list(responses)
 
+    # 弹出并返回下一条预设回复
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -33,11 +34,13 @@ class DemoScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
+# 打印每一步工具调用（Act）与工具返回观察（Observe）
 def _print_step(name: str, args: str, observation: str) -> None:
     print(f"  [Act]     {name}({args})")
     print(f"  [Observe] {observation}")
 
 
+# 运行两个离线演示场景：多轮链式工具调用 + 工具参数出错自愈
 def run_offline_demo(show_messages: bool = False) -> None:
     tools = ToolRegistry(
         *load_plugin_tools(["plugins/custom_tools.py"], ROOT),
@@ -126,6 +129,7 @@ def run_offline_demo(show_messages: bool = False) -> None:
         print(json.dumps(msgs2, ensure_ascii=False, indent=2))
 
 
+# 读取 .env 并向真实模型发起单句提问，用于快速验证真实工具调用链路
 def run_live_ask(question: str, show_messages: bool = False) -> int:
     load_dotenv(ROOT / ".env")
     client = from_env()
@@ -148,6 +152,7 @@ def run_live_ask(question: str, show_messages: bool = False) -> int:
     return 0
 
 
+# 演示脚本命令行入口：不传 --ask 跑离线演示，传 --ask 跑真实模型提问
 def main() -> int:
     parser = argparse.ArgumentParser(description="测试与演示最小 ReAct 循环")
     parser.add_argument("--ask", help="使用 .env 中配置的真实模型测试单句提问")

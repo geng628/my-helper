@@ -1,4 +1,4 @@
-"""Lightweight evaluation runner for Markdown search and end-to-end ReAct agent runs."""
+"""轻量评测运行器：支持 Markdown 离线检索评测与真实 Agent 端到端评测。"""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +18,8 @@ from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
 from personal_assistant.react import MAX_TOOL_ROUNDS, run_react
 
 
+# 获取当前仓库短 Git Commit SHA（若有未提交改动则追加 -dirty），用于绑定评测基线
 def current_git_commit(repo_root: Path = REPO_ROOT) -> str:
-    """Return short HEAD SHA (plus '-dirty' if working tree has edits) for benchmark provenance."""
     try:
         sha = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
@@ -42,8 +42,8 @@ def current_git_commit(repo_root: Path = REPO_ROOT) -> str:
         return "unknown"
 
 
+# 从 JSONL 文件逐行加载评测案例，并校验案例 id 唯一且包含非空 query
 def load_cases(cases_path: Path) -> list[dict[str, object]]:
-    """Read evaluation cases from a JSONL file (one JSON object per non-empty line)."""
     cases: list[dict[str, object]] = []
     seen_ids: set[str] = set()
     for line_no, raw_line in enumerate(cases_path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -68,6 +68,7 @@ def load_cases(cases_path: Path) -> list[dict[str, object]]:
     return cases
 
 
+# 校验每条期望来源（金标）文件可读且引文确实存在于原文，并规范化路径展示格式
 def _normalize_expected_sources(
     memory: MemoryStore, raw_sources: object
 ) -> list[dict[str, str]]:
@@ -95,6 +96,7 @@ def _normalize_expected_sources(
     return normalized
 
 
+# 离线检索评测（零模型调用）：统计来源召回率、MRR、引文覆盖率、负例表现与失败列表
 def evaluate_search(
     memory: MemoryStore,
     cases: list[dict[str, object]],
@@ -103,7 +105,6 @@ def evaluate_search(
     limit: int = 5,
     git_commit: str | None = None,
 ) -> dict[str, object]:
-    """Offline retrieval benchmark against MemoryStore.search_hits (zero LLM calls)."""
     if limit < 1:
         raise ValueError("limit 必须 >= 1。")
 
@@ -216,6 +217,7 @@ def evaluate_search(
     }
 
 
+# 端到端 Agent 评测：在临时隔离副本上跑完整 ReAct 循环，记录工具轨迹与最终回答供复核
 def evaluate_agent(
     llm: LLMClient,
     data_dir: Path,
@@ -225,7 +227,6 @@ def evaluate_agent(
     max_rounds: int = MAX_TOOL_ROUNDS,
     git_commit: str | None = None,
 ) -> dict[str, object]:
-    """Run full ReAct loop in an isolated copy of `data_dir` and record tool traces & answers."""
     cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
     project_root = cfg_path.parent.parent if cfg_path.is_file() else REPO_ROOT
     cfg = ToolsConfig.load(cfg_path, project_root=project_root) if cfg_path.is_file() else None
@@ -270,6 +271,7 @@ def evaluate_agent(
             ]
             steps: list[dict[str, str]] = []
 
+            # 记录当前题目的每一次工具调用及前 300 字符观察结果
             def on_step(name: str, args: str, obs: str) -> None:
                 steps.append(
                     {
@@ -329,6 +331,7 @@ def evaluate_agent(
     }
 
 
+# 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染资料库
 def _safe_write_report(output_path: Path, data_dir: Path, report: dict[str, object]) -> None:
     resolved_out = output_path.resolve()
     resolved_data = data_dir.resolve()
@@ -338,6 +341,7 @@ def _safe_write_report(output_path: Path, data_dir: Path, report: dict[str, obje
     resolved_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+# 评测命令行入口：解析 --mode/--data-dir/--cases/--output 参数并打印汇总结果
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(REPO_ROOT / ".env")
     parser = argparse.ArgumentParser(description="My Helper v2 评测运行器（检索离线评测 / Agent 端到端评测）")

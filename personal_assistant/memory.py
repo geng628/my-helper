@@ -1,4 +1,4 @@
-"""Plain Markdown memory, rules, and allowlisted knowledge file tools."""
+"""纯 Markdown 记忆、规则存储以及受目录白名单保护的笔记读写工具。"""
 from __future__ import annotations
 
 import json
@@ -20,6 +20,7 @@ DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads")
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
 
 
+# 校验配置中的整数项必须为正整数，缺省时返回默认值
 def _positive_int(value: object, default: int, name: str) -> int:
     if value is None:
         return default
@@ -28,6 +29,7 @@ def _positive_int(value: object, default: int, name: str) -> int:
     return value
 
 
+# 将配置里的相对目录安全解析为绝对路径，data/* 前缀自动映射到自定义 data_root
 def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | None) -> Path:
     if not isinstance(entry, str) or not entry.strip():
         raise ValueError("目录配置必须是非空字符串。")
@@ -48,6 +50,7 @@ def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | Non
     return target
 
 
+# 文件访问白名单策略（允许读写根目录、行数/字节限制与禁止访问目录段）
 @dataclass(frozen=True)
 class FilesPolicy:
     project_root: Path
@@ -59,6 +62,7 @@ class FilesPolicy:
     max_results: int = 100
     reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS
 
+    # 从 tools.json 的 files 字段字典构造并校验 FilesPolicy
     @classmethod
     def from_dict(
         cls,
@@ -90,6 +94,7 @@ class FilesPolicy:
         )
 
 
+# 通过同目录临时文件 + os.replace 实现原子写入，防止写到一半断电损坏文件
 def _atomic_write(target: Path, content: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
@@ -103,6 +108,7 @@ def _atomic_write(target: Path, content: str) -> None:
         raise
 
 
+# 从中英文查询语句提取主检索词（primary）与中文二元组兜底词（secondary）
 def _extract_terms(query: str) -> tuple[list[str], list[str]]:
     normalized = " ".join(query.strip().lower().split())
     if not normalized:
@@ -123,6 +129,7 @@ def _extract_terms(query: str) -> tuple[list[str], list[str]]:
     return primary, secondary
 
 
+# 单条 Markdown 搜索命中结果（路径、行号、所属章节、上下文片段与得分）
 @dataclass(frozen=True)
 class SearchHit:
     path: str
@@ -132,9 +139,9 @@ class SearchHit:
     score: float
 
 
+# 纯 Markdown 记忆与知识库管理类：不建向量索引，直接读写磁盘 .md 文件
 class MemoryStore:
-    """Direct Markdown memory, rule storage, and allowlisted file operations."""
-
+    # 初始化数据目录与安全策略；create_dirs=False 时以只读方式打开（供 eval 使用）
     def __init__(
         self,
         data_root: Path | str,
@@ -177,6 +184,7 @@ class MemoryStore:
                 directory.mkdir(parents=True, exist_ok=True)
         self._roots = self._build_roots()
 
+    # 预先整理所有允许根目录的（逻辑路径、真实路径、展示前缀、短别名）映射表
     def _build_roots(self) -> list[tuple[Path, Path, str, str]]:
         seen: set[Path] = set()
         entries: list[tuple[Path, Path, str, str]] = []
@@ -188,6 +196,7 @@ class MemoryStore:
             entries.append((raw, resolved, *self._root_labels(raw)))
         return entries
 
+    # 计算单个允许根目录的标准展示路径（如 data/knowledge）和简写别名（如 knowledge）
     def _root_labels(self, raw_root: Path) -> tuple[str, str]:
         for base, prefix in ((self.data_root, "data"), (self.project_root, "")):
             try:
@@ -202,9 +211,11 @@ class MemoryStore:
                 continue
         return raw_root.name, raw_root.name
 
+    # 将磁盘绝对路径转换为统一的相对展示路径（供外部模块如 eval 调用）
     def display_path(self, resolved: Path) -> str:
         return self._to_display_path(resolved)
 
+    # 内部路径格式化：按允许根目录把真实路径转回 logic 相对路径（支持软链接笔记库）
     def _to_display_path(self, resolved: Path) -> str:
         for _, root_resolved, display_prefix, _ in self._roots:
             if resolved.is_relative_to(root_resolved):
@@ -214,13 +225,14 @@ class MemoryStore:
             return ("data" / resolved.relative_to(self.data_root)).as_posix()
         return resolved.name
 
+    # 检查路径中是否包含受保护的敏感目录段（如 .env、.git、state）
     def _check_segments(self, parts: tuple[str, ...]) -> None:
         for part in parts:
             if part in self.policy.reject_segments:
                 raise ValueError(f"禁止访问受保护路径：{part}")
 
+    # 安全解析相对路径：校验读写白名单、拒绝 .. 穿越、敏感目录与越权软链接
     def resolve_path(self, rel_path: str, *, write: bool = False) -> Path:
-        """Resolve a relative path safely within allowlisted read/write roots."""
         if not isinstance(rel_path, str) or not rel_path.strip() or "\x00" in rel_path:
             raise ValueError("路径必须是非空字符串。")
         rel = Path(rel_path.strip().replace("\\", "/"))
@@ -241,6 +253,7 @@ class MemoryStore:
         allowed = "、".join(self._root_labels(r)[0] for r in self.policy.read_roots)
         raise ValueError(f"路径不在允许读取的目录内；允许范围：{allowed}")
 
+    # 解析并校验写入路径：限制在 write_root（data/workspace）内且禁止任何软链接组件
     def _resolve_write_path(self, rel: Path) -> Path:
         parts = rel.parts
         write_root = self.policy.write_root
@@ -268,6 +281,7 @@ class MemoryStore:
         self._check_segments(resolved.relative_to(write_resolved).parts)
         return resolved
 
+    # 判断写入路径是否误指向其他只读根目录（如 data/knowledge、docs 等）
     def _matches_other_root(self, parts: tuple[str, ...]) -> bool:
         if not parts:
             return False
@@ -280,6 +294,7 @@ class MemoryStore:
                 return True
         return False
 
+    # 将用户传入的读取路径（支持 data/knowledge/... 或简写 knowledge/...）映射到磁盘路径
     def _map_read_candidate(self, rel: Path) -> Path:
         parts = rel.parts
         for raw_root, _, display_prefix, short_alias in self._roots:
@@ -294,8 +309,9 @@ class MemoryStore:
             return self.data_root / Path(*parts[1:])
         return self.project_root / rel
 
-    # ---- Always-in-Prompt core memory & rules ----
+    # ---- 常驻提示词直读：MEMORY.md 与 rules/*.md ----
 
+    # 直接读取 data/memory/MEMORY.md 注入系统提示词，超长时保留标题与最近记录
     def read_core_memory(self, max_chars: int = 4000) -> str:
         if not self.memory_file.is_file():
             return ""
@@ -308,6 +324,7 @@ class MemoryStore:
             tail = tail.split("\n", 1)[1]
         return f'{header}\n（仅展示最近 {len(tail)} 字符；完整记录请调用 read_markdown("data/memory/MEMORY.md", ...)）\n{tail}'
 
+    # 倒序读取 data/memory/rules/*.md，提取所有行为规则摘要列表
     def read_rules_summary(self, limit: int = 30) -> str:
         if not self.rules_dir.is_dir():
             return ""
@@ -319,6 +336,7 @@ class MemoryStore:
             lines.append(f"- 另有 {len(rules) - limit} 条较早规则，可用 search_markdown 查看 data/memory/rules。")
         return "\n".join(lines)
 
+    # 从单篇规则 Markdown 文件中提取 Statement 或首行标题
     @staticmethod
     def _rule_statement(rule: Path) -> str:
         content = rule.read_text(encoding="utf-8")
@@ -330,8 +348,9 @@ class MemoryStore:
                 return line.strip().lstrip("# ").removeprefix("Rule:").strip() or "（无标题）"
         return "（空规则文件）"
 
-    # ---- On-demand Markdown browsing & search ----
+    # ---- 按需浏览与搜索 Markdown 笔记 ----
 
+    # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段及越界软链接
     def _safe_files(self, target: Path, iterator) -> list[Path]:
         files: list[Path] = []
         for item in sorted(iterator):
@@ -349,6 +368,7 @@ class MemoryStore:
             files.append(resolved)
         return files
 
+    # 按 glob 模式列出允许读取目录内的所有文件路径（最多返回 max_results 条）
     def list_files(self, root: str = "data/knowledge", pattern: str = "*.md") -> str:
         if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 200:
             raise ValueError("pattern 必须是 200 字符以内的 glob，例如 *.md。")
@@ -365,6 +385,7 @@ class MemoryStore:
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
         return "\n".join(found) + suffix
 
+    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表
     def search_hits(self, query: str, root: str = "data/knowledge", limit: int = 10) -> list[SearchHit]:
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
@@ -391,6 +412,7 @@ class MemoryStore:
             for score, path, line_no, section, snippet in candidates[:limit]
         ]
 
+    # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
     def search_markdown(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
         hits = self.search_hits(query, root=root, limit=limit)
         if not hits:
@@ -400,6 +422,7 @@ class MemoryStore:
             for hit in hits
         )
 
+    # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段
     def _score_file(
         self, display_path: str, text: str, primary: list[str], secondary: list[str]
     ) -> list[tuple[float, str, int, str, str]]:
@@ -445,6 +468,7 @@ class MemoryStore:
                 break
         return picked
 
+    # 按行号分页读取允许目录下的 Markdown/文本文件，附带总行数和字节截断保护
     def read_markdown(self, path: str, start_line: int = 1, end_line: int = 120) -> str:
         if start_line < 1 or end_line < start_line:
             raise ValueError("行号范围无效：start_line >= 1 且 end_line >= start_line。")
@@ -466,8 +490,9 @@ class MemoryStore:
         body = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start_line, actual_end + 1))
         return truncate_utf8(f"文件：{display_path}（共 {total} 行，显示第 {start_line}-{actual_end} 行）\n{body}", self.policy.max_read_bytes)
 
-    # ---- Allowlisted Writes (workspace / MEMORY.md / rules) ----
+    # ---- 白名单受控写入（workspace / MEMORY.md / rules） ----
 
+    # 在 data/workspace 中创建或覆盖文本文件，覆盖已有文件前自动备份至 .backups/
     def write_workspace_file(self, path: str, content: str, mode: str = "create") -> str:
         if mode not in {"create", "overwrite"}:
             raise ValueError("mode 只能是 create 或 overwrite。")
@@ -498,6 +523,7 @@ class MemoryStore:
         self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
         return rel_path
 
+    # 将用户原话按时间戳与消息编号幂等追加到 data/memory/MEMORY.md
     def remember_user_statement(self, user_text: str, message_id: int | None = None) -> str:
         clean = " ".join(user_text.split())
         if not clean:
@@ -513,6 +539,7 @@ class MemoryStore:
         self.record_audit(action="remember_fact", actor="user", target="data/memory/MEMORY.md", old_value=None, new_value=clean)
         return "data/memory/MEMORY.md"
 
+    # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
     def save_rule(self, statement: str, source: str = "agent") -> Path:
         clean = " ".join(statement.split())
         if not clean:
@@ -530,6 +557,7 @@ class MemoryStore:
         self.record_audit(action="save_rule", actor=source, target=f"data/memory/rules/{path.name}", old_value=None, new_value=clean)
         return path
 
+    # 向 data/memory/audit.jsonl 追加一条写入或记忆变更审计日志
     def record_audit(
         self, *, action: str, actor: str, target: str, old_value: str | None, new_value: str | None
     ) -> dict[str, object]:
@@ -547,6 +575,7 @@ class MemoryStore:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry
 
+    # 读取最近 limit 条记忆与文件操作审计记录
     def audit_entries(self, limit: int = 50) -> list[dict[str, object]]:
         if not self.audit_path.is_file():
             return []
@@ -554,12 +583,12 @@ class MemoryStore:
         return [json.loads(line) for line in lines[-limit:]]
 
 
+# 将 MemoryStore 的核心能力打包成 6 个基础内置 Tool（受 config/tools.json 白名单开关控制）
 def memory_tools(
     memory: MemoryStore,
     get_user_message: Callable[[], tuple[str, int | None]] | None = None,
 ) -> list[Tool]:
-    """Expose MemoryStore operations as pure allowlist-ready Tools."""
-
+    # 适配 read_markdown 工具参数（将模型传入的字符串行号转为整数）
     def read_markdown(path: str, start_line: str, end_line: str) -> str:
         try:
             start, end = int(start_line), int(end_line)
@@ -567,10 +596,12 @@ def memory_tools(
             raise ValueError("start_line 和 end_line 必须是整数。") from error
         return memory.read_markdown(path, start, end)
 
+    # 适配 write_file 工具：写入工作区并返回相对路径提示
     def write_file(path: str, content: str, mode: str) -> str:
         saved = memory.write_workspace_file(path, content, mode=mode)
         return f"已写入：{saved}"
 
+    # 适配 remember_fact 工具：直接保存当前轮用户原话，防止模型篡改事实
     def remember_fact() -> str:
         if get_user_message is None:
             raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
@@ -578,6 +609,7 @@ def memory_tools(
         target = memory.remember_user_statement(user_text, message_id=message_id)
         return f"已记录用户原话到 {target}"
 
+    # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
     def save_rule(statement: str) -> str:
         path = memory.save_rule(statement, source="agent")
         return f"已保存行为规则：data/memory/rules/{path.name}"
