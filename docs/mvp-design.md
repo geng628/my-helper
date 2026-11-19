@@ -53,7 +53,8 @@ my-helper/
 │   ├── cli.py                     # 命令行入口：chat (终端交互)
 │   ├── app.py                     # AssistantApp：装配、上下文与会话历史
 │   ├── react.py                   # 极简 ReAct 核心循环（最多 4 轮原生工具调用）
-│   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib）
+│   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib + usage 解析）
+│   ├── cache_metrics.py           # KV 缓存观测（服务端 cached_tokens 命中率 + 本地前缀复用率）
 │   ├── memory.py                  # 核心内置 Markdown 记忆与安全文件读写工具
 │   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具

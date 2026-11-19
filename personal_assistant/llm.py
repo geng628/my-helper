@@ -1,11 +1,11 @@
-"""零第三方依赖的 OpenAI 兼容大模型客户端。"""
+"""零第三方依赖的 OpenAI 兼容大模型客户端，支持解析响应中的 Token 与 KV 缓存命中统计。"""
 from __future__ import annotations
 
 import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.request import Request, urlopen
 
 
@@ -15,6 +15,64 @@ class LLMNotConfigured(RuntimeError):
 
 
 PostJson = Callable[[str, dict[str, object], dict[str, str]], dict[str, object]]
+
+
+# 单次大模型调用的 Token 消耗与服务端 KV 缓存命中记录
+@dataclass(frozen=True)
+class TokenUsage:
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+
+    # 计算本次请求的服务端缓存命中率（无输入 token 时返回 None）
+    @property
+    def cache_hit_rate(self) -> float | None:
+        if self.prompt_tokens <= 0:
+            return None
+        return round(self.cached_tokens / self.prompt_tokens, 4)
+
+    # 转换为便于 JSON 序列化的统计字典
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cache_hit_rate": self.cache_hit_rate,
+        }
+
+
+# 安全将接口返回的数字字段解析为非负整数
+def _non_negative_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
+# 从 OpenAI / DeepSeek / 通义千问等兼容响应中提取 Token 与缓存命中统计
+def extract_usage(response: dict[str, object]) -> TokenUsage | None:
+    raw = response.get("usage")
+    if not isinstance(raw, dict):
+        return None
+    prompt_tokens = _non_negative_int(raw.get("prompt_tokens") or raw.get("input_tokens"))
+    completion_tokens = _non_negative_int(raw.get("completion_tokens") or raw.get("output_tokens"))
+
+    # 兼容 DeepSeek 顶级字段、OpenAI 标准 prompt_tokens_details 及 Anthropic 代理字段
+    cached_raw: object = raw.get("prompt_cache_hit_tokens")
+    if cached_raw is None:
+        details = raw.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached_raw = details.get("cached_tokens")
+    if cached_raw is None:
+        cached_raw = raw.get("cache_read_input_tokens")
+    cached_tokens = _non_negative_int(cached_raw)
+    if prompt_tokens > 0:
+        cached_tokens = min(cached_tokens, prompt_tokens)
+
+    return TokenUsage(
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+    )
 
 
 # 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求并解析返回体
@@ -37,6 +95,8 @@ def default_post_json(
 
 # 大模型客户端抽象基类，供 ReAct 循环调用
 class LLMClient(ABC):
+    last_usage: TokenUsage | None = None
+
     # 发送对话历史与工具定义，返回模型本轮的 assistant 消息（含纯文本或 tool_calls）
     @abstractmethod
     def respond(
@@ -60,15 +120,16 @@ class NoopLLMClient(LLMClient):
 
 
 # OpenAI 兼容 Chat Completions 客户端（支持 DeepSeek / OpenAI / 通义千问等）
-@dataclass(frozen=True)
+@dataclass
 class OpenAICompatibleLLM(LLMClient):
     api_key: str
     base_url: str
     model: str
     temperature: float = 0.2
     post_json: PostJson = default_post_json
+    last_usage: TokenUsage | None = field(default=None, init=False, repr=False)
 
-    # 组装 OpenAI 格式请求体调用 /chat/completions，原样返回首条 assistant 消息
+    # 组装 OpenAI 格式请求体调用 /chat/completions，记录 usage 并返回首条 assistant 消息
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -89,6 +150,7 @@ class OpenAICompatibleLLM(LLMClient):
             payload,
             {"Authorization": f"Bearer {self.api_key}"},
         )
+        self.last_usage = extract_usage(response)
         return dict(response["choices"][0]["message"])
 
 

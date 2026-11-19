@@ -123,7 +123,10 @@ def test_agent_eval_isolates_data_dir_and_records_tool_trace(tmp_path: Path) -> 
     report = evaluate_agent(llm, data_dir, cases, git_commit="sha123")
 
     assert report["summary"]["expected_tools_all_hit"] == 1
+    assert report["summary"]["cache"]["llm_calls"] == 2
+    assert float(report["summary"]["cache"]["mean_prefix_reuse_rate"]) > 0.7
     assert report["cases"][0]["called_tools"] == ["search_markdown", "remember_fact"]
+    assert report["cases"][0]["cache"]["llm_calls"] == 2
     assert report["cases"][0]["review_status"] == "needs_human_review"
     # 即使评测过程中调用了 remember_fact，原始数据目录也不应被写入 MEMORY.md 或 facts.md
     assert not (data_dir / "memory" / "MEMORY.md").exists()

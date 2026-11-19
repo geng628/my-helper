@@ -53,7 +53,8 @@ my_helper_v2/
 ├── personal_assistant/
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
-│   ├── llm.py                     # 零依赖 OpenAI 兼容客户端
+│   ├── llm.py                     # 零依赖 OpenAI 兼容客户端（含 Token 与缓存 usage 解析）
+│   ├── cache_metrics.py           # KV 缓存观测（服务端命中率 + 本地前缀复用率）
 │   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
@@ -70,7 +71,8 @@ my_helper_v2/
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
 │   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
-│   ├── test_step4_app.py          # SQLite 历史与 AssistantApp 编排单元测试
+│   ├── test_step4_app.py          # SQLite 历史、前缀冻结与 AssistantApp 编排单元测试
+│   ├── test_cache_metrics.py      # KV 缓存命中与前缀复用率单元测试
 │   └── test_eval.py               # Eval 评测器自身单元测试
 ├── .env.example
 ├── .gitignore

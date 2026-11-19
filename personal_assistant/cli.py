@@ -9,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from personal_assistant.app import AssistantApp, build_app
+from personal_assistant.cache_metrics import format_cache_summary
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
@@ -153,6 +154,9 @@ def run_repl(
                 print(f"助手> {error}")
                 continue
             print(f"助手> {result['reply']}")
+            cache_info = result.get("cache")
+            if isinstance(cache_info, dict) and cache_info.get("llm_calls"):
+                print(f"  [Cache] {format_cache_summary(cache_info)}")
     finally:
         if owned:
             active_app.close()

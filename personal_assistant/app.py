@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from personal_assistant.cache_metrics import CacheMonitor
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.db import StateStore
 from personal_assistant.llm import LLMClient, NoopLLMClient, from_env
@@ -61,6 +62,7 @@ class AssistantApp:
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
         self.llm = llm or from_env()
         self._session_prompts: dict[str, str] = {}
+        self.cache_monitor = CacheMonitor()
 
     # 关闭底层状态存储资源
     def close(self) -> None:
@@ -155,8 +157,10 @@ class AssistantApp:
             if on_step is not None:
                 on_step(name, args, obs)
 
+        start_idx = self.cache_monitor.snapshot_index()
+        tracked_llm = self.cache_monitor.wrap(self.llm, session_key=chat_id)
         reply = run_react(
-            self.llm,
+            tracked_llm,
             messages,
             registry,
             max_rounds=max_rounds,
@@ -168,6 +172,7 @@ class AssistantApp:
             "chat_id": chat_id,
             "message_id": assistant_msg_id,
             "tool_calls": traces,
+            "cache": self.cache_monitor.summary(since=start_idx),
         }
 
     # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
@@ -204,6 +209,7 @@ class AssistantApp:
             "messages": self.state.count_messages(),
             "tools": registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],
+            "cache": self.cache_monitor.summary(),
         }
 
 

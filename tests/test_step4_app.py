@@ -113,11 +113,20 @@ def test_assistant_app_kv_cache_prefix_and_memory_index(tmp_path: Path) -> None:
         assert "data/memory/facts.md" in new_session_system
         assert "我正在开发 my-helper 项目" not in new_session_system
 
+        # 验证缓存观测：第 1 轮含 2 次模型调用（第 2 步 ReAct 复用前缀），第 2 轮直接复用第 1 轮前缀
+        assert turn1["cache"]["llm_calls"] == 2
+        assert turn1["cache"]["warm_calls"] == 1
+        assert float(turn1["cache"]["mean_prefix_reuse_rate"]) > 0.7
+        assert turn2["cache"]["llm_calls"] == 1
+        assert turn2["cache"]["warm_calls"] == 1
+        assert float(turn2["cache"]["mean_prefix_reuse_rate"]) > 0.7
+
         status = app.status()
         assert status["status"] == "ok"
         assert status["llm_configured"] is True
         assert status["memory_files"] == 2
         assert status["messages"] == 6
+        assert status["cache"]["llm_calls"] == 4
         assert "get_current_time" in status["tools"]
         overview = app.memory_overview()
         assert "MEMORY.md" in overview

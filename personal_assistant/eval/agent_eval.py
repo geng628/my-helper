@@ -8,6 +8,7 @@ from pathlib import Path
 from statistics import mean
 from time import perf_counter
 
+from personal_assistant.cache_metrics import CacheMonitor
 from personal_assistant.cli import REPO_ROOT, format_system_prompt
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.eval.common import current_git_commit, normalize_expected_sources
@@ -52,12 +53,16 @@ def evaluate_agent(
     per_case: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
     latencies: list[float] = []
+    monitor = CacheMonitor()
+    tracked_llm = monitor.wrap(llm, session_key="agent-eval")
 
     with tempfile.TemporaryDirectory(prefix="my-helper-eval-") as tmp:
         memory = _prepare_isolated_memory(data_dir, Path(tmp), cfg, project_root)
         current_user: list[tuple[str, int | None]] = [("", None)]
         builtins = memory_tools(memory, get_user_message=lambda: current_user[0])
         registry = cfg.build_registry(*builtins) if cfg is not None else ToolRegistry(*builtins)
+        # 评测批次内冻结系统提示词，确保跨题前缀一致且与真实会话行为对齐
+        frozen_system_prompt = format_system_prompt(memory)
 
         for idx, case in enumerate(cases, start=1):
             case_id = str(case["id"])
@@ -67,7 +72,7 @@ def evaluate_agent(
 
             current_user[0] = (query, idx)
             messages: list[dict[str, object]] = [
-                {"role": "system", "content": format_system_prompt(memory)},
+                {"role": "system", "content": frozen_system_prompt},
                 {"role": "user", "content": query},
             ]
             steps: list[dict[str, str]] = []
@@ -82,8 +87,9 @@ def evaluate_agent(
                     }
                 )
 
+            start_idx = monitor.snapshot_index()
             t0 = perf_counter()
-            reply = run_react(llm, messages, registry, max_rounds=max_rounds, on_step=on_step)
+            reply = run_react(tracked_llm, messages, registry, max_rounds=max_rounds, on_step=on_step)
             elapsed_ms = round((perf_counter() - t0) * 1000, 3)
             latencies.append(elapsed_ms)
 
@@ -110,6 +116,7 @@ def evaluate_agent(
                     "tool_trace": steps,
                     "reply": reply,
                     "latency_ms": elapsed_ms,
+                    "cache": monitor.summary(since=start_idx),
                     "review_status": "needs_human_review",
                 }
             )
@@ -120,6 +127,7 @@ def evaluate_agent(
         "tool_check_failures": len(failures),
         "mean_tool_calls": round(mean([int(item["tool_call_count"]) for item in per_case]), 2),
         "mean_latency_ms": round(mean(latencies), 3) if latencies else 0.0,
+        "cache": monitor.summary(),
         "note": "工具调用命中不代表回答事实正确，请结合 tool_trace 与 reply 逐例人工核验。",
     }
     return {
