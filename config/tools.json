@@ -10,7 +10,7 @@
   ],
   "plugins": ["plugins"],
   "files": {
-    "read_roots": ["data/knowledge", "data/memory", "docs", "data/workspace"],
+    "read_roots": ["data/memory", "data/workspace", "docs"],
     "write_root": "data/workspace",
     "max_read_bytes": 65536,
     "max_write_bytes": 65536,

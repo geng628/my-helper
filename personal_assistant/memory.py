@@ -1,4 +1,4 @@
-"""纯 Markdown 记忆、规则存储以及受目录白名单保护的笔记读写工具。"""
+"""纯 Markdown 记忆、规则存储以及受目录白名单保护的文件读写工具。"""
 from __future__ import annotations
 
 import json
@@ -74,7 +74,7 @@ class FilesPolicy:
         cfg = raw or {}
         if not isinstance(cfg, dict):
             raise ValueError("files 配置必须是 JSON 对象。")
-        raw_reads = cfg.get("read_roots", ["data/knowledge", "data/memory", "docs", "data/workspace"])
+        raw_reads = cfg.get("read_roots", ["data/memory", "data/workspace", "docs"])
         if not isinstance(raw_reads, list) or not raw_reads:
             raise ValueError("files.read_roots 必须是非空数组。")
         read_roots = tuple(_resolve_config_dir(item, root, data_root) for item in raw_reads)
@@ -139,7 +139,7 @@ class SearchHit:
     score: float
 
 
-# 纯 Markdown 记忆与知识库管理类：不建向量索引，直接读写磁盘 .md 文件
+# 纯 Markdown 记忆与本地文件管理类：直接读写磁盘 .md/.txt 文件
 class MemoryStore:
     # 初始化数据目录与安全策略；create_dirs=False 时以只读方式打开（供 eval 使用）
     def __init__(
@@ -155,10 +155,9 @@ class MemoryStore:
             self.policy = FilesPolicy(
                 project_root=proj,
                 read_roots=(
-                    self.data_root / "knowledge",
                     self.data_root / "memory",
-                    proj / "docs",
                     self.data_root / "workspace",
+                    proj / "docs",
                 ),
                 write_root=self.data_root / "workspace",
             )
@@ -169,14 +168,11 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.rules_dir = self.memory_dir / "rules"
         self.audit_path = self.memory_dir / "audit.jsonl"
-        self.knowledge_dir = self.data_root / "knowledge"
-        self.inbox_dir = self.knowledge_dir / "inbox"
         self.workspace_dir = self.policy.write_root
 
         if create_dirs:
             for directory in (
                 self.rules_dir,
-                self.inbox_dir,
                 self.workspace_dir,
                 self.workspace_dir / ".backups",
                 self.workspace_dir / ".tmp",
@@ -196,7 +192,7 @@ class MemoryStore:
             entries.append((raw, resolved, *self._root_labels(raw)))
         return entries
 
-    # 计算单个允许根目录的标准展示路径（如 data/knowledge）和简写别名（如 knowledge）
+    # 计算单个允许根目录的标准展示路径（如 data/memory）和简写别名（如 memory）
     def _root_labels(self, raw_root: Path) -> tuple[str, str]:
         for base, prefix in ((self.data_root, "data"), (self.project_root, "")):
             try:
@@ -215,7 +211,7 @@ class MemoryStore:
     def display_path(self, resolved: Path) -> str:
         return self._to_display_path(resolved)
 
-    # 内部路径格式化：按允许根目录把真实路径转回 logic 相对路径（支持软链接笔记库）
+    # 内部路径格式化：按允许根目录把真实路径转回统一的相对展示路径
     def _to_display_path(self, resolved: Path) -> str:
         for _, root_resolved, display_prefix, _ in self._roots:
             if resolved.is_relative_to(root_resolved):
@@ -281,7 +277,7 @@ class MemoryStore:
         self._check_segments(resolved.relative_to(write_resolved).parts)
         return resolved
 
-    # 判断写入路径是否误指向其他只读根目录（如 data/knowledge、docs 等）
+    # 判断写入路径是否误指向其他只读根目录（如 data/memory、docs 等）
     def _matches_other_root(self, parts: tuple[str, ...]) -> bool:
         if not parts:
             return False
@@ -294,7 +290,7 @@ class MemoryStore:
                 return True
         return False
 
-    # 将用户传入的读取路径（支持 data/knowledge/... 或简写 knowledge/...）映射到磁盘路径
+    # 将用户传入的读取路径（支持 data/memory/... 或简写 memory/...）映射到磁盘路径
     def _map_read_candidate(self, rel: Path) -> Path:
         parts = rel.parts
         for raw_root, _, display_prefix, short_alias in self._roots:
@@ -348,7 +344,7 @@ class MemoryStore:
                 return line.strip().lstrip("# ").removeprefix("Rule:").strip() or "（无标题）"
         return "（空规则文件）"
 
-    # ---- 按需浏览与搜索 Markdown 笔记 ----
+    # ---- 按需浏览与搜索 Markdown 文件 ----
 
     # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段及越界软链接
     def _safe_files(self, target: Path, iterator) -> list[Path]:
@@ -369,7 +365,7 @@ class MemoryStore:
         return files
 
     # 按 glob 模式列出允许读取目录内的所有文件路径（最多返回 max_results 条）
-    def list_files(self, root: str = "data/knowledge", pattern: str = "*.md") -> str:
+    def list_files(self, root: str = "data/memory", pattern: str = "*.md") -> str:
         if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 200:
             raise ValueError("pattern 必须是 200 字符以内的 glob，例如 *.md。")
         if ".." in pattern or "\x00" in pattern:
@@ -386,7 +382,7 @@ class MemoryStore:
         return "\n".join(found) + suffix
 
     # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表
-    def search_hits(self, query: str, root: str = "data/knowledge", limit: int = 10) -> list[SearchHit]:
+    def search_hits(self, query: str, root: str = "data/memory", limit: int = 10) -> list[SearchHit]:
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
             raise ValueError("搜索关键词不能为空。")
@@ -413,10 +409,10 @@ class MemoryStore:
         ]
 
     # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
-    def search_markdown(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
+    def search_markdown(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
         hits = self.search_hits(query, root=root, limit=limit)
         if not hits:
-            return f"未在 {root} 下找到匹配「{query}」的笔记内容。"
+            return f"未在 {root} 下找到匹配「{query}」的 Markdown 内容。"
         return "\n\n".join(
             f"{hit.path}:{hit.line} [章节: {hit.section or '正文'}]\n{hit.snippet}"
             for hit in hits
@@ -618,19 +614,19 @@ def memory_tools(
         Tool(
             "list_files",
             "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
-            {"root": "目录起点，如 data/knowledge、data/memory、docs", "pattern": "glob 模式，如 *.md"},
+            {"root": "目录起点，如 data/memory、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
             memory.list_files,
         ),
         Tool(
             "search_markdown",
-            "按关键词搜索个人笔记或规则中的 Markdown 文件名、标题与正文上下文。",
-            {"query": "搜索关键词", "root": "搜索目录，通常为 data/knowledge"},
+            "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
+            {"query": "搜索关键词", "root": "搜索目录，如 data/memory、data/workspace、docs"},
             memory.search_markdown,
         ),
         Tool(
             "read_markdown",
             "按路径和行号读取允许目录内的 Markdown/文本文件。",
-            {"path": "相对路径，如 data/knowledge/ostep/28.锁.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
+            {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
             read_markdown,
         ),
         Tool(

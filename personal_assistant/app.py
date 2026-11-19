@@ -1,7 +1,6 @@
 """核心应用编排（AssistantApp）：串联记忆、白名单工具、SQLite 历史与 ReAct 循环。"""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -12,13 +11,12 @@ from zoneinfo import ZoneInfo
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.db import StateStore
 from personal_assistant.llm import LLMClient, NoopLLMClient, from_env
-from personal_assistant.memory import FilesPolicy, MemoryStore, _atomic_write, memory_tools
+from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
 from personal_assistant.react import MAX_TOOL_ROUNDS, SYSTEM_PROMPT, run_react
 from personal_assistant.tools import ToolRegistry
 
 MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_ITEM_CHARS = 600
-MAX_NOTE_BYTES = 2 * 1024 * 1024
 
 
 # 统一编排层：供终端 CLI 与本地 HTTP 接口共同调用
@@ -157,8 +155,8 @@ class AssistantApp:
             "tool_calls": traces,
         }
 
-    # 不经过模型，直接按关键词搜索本地 Markdown 笔记（离线可用）
-    def search(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
+    # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
+    def search(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
         return self.memory.search_markdown(query, root=root, limit=limit)
 
     # 汇总当前 MEMORY.md 与 rules/ 规则文本，供 /memory 命令查看
@@ -167,83 +165,22 @@ class AssistantApp:
         rules = self.memory.read_rules_summary() or "（暂无行为规则）"
         return f"【长期记忆 (MEMORY.md)】\n{core}\n\n【行为规则 (rules/)】\n{rules}"
 
-    # 安全收存上传的 .md/.txt 笔记到 data/knowledge/inbox/，按内容哈希去重且不覆盖旧文件
-    def ingest_note(self, filename: str, content: str) -> dict[str, object]:
-        if not isinstance(filename, str) or not isinstance(content, str):
-            raise ValueError("文件名和内容必须是文本。")
-        name = filename.strip()
-        if (
-            not name
-            or len(name) > 160
-            or "/" in name
-            or "\\" in name
-            or name.startswith(".")
-            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)
-        ):
-            raise ValueError("文件名无效：只接受普通文件名。")
-        suffix = Path(name).suffix.lower()
-        if suffix not in {".md", ".txt"}:
-            raise ValueError("只支持 .md 或 .txt 笔记文件。")
-        if suffix == ".txt":
-            name = f"{Path(name).stem}.md"
-        if not content.strip():
-            raise ValueError("笔记内容不能为空。")
-
-        payload = content.encode("utf-8")
-        if len(payload) > MAX_NOTE_BYTES:
-            raise ValueError(f"笔记超过 {MAX_NOTE_BYTES} 字节上限。")
-
-        inbox = self.memory.inbox_dir
-        inbox.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(payload).hexdigest()
-        target = inbox / name
-        duplicate = False
-
-        if target.exists():
-            if target.is_symlink() or not target.is_file():
-                raise ValueError("同名目标不是普通文件。")
-            if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
-                duplicate = True
-            else:
-                stem = Path(name).stem
-                counter = 0
-                while True:
-                    tail = digest[:8] if counter == 0 else f"{digest[:8]}-{counter + 1}"
-                    candidate = inbox / f"{stem}-{tail}.md"
-                    if not candidate.exists():
-                        target = candidate
-                        break
-                    if (
-                        candidate.is_file()
-                        and not candidate.is_symlink()
-                        and hashlib.sha256(candidate.read_bytes()).hexdigest() == digest
-                    ):
-                        target = candidate
-                        duplicate = True
-                        break
-                    counter += 1
-                    if counter > 20:
-                        raise ValueError("同名文件过多，请改名后重试。")
-
-        if not duplicate:
-            _atomic_write(target, content)
-        return {
-            "path": self.memory.display_path(target.resolve()),
-            "duplicate": duplicate,
-        }
-
-    # 返回系统运行状态摘要（LLM 配置状态、笔记数、消息数、白名单工具及已加载插件）
+    # 返回系统运行状态摘要（LLM 配置状态、记忆文件数、消息数、白名单工具及已加载插件）
     def status(self) -> dict[str, object]:
-        knowledge_count = sum(
-            1
-            for p in self.memory.knowledge_dir.rglob("*")
-            if p.is_file() and p.suffix.lower() in {".md", ".txt"} and not p.name.startswith(".")
+        memory_count = (
+            sum(
+                1
+                for p in self.memory.memory_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in {".md", ".txt"} and not p.name.startswith(".")
+            )
+            if self.memory.memory_dir.is_dir()
+            else 0
         )
         registry = self.build_tools()
         return {
             "status": "ok",
             "llm_configured": not isinstance(self.llm, NoopLLMClient),
-            "knowledge_files": knowledge_count,
+            "memory_files": memory_count,
             "messages": self.state.count_messages(),
             "tools": registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],

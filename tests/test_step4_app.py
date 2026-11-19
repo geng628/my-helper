@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from personal_assistant.app import AssistantApp
 from personal_assistant.db import StateStore
 from personal_assistant.llm import LLMClient, NoopLLMClient
@@ -91,12 +89,12 @@ def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
         llm=llm,
     )
     try:
-        turn1 = app.chat("记住，我正在开发 my-helper 项目", chat_id="tg-1")
+        turn1 = app.chat("记住，我正在开发 my-helper 项目", chat_id="cli-1")
         assert turn1["reply"] == "已记住你的偏好，并查看了当前时间。"
         assert [t["tool"] for t in turn1["tool_calls"]] == ["remember_fact", "get_current_time"]
         assert "(msg#1)" in app.memory.read_core_memory()
 
-        turn2 = app.chat("我刚才说自己在做什么？", chat_id="tg-1")
+        turn2 = app.chat("我刚才说自己在做什么？", chat_id="cli-1")
         assert "my-helper" in str(turn2["reply"])
 
         # 检查第 2 轮发给模型的上下文：System Prompt 含 MEMORY.md，User 消息含 history_reference
@@ -110,6 +108,7 @@ def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
         status = app.status()
         assert status["status"] == "ok"
         assert status["llm_configured"] is True
+        assert status["memory_files"] == 1
         assert status["messages"] == 4
         assert "get_current_time" in status["tools"]
         assert "MEMORY.md" in app.memory_overview()
@@ -117,35 +116,18 @@ def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
         app.close()
 
 
-# 测试无 LLM 时的离线检索、ingest_note 收存去重、同名防覆盖与非法文件名拦截
-def test_assistant_app_ingest_note_and_offline_search(tmp_path: Path) -> None:
+# 测试无 LLM 配置时的状态返回以及对 memory/workspace 的离线关键词检索
+def test_assistant_app_offline_status_and_search(tmp_path: Path) -> None:
     app = AssistantApp(data_root=tmp_path / "data", llm=NoopLLMClient())
     try:
         assert app.status()["llm_configured"] is False
+        assert app.status()["memory_files"] == 0
 
-        # .txt 自动转为 .md 存入 inbox
-        r1 = app.ingest_note("study.txt", "# 笔记\n自旋锁适合极短临界区。\n")
-        assert r1["path"] == "data/knowledge/inbox/study.md"
-        assert r1["duplicate"] is False
+        app.memory.remember_user_statement("记住，代码函数前需要写中文注释", message_id=1)
+        app.memory.write_workspace_file("plan.md", "# 计划\n用纯标准库完成最小 Agent。\n", mode="create")
 
-        # 相同内容再次上传幂等去重
-        r2 = app.ingest_note("study.md", "# 笔记\n自旋锁适合极短临界区。\n")
-        assert r2["path"] == "data/knowledge/inbox/study.md"
-        assert r2["duplicate"] is True
-
-        # 同名但内容不同时追加短哈希后缀，绝不覆盖旧笔记
-        r3 = app.ingest_note("study.md", "# 笔记 v2\n新增休眠锁内容。\n")
-        assert r3["duplicate"] is False
-        assert r3["path"] != "data/knowledge/inbox/study.md"
-        assert str(r3["path"]).startswith("data/knowledge/inbox/study-")
-
-        # 离线检索立刻能搜到两份入库笔记
-        assert "自旋锁适合极短临界区" in app.search("自旋锁")
-        assert "新增休眠锁内容" in app.search("休眠锁")
-
-        # 拦截非法路径或不支持后缀
-        for bad_name in ("../evil.md", ".hidden.md", "sub/a.md", "binary.exe"):
-            with pytest.raises(ValueError):
-                app.ingest_note(bad_name, "hello")
+        assert app.status()["memory_files"] == 1
+        assert "中文注释" in app.search("中文注释")
+        assert "纯标准库" in app.search("纯标准库", root="data/workspace")
     finally:
         app.close()

@@ -46,8 +46,8 @@ my_helper_v2/
 ├── plugins/
 │   └── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
 ├── evals/
-│   ├── sample_cases.jsonl         # 公开脱敏评测案例集（私人案例放外部目录，不提交 Git）
-│   └── sample_data/               # 公开评测用样例 Markdown 笔记
+│   ├── sample_cases.jsonl         # 公开脱敏评测案例集
+│   └── sample_data/               # 公开评测样例 Markdown 文件
 ├── docs/
 │   └── mvp-design.md              # 整体设计文档
 ├── personal_assistant/
@@ -82,7 +82,7 @@ my_helper_v2/
 
 - [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
 - [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`, `plugins.py`）
-- [x] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
+- [x] **Step 3**：纯 Markdown 记忆与安全文件读写工具（`memory.py`）
 - [x] **Eval**：离线检索与端到端 Agent 评测包（`eval/`）
 - [x] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
 - [ ] **Step 5**：轻量本地 HTTP API 服务（`server.py`，可选）

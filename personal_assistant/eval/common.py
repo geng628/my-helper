@@ -87,7 +87,7 @@ def normalize_expected_sources(
     return normalized
 
 
-# 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染资料库
+# 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染数据目录
 def safe_write_report(output_path: Path, data_dir: Path, report: dict[str, object]) -> None:
     resolved_out = output_path.resolve()
     resolved_data = data_dir.resolve()

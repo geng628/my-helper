@@ -9,7 +9,7 @@ from personal_assistant.eval.common import current_git_commit, normalize_expecte
 from personal_assistant.memory import MemoryStore
 
 
-# 评测单道检索题（区分可回答正例与无资料负例），返回明细记录与可选失败原因
+# 评测单道检索题（区分可回答正例与无命中负例），返回明细记录与可选失败原因
 def _score_search_case(
     memory: MemoryStore,
     case: dict[str, object],
@@ -85,7 +85,7 @@ def evaluate_search(
     memory: MemoryStore,
     cases: list[dict[str, object]],
     *,
-    root: str = "data/knowledge",
+    root: str = "data/memory",
     limit: int = 5,
     git_commit: str | None = None,
 ) -> dict[str, object]:

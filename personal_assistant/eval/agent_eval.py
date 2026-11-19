@@ -17,13 +17,13 @@ from personal_assistant.react import MAX_TOOL_ROUNDS, run_react
 from personal_assistant.tools import ToolRegistry
 
 
-# 将原始资料目录的 knowledge/ 与 memory/ 复制到临时目录，确保评测过程绝不改写生产数据
+# 将原始数据目录的 memory/ 与 workspace/ 复制到临时目录，确保评测过程绝不改写生产数据
 def _prepare_isolated_memory(
     data_dir: Path, tmp_dir: Path, cfg: ToolsConfig | None, project_root: Path
 ) -> MemoryStore:
     isolated_data = tmp_dir / "data"
     isolated_data.mkdir(parents=True)
-    for sub in ("knowledge", "memory"):
+    for sub in ("memory", "workspace"):
         src = data_dir.resolve() / sub
         if src.exists():
             shutil.copytree(src, isolated_data / sub, symlinks=False)
