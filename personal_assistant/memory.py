@@ -9,11 +9,18 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from personal_assistant.commands import truncate_utf8
+from personal_assistant.memory_lifecycle import (
+    apply_topic_operations,
+    archive_expired_topics,
+    is_line_expired,
+    read_topic_snapshots as _read_topic_snapshots,
+    today_shanghai as _today_shanghai,
+)
 from personal_assistant.tools import Tool
 
 DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads")
@@ -168,6 +175,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.facts_file = self.memory_dir / "facts.md"
         self.rules_dir = self.memory_dir / "rules"
+        self.archive_dir = self.memory_dir / "archive"
         self.audit_path = self.memory_dir / "audit.jsonl"
         self.workspace_dir = self.policy.write_root
 
@@ -369,6 +377,10 @@ class MemoryStore:
                 return line.strip().lstrip("# ").removeprefix("Rule:").strip() or "（无标题）"
         return "（空规则文件）"
 
+    # 读取全部活跃主题记忆文件快照（排除 MEMORY.md 与 archive/），供沉淀器读旧改旧消冲突
+    def read_topic_snapshots(self, max_total_chars: int = 6000) -> str:
+        return _read_topic_snapshots(self.memory_dir, max_total_chars=max_total_chars)
+
     # ---- 按需浏览与搜索 Markdown 文件 ----
 
     # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段及越界软链接
@@ -406,8 +418,15 @@ class MemoryStore:
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
         return "\n".join(found) + suffix
 
-    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表
-    def search_hits(self, query: str, root: str = "data/memory", limit: int = 10) -> list[SearchHit]:
+    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（默认跳过归档与已过期记忆）
+    def search_hits(
+        self,
+        query: str,
+        root: str = "data/memory",
+        limit: int = 10,
+        *,
+        today: date | None = None,
+    ) -> list[SearchHit]:
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
             raise ValueError("搜索关键词不能为空。")
@@ -415,9 +434,16 @@ class MemoryStore:
         if not target.is_dir():
             raise ValueError(f"目录不存在：{root}")
 
+        ref_day = today or _today_shanghai()
+        archive_resolved = self.archive_dir.resolve()
+        memory_resolved = self.memory_dir.resolve()
+        searching_archive = target.is_relative_to(archive_resolved)
+
         candidates: list[tuple[float, str, int, str, str]] = []
         for resolved in self._safe_files(target, target.rglob("*")):
             if resolved.suffix.lower() not in {".md", ".txt"}:
+                continue
+            if not searching_archive and resolved.is_relative_to(archive_resolved):
                 continue
             try:
                 if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
@@ -425,7 +451,16 @@ class MemoryStore:
                 text = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            candidates.extend(self._score_file(self._to_display_path(resolved), text, primary, secondary))
+            skip_expired = ref_day if (not searching_archive and resolved.is_relative_to(memory_resolved)) else None
+            candidates.extend(
+                self._score_file(
+                    self._to_display_path(resolved),
+                    text,
+                    primary,
+                    secondary,
+                    skip_expired_today=skip_expired,
+                )
+            )
 
         candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
         return [
@@ -434,8 +469,15 @@ class MemoryStore:
         ]
 
     # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
-    def search_markdown(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
-        hits = self.search_hits(query, root=root, limit=limit)
+    def search_markdown(
+        self,
+        query: str,
+        root: str = "data/memory",
+        limit: int = 10,
+        *,
+        today: date | None = None,
+    ) -> str:
+        hits = self.search_hits(query, root=root, limit=limit, today=today)
         if not hits:
             return f"未在 {root} 下找到匹配「{query}」的 Markdown 内容。"
         return "\n\n".join(
@@ -443,17 +485,29 @@ class MemoryStore:
             for hit in hits
         )
 
-    # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段
+    # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段（支持跳过已过期记忆行）
     def _score_file(
-        self, display_path: str, text: str, primary: list[str], secondary: list[str]
+        self,
+        display_path: str,
+        text: str,
+        primary: list[str],
+        secondary: list[str],
+        *,
+        skip_expired_today: date | None = None,
     ) -> list[tuple[float, str, int, str, str]]:
         lines = text.splitlines()
         if not lines:
             return []
+        expired_flags = [
+            (skip_expired_today is not None and is_line_expired(line, today=skip_expired_today))
+            for line in lines
+        ]
         path_bonus = sum(4.0 for t in primary if t in display_path.lower())
         section = ""
         hits: list[tuple[float, int, str]] = []
         for idx, line in enumerate(lines, start=1):
+            if expired_flags[idx - 1]:
+                continue
             stripped = line.strip()
             if stripped.startswith("#"):
                 section = stripped.lstrip("# ").strip() or section
@@ -482,7 +536,9 @@ class MemoryStore:
                 continue
             used.append(line_no)
             snippet = "\n".join(
-                f"  {n}: {lines[n - 1]}" for n in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1)
+                f"  {n}: {lines[n - 1]}"
+                for n in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1)
+                if not expired_flags[n - 1]
             )
             picked.append((score, display_path, line_no, sec, snippet))
             if len(picked) >= 3:
@@ -580,52 +636,50 @@ class MemoryStore:
         self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
         return "data/memory/facts.md"
 
-    # 将沉淀提炼的长期记忆按主题去重追加到 data/memory/<topic>.md，并仅在 MEMORY.md 登记一次索引指针
+    # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突并登记 MEMORY.md 索引
+    def apply_memory_operations(
+        self,
+        topic: str,
+        title: str,
+        index_summary: str,
+        operations: list[dict[str, object]],
+        *,
+        today: date | None = None,
+    ) -> str | None:
+        return apply_topic_operations(
+            self.memory_dir,
+            topic=topic,
+            title=title,
+            index_summary=index_summary,
+            operations=operations,
+            write_fn=_atomic_write,
+            ensure_index_fn=self._ensure_index_entry,
+            audit_fn=self.record_audit,
+            today=today,
+        )
+
+    # 将沉淀提炼的长期记忆按主题去重追加到 data/memory/<topic>.md（兼容旧接口）
     def save_memory_entries(
         self,
         topic: str,
         title: str,
         index_summary: str,
         items: list[str],
+        *,
+        today: date | None = None,
     ) -> str | None:
-        slug = re.sub(r"[^a-z0-9_-]+", "-", topic.strip().lower()).strip("-_")[:40]
-        if not slug or slug in {"memory", "audit", "rules"}:
-            raise ValueError(f"无效的记忆主题名：{topic}")
+        ops = [{"op": "add", "text": str(item)} for item in items if str(item).strip()]
+        return self.apply_memory_operations(topic, title, index_summary, ops, today=today)
 
-        cleaned = [" ".join(str(item).split()) for item in items if str(item).strip()]
-        if not cleaned:
-            return None
-
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        target = self.memory_dir / f"{slug}.md"
-        rel_path = f"data/memory/{slug}.md"
-        clean_title = " ".join(title.split()) or slug
-        existing = (
-            target.read_text(encoding="utf-8")
-            if target.is_file()
-            else f"# {clean_title} ({slug}.md)\n\n"
+    # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md
+    def archive_expired_memories(self, today: date | None = None) -> dict[str, int]:
+        return archive_expired_topics(
+            self.memory_dir,
+            self.archive_dir,
+            write_fn=_atomic_write,
+            audit_fn=self.record_audit,
+            today=today,
         )
-
-        # 按正文去重，防止重复沉淀写入相同条目
-        new_items = [item for item in cleaned if item not in existing]
-        if not new_items:
-            return None
-
-        stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
-        sep = "" if not existing or existing.endswith("\n") else "\n"
-        appended = "".join(f"- [{stamp}] {item}\n" for item in new_items)
-        _atomic_write(target, f"{existing}{sep}{appended}")
-
-        summary_line = " ".join(index_summary.split()) or f"自动沉淀的 {clean_title} 记录，请按需检索"
-        self._ensure_index_entry(rel_path, f"- [{clean_title}]({rel_path}) — {summary_line}")
-        self.record_audit(
-            action="consolidate_memory",
-            actor="consolidator",
-            target=rel_path,
-            old_value=None,
-            new_value="; ".join(new_items),
-        )
-        return rel_path
 
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
     def save_rule(self, statement: str, source: str = "agent") -> Path:

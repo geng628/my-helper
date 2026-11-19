@@ -6,13 +6,15 @@ import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from personal_assistant.db import StateStore
 from personal_assistant.llm import LLMClient, NoopLLMClient
 from personal_assistant.memory import MemoryStore
 
 CONSOLIDATION_SYSTEM_PROMPT = (
-    "你是个人助手的后台记忆整理器。你会收到已有的前情摘要、当前 MEMORY.md 目录索引，以及一段即将从活跃窗口移除的历史对话。\n"
+    "你是个人助手的后台记忆整理器。你会收到当前日期、已有主题记忆内容、MEMORY.md 索引、前情摘要，以及一段即将从活跃窗口移除的历史对话。\n"
     "请严格输出一个合法 JSON 对象（不要输出任何额外解释），结构如下：\n"
     "{\n"
     '  "session_summary": "合并旧摘要与本批对话后的精简前情摘要（3-6 条要点，保留未完事项与关键上下文）",\n'
@@ -21,14 +23,19 @@ CONSOLIDATION_SYSTEM_PROMPT = (
     '      "topic": "仅含小写字母/数字/连字符的主题文件名，例如 preferences、projects、facts",\n'
     '      "title": "简短中文标题，如 个人偏好、项目备忘",\n'
     '      "index_summary": "一句简短索引说明（20字以内）",\n'
-    '      "items": ["只保留值得跨会话长期记住的明确事实、偏好或决策；每条一句话"]\n'
+    '      "operations": [\n'
+    '        {"op": "add", "text": "新增的明确事实/偏好/决定（可选填 until: YYYY-MM-DD）"},\n'
+    '        {"op": "replace", "old": "已有记忆中被更新的旧句关键词", "new": "更新后的完整陈述"},\n'
+    '        {"op": "remove", "old": "已作废或用户明确要求忘掉的旧句关键词"}\n'
+    "      ]\n"
     "    }\n"
     "  ]\n"
     "}\n"
     "严格要求：\n"
-    "1. 严禁编造对话中未明确出现的信息。\n"
-    "2. 纯闲聊、一次性提问或临时寒暄不要写入 memories（没有可沉淀内容时返回空数组 []）。\n"
-    "3. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
+    "1. 严禁编造对话中未明确出现的信息；纯闲聊或一次性问答不要写入 memories（返回空数组 []）。\n"
+    "2. 若对话更新了已有主题记忆中的旧值（如修改端口、更换方案），必须用 op=replace 替换旧条目，绝不保留冲突双版本。\n"
+    "3. 遇到带明确时间范围的临时事实（如某天开会、本周出差），必须结合【当前日期】换算成绝对日期（YYYY-MM-DD），并在操作中填写 until（有效截止日 YYYY-MM-DD）；永久偏好与长期决策不要填 until。\n"
+    "4. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
 )
 
 
@@ -123,19 +130,31 @@ class MemoryConsolidator:
         existing_summary = str(self.state.get_compaction(chat_id).get("summary") or "")
         return existing_summary, active[:cutoff]
 
-    # 对指定会话执行一次完整沉淀：提炼长期记忆写盘、生成滚动摘要并原子推进压缩游标
-    def consolidate_once(self, chat_id: str) -> ConsolidationResult | None:
+    # 对指定会话执行一次完整沉淀：归档过期记忆、读旧改旧消冲突、生成滚动摘要并原子推进游标
+    def consolidate_once(
+        self,
+        chat_id: str,
+        *,
+        today: date | None = None,
+    ) -> ConsolidationResult | None:
         if isinstance(self.llm, NoopLLMClient):
             return None
         selected = self.select_batch(chat_id)
         if selected is None:
             return None
         existing_summary, batch = selected
+        ref_day = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+        # 沉淀前先零成本归档已过期的临时记忆，避免把过期条目再喂给模型
+        self.memory.archive_expired_memories(today=ref_day)
 
         index_text = self.memory.read_memory_index() or "（暂无记忆索引）"
+        topic_snapshots = self.memory.read_topic_snapshots() or "（暂无已有主题记忆）"
         transcript = _format_transcript(batch)
         user_payload = (
+            f"【当前日期】{ref_day.isoformat()}（北京时间）\n\n"
             f"【当前 MEMORY.md 索引】\n{index_text}\n\n"
+            f"【已有主题记忆（用于识别冲突与 replace/remove）】\n{topic_snapshots}\n\n"
             f"【已有前情摘要】\n{existing_summary or '（无）'}\n\n"
             f"【待沉淀与压缩的早期对话（共 {len(batch)} 条）】\n{transcript}"
         )
@@ -160,14 +179,23 @@ class MemoryConsolidator:
                 topic = str(entry.get("topic") or "").strip()
                 title = str(entry.get("title") or topic).strip()
                 index_summary = str(entry.get("index_summary") or "").strip()
-                raw_items = entry.get("items")
-                if not topic or not isinstance(raw_items, list):
+                if not topic:
                     continue
-                items = [str(item) for item in raw_items if str(item).strip()]
-                if not items:
+
+                # 同时支持新格式 operations（add/replace/remove）与旧格式 items（纯追加）
+                ops: list[dict[str, object]] = []
+                raw_ops = entry.get("operations")
+                if isinstance(raw_ops, list):
+                    ops.extend(op for op in raw_ops if isinstance(op, dict))
+                raw_items = entry.get("items")
+                if isinstance(raw_items, list):
+                    ops.extend({"op": "add", "text": str(item)} for item in raw_items if str(item).strip())
+                if not ops:
                     continue
                 try:
-                    saved = self.memory.save_memory_entries(topic, title, index_summary, items)
+                    saved = self.memory.apply_memory_operations(
+                        topic, title, index_summary, ops, today=ref_day
+                    )
                 except ValueError:
                     continue
                 if saved and saved not in saved_files:

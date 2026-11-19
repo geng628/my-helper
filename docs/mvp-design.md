@@ -56,6 +56,7 @@ my-helper/
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib + usage 解析）
 │   ├── cache_metrics.py           # KV 缓存观测（服务端 cached_tokens 命中率 + 本地前缀复用率）
 │   ├── memory.py                  # 核心内置 Markdown 记忆与安全文件读写工具
+│   ├── memory_lifecycle.py        # 记忆生命周期（读旧改旧消冲突、(until: YYYY-MM-DD) 过期归档）
 │   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig
@@ -77,6 +78,7 @@ data/
 │   ├── MEMORY.md                  # 记忆目录索引（限长前 100 行，会话内冻结，不存流水账）
 │   ├── facts.md                   # remember_fact 追加的长期事实（不注入 Prompt，按需检索）
 │   ├── rules/                     # 行为规则（每条一个 .md 文件，可读可直接手改）
+│   ├── archive/                   # 已过期临时记忆的按月归档目录（默认不参与主检索）
 │   └── audit.jsonl                # 记忆与文件写入审计日志
 ├── workspace/                     # write_file 唯一允许写入的工作目录（覆盖时自动备份至 .backups/）
 └── state/

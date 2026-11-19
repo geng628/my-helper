@@ -71,6 +71,7 @@ class AssistantApp:
         self.llm = llm or from_env()
         self._prompt_lock = threading.Lock()
         self._session_prompts: dict[str, str] = {}
+        self._last_archive_day = ""
         self.cache_monitor = CacheMonitor()
         self.consolidator = MemoryConsolidator(
             self.state,
@@ -149,6 +150,16 @@ class AssistantApp:
             result.append({"role": role, "content": content})
         return result
 
+    # 每个自然日首次对话时自动扫描归档已过期的临时记忆（纯本地零 Token 耗时 < 1ms）
+    def _maybe_archive_expired(self) -> None:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        today_str = today.isoformat()
+        with self._prompt_lock:
+            if self._last_archive_day == today_str:
+                return
+            self._last_archive_day = today_str
+        self.memory.archive_expired_memories(today=today)
+
     # 处理一轮完整对话：加载摘要与活跃历史、执行 ReAct 循环、持久化回答并在达阈值时后台自动沉淀
     def chat(
         self,
@@ -162,6 +173,7 @@ class AssistantApp:
         if not clean_text:
             raise ValueError("消息内容不能为空。")
 
+        self._maybe_archive_expired()
         compaction = self.state.get_compaction(chat_id)
         history = self.state.active_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
         user_msg_id = self.state.append_message(chat_id, "user", clean_text)

@@ -1,0 +1,255 @@
+"""记忆生命周期模块：负责有效期判断、主题冲突替换（add/replace/remove）与过期归档。"""
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from datetime import date, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+UNTIL_PATTERN = re.compile(r"\(until:\s*(\d{4}-\d{2}-\d{2})\)")
+ECHOED_PREFIX_PATTERN = re.compile(
+    r"^(?:-\s+)?(?:\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*)*(?:\(until:\s*\d{4}-\d{2}-\d{2}\)\s*)?"
+)
+RESERVED_MEMORY_TOPICS = frozenset({"memory", "audit", "rules", "archive"})
+
+WriteFn = Callable[[Path, str], None]
+IndexFn = Callable[[str, str], None]
+AuditFn = Callable[..., dict[str, object]]
+
+
+# 获取北京时间当天日期，用于统一的记忆有效期与时间戳判断
+def today_shanghai() -> date:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
+# 安全解析 YYYY-MM-DD 格式日期，非法输入返回 None
+def parse_iso_date(raw: object) -> date | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+
+
+# 判断单行记忆是否带 (until: YYYY-MM-DD) 且已严格过期（until < today 为过期，当天仍有效）
+def is_line_expired(line: str, today: date | None = None) -> bool:
+    match = UNTIL_PATTERN.search(line)
+    if not match:
+        return False
+    until_day = parse_iso_date(match.group(1))
+    if until_day is None:
+        return False
+    ref_day = today or today_shanghai()
+    return until_day < ref_day
+
+
+# 清洗模型输出中可能误复读的列表符、旧日期与旧 until 前缀，避免出现重复时间戳
+def clean_memory_body(text: str) -> str:
+    collapsed = " ".join(text.split())
+    return ECHOED_PREFIX_PATTERN.sub("", collapsed).strip()
+
+
+# 格式化单条主题记忆行（可选附加 (until: YYYY-MM-DD) 有效期标记）
+def format_memory_bullet(text: str, stamp_day: date, until_day: date | None = None) -> str:
+    body = clean_memory_body(text)
+    if until_day is not None:
+        return f"- [{stamp_day.isoformat()}] (until: {until_day.isoformat()}) {body}"
+    return f"- [{stamp_day.isoformat()}] {body}"
+
+
+# 读取全部活跃主题记忆文件快照（排除 MEMORY.md 与 archive/），供沉淀器读旧改旧消冲突
+def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
+    if not memory_dir.is_dir():
+        return ""
+    chunks: list[str] = []
+    used = 0
+    for path in sorted(memory_dir.glob("*.md")):
+        if path.name == "MEMORY.md" or path.name.startswith(".") or not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not content:
+            continue
+        block = f"### data/memory/{path.name}\n{content}"
+        if used + len(block) > max_total_chars:
+            remain = max_total_chars - used
+            if remain > 120:
+                chunks.append(block[:remain] + "\n…（已截断）")
+            break
+        chunks.append(block)
+        used += len(block) + 2
+    return "\n\n".join(chunks)
+
+
+# 对指定主题记忆文件执行 add / replace / remove 操作，写入期消解冲突并登记索引与审计日志
+def apply_topic_operations(
+    memory_dir: Path,
+    *,
+    topic: str,
+    title: str,
+    index_summary: str,
+    operations: list[dict[str, object]],
+    write_fn: WriteFn,
+    ensure_index_fn: IndexFn,
+    audit_fn: AuditFn,
+    today: date | None = None,
+) -> str | None:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", topic.strip().lower()).strip("-_")[:40]
+    if not slug or slug in RESERVED_MEMORY_TOPICS:
+        raise ValueError(f"无效的记忆主题名：{topic}")
+    if not operations:
+        return None
+
+    ref_day = today or today_shanghai()
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    target = memory_dir / f"{slug}.md"
+    rel_path = f"data/memory/{slug}.md"
+    clean_title = " ".join(title.split()) or slug
+    lines = (
+        target.read_text(encoding="utf-8").splitlines()
+        if target.is_file()
+        else [f"# {clean_title} ({slug}.md)", ""]
+    )
+
+    changed = False
+    removed_log: list[str] = []
+    added_log: list[str] = []
+
+    for op_entry in operations:
+        if not isinstance(op_entry, dict):
+            continue
+        op = str(op_entry.get("op") or "add").strip().lower()
+        until_day = parse_iso_date(op_entry.get("until"))
+
+        if op == "add":
+            body = clean_memory_body(str(op_entry.get("text") or op_entry.get("new") or ""))
+            if not body:
+                continue
+            if until_day is not None and until_day < ref_day:
+                continue
+            if any(body in existing_line for existing_line in lines):
+                continue
+            lines.append(format_memory_bullet(body, ref_day, until_day))
+            added_log.append(body)
+            changed = True
+
+        elif op == "replace":
+            old_key = clean_memory_body(str(op_entry.get("old") or ""))
+            new_body = clean_memory_body(str(op_entry.get("new") or op_entry.get("text") or ""))
+            if not new_body:
+                continue
+            if until_day is not None and until_day < ref_day:
+                continue
+            formatted = format_memory_bullet(new_body, ref_day, until_day)
+            matched_indices = (
+                [
+                    idx
+                    for idx, line in enumerate(lines)
+                    if line.lstrip().startswith("- ") and old_key.lower() in line.lower()
+                ]
+                if old_key
+                else []
+            )
+            if matched_indices:
+                first_idx = matched_indices[0]
+                for idx in matched_indices:
+                    removed_log.append(lines[idx])
+                lines[first_idx] = formatted
+                for idx in reversed(matched_indices[1:]):
+                    lines.pop(idx)
+                added_log.append(new_body)
+                changed = True
+            elif not any(new_body in existing_line for existing_line in lines):
+                lines.append(formatted)
+                added_log.append(new_body)
+                changed = True
+
+        elif op == "remove":
+            old_key = clean_memory_body(str(op_entry.get("old") or op_entry.get("text") or ""))
+            if not old_key:
+                continue
+            kept: list[str] = []
+            for line in lines:
+                if line.lstrip().startswith("- ") and old_key.lower() in line.lower():
+                    removed_log.append(line)
+                    changed = True
+                else:
+                    kept.append(line)
+            lines = kept
+
+    if not changed:
+        return None
+
+    write_fn(target, "\n".join(lines).rstrip() + "\n")
+    summary_line = " ".join(index_summary.split()) or f"自动沉淀的 {clean_title} 记录，请按需检索"
+    ensure_index_fn(rel_path, f"- [{clean_title}]({rel_path}) — {summary_line}")
+    audit_fn(
+        action="consolidate_memory",
+        actor="consolidator",
+        target=rel_path,
+        old_value="; ".join(removed_log) if removed_log else None,
+        new_value="; ".join(added_log) if added_log else None,
+    )
+    return rel_path
+
+
+# 扫描活跃主题记忆文件，将已过期的 (until: YYYY-MM-DD) 条目原子归档至 archive/YYYY-MM.md
+def archive_expired_topics(
+    memory_dir: Path,
+    archive_dir: Path,
+    *,
+    write_fn: WriteFn,
+    audit_fn: AuditFn,
+    today: date | None = None,
+) -> dict[str, int]:
+    if not memory_dir.is_dir():
+        return {}
+    ref_day = today or today_shanghai()
+    archived_counts: dict[str, int] = {}
+    archive_name = f"{ref_day.strftime('%Y-%m')}.md"
+    archive_path = archive_dir / archive_name
+    archive_rel = f"data/memory/archive/{archive_name}"
+
+    for path in sorted(memory_dir.glob("*.md")):
+        if path.name == "MEMORY.md" or path.name.startswith(".") or not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        active_lines: list[str] = []
+        expired_lines: list[str] = []
+        for line in lines:
+            if line.lstrip().startswith("- ") and is_line_expired(line, today=ref_day):
+                expired_lines.append(line)
+            else:
+                active_lines.append(line)
+        if not expired_lines:
+            continue
+
+        write_fn(path, "\n".join(active_lines).rstrip() + "\n")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        existing_archive = (
+            archive_path.read_text(encoding="utf-8")
+            if archive_path.is_file()
+            else f"# 过期记忆归档 ({ref_day.strftime('%Y-%m')})\n\n"
+        )
+        sep = "" if not existing_archive or existing_archive.endswith("\n") else "\n"
+        moved = "".join(f"{line} (from: {path.name})\n" for line in expired_lines)
+        write_fn(archive_path, f"{existing_archive}{sep}{moved}")
+
+        rel_path = f"data/memory/{path.name}"
+        archived_counts[rel_path] = len(expired_lines)
+        audit_fn(
+            action="archive_expired",
+            actor="lifecycle",
+            target=rel_path,
+            old_value="; ".join(expired_lines),
+            new_value=archive_rel,
+        )
+    return archived_counts
