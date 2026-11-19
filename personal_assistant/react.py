@@ -13,7 +13,8 @@ SYSTEM_PROMPT = (
     "能力严格以本轮提供的工具为准；需要查证事实或借助工具时先调用工具，"
     "拿到足够证据后直接回答，不要编造未观测到的结果。\n"
     "系统提示中的 MEMORY.md 仅作记忆目录索引，详细事实与主题文件存放在 data/memory/，"
-    "需要回忆往事或核对细节时请按需调用 search_markdown 或 read_markdown 查阅。"
+    "需要回忆往事或核对细节时请按需调用 search_markdown 或 read_markdown 查阅。\n"
+    "当用户更新偏好或项目事实时直接确认即可，无需用 write_file 写入工作区，也无需让用户手动修改 data/memory/，后台会自动整理沉淀。"
 )
 
 

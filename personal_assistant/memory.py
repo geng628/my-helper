@@ -18,6 +18,7 @@ from personal_assistant.memory_lifecycle import (
     apply_topic_operations,
     archive_expired_topics,
     is_line_expired,
+    prune_raw_facts_for_batch,
     read_topic_snapshots as _read_topic_snapshots,
     today_shanghai as _today_shanghai,
 )
@@ -679,6 +680,18 @@ class MemoryStore:
             write_fn=_atomic_write,
             audit_fn=self.record_audit,
             today=today,
+        )
+
+    # 清理 facts.md 中已被本次沉淀规范化吸收的原始 (msg#...) 裸行，防止残留无有效期副本
+    def prune_consolidated_raw_facts(
+        self, batch_msg_ids: set[int], written_texts: list[str]
+    ) -> int:
+        return prune_raw_facts_for_batch(
+            self.memory_dir,
+            batch_msg_ids,
+            written_texts,
+            write_fn=_atomic_write,
+            audit_fn=self.record_audit,
         )
 
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件

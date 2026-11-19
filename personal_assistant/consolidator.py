@@ -34,8 +34,9 @@ CONSOLIDATION_SYSTEM_PROMPT = (
     "严格要求：\n"
     "1. 严禁编造对话中未明确出现的信息；纯闲聊或一次性问答不要写入 memories（返回空数组 []）。\n"
     "2. 若对话更新了已有主题记忆中的旧值（如修改端口、更换方案），必须用 op=replace 替换旧条目，绝不保留冲突双版本。\n"
-    "3. 遇到带明确时间范围的临时事实（如某天开会、本周出差），必须结合【当前日期】换算成绝对日期（YYYY-MM-DD），并在操作中填写 until（有效截止日 YYYY-MM-DD）；永久偏好与长期决策不要填 until。\n"
-    "4. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
+    "3. 若 data/memory/facts.md 中已有带 (msg#...) 标记的原始记录对应本次整理内容，必须用 op=replace 原地规范化（或迁至其他主题后对 facts.md 执行 op=remove），绝不同时保留原始裸句与规范化副本。\n"
+    "4. 遇到带明确时间范围的临时事实（如某天开会、本周出差），必须结合【当前日期】换算成绝对日期（YYYY-MM-DD），并在操作中填写 until（有效截止日 YYYY-MM-DD）；永久偏好与长期决策不要填 until。\n"
+    "5. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
 )
 
 
@@ -171,6 +172,7 @@ class MemoryConsolidator:
             raise ValueError("模型未返回有效的 session_summary，取消推进压缩游标。")
 
         saved_files: list[str] = []
+        written_texts: list[str] = []
         raw_memories = parsed.get("memories")
         if isinstance(raw_memories, list):
             for entry in raw_memories:
@@ -198,8 +200,19 @@ class MemoryConsolidator:
                     )
                 except ValueError:
                     continue
-                if saved and saved not in saved_files:
-                    saved_files.append(saved)
+                if saved:
+                    if saved not in saved_files:
+                        saved_files.append(saved)
+                    for op_item in ops:
+                        if str(op_item.get("op") or "add").lower() in {"add", "replace"}:
+                            val = str(op_item.get("new") or op_item.get("text") or "").strip()
+                            if val:
+                                written_texts.append(val)
+
+        # 兜底清理 facts.md 中已被本次沉淀规范化的原始 (msg#...) 幽灵行，避免临时事实漏过期
+        batch_ids = {int(msg["id"]) for msg in batch if msg.get("id") is not None}
+        if written_texts:
+            self.memory.prune_consolidated_raw_facts(batch_ids, written_texts)
 
         # 只有长期记忆文件落盘与摘要解析均成功后，才推进 SQLite 压缩游标
         cutoff_id = int(batch[-1]["id"])

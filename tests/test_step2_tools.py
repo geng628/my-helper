@@ -209,3 +209,22 @@ def test_command_runner_handles_timeout_and_react_integration(tmp_path: Path) ->
     reply = run_react(llm, messages, registry)
     assert reply == "命令返回了 hello GitHub。"
     assert "hello GitHub" in str(messages[-2]["content"])
+
+
+# 测试工具参数校验兼容模型直接传入数字（如 start_line: 1），同时依然拒绝布尔值与空串
+def test_tool_registry_accepts_numeric_arguments_and_rejects_booleans() -> None:
+    registry = ToolRegistry(
+        Tool(
+            "slice_lines",
+            "读取指定行号范围",
+            {"path": "路径", "start_line": "起始行", "end_line": "结束行"},
+            lambda path, start_line, end_line: f"{path}:{start_line}-{end_line}",
+        )
+    )
+    ok = registry.execute("slice_lines", '{"path": "a.md", "start_line": 1, "end_line": 40}')
+    assert ok == "a.md:1-40"
+
+    bad_bool = registry.execute("slice_lines", '{"path": "a.md", "start_line": true, "end_line": 40}')
+    assert "错误" in bad_bool
+    bad_empty = registry.execute("slice_lines", '{"path": "a.md", "start_line": " ", "end_line": 40}')
+    assert "错误" in bad_empty

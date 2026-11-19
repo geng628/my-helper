@@ -242,3 +242,58 @@ def test_assistant_app_auto_archives_expired_memories_on_new_day(tmp_path: Path)
         assert "历史临时会议" in archive_files[0].read_text(encoding="utf-8")
     finally:
         app.close()
+
+
+# 测试沉淀时自动清理 facts.md 中已被规范化沉淀的原始 (msg#...) 幽灵行，同时绝不误删未沉淀的无关原话
+def test_consolidator_cleans_up_raw_remember_fact_ghost_without_losing_unrelated_facts(tmp_path: Path) -> None:
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        m1 = state.append_message("ghost-1", "user", "记住，我养了一只叫橘猫的宠物。")
+        memory.remember_user_statement("记住，我养了一只叫橘猫的宠物。", message_id=m1)
+        state.append_message("ghost-1", "assistant", "好的，记下了。")
+        m3 = state.append_message("ghost-1", "user", "另外明天下午两点我要参加版本发布演练会。")
+        memory.remember_user_statement("另外明天下午两点我要参加版本发布演练会。", message_id=m3)
+        state.append_message("ghost-1", "assistant", "记下了。")
+        state.append_message("ghost-1", "user", "今天就先到这里。")
+        state.append_message("ghost-1", "assistant", "好的。")
+
+        # 刻意模拟模型只输出 add（忘了 replace 旧裸行）的最坏情况，验证程序兜底清理幽灵副本
+        llm = CapturingLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "用户明天下午两点有版本发布演练会。",
+                        "memories": [
+                            {
+                                "topic": "facts",
+                                "title": "事实备忘",
+                                "index_summary": "临时日程与事实",
+                                "operations": [
+                                    {
+                                        "op": "add",
+                                        "text": "2026-11-20 下午两点参加版本发布演练会。",
+                                        "until": "2026-11-20",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=6, keep_recent_messages=2, min_batch_messages=4)
+        consolidator = MemoryConsolidator(state, memory, llm, policy=policy)
+        consolidator.consolidate_once("ghost-1", today=date(2026, 11, 19))
+
+        facts_text = (memory.memory_dir / "facts.md").read_text(encoding="utf-8")
+        # 已被规范化的 msg#3 裸原话必须被清除，不留永不过期的幽灵副本
+        assert f"(msg#{m3})" not in facts_text
+        assert "(until: 2026-11-20)" in facts_text
+        # 未被本次沉淀提及的无关原话 msg#1（橘猫）必须完好保留
+        assert "橘猫" in facts_text
+        # 到了过期日后，搜索“演练”必须完全为空
+        assert memory.search_hits("演练", root="data/memory", today=date(2026, 11, 25)) == []
+    finally:
+        state.close()

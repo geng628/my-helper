@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 UNTIL_PATTERN = re.compile(r"\(until:\s*(\d{4}-\d{2}-\d{2})\)")
+MSG_TAG_PATTERN = re.compile(r"\(msg#(\d+)\)")
 ECHOED_PREFIX_PATTERN = re.compile(
     r"^(?:-\s+)?(?:\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*)*(?:\(until:\s*\d{4}-\d{2}-\d{2}\)\s*)?"
 )
@@ -253,3 +254,66 @@ def archive_expired_topics(
             new_value=archive_rel,
         )
     return archived_counts
+
+
+# 提取文本的中英文核心检索单元（英文词与中文二元组），用于判断裸原话是否已被规范化沉淀
+def _overlap_tokens(text: str) -> set[str]:
+    lowered = text.lower()
+    tokens: set[str] = set(re.findall(r"[a-z0-9_+-]{2,}", lowered))
+    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
+        if len(run) == 1:
+            tokens.add(run)
+        else:
+            for idx in range(len(run) - 1):
+                tokens.add(run[idx : idx + 2])
+    return tokens
+
+
+# 清理 facts.md 中已被本次沉淀规范化的原始 (msg#...) 裸原话，防止临时事实留存永不过期的幽灵副本
+def prune_raw_facts_for_batch(
+    memory_dir: Path,
+    batch_msg_ids: set[int],
+    written_texts: list[str],
+    *,
+    write_fn: WriteFn,
+    audit_fn: AuditFn,
+) -> int:
+    facts_path = memory_dir / "facts.md"
+    if not batch_msg_ids or not written_texts or not facts_path.is_file():
+        return 0
+    written_tokens: set[str] = set()
+    for text in written_texts:
+        written_tokens.update(_overlap_tokens(text))
+    if not written_tokens:
+        return 0
+
+    lines = facts_path.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in lines:
+        match = MSG_TAG_PATTERN.search(line)
+        if not match or int(match.group(1)) not in batch_msg_ids:
+            kept.append(line)
+            continue
+        raw_body = line[match.end() :].strip()
+        raw_tokens = _overlap_tokens(raw_body)
+        shared = raw_tokens & written_tokens
+        # 只有原始句与本次写入的规范化记忆有明显语义重合时才移除，绝不误删无关原话
+        overlap_ratio = (len(shared) / len(raw_tokens)) if raw_tokens else 0.0
+        if len(shared) >= 2 and overlap_ratio >= 0.25:
+            removed.append(line)
+        else:
+            kept.append(line)
+
+    if not removed:
+        return 0
+
+    write_fn(facts_path, "\n".join(kept).rstrip() + "\n")
+    audit_fn(
+        action="dedupe_raw_fact",
+        actor="consolidator",
+        target="data/memory/facts.md",
+        old_value="; ".join(removed),
+        new_value=None,
+    )
+    return len(removed)

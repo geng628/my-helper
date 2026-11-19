@@ -128,6 +128,9 @@ class ToolRegistry:
         clean: dict[str, str] = {}
         for key in item.parameters:
             val = parsed[key]
+            # 兼容模型直接传入数字参数（如行号 start_line: 1），同时严格拒绝布尔值与空串
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                val = str(val)
             if not isinstance(val, str) or not val.strip():
                 return {}, f"{item.name} 的参数 {key} 必须是非空字符串。"
             if item.param_enums and key in item.param_enums and val not in item.param_enums[key]:
