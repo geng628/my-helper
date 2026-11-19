@@ -166,6 +166,7 @@ class MemoryStore:
         self.project_root = self.policy.project_root.resolve()
         self.memory_dir = self.data_root / "memory"
         self.memory_file = self.memory_dir / "MEMORY.md"
+        self.facts_file = self.memory_dir / "facts.md"
         self.rules_dir = self.memory_dir / "rules"
         self.audit_path = self.memory_dir / "audit.jsonl"
         self.workspace_dir = self.policy.write_root
@@ -305,20 +306,44 @@ class MemoryStore:
             return self.data_root / Path(*parts[1:])
         return self.project_root / rel
 
-    # ---- 常驻提示词直读：MEMORY.md 与 rules/*.md ----
+    # ---- 常驻提示词直读：MEMORY.md 目录索引与 rules/*.md ----
 
-    # 直接读取 data/memory/MEMORY.md 注入系统提示词，超长时保留标题与最近记录
-    def read_core_memory(self, max_chars: int = 4000) -> str:
+    # 读取 data/memory/MEMORY.md 记忆索引（严格限制前 max_lines 行与 max_chars 字符，防止提示词膨胀）
+    def read_memory_index(self, max_lines: int = 100, max_chars: int = 4000) -> str:
         if not self.memory_file.is_file():
             return ""
         text = self.memory_file.read_text(encoding="utf-8").strip()
-        if not text or len(text) <= max_chars:
-            return text
-        header = text.splitlines()[0] if text.startswith("#") else "# 长期记忆 (MEMORY.md)"
-        tail = text[-max(200, max_chars - len(header) - 80) :]
-        if "\n" in tail:
-            tail = tail.split("\n", 1)[1]
-        return f'{header}\n（仅展示最近 {len(tail)} 字符；完整记录请调用 read_markdown("data/memory/MEMORY.md", ...)）\n{tail}'
+        if not text:
+            return ""
+        lines = text.splitlines()
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+        body = "\n".join(lines)
+        if len(body) > max_chars:
+            body = body[:max_chars]
+            if "\n" in body:
+                body = body.rsplit("\n", 1)[0]
+            truncated = True
+        if truncated:
+            return f'{body}\n（索引已截断，完整目录请调用 read_markdown("data/memory/MEMORY.md", ...)）'
+        return body
+
+    # 读取 data/memory/facts.md 中最近 limit 条事实记录（仅供 /memory 展示，不注入系统提示词）
+    def read_recent_facts(self, limit: int = 20) -> str:
+        if not self.facts_file.is_file() or limit <= 0:
+            return ""
+        items = [
+            line
+            for line in self.facts_file.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("- ")
+        ]
+        if not items:
+            return ""
+        shown = items[-limit:]
+        prefix = f"（仅展示最近 {len(shown)}/{len(items)} 条）\n" if len(items) > limit else ""
+        return prefix + "\n".join(shown)
 
     # 倒序读取 data/memory/rules/*.md，提取所有行为规则摘要列表
     def read_rules_summary(self, limit: int = 30) -> str:
@@ -519,21 +544,41 @@ class MemoryStore:
         self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
         return rel_path
 
-    # 将用户原话按时间戳与消息编号幂等追加到 data/memory/MEMORY.md
+    # 确保指定记忆文件已在 MEMORY.md 索引中登记一次，避免重复改写索引破坏 KV Cache
+    def _ensure_index_entry(self, target_path: str, entry_line: str) -> None:
+        existing = (
+            self.memory_file.read_text(encoding="utf-8")
+            if self.memory_file.is_file()
+            else "# 记忆索引 (MEMORY.md)\n\n"
+        )
+        if target_path in existing or Path(target_path).name in existing:
+            return
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        _atomic_write(self.memory_file, f"{existing}{sep}{entry_line}\n")
+
+    # 将用户原话按时间戳与消息编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
     def remember_user_statement(self, user_text: str, message_id: int | None = None) -> str:
         clean = " ".join(user_text.split())
         if not clean:
             raise ValueError("要记住的内容不能为空。")
         self.memory_dir.mkdir(parents=True, exist_ok=True)
-        existing = self.memory_file.read_text(encoding="utf-8") if self.memory_file.is_file() else "# 长期记忆 (MEMORY.md)\n\n"
+        existing = (
+            self.facts_file.read_text(encoding="utf-8")
+            if self.facts_file.is_file()
+            else "# 事实备忘 (facts.md)\n\n"
+        )
         if message_id is not None and f"(msg#{message_id})" in existing:
-            return "data/memory/MEMORY.md"
+            return "data/memory/facts.md"
         stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
         tag = f" (msg#{message_id})" if message_id is not None else ""
         sep = "" if not existing or existing.endswith("\n") else "\n"
-        _atomic_write(self.memory_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
-        self.record_audit(action="remember_fact", actor="user", target="data/memory/MEMORY.md", old_value=None, new_value=clean)
-        return "data/memory/MEMORY.md"
+        _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
+        self._ensure_index_entry(
+            "data/memory/facts.md",
+            "- [事实备忘](data/memory/facts.md) — 通过 remember_fact 记录的长期事实，需要时请按需检索",
+        )
+        self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
+        return "data/memory/facts.md"
 
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
     def save_rule(self, statement: str, source: str = "agent") -> Path:
@@ -638,7 +683,7 @@ def memory_tools(
         ),
         Tool(
             "remember_fact",
-            "仅在用户明确要求记住信息时调用，保存当前用户原话到 data/memory/MEMORY.md。",
+            "仅在用户明确要求记住信息时调用，将当前用户原话追加到 data/memory/facts.md（按需检索，不膨胀索引）。",
             {},
             remember_fact,
         ),

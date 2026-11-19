@@ -6,9 +6,10 @@
 
 1. **无编译、无后台索引同步**：
    - 不做后台摘要编译、不做向量数据库同步，也不设后台 `worker` 进程。
-2. **记忆与本地文件直读纯文本 Markdown**：
-   - **常驻记忆与规则**：直接读取 `data/memory/MEMORY.md` 与 `data/memory/rules/*.md`。
-   - **按需查阅文件**：允许目录（`data/memory`、`data/workspace`、`docs`）下的 Markdown/文本文件，由模型按需通过白名单工具（`list_files`、`search_markdown`、`read_markdown`）直接读取源文件，手动编辑即刻生效。
+2. **索引式纯文本 Markdown 记忆（防膨胀、KV Cache 友好）**：
+   - **静态规则 + 目录索引（常驻前缀、会话内冻结）**：`data/memory/rules/*.md`（行为规则）与 `data/memory/MEMORY.md`（限长记忆目录索引，最多读取前 100 行 / 4000 字符）只在会话启动时读入一次并冻结在 `system` 前缀，绝不把无限增长的流水账塞进 Prompt。
+   - **事实备忘与主题文件（按需检索）**：`remember_fact` 统一追加到 `data/memory/facts.md`（只在首次创建时往 `MEMORY.md` 登记一行索引指针，后续追加永不改动 `MEMORY.md`）；需要回忆历史事实或主题细节时，由模型按需调 `search_markdown` / `read_markdown` 查阅 `data/memory/`。
+   - **追加式多轮历史**：`AssistantApp` 以标准 `[system, user_1, assistant_1, ..., user_n]` 顺序追加消息，不改写前面轮次，最大化跨轮 KV Cache 命中率。
 3. **无 MCP，纯原生白名单与插件机制**：
    - 所有工具由宿主机纯 Python 原生实现，并通过唯一的配置文件 `config/tools.json` 进行**三级白名单管控**（工具名称白名单、文件读写目录白名单、固定 `argv` 命令模板白名单）。
    - 核心只保留必要的 Markdown 记忆与文件读写内置工具；其余扩展工具直接写在 `plugins/*.py` 中用 `@tool(...)` 声明，在白名单中勾选即可热插拔。
@@ -71,7 +72,8 @@ my-helper/
 ```text
 data/
 ├── memory/
-│   ├── MEMORY.md                  # 个人记忆文件（纯文本 Markdown）
+│   ├── MEMORY.md                  # 记忆目录索引（限长前 100 行，会话内冻结，不存流水账）
+│   ├── facts.md                   # remember_fact 追加的长期事实（不注入 Prompt，按需检索）
 │   ├── rules/                     # 行为规则（每条一个 .md 文件，可读可直接手改）
 │   └── audit.jsonl                # 记忆与文件写入审计日志
 ├── workspace/                     # write_file 唯一允许写入的工作目录（覆盖时自动备份至 .backups/）
@@ -87,8 +89,8 @@ data/
 
 不建数据库索引、不跑后台编译，所有读取直接面向文件系统中的 `.md` / `.txt` 文本文件：
 
-1. **核心记忆与规则读取**：
-   - `read_core_memory(max_chars=4000) -> str`：直接读取 `data/memory/MEMORY.md`。若文件不存在则返回空字符串；超长时保留标题与最近内容。
+1. **常驻前缀读取（仅会话首次加载并冻结）**：
+   - `read_memory_index(max_lines=100, max_chars=4000) -> str`：只读取 `data/memory/MEMORY.md` 顶部目录索引；超长时截断尾部并提示按需调用 `read_markdown` 查阅全文。
    - `read_rules_summary(limit=30) -> str`：按文件名倒序读取 `data/memory/rules/*.md`，提取每条规则的 `- Statement:`（或首行标题），拼成列表。
 
 2. **按需 Markdown 浏览与检索（供白名单工具调用）**：
@@ -102,7 +104,7 @@ data/
      - 读取指定行号范围（单次上限 `max_lines=400`、`max_read_bytes=65536`），输出带行号的原文及总行数提示。
 
 3. **记忆与规则写入**：
-   - `remember_user_statement(user_text: str, message_id: int | None) -> str`：按时间戳与消息编号幂等追加记录，并写入 `data/memory/audit.jsonl`。
+   - `remember_user_statement(user_text: str, message_id: int | None) -> str`：按时间戳与消息编号幂等追加到 `data/memory/facts.md`，仅在首次创建时往 `MEMORY.md` 登记一行索引指针，并写入 `data/memory/audit.jsonl`。
    - `save_rule(statement: str, source: str) -> Path`：写入 `data/memory/rules/<timestamp>-<slug>.md` 并记录 `audit.jsonl`。
    - `write_workspace_file(path: str, content: str, mode: str) -> str`：仅限写入 `data/workspace/`，`overwrite` 覆盖前自动备份到 `.backups/`。
 

@@ -1,7 +1,6 @@
 """核心应用编排（AssistantApp）：串联记忆、白名单工具、SQLite 历史与 ReAct 循环。"""
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable
 from datetime import datetime
@@ -15,8 +14,8 @@ from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
 from personal_assistant.react import MAX_TOOL_ROUNDS, SYSTEM_PROMPT, run_react
 from personal_assistant.tools import ToolRegistry
 
-MAX_HISTORY_MESSAGES = 12
-MAX_HISTORY_ITEM_CHARS = 600
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_ITEM_CHARS = 2000
 
 
 # 统一编排层：供终端 CLI 与本地 HTTP 接口共同调用
@@ -61,6 +60,7 @@ class AssistantApp:
 
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
         self.llm = llm or from_env()
+        self._session_prompts: dict[str, str] = {}
 
     # 关闭底层状态存储资源
     def close(self) -> None:
@@ -78,38 +78,51 @@ class AssistantApp:
             return self.tools_config.build_registry(*builtins)
         return ToolRegistry(*builtins)
 
-    # 拼装本轮系统提示词：注入日期、当前可用白名单工具名、行为规则与 MEMORY.md 核心记忆
+    # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用
     def build_system_prompt(self, registry: ToolRegistry) -> str:
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         tool_list = "、".join(registry.names) or "（无）"
         parts = [
             SYSTEM_PROMPT,
-            f"今天是 {today}（北京时间）。",
             f"【可用白名单工具】\n{tool_list}",
         ]
         rules = self.memory.read_rules_summary()
         if rules:
             parts.append(f"【行为规则 (data/memory/rules/)】\n{rules}")
-        core = self.memory.read_core_memory()
-        if core:
-            parts.append(f"【长期记忆 (data/memory/MEMORY.md)】\n{core}")
+        index = self.memory.read_memory_index()
+        if index:
+            parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        parts.append(f"今天是 {today}（北京时间）。")
         return "\n\n".join(parts)
 
-    # 构造发给模型的 user 消息：若有历史记录则以参考上下文 JSON 包装，防止旧拒答误导本轮
+    # 获取指定会话冻结的系统提示词：整场会话复用首次快照，防止中途改写记忆打穿 KV Cache
+    def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
+        prompt = self._session_prompts.get(chat_id)
+        if prompt is None:
+            prompt = self.build_system_prompt(registry)
+            self._session_prompts[chat_id] = prompt
+        return prompt
+
+    # 主动重置指定会话（或全部会话）冻结的系统提示词，用于手动编辑规则/索引后显式刷新
+    def reset_session_prompt(self, chat_id: str | None = None) -> None:
+        if chat_id is None:
+            self._session_prompts.clear()
+        else:
+            self._session_prompts.pop(chat_id, None)
+
+    # 将持久化历史转换为标准追加式消息列表，保持前缀字节级稳定以命中跨轮 KV Cache
     @staticmethod
-    def _format_user_input(text: str, history: list[dict[str, object]]) -> str:
-        if not history:
-            return text
-        compact = []
+    def _build_history_messages(history: list[dict[str, object]]) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
         for msg in history:
-            content = str(msg.get("content", ""))
+            role = str(msg.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(msg.get("content") or "")
             if len(content) > MAX_HISTORY_ITEM_CHARS:
                 content = content[:MAX_HISTORY_ITEM_CHARS] + "…"
-            compact.append({"role": msg["role"], "content": content})
-        return json.dumps(
-            {"history_reference": compact, "current_user_message": text},
-            ensure_ascii=False,
-        )
+            result.append({"role": role, "content": content})
+        return result
 
     # 处理一轮完整对话：持久化提问、执行 ReAct 循环、持久化回答并返回结果与工具轨迹
     def chat(
@@ -127,9 +140,11 @@ class AssistantApp:
         history = self.state.recent_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
         user_msg_id = self.state.append_message(chat_id, "user", clean_text)
         registry = self.build_tools(user_text=clean_text, message_id=user_msg_id)
+        system_prompt = self.get_session_system_prompt(chat_id, registry)
         messages: list[dict[str, object]] = [
-            {"role": "system", "content": self.build_system_prompt(registry)},
-            {"role": "user", "content": self._format_user_input(clean_text, history)},
+            {"role": "system", "content": system_prompt},
+            *self._build_history_messages(history),
+            {"role": "user", "content": clean_text},
         ]
 
         traces: list[dict[str, str]] = []
@@ -159,11 +174,16 @@ class AssistantApp:
     def search(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
         return self.memory.search_markdown(query, root=root, limit=limit)
 
-    # 汇总当前 MEMORY.md 与 rules/ 规则文本，供 /memory 命令查看
+    # 汇总当前 MEMORY.md 索引、rules/ 规则与最近 facts.md 备忘，供 /memory 命令查看
     def memory_overview(self) -> str:
-        core = self.memory.read_core_memory() or "（暂无长期记忆）"
+        index = self.memory.read_memory_index() or "（暂无记忆索引）"
         rules = self.memory.read_rules_summary() or "（暂无行为规则）"
-        return f"【长期记忆 (MEMORY.md)】\n{core}\n\n【行为规则 (rules/)】\n{rules}"
+        facts = self.memory.read_recent_facts() or "（暂无事实备忘）"
+        return (
+            f"【记忆索引 (MEMORY.md)】\n{index}\n\n"
+            f"【行为规则 (rules/)】\n{rules}\n\n"
+            f"【事实备忘 (facts.md，按需检索不注入 Prompt)】\n{facts}"
+        )
 
     # 返回系统运行状态摘要（LLM 配置状态、记忆文件数、消息数、白名单工具及已加载插件）
     def status(self) -> dict[str, object]:

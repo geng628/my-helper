@@ -63,25 +63,39 @@ def test_path_security_and_symlink_handling(tmp_path: Path) -> None:
     ).resolve()
 
 
-# 测试核心记忆读写幂等与截断、行为规则落盘以及工作区覆盖前自动备份
+# 测试记忆索引截断、facts.md 幂等追加不膨胀索引、规则落盘以及工作区覆盖前自动备份
 def test_core_memory_rules_and_workspace_backup(tmp_path: Path) -> None:
     memory = MemoryStore(tmp_path / "data")
-    assert memory.read_core_memory() == ""
+    assert memory.read_memory_index() == ""
     assert memory.read_rules_summary() == ""
+    assert memory.read_recent_facts() == ""
 
-    # 记忆写入与同 message_id 幂等去重
-    assert memory.remember_user_statement("记住，我喜欢早上写代码", message_id=7) == "data/memory/MEMORY.md"
+    # 事实记忆写入 facts.md，同 message_id 幂等去重，且只在 MEMORY.md 注册一次索引指针
+    assert memory.remember_user_statement("记住，我喜欢早上写代码", message_id=7) == "data/memory/facts.md"
     memory.remember_user_statement("记住，我喜欢早上写代码", message_id=7)
-    core = memory.read_core_memory()
-    assert core.count("(msg#7)") == 1
-    assert "早上写代码" in core
+    facts_text = memory.read_recent_facts()
+    assert facts_text.count("(msg#7)") == 1
+    assert "早上写代码" in facts_text
 
-    # 超长时保留标题与最近记录
+    # 多次追加事实后，MEMORY.md 索引内容保持字节级不变（不膨胀、不打穿 KV Cache）
+    index_after_first = memory.memory_file.read_text(encoding="utf-8")
+    assert "data/memory/facts.md" in index_after_first
+    assert "早上写代码" not in index_after_first
+
     for i in range(25):
-        memory.remember_user_statement(f"偏好 {i}：" + "内容" * 30, message_id=100 + i)
-    truncated = memory.read_core_memory(max_chars=500)
-    assert "完整记录请调用 read_markdown" in truncated
-    assert "偏好 24" in truncated
+        memory.remember_user_statement(f"事实 {i}：测试记录", message_id=100 + i)
+    assert memory.memory_file.read_text(encoding="utf-8") == index_after_first
+    assert "事实 24" in memory.read_recent_facts(limit=5)
+
+    # 手工维护的超长 MEMORY.md 索引按头部行数/字符数截断（保留前部目录）
+    memory.memory_file.write_text(
+        "# 记忆索引\n" + "\n".join(f"- [主题 {i}](topic_{i}.md) — 说明" for i in range(120)),
+        encoding="utf-8",
+    )
+    truncated = memory.read_memory_index(max_lines=10)
+    assert "主题 0" in truncated
+    assert "主题 50" not in truncated
+    assert "索引已截断" in truncated
 
     # 保存行为规则并汇总列表
     rule_path = memory.save_rule("回答尽量简洁分条", source="agent")
@@ -169,7 +183,8 @@ def test_memory_tools_and_react_integration(tmp_path: Path) -> None:
     reply = run_react(llm, messages, registry)
 
     assert "shell=False" in reply
-    assert "Python 标准库示例" in memory.read_core_memory()
+    assert "Python 标准库示例" in memory.read_recent_facts()
+    assert "data/memory/facts.md" in memory.read_memory_index()
     assert "回答前先查证已有记录" in memory.read_rules_summary()
     assert (memory.workspace_dir / "summary.md").read_text(encoding="utf-8") == "命令必须设置 shell=False"
     assert len(memory.audit_entries()) == 3

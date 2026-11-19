@@ -61,16 +61,17 @@ def build_repl_tools(
     return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message)), memory
 
 
-# 组装每轮系统提示词：拼接基础人设、当前日期、行为规则与 MEMORY.md 核心记忆
+# 组装系统提示词：静态指令与规则在前、目录索引与日期在后（供离线评测与独立调用复用）
 def format_system_prompt(memory: MemoryStore) -> str:
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    parts = [SYSTEM_PROMPT, f"今天是 {today}（北京时间）。"]
+    parts = [SYSTEM_PROMPT]
     rules = memory.read_rules_summary()
     if rules:
         parts.append(f"【行为规则 (data/memory/rules/)】\n{rules}")
-    core = memory.read_core_memory()
-    if core:
-        parts.append(f"【长期记忆 (data/memory/MEMORY.md)】\n{core}")
+    index = memory.read_memory_index()
+    if index:
+        parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    parts.append(f"今天是 {today}（北京时间）。")
     return "\n\n".join(parts)
 
 
@@ -80,12 +81,15 @@ def _print_step(name: str, args: str, observation: str) -> None:
     print(f"  [Observe] {observation}")
 
 
-# 处理终端本地快捷命令（/status、/memory、/search），不消耗模型 Token
-def _handle_repl_command(app: AssistantApp, text: str) -> str | None:
+# 处理终端本地快捷命令（/status、/memory、/search、/refresh），不消耗模型 Token
+def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> str | None:
     if text == "/status":
         return json.dumps(app.status(), ensure_ascii=False, indent=2)
     if text == "/memory":
         return app.memory_overview()
+    if text == "/refresh":
+        app.reset_session_prompt(chat_id)
+        return "已清空当前会话冻结的系统提示词，下一轮将重新加载最新规则与 MEMORY.md 索引。"
     if text.startswith("/search "):
         query = text.removeprefix("/search ").strip()
         return app.search(query) if query else "用法：/search <关键词>"
@@ -128,7 +132,7 @@ def run_repl(
     active_app = app or build_app(llm=llm)
     try:
         tool_names = ", ".join(active_app.build_tools().names)
-        print(f"My Helper v2 REPL（可用工具：{tool_names}；命令：/status /memory /search；exit 退出）")
+        print(f"My Helper REPL（可用工具：{tool_names}；命令：/status /memory /search /refresh；exit 退出）")
         while True:
             try:
                 user_text = input("\n你> ").strip()
@@ -139,7 +143,7 @@ def run_repl(
                 continue
             if user_text.lower() in {"exit", "quit", "/quit"}:
                 break
-            cmd_reply = _handle_repl_command(active_app, user_text)
+            cmd_reply = _handle_repl_command(active_app, user_text, chat_id=chat_id)
             if cmd_reply is not None:
                 print(f"助手>\n{cmd_reply}")
                 continue

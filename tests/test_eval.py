@@ -125,8 +125,9 @@ def test_agent_eval_isolates_data_dir_and_records_tool_trace(tmp_path: Path) -> 
     assert report["summary"]["expected_tools_all_hit"] == 1
     assert report["cases"][0]["called_tools"] == ["search_markdown", "remember_fact"]
     assert report["cases"][0]["review_status"] == "needs_human_review"
-    # 即使评测过程中调用了 remember_fact，原始数据目录也不应被写入 MEMORY.md
+    # 即使评测过程中调用了 remember_fact，原始数据目录也不应被写入 MEMORY.md 或 facts.md
     assert not (data_dir / "memory" / "MEMORY.md").exists()
+    assert not (data_dir / "memory" / "facts.md").exists()
 
 
 # 测试评测 CLI 输出报告以及拦截把报告写进 --data-dir 内部的行为

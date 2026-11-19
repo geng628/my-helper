@@ -9,7 +9,7 @@
 - **纯 Python 标准库实现**：生产环境不引入任何第三方库（仅用 `urllib`、`sqlite3`、`json`、`pathlib` 等标准库），代码一眼看穿。
 - **经典 ReAct 闭环**：基于 OpenAI 兼容 Chat Completions 原生 Function Calling 实现 `Reason -> Act -> Observe` 循环，并将工具参数/执行异常作为 Observation 回传模型自愈。
 - **纯白名单与插件化工具**：
-  - 记忆直接读写明文 Markdown（`MEMORY.md` 与 `rules/*.md`），不做复杂的隐式编译与向量黑盒。
+  - 记忆采用“目录索引 + 独立主题/事实文件”的纯 Markdown 设计：`MEMORY.md` 仅作限长索引并在会话内冻结前缀（配合追加式多轮历史，最大化 KV Cache 命中率）；随时间增长的事实记入 `facts.md` 按需检索。
   - 核心只保留必要的 Markdown/文件内置工具；其余自定义工具全部写在可自由编辑的 [plugins/custom_tools.py](plugins/custom_tools.py)（或 `plugins/*.py`）中，用 `@tool(...)` 声明并在 `config/tools.json` 白名单中勾选即可热插拔。
 
 ## 快速开始
@@ -62,7 +62,7 @@ my_helper_v2/
 │   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具与 ReAct）
 │   ├── eval/                      # 评测包（按模式拆分：common / search_eval / agent_eval / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
-│   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search）
+│   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
 │   └── demo.py                    # 离线演示与单句实测脚本
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）

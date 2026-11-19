@@ -1,7 +1,6 @@
-"""Step 4 单元测试：验证 SQLite 对话历史与 AssistantApp 核心编排闭环。"""
+"""Step 4 单元测试：验证 SQLite 对话历史、KV Cache 前缀冻结与索引式记忆编排。"""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from personal_assistant.app import AssistantApp
@@ -53,13 +52,13 @@ def test_state_store_persistence_and_isolation(tmp_path: Path) -> None:
         reopened.close()
 
 
-# 测试 AssistantApp 多轮对话持久化、history_reference 注入、记忆联动与插件调用
-def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
+# 测试会话内冻结 System Prompt、标准追加式历史前缀复用（保 KV Cache）以及新会话加载记忆索引
+def test_assistant_app_kv_cache_prefix_and_memory_index(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     data_root = tmp_path / "data"
     llm = RecordingLLM(
         [
-            # 第 1 轮：调用 remember_fact 与插件工具 get_current_time
+            # 第 1 轮：调用 remember_fact 写入 facts.md，并调用插件 get_current_time
             {
                 "role": "assistant",
                 "content": None,
@@ -76,9 +75,11 @@ def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
                     },
                 ],
             },
-            {"role": "assistant", "content": "已记住你的偏好，并查看了当前时间。"},
-            # 第 2 轮：验证历史对话与 MEMORY.md 已自动注入上下文
-            {"role": "assistant", "content": "你之前说过你正在开发 my-helper。"},
+            {"role": "assistant", "content": "已记下你的项目，并查看了当前时间。"},
+            # 第 2 轮（同一会话）：前缀应与第 1 轮字节级完全一致
+            {"role": "assistant", "content": "你刚才说你在开发 my-helper 项目。"},
+            # 新会话：system prompt 应加载 MEMORY.md 索引指针，但不把 facts.md 原文硬塞进 system
+            {"role": "assistant", "content": "让我先检索记忆。"},
         ]
     )
 
@@ -90,28 +91,37 @@ def test_assistant_app_chat_history_memory_and_plugins(tmp_path: Path) -> None:
     )
     try:
         turn1 = app.chat("记住，我正在开发 my-helper 项目", chat_id="cli-1")
-        assert turn1["reply"] == "已记住你的偏好，并查看了当前时间。"
+        assert turn1["reply"] == "已记下你的项目，并查看了当前时间。"
         assert [t["tool"] for t in turn1["tool_calls"]] == ["remember_fact", "get_current_time"]
-        assert "(msg#1)" in app.memory.read_core_memory()
+        assert "(msg#1)" in app.memory.read_recent_facts()
+        assert "data/memory/facts.md" in app.memory.read_memory_index()
 
         turn2 = app.chat("我刚才说自己在做什么？", chat_id="cli-1")
         assert "my-helper" in str(turn2["reply"])
 
-        # 检查第 2 轮发给模型的上下文：System Prompt 含 MEMORY.md，User 消息含 history_reference
-        second_system = str(llm.requests[2][0][0]["content"])
-        second_user = json.loads(str(llm.requests[2][0][1]["content"]))
-        assert "我正在开发 my-helper 项目" in second_system
-        assert second_user["current_user_message"] == "我刚才说自己在做什么？"
-        assert len(second_user["history_reference"]) == 2
-        assert second_user["history_reference"][0]["content"] == "记住，我正在开发 my-helper 项目"
+        # 验证 KV Cache 友好性：第 2 轮 system 与第 1 轮字节级完全相同，历史按标准 user/assistant 追加
+        turn1_msgs = llm.requests[0][0]
+        turn2_msgs = llm.requests[2][0]
+        assert turn2_msgs[0] == turn1_msgs[0]
+        assert turn2_msgs[1] == {"role": "user", "content": "记住，我正在开发 my-helper 项目"}
+        assert turn2_msgs[2] == {"role": "assistant", "content": "已记下你的项目，并查看了当前时间。"}
+        assert turn2_msgs[3] == {"role": "user", "content": "我刚才说自己在做什么？"}
+
+        # 开启新会话（或 reset_session_prompt 后）：system 加载 MEMORY.md 目录索引，但不灌入具体事实正文
+        app.chat("查一下我的项目备忘", chat_id="cli-2")
+        new_session_system = str(llm.requests[3][0][0]["content"])
+        assert "data/memory/facts.md" in new_session_system
+        assert "我正在开发 my-helper 项目" not in new_session_system
 
         status = app.status()
         assert status["status"] == "ok"
         assert status["llm_configured"] is True
-        assert status["memory_files"] == 1
-        assert status["messages"] == 4
+        assert status["memory_files"] == 2
+        assert status["messages"] == 6
         assert "get_current_time" in status["tools"]
-        assert "MEMORY.md" in app.memory_overview()
+        overview = app.memory_overview()
+        assert "MEMORY.md" in overview
+        assert "facts.md" in overview
     finally:
         app.close()
 
@@ -126,7 +136,8 @@ def test_assistant_app_offline_status_and_search(tmp_path: Path) -> None:
         app.memory.remember_user_statement("记住，代码函数前需要写中文注释", message_id=1)
         app.memory.write_workspace_file("plan.md", "# 计划\n用纯标准库完成最小 Agent。\n", mode="create")
 
-        assert app.status()["memory_files"] == 1
+        # remember_fact 会创建 facts.md 与索引 MEMORY.md 共 2 个文件
+        assert app.status()["memory_files"] == 2
         assert "中文注释" in app.search("中文注释")
         assert "纯标准库" in app.search("纯标准库", root="data/workspace")
     finally:
