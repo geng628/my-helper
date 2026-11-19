@@ -1,12 +1,14 @@
-"""最小终端交互（REPL）入口，用于本地测试 ReAct 循环与记忆工具。"""
+"""最小终端交互（REPL）入口，基于 AssistantApp 提供持久化对话与快捷斜杠命令。"""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from personal_assistant.app import AssistantApp, build_app
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
@@ -38,7 +40,7 @@ def build_demo_tools() -> ToolRegistry:
     return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
-# 根据 config/tools.json 装配终端 REPL 使用的白名单工具注册表与 Markdown 记忆库
+# 根据 config/tools.json 装配白名单工具注册表与 Markdown 记忆库
 def build_repl_tools(
     config_path: Path | None = None,
     data_root: Path | None = None,
@@ -78,53 +80,92 @@ def _print_step(name: str, args: str, observation: str) -> None:
     print(f"  [Observe] {observation}")
 
 
-# 启动交互式终端对话循环，持续读取用户输入并驱动 ReAct 执行
-def run_repl(llm: LLMClient | None = None, tools: ToolRegistry | None = None) -> None:
-    client = llm or from_env()
-    current_user: list[tuple[str, int | None]] = [("", None)]
-    msg_id = 0
+# 处理终端本地快捷命令（/status、/memory、/search），不消耗模型 Token
+def _handle_repl_command(app: AssistantApp, text: str) -> str | None:
+    if text == "/status":
+        return json.dumps(app.status(), ensure_ascii=False, indent=2)
+    if text == "/memory":
+        return app.memory_overview()
+    if text.startswith("/search "):
+        query = text.removeprefix("/search ").strip()
+        return app.search(query) if query else "用法：/search <关键词>"
+    return None
 
-    if tools is None:
-        registry, memory = build_repl_tools(get_user_message=lambda: current_user[0])
-    else:
-        registry, memory = tools, None
 
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": format_system_prompt(memory) if memory else SYSTEM_PROMPT}
-    ]
-    print(f"My Helper v2 ReAct REPL（可用工具：{', '.join(registry.names)}；输入 exit/quit 退出）")
+# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与加载白名单工具
+def run_repl(
+    app: AssistantApp | None = None,
+    *,
+    llm: LLMClient | None = None,
+    tools: ToolRegistry | None = None,
+    chat_id: str = "cli",
+) -> None:
+    if tools is not None:
+        client = llm or from_env()
+        messages: list[dict[str, object]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        print(f"My Helper v2 ReAct REPL（可用工具：{', '.join(tools.names)}；输入 exit/quit 退出）")
+        while True:
+            try:
+                user_text = input("\n你> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not user_text:
+                continue
+            if user_text.lower() in {"exit", "quit", "/quit"}:
+                break
+            messages.append({"role": "user", "content": user_text})
+            try:
+                reply = run_react(client, messages, tools, on_step=_print_step)
+            except LLMNotConfigured as error:
+                messages.pop()
+                print(f"助手> {error}")
+                continue
+            print(f"助手> {reply}")
+        return
 
-    while True:
-        try:
-            user_text = input("\n你> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not user_text:
-            continue
-        if user_text.lower() in {"exit", "quit", "/quit"}:
-            break
-
-        msg_id += 1
-        current_user[0] = (user_text, msg_id)
-        if memory is not None:
-            messages[0]["content"] = format_system_prompt(memory)
-        messages.append({"role": "user", "content": user_text})
-        try:
-            reply = run_react(client, messages, registry, on_step=_print_step)
-        except LLMNotConfigured as error:
-            messages.pop()
-            print(f"助手> {error}")
-            continue
-        print(f"助手> {reply}")
+    owned = app is None
+    active_app = app or build_app(llm=llm)
+    try:
+        tool_names = ", ".join(active_app.build_tools().names)
+        print(f"My Helper v2 REPL（可用工具：{tool_names}；命令：/status /memory /search；exit 退出）")
+        while True:
+            try:
+                user_text = input("\n你> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not user_text:
+                continue
+            if user_text.lower() in {"exit", "quit", "/quit"}:
+                break
+            cmd_reply = _handle_repl_command(active_app, user_text)
+            if cmd_reply is not None:
+                print(f"助手>\n{cmd_reply}")
+                continue
+            try:
+                result = active_app.chat(user_text, chat_id=chat_id, on_step=_print_step)
+            except LLMNotConfigured as error:
+                print(f"助手> {error}")
+                continue
+            print(f"助手> {result['reply']}")
+    finally:
+        if owned:
+            active_app.close()
 
 
 # 命令行总入口：加载 .env 并解析子命令（默认进入 chat 交互模式）
 def main(argv: list[str] | None = None) -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="my-helper")
+    parser.add_argument("--data", default=None, help="数据目录路径（默认读取 MY_HELPER_DATA 或 data）")
+    parser.add_argument("--config", default=None, help="配置目录路径（默认读取 MY_HELPER_CONFIG 或 config）")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
     args = parser.parse_args(argv)
     if args.command in (None, "chat"):
-        run_repl()
+        app = build_app(
+            data_root=Path(args.data) if args.data else None,
+            config_root=Path(args.config) if args.config else None,
+        )
+        run_repl(app)

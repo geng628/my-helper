@@ -37,7 +37,7 @@ uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.j
 uv run python -m personal_assistant chat
 ```
 
-## 当前项目结构（Step 3）
+## 当前项目结构（Step 4）
 
 ```text
 my_helper_v2/
@@ -58,9 +58,11 @@ my_helper_v2/
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
 │   ├── memory.py                  # 核心内置 Markdown 记忆与文件读写工具
+│   ├── db.py                      # 极简 SQLite 对话历史存储（messages 表）
+│   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具与 ReAct）
 │   ├── eval/                      # 评测包（按模式拆分：common / search_eval / agent_eval / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
-│   └── cli.py                     # 终端交互 REPL
+│   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search）
 ├── scripts/
 │   └── demo.py                    # 离线演示与单句实测脚本
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）
@@ -68,6 +70,7 @@ my_helper_v2/
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
 │   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
+│   ├── test_step4_app.py          # SQLite 历史与 AssistantApp 编排单元测试
 │   └── test_eval.py               # Eval 评测器自身单元测试
 ├── .env.example
 ├── .gitignore
@@ -78,9 +81,10 @@ my_helper_v2/
 ## 开发路线图
 
 - [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
-- [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`）
+- [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`, `plugins.py`）
 - [x] **Step 3**：纯 Markdown 记忆与笔记直读检索（`memory.py`）
-- [ ] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
+- [x] **Eval**：离线检索与端到端 Agent 评测包（`eval/`）
+- [x] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
 - [ ] **Step 5**：纯 Python Telegram Long Polling 与轻量 HTTP 服务（`telegram_bot.py`, `server.py`）
 
 ## License
