@@ -59,8 +59,9 @@ my_helper_v2/
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
 │   ├── memory.py                  # 核心内置 Markdown 记忆与文件读写工具
-│   ├── db.py                      # 极简 SQLite 对话历史存储（messages 表）
-│   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具与 ReAct）
+│   ├── db.py                      # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
+│   ├── consolidator.py            # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
+│   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
 │   ├── eval/                      # 评测包（按模式拆分：common / search_eval / agent_eval / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
@@ -73,6 +74,7 @@ my_helper_v2/
 │   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
 │   ├── test_step4_app.py          # SQLite 历史、前缀冻结与 AssistantApp 编排单元测试
 │   ├── test_cache_metrics.py      # KV 缓存命中与前缀复用率单元测试
+│   ├── test_consolidator.py       # 自动阈值沉淀与后台上下文压缩单元测试
 │   └── test_eval.py               # Eval 评测器自身单元测试
 ├── .env.example
 ├── .gitignore

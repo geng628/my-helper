@@ -580,6 +580,53 @@ class MemoryStore:
         self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
         return "data/memory/facts.md"
 
+    # 将沉淀提炼的长期记忆按主题去重追加到 data/memory/<topic>.md，并仅在 MEMORY.md 登记一次索引指针
+    def save_memory_entries(
+        self,
+        topic: str,
+        title: str,
+        index_summary: str,
+        items: list[str],
+    ) -> str | None:
+        slug = re.sub(r"[^a-z0-9_-]+", "-", topic.strip().lower()).strip("-_")[:40]
+        if not slug or slug in {"memory", "audit", "rules"}:
+            raise ValueError(f"无效的记忆主题名：{topic}")
+
+        cleaned = [" ".join(str(item).split()) for item in items if str(item).strip()]
+        if not cleaned:
+            return None
+
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        target = self.memory_dir / f"{slug}.md"
+        rel_path = f"data/memory/{slug}.md"
+        clean_title = " ".join(title.split()) or slug
+        existing = (
+            target.read_text(encoding="utf-8")
+            if target.is_file()
+            else f"# {clean_title} ({slug}.md)\n\n"
+        )
+
+        # 按正文去重，防止重复沉淀写入相同条目
+        new_items = [item for item in cleaned if item not in existing]
+        if not new_items:
+            return None
+
+        stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        appended = "".join(f"- [{stamp}] {item}\n" for item in new_items)
+        _atomic_write(target, f"{existing}{sep}{appended}")
+
+        summary_line = " ".join(index_summary.split()) or f"自动沉淀的 {clean_title} 记录，请按需检索"
+        self._ensure_index_entry(rel_path, f"- [{clean_title}]({rel_path}) — {summary_line}")
+        self.record_audit(
+            action="consolidate_memory",
+            actor="consolidator",
+            target=rel_path,
+            old_value=None,
+            new_value="; ".join(new_items),
+        )
+        return rel_path
+
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
     def save_rule(self, statement: str, source: str = "agent") -> Path:
         clean = " ".join(statement.split())

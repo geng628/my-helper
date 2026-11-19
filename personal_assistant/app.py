@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,11 @@ from zoneinfo import ZoneInfo
 
 from personal_assistant.cache_metrics import CacheMonitor
 from personal_assistant.commands import ToolsConfig
+from personal_assistant.consolidator import (
+    BackgroundConsolidator,
+    ConsolidationPolicy,
+    MemoryConsolidator,
+)
 from personal_assistant.db import StateStore
 from personal_assistant.llm import LLMClient, NoopLLMClient, from_env
 from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
@@ -21,7 +27,7 @@ MAX_HISTORY_ITEM_CHARS = 2000
 
 # 统一编排层：供终端 CLI 与本地 HTTP 接口共同调用
 class AssistantApp:
-    # 装配数据目录、工具白名单配置、Markdown 记忆库、SQLite 历史与大模型客户端
+    # 装配数据目录、工具白名单配置、Markdown 记忆库、SQLite 历史、大模型与后台沉淀器
     def __init__(
         self,
         data_root: Path | str,
@@ -31,6 +37,8 @@ class AssistantApp:
         llm: LLMClient | None = None,
         memory: MemoryStore | None = None,
         state: StateStore | None = None,
+        consolidation_policy: ConsolidationPolicy | None = None,
+        consolidator_llm: LLMClient | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -61,11 +69,24 @@ class AssistantApp:
 
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
         self.llm = llm or from_env()
+        self._prompt_lock = threading.Lock()
         self._session_prompts: dict[str, str] = {}
         self.cache_monitor = CacheMonitor()
+        self.consolidator = MemoryConsolidator(
+            self.state,
+            self.memory,
+            consolidator_llm or self.llm,
+            policy=consolidation_policy,
+        )
+        self.background_consolidator = BackgroundConsolidator(self.consolidator)
 
-    # 关闭底层状态存储资源
+    # 等待所有在途后台沉淀任务完成（供退出收尾或测试调用）
+    def wait_for_consolidation(self, timeout: float = 15.0) -> None:
+        self.background_consolidator.wait(timeout=timeout)
+
+    # 先等待后台沉淀收尾，再关闭底层状态存储资源
     def close(self) -> None:
+        self.background_consolidator.wait(timeout=15.0)
         self.state.close()
 
     # 为单轮对话构建受白名单管控的工具注册表，并将当前用户消息绑定到 remember_fact
@@ -99,18 +120,20 @@ class AssistantApp:
 
     # 获取指定会话冻结的系统提示词：整场会话复用首次快照，防止中途改写记忆打穿 KV Cache
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
-        prompt = self._session_prompts.get(chat_id)
-        if prompt is None:
-            prompt = self.build_system_prompt(registry)
-            self._session_prompts[chat_id] = prompt
-        return prompt
+        with self._prompt_lock:
+            prompt = self._session_prompts.get(chat_id)
+            if prompt is None:
+                prompt = self.build_system_prompt(registry)
+                self._session_prompts[chat_id] = prompt
+            return prompt
 
-    # 主动重置指定会话（或全部会话）冻结的系统提示词，用于手动编辑规则/索引后显式刷新
+    # 主动重置指定会话（或全部会话）冻结的系统提示词，用于后台沉淀或手动改文件后刷新
     def reset_session_prompt(self, chat_id: str | None = None) -> None:
-        if chat_id is None:
-            self._session_prompts.clear()
-        else:
-            self._session_prompts.pop(chat_id, None)
+        with self._prompt_lock:
+            if chat_id is None:
+                self._session_prompts.clear()
+            else:
+                self._session_prompts.pop(chat_id, None)
 
     # 将持久化历史转换为标准追加式消息列表，保持前缀字节级稳定以命中跨轮 KV Cache
     @staticmethod
@@ -126,7 +149,7 @@ class AssistantApp:
             result.append({"role": role, "content": content})
         return result
 
-    # 处理一轮完整对话：持久化提问、执行 ReAct 循环、持久化回答并返回结果与工具轨迹
+    # 处理一轮完整对话：加载摘要与活跃历史、执行 ReAct 循环、持久化回答并在达阈值时后台自动沉淀
     def chat(
         self,
         text: str,
@@ -139,15 +162,24 @@ class AssistantApp:
         if not clean_text:
             raise ValueError("消息内容不能为空。")
 
-        history = self.state.recent_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
+        compaction = self.state.get_compaction(chat_id)
+        history = self.state.active_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
         user_msg_id = self.state.append_message(chat_id, "user", clean_text)
         registry = self.build_tools(user_text=clean_text, message_id=user_msg_id)
         system_prompt = self.get_session_system_prompt(chat_id, registry)
-        messages: list[dict[str, object]] = [
-            {"role": "system", "content": system_prompt},
-            *self._build_history_messages(history),
-            {"role": "user", "content": clean_text},
-        ]
+        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}]
+        summary_text = str(compaction.get("summary") or "").strip()
+        if summary_text:
+            # 使用标准 user/assistant 承接对注入前情摘要，保证仅含单条 system 消息且兼容全部模型接口
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"【本会话已压缩前情摘要（供承接上下文）】\n{summary_text}",
+                }
+            )
+            messages.append({"role": "assistant", "content": "已了解前情摘要，请继续。"})
+        messages.extend(self._build_history_messages(history))
+        messages.append({"role": "user", "content": clean_text})
 
         traces: list[dict[str, str]] = []
 
@@ -167,12 +199,17 @@ class AssistantApp:
             on_step=record_step,
         )
         assistant_msg_id = self.state.append_message(chat_id, "assistant", reply)
+        scheduled = self.background_consolidator.maybe_schedule(
+            chat_id,
+            on_complete=lambda res: self.reset_session_prompt(res.chat_id),
+        )
         return {
             "reply": reply,
             "chat_id": chat_id,
             "message_id": assistant_msg_id,
             "tool_calls": traces,
             "cache": self.cache_monitor.summary(since=start_idx),
+            "consolidation_scheduled": scheduled,
         }
 
     # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
@@ -210,6 +247,7 @@ class AssistantApp:
             "tools": registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],
             "cache": self.cache_monitor.summary(),
+            "consolidation": self.background_consolidator.status(),
         }
 
 

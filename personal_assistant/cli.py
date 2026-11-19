@@ -157,6 +157,8 @@ def run_repl(
             cache_info = result.get("cache")
             if isinstance(cache_info, dict) and cache_info.get("llm_calls"):
                 print(f"  [Cache] {format_cache_summary(cache_info)}")
+            if result.get("consolidation_scheduled"):
+                print("  [Memory] 上下文已达阈值，后台正在自动沉淀长期记忆并缩减上下文…")
     finally:
         if owned:
             active_app.close()

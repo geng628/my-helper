@@ -1,0 +1,261 @@
+"""自动记忆沉淀与上下文压缩模块：达阈值后后台提炼长期记忆并缩减活跃上下文。"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from personal_assistant.db import StateStore
+from personal_assistant.llm import LLMClient, NoopLLMClient
+from personal_assistant.memory import MemoryStore
+
+CONSOLIDATION_SYSTEM_PROMPT = (
+    "你是个人助手的后台记忆整理器。你会收到已有的前情摘要、当前 MEMORY.md 目录索引，以及一段即将从活跃窗口移除的历史对话。\n"
+    "请严格输出一个合法 JSON 对象（不要输出任何额外解释），结构如下：\n"
+    "{\n"
+    '  "session_summary": "合并旧摘要与本批对话后的精简前情摘要（3-6 条要点，保留未完事项与关键上下文）",\n'
+    '  "memories": [\n'
+    "    {\n"
+    '      "topic": "仅含小写字母/数字/连字符的主题文件名，例如 preferences、projects、facts",\n'
+    '      "title": "简短中文标题，如 个人偏好、项目备忘",\n'
+    '      "index_summary": "一句简短索引说明（20字以内）",\n'
+    '      "items": ["只保留值得跨会话长期记住的明确事实、偏好或决策；每条一句话"]\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "严格要求：\n"
+    "1. 严禁编造对话中未明确出现的信息。\n"
+    "2. 纯闲聊、一次性提问或临时寒暄不要写入 memories（没有可沉淀内容时返回空数组 []）。\n"
+    "3. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
+)
+
+
+# 自动沉淀与上下文缩减的阈值策略配置
+@dataclass(frozen=True)
+class ConsolidationPolicy:
+    max_active_messages: int = 16
+    max_active_chars: int = 8000
+    keep_recent_messages: int = 6
+    min_batch_messages: int = 4
+
+
+# 单次沉淀与压缩完成后的结构化结果
+@dataclass(frozen=True)
+class ConsolidationResult:
+    chat_id: str
+    compacted_messages: int
+    compacted_until_id: int
+    saved_files: tuple[str, ...]
+    summary: str
+
+    # 转换为便于 /status 展示与日志记录的字典
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "chat_id": self.chat_id,
+            "compacted_messages": self.compacted_messages,
+            "compacted_until_id": self.compacted_until_id,
+            "saved_files": list(self.saved_files),
+            "summary_chars": len(self.summary),
+        }
+
+
+# 从模型输出文本中稳健提取 JSON 对象（兼容 Markdown 代码块包裹）
+def _parse_json_object(raw: str) -> dict[str, object]:
+    text = raw.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    elif not text.startswith("{"):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start : end + 1]
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("沉淀结果必须是 JSON 对象。")
+    return parsed
+
+
+# 将待沉淀的历史消息格式化为紧凑文本，供整理模型阅读
+def _format_transcript(batch: list[dict[str, object]], max_item_chars: int = 1000) -> str:
+    lines: list[str] = []
+    for msg in batch:
+        role = "用户" if msg.get("role") == "user" else "助手"
+        content = str(msg.get("content") or "").strip()
+        if len(content) > max_item_chars:
+            content = content[:max_item_chars] + "…"
+        lines.append(f"[{role} #{msg.get('id')}] {content}")
+    return "\n".join(lines)
+
+
+# 纯同步记忆沉淀与上下文压缩核心（不绑定线程，未来可直接挂载到独立 worker）
+class MemoryConsolidator:
+    # 绑定状态存储、Markdown 记忆库、大模型客户端与触发策略
+    def __init__(
+        self,
+        state: StateStore,
+        memory: MemoryStore,
+        llm: LLMClient,
+        *,
+        policy: ConsolidationPolicy | None = None,
+    ) -> None:
+        self.state = state
+        self.memory = memory
+        self.llm = llm
+        self.policy = policy or ConsolidationPolicy()
+
+    # 检查指定会话是否达到沉淀阈值；若达到则返回（旧摘要，待沉淀旧消息批次），否则返回 None
+    def select_batch(self, chat_id: str) -> tuple[str, list[dict[str, object]]] | None:
+        active = self.state.active_messages(chat_id)
+        if not active:
+            return None
+        total_chars = sum(len(str(msg.get("content") or "")) for msg in active)
+        reached = (
+            len(active) >= self.policy.max_active_messages
+            or total_chars >= self.policy.max_active_chars
+        )
+        if not reached:
+            return None
+        cutoff = len(active) - max(0, self.policy.keep_recent_messages)
+        if cutoff < self.policy.min_batch_messages:
+            return None
+        existing_summary = str(self.state.get_compaction(chat_id).get("summary") or "")
+        return existing_summary, active[:cutoff]
+
+    # 对指定会话执行一次完整沉淀：提炼长期记忆写盘、生成滚动摘要并原子推进压缩游标
+    def consolidate_once(self, chat_id: str) -> ConsolidationResult | None:
+        if isinstance(self.llm, NoopLLMClient):
+            return None
+        selected = self.select_batch(chat_id)
+        if selected is None:
+            return None
+        existing_summary, batch = selected
+
+        index_text = self.memory.read_memory_index() or "（暂无记忆索引）"
+        transcript = _format_transcript(batch)
+        user_payload = (
+            f"【当前 MEMORY.md 索引】\n{index_text}\n\n"
+            f"【已有前情摘要】\n{existing_summary or '（无）'}\n\n"
+            f"【待沉淀与压缩的早期对话（共 {len(batch)} 条）】\n{transcript}"
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": CONSOLIDATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_payload},
+        ]
+
+        reply_msg = self.llm.respond(messages, tools=None)
+        parsed = _parse_json_object(str(reply_msg.get("content") or ""))
+
+        summary = str(parsed.get("session_summary") or "").strip()
+        if not summary:
+            raise ValueError("模型未返回有效的 session_summary，取消推进压缩游标。")
+
+        saved_files: list[str] = []
+        raw_memories = parsed.get("memories")
+        if isinstance(raw_memories, list):
+            for entry in raw_memories:
+                if not isinstance(entry, dict):
+                    continue
+                topic = str(entry.get("topic") or "").strip()
+                title = str(entry.get("title") or topic).strip()
+                index_summary = str(entry.get("index_summary") or "").strip()
+                raw_items = entry.get("items")
+                if not topic or not isinstance(raw_items, list):
+                    continue
+                items = [str(item) for item in raw_items if str(item).strip()]
+                if not items:
+                    continue
+                try:
+                    saved = self.memory.save_memory_entries(topic, title, index_summary, items)
+                except ValueError:
+                    continue
+                if saved and saved not in saved_files:
+                    saved_files.append(saved)
+
+        # 只有长期记忆文件落盘与摘要解析均成功后，才推进 SQLite 压缩游标
+        cutoff_id = int(batch[-1]["id"])
+        self.state.save_compaction(chat_id, summary, cutoff_id)
+        return ConsolidationResult(
+            chat_id=chat_id,
+            compacted_messages=len(batch),
+            compacted_until_id=cutoff_id,
+            saved_files=tuple(saved_files),
+            summary=summary,
+        )
+
+
+# 进程内后台调度器：用标准库线程异步执行沉淀，不阻塞对话回复并确保同会话互斥
+class BackgroundConsolidator:
+    # 初始化后台调度锁、在途会话集合与最近执行状态记录
+    def __init__(self, consolidator: MemoryConsolidator) -> None:
+        self.consolidator = consolidator
+        self._lock = threading.Lock()
+        self._in_flight: set[str] = set()
+        self._threads: dict[str, threading.Thread] = {}
+        self.last_result: dict[str, object] | None = None
+        self.last_error: str | None = None
+
+    # 检查阈值并按需拉起后台线程执行沉淀；若已触发返回 True，未达阈值或正在执行返回 False
+    def maybe_schedule(
+        self,
+        chat_id: str,
+        *,
+        on_complete: Callable[[ConsolidationResult], None] | None = None,
+    ) -> bool:
+        if isinstance(self.consolidator.llm, NoopLLMClient):
+            return False
+        if self.consolidator.select_batch(chat_id) is None:
+            return False
+
+        with self._lock:
+            if chat_id in self._in_flight:
+                return False
+            self._in_flight.add(chat_id)
+            worker = threading.Thread(
+                target=self._run_worker,
+                args=(chat_id, on_complete),
+                name=f"consolidate-{chat_id}",
+                daemon=True,
+            )
+            self._threads[chat_id] = worker
+            worker.start()
+        return True
+
+    # 后台工作线程主体：捕获异常不崩溃主进程，完成后记录状态并触发回调
+    def _run_worker(
+        self,
+        chat_id: str,
+        on_complete: Callable[[ConsolidationResult], None] | None,
+    ) -> None:
+        try:
+            result = self.consolidator.consolidate_once(chat_id)
+            if result is not None:
+                with self._lock:
+                    self.last_result = result.to_dict()
+                    self.last_error = None
+                if on_complete is not None:
+                    on_complete(result)
+        except Exception as error:  # noqa: BLE001
+            with self._lock:
+                self.last_error = f"{type(error).__name__}: {error}"
+        finally:
+            with self._lock:
+                self._in_flight.discard(chat_id)
+                self._threads.pop(chat_id, None)
+
+    # 等待所有在途后台沉淀线程结束（供程序退出或单元测试收尾调用）
+    def wait(self, timeout: float = 15.0) -> None:
+        with self._lock:
+            threads = list(self._threads.values())
+        for thread in threads:
+            thread.join(timeout=timeout)
+
+    # 返回当前后台沉淀运行状态与最近一次结果/错误信息，供 /status 展示
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "running_sessions": sorted(self._in_flight),
+                "last_result": self.last_result,
+                "last_error": self.last_error,
+            }

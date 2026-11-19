@@ -9,7 +9,7 @@
 2. **索引式纯文本 Markdown 记忆（防膨胀、KV Cache 友好）**：
    - **静态规则 + 目录索引（常驻前缀、会话内冻结）**：`data/memory/rules/*.md`（行为规则）与 `data/memory/MEMORY.md`（限长记忆目录索引，最多读取前 100 行 / 4000 字符）只在会话启动时读入一次并冻结在 `system` 前缀，绝不把无限增长的流水账塞进 Prompt。
    - **事实备忘与主题文件（按需检索）**：`remember_fact` 统一追加到 `data/memory/facts.md`（只在首次创建时往 `MEMORY.md` 登记一行索引指针，后续追加永不改动 `MEMORY.md`）；需要回忆历史事实或主题细节时，由模型按需调 `search_markdown` / `read_markdown` 查阅 `data/memory/`。
-   - **追加式多轮历史**：`AssistantApp` 以标准 `[system, user_1, assistant_1, ..., user_n]` 顺序追加消息，不改写前面轮次，最大化跨轮 KV Cache 命中率。
+   - **追加式多轮历史 + 阈值后台沉淀压缩**：`AssistantApp` 以标准 `[system, user_1, assistant_1, ..., user_n]` 顺序追加消息最大化跨轮 KV Cache 命中率；当活跃消息数或字符数达到阈值时，后台线程自动将较早轮次提炼沉淀至 `data/memory/<topic>.md` 并压缩为【前情摘要】，零手动干预完成上下文瘦身。
 3. **无 MCP，纯原生白名单与插件机制**：
    - 所有工具由宿主机纯 Python 原生实现，并通过唯一的配置文件 `config/tools.json` 进行**三级白名单管控**（工具名称白名单、文件读写目录白名单、固定 `argv` 命令模板白名单）。
    - 核心只保留必要的 Markdown 记忆与文件读写内置工具；其余扩展工具直接写在 `plugins/*.py` 中用 `@tool(...)` 声明，在白名单中勾选即可热插拔。
@@ -59,7 +59,8 @@ my-helper/
 │   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig
-│   ├── db.py                      # SQLite 连接与极简表结构（messages）
+│   ├── db.py                      # 线程安全 SQLite（messages 历史 + session_compactions 压缩状态）
+│   ├── consolidator.py            # 阈值触发的后台记忆沉淀与上下文压缩模块
 │   └── eval/                      # 离线检索评测与端到端 Agent 评测包
 ├── tests/                         # 面向 MVP 核心闭环的确定性单元测试
 ├── .env.example
