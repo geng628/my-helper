@@ -58,7 +58,7 @@ my_helper_v2/
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
 │   ├── memory.py                  # 核心内置 Markdown 记忆与文件读写工具
-│   ├── eval.py                    # 离线检索评测与端到端 Agent 评测（绑定 Git SHA）
+│   ├── eval/                      # 评测包（按模式拆分：common / search_eval / agent_eval / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL
 ├── scripts/

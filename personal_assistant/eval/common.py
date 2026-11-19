@@ -1,0 +1,97 @@
+"""评测模块共用工具：加载 JSONL 案例、校验金标引文、获取 Git SHA 与保存报告。"""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+from personal_assistant.cli import REPO_ROOT
+from personal_assistant.memory import MemoryStore
+
+
+# 获取当前仓库短 Git Commit SHA（若有未提交改动则追加 -dirty），用于绑定评测基线
+def current_git_commit(repo_root: Path = REPO_ROOT) -> str:
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(repo_root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            ).stdout.strip()
+        )
+        return f"{sha}-dirty" if dirty else sha
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+# 从 JSONL 文件逐行读取评测案例，校验案例 id 唯一且包含非空 query
+def load_cases(cases_path: Path) -> list[dict[str, object]]:
+    cases: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for line_no, raw_line in enumerate(cases_path.read_text(encoding="utf-8").splitlines(), start=1):
+        text = raw_line.strip()
+        if not text:
+            continue
+        item = json.loads(text)
+        if not isinstance(item, dict):
+            raise ValueError(f"{cases_path.name}:{line_no} 必须是 JSON 对象。")
+        case_id = str(item.get("id") or f"case-{line_no}").strip()
+        if case_id in seen_ids:
+            raise ValueError(f"重复的案例 id：{case_id}")
+        seen_ids.add(case_id)
+        query = str(item.get("query") or "").strip()
+        if not query:
+            raise ValueError(f"案例 {case_id} 缺少非空 query。")
+        item["id"] = case_id
+        item["query"] = query
+        cases.append(item)
+    if not cases:
+        raise ValueError("评测案例文件为空。")
+    return cases
+
+
+# 校验每条期望来源（金标）文件可读且引文确实存在于原文，并返回标准化路径列表
+def normalize_expected_sources(
+    memory: MemoryStore, raw_sources: object
+) -> list[dict[str, str]]:
+    if not raw_sources:
+        return []
+    if not isinstance(raw_sources, list):
+        raise ValueError("expected_sources 必须是数组。")
+    normalized: list[dict[str, str]] = []
+    file_cache: dict[Path, str] = {}
+    for entry in raw_sources:
+        if not isinstance(entry, dict):
+            raise ValueError("expected_sources 项必须是对象。")
+        raw_path = str(entry.get("path") or "").strip()
+        quote = str(entry.get("quote") or "").strip()
+        if not raw_path or not quote:
+            raise ValueError("expected_sources 每项都需要非空 path 和 quote。")
+        resolved = memory.resolve_path(raw_path, write=False)
+        if not resolved.is_file():
+            raise ValueError(f"金标来源文件不存在：{raw_path}")
+        if resolved not in file_cache:
+            file_cache[resolved] = resolved.read_text(encoding="utf-8")
+        if quote not in file_cache[resolved]:
+            raise ValueError(f"金标 quote 未在原文中找到：{raw_path}")
+        normalized.append({"path": memory.display_path(resolved), "quote": quote})
+    return normalized
+
+
+# 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染资料库
+def safe_write_report(output_path: Path, data_dir: Path, report: dict[str, object]) -> None:
+    resolved_out = output_path.resolve()
+    resolved_data = data_dir.resolve()
+    if resolved_out.is_relative_to(resolved_data):
+        raise ValueError("评测报告输出路径不能放在 --data-dir 目录内。")
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
+    resolved_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
