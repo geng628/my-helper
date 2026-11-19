@@ -2,13 +2,16 @@
 from personal_assistant.eval.agent_eval import evaluate_agent
 from personal_assistant.eval.cli import main
 from personal_assistant.eval.common import current_git_commit, load_cases, safe_write_report
+from personal_assistant.eval.memory_eval import evaluate_memory, load_scenarios
 from personal_assistant.eval.search_eval import evaluate_search
 
 __all__ = [
     "current_git_commit",
     "evaluate_agent",
+    "evaluate_memory",
     "evaluate_search",
     "load_cases",
+    "load_scenarios",
     "main",
     "safe_write_report",
 ]

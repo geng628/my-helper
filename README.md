@@ -29,11 +29,12 @@ uv run python -m personal_assistant.eval --mode search
 # 4. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
 
-# 5. 配置环境变量并启动真实对话或端到端 Agent 评测
+# 5. 配置环境变量并启动真实对话或端到端评测（单轮 agent / 多轮记忆生命周期 memory）
 cp .env.example .env
 # 编辑 .env，设置 LLM_MODE=on、LLM_API_KEY、LLM_BASE_URL 与 LLM_MODEL
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
+uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
 uv run python -m personal_assistant chat
 ```
 
@@ -46,7 +47,8 @@ my_helper_v2/
 ├── plugins/
 │   └── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
 ├── evals/
-│   ├── sample_cases.jsonl         # 公开脱敏评测案例集
+│   ├── sample_cases.jsonl         # 公开脱敏检索与单轮问答案例集
+│   ├── memory_scenarios.jsonl     # 多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
 │   └── sample_data/               # 公开评测样例 Markdown 文件
 ├── docs/
 │   └── mvp-design.md              # 整体设计文档
@@ -63,7 +65,7 @@ my_helper_v2/
 │   ├── db.py                      # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
 │   ├── consolidator.py            # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
 │   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
-│   ├── eval/                      # 评测包（按模式拆分：common / search_eval / agent_eval / cli）
+│   ├── eval/                      # 评测包（common / search_eval / agent_eval / memory_eval / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
@@ -77,7 +79,8 @@ my_helper_v2/
 │   ├── test_cache_metrics.py      # KV 缓存命中与前缀复用率单元测试
 │   ├── test_consolidator.py       # 自动阈值沉淀与后台上下文压缩单元测试
 │   ├── test_memory_lifecycle.py   # 记忆冲突替换与临时事实过期归档单元测试
-│   └── test_eval.py               # Eval 评测器自身单元测试
+│   ├── test_eval.py               # 检索与单轮 Agent 评测器单元测试
+│   └── test_memory_eval.py        # 多轮记忆与生命周期评测器单元测试
 ├── .env.example
 ├── .gitignore
 ├── LICENSE
