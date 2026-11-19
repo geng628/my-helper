@@ -42,7 +42,9 @@ flowchart TD
 ```text
 my_helper_v2/
 ├── config/
-│   └── tools.json                 # 唯一工具与安全边界白名单配置
+│   └── tools.json                 # 工具白名单、插件路径与目录安全配置
+├── plugins/
+│   └── custom_tools.py            # 用户可编辑工具插件（@tool 声明，按白名单插入）
 ├── docs/
 │   └── mvp-design.md              # 本设计文档
 ├── personal_assistant/
@@ -52,9 +54,10 @@ my_helper_v2/
 │   ├── app.py                     # AssistantApp：装配、提示词上下文与会话历史 (~120 行)
 │   ├── react.py                   # 极简 ReAct 核心循环（最多 4 轮原生工具调用） (~70 行)
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib） (~100 行)
-│   ├── memory.py                  # Markdown 直读、关键词搜索、按行读取、记忆/规则写入 (~260 行)
-│   ├── tools.py                   # Tool 与 ToolRegistry 白名单注册表 (~110 行)
-│   ├── commands.py                # 固定 argv 命令模板加载与安全执行器 (~240 行)
+│   ├── memory.py                  # 核心内置 Markdown 记忆与知识工具 (~590 行)
+│   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表 (~130 行)
+│   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具 (~85 行)
+│   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig (~260 行)
 │   ├── db.py                      # SQLite 连接与极简表结构（messages） (~60 行)
 │   ├── telegram_bot.py            # 纯 Python Telegram Long Polling 与斜杠命令处理 (~150 行)
 │   └── server.py                  # 轻量本地 HTTP API (/health, /status, /chat) (~90 行)

@@ -12,8 +12,9 @@ if str(ROOT) not in sys.path:
 
 from personal_assistant.cli import build_demo_tools, load_dotenv
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.plugins import load_plugin_tools
 from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.tools import ToolRegistry
 
 
 class DemoScriptedLLM(LLMClient):
@@ -39,13 +40,8 @@ def _print_step(name: str, args: str, observation: str) -> None:
 
 def run_offline_demo(show_messages: bool = False) -> None:
     tools = ToolRegistry(
-        *build_demo_tools(),
-        Tool(
-            name="add_numbers",
-            description="计算两个整数之和。",
-            parameters={"a": "第一个整数", "b": "第二个整数"},
-            handler=lambda a, b: str(int(a) + int(b)),
-        ),
+        *load_plugin_tools(["plugins/custom_tools.py"], ROOT),
+        allowed_names=["get_current_time", "add_numbers"],
     )
 
     print("=== 场景 1：多轮 ReAct（先查时间，再做计算）===")

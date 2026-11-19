@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from personal_assistant.plugins import load_plugin_tools
 from personal_assistant.tools import Tool, ToolRegistry
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
@@ -198,6 +199,8 @@ class ToolsConfig:
     enabled_tools: tuple[str, ...]
     files: dict[str, object]
     commands: tuple[CommandSpec, ...]
+    plugins: tuple[str, ...] = ()
+    plugin_tools: tuple[Tool, ...] = ()
 
     @classmethod
     def load(cls, config_path: Path, project_root: Path | None = None) -> "ToolsConfig":
@@ -210,6 +213,10 @@ class ToolsConfig:
         enabled_raw = raw.get("enabled_tools", [])
         if not isinstance(enabled_raw, list) or not all(isinstance(x, str) and x for x in enabled_raw):
             raise ValueError("enabled_tools 必须是字符串数组。")
+
+        plugins_raw = raw.get("plugins", [])
+        if not isinstance(plugins_raw, list) or not all(isinstance(x, str) and x for x in plugins_raw):
+            raise ValueError("plugins 必须是字符串数组。")
 
         files_raw = raw.get("files", {})
         if not isinstance(files_raw, dict):
@@ -229,10 +236,14 @@ class ToolsConfig:
             if enabled:
                 commands.append(spec)
 
+        loaded_plugins = tuple(load_plugin_tools(plugins_raw, root))
+
         return cls(
             enabled_tools=tuple(enabled_raw),
             files=dict(files_raw),
             commands=tuple(commands),
+            plugins=tuple(plugins_raw),
+            plugin_tools=loaded_plugins,
         )
 
     def command_tools(self) -> list[Tool]:
@@ -243,7 +254,7 @@ class ToolsConfig:
         *builtin_tools: Tool,
         extra_tools: Iterable[Tool] = (),
     ) -> ToolRegistry:
-        """Filter built-in tools by `enabled_tools`, then mount enabled commands & extras."""
+        """Filter built-in & plugin tools by `enabled_tools`, then mount enabled commands & extras."""
         allowset = set(self.enabled_tools)
-        selected_builtins = [tool for tool in builtin_tools if tool.name in allowset]
-        return ToolRegistry(*selected_builtins, *self.command_tools(), *extra_tools)
+        selected = [tool for tool in (*builtin_tools, *self.plugin_tools) if tool.name in allowset]
+        return ToolRegistry(*selected, *self.command_tools(), *extra_tools)

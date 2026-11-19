@@ -10,8 +10,11 @@ from zoneinfo import ZoneInfo
 from personal_assistant.commands import ToolsConfig
 from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.plugins import load_plugin_tools
 from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.tools import ToolRegistry
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -29,18 +32,9 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 
 
 def build_demo_tools() -> ToolRegistry:
-    def get_current_time() -> str:
-        now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        return now.strftime("%Y-%m-%d %H:%M:%S (Asia/Shanghai)")
-
-    return ToolRegistry(
-        Tool(
-            name="get_current_time",
-            description="获取当前北京时间（YYYY-MM-DD HH:MM:SS）。",
-            parameters={},
-            handler=get_current_time,
-        )
-    )
+    """Load the demo time tool from the editable plugin file (no hardcoded tools)."""
+    plugin_tools = load_plugin_tools(["plugins/custom_tools.py"], REPO_ROOT)
+    return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
 def build_repl_tools(
@@ -51,20 +45,16 @@ def build_repl_tools(
     cfg_path = config_path or Path(os.getenv("MY_HELPER_CONFIG", "config")) / "tools.json"
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
     project_root = cfg_path.resolve().parent.parent if cfg_path.is_file() else data_dir.parent
-    demo = list(build_demo_tools())
 
     if cfg_path.is_file():
         cfg = ToolsConfig.load(cfg_path, project_root=project_root)
         policy = FilesPolicy.from_dict(cfg.files, project_root=project_root, data_root=data_dir)
         memory = MemoryStore(data_dir, policy=policy)
-        registry = cfg.build_registry(
-            *memory_tools(memory, get_user_message=get_user_message),
-            extra_tools=demo,
-        )
+        registry = cfg.build_registry(*memory_tools(memory, get_user_message=get_user_message))
         return registry, memory
 
     memory = MemoryStore(data_dir)
-    return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message), *demo), memory
+    return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message)), memory
 
 
 def format_system_prompt(memory: MemoryStore) -> str:

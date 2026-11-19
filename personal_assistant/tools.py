@@ -15,6 +15,29 @@ class Tool:
     param_enums: dict[str, tuple[str, ...]] | None = None
 
 
+def tool(
+    *,
+    description: str,
+    parameters: dict[str, str] | None = None,
+    name: str | None = None,
+    param_enums: dict[str, tuple[str, ...]] | None = None,
+) -> Callable[[Callable[..., str]], Callable[..., str]]:
+    """Mark a Python function as an agent plugin tool without changing how it runs."""
+
+    def decorator(fn: Callable[..., str]) -> Callable[..., str]:
+        spec = Tool(
+            name=name or fn.__name__,
+            description=description,
+            parameters=dict(parameters or {}),
+            handler=fn,
+            param_enums=param_enums,
+        )
+        setattr(fn, "__agent_tool__", spec)
+        return fn
+
+    return decorator
+
+
 class ToolRegistry:
     """Publish allowlisted tool schemas and run validated tool calls directly."""
 

@@ -5,8 +5,10 @@
     "read_markdown",
     "write_file",
     "remember_fact",
-    "save_rule"
+    "save_rule",
+    "get_current_time"
   ],
+  "plugins": ["plugins"],
   "files": {
     "read_roots": ["data/knowledge", "data/memory", "docs", "data/workspace"],
     "write_root": "data/workspace",
