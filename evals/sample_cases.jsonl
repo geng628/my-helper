@@ -1,0 +1,4 @@
+{"id":"os-spinlock-sleep","query":"持有自旋锁时为什么不能 sleep","answerable":true,"expected_sources":[{"path":"data/knowledge/os/locks.md","quote":"持有自旋锁时不能 sleep"}],"expected_tools":["search_markdown"]}
+{"id":"os-barging","query":"队列休眠锁为什么会出现插队 barging","answerable":true,"expected_sources":[{"path":"data/knowledge/os/locks.md","quote":"仍可能出现新到达线程插队（barging）的问题"}],"expected_tools":["search_markdown"]}
+{"id":"py-asyncio-sleep","query":"协程里为什么不能用 time.sleep","answerable":true,"expected_sources":[{"path":"data/knowledge/python/async.md","quote":"在协程里调用阻塞的 time.sleep 会卡住整个事件循环"}],"expected_tools":["search_markdown"]}
+{"id":"neg-quantum","query":"量子纠错码的表面码阈值是多少","answerable":false,"expected_sources":[],"expected_tools":["search_markdown"]}

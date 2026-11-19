@@ -20,16 +20,20 @@
 # 1. 初始化虚拟环境并安装开发测试依赖（pytest）
 uv sync
 
-# 2. 运行单元测试（验证 ReAct 核心循环，不消耗 API Token）
+# 2. 运行单元测试（验证代码逻辑，不消耗 API Token）
 uv run pytest -v
 
-# 3. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
+# 3. 运行离线检索评测（使用公开样本，零 Token）
+uv run python -m personal_assistant.eval --mode search
+
+# 4. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
 
-# 4. 配置环境变量并启动真实对话（单次测试或终端交互 REPL）
+# 5. 配置环境变量并启动真实对话或端到端 Agent 评测
 cp .env.example .env
 # 编辑 .env，设置 LLM_MODE=on、LLM_API_KEY、LLM_BASE_URL 与 LLM_MODEL
 uv run python scripts/demo.py --ask "现在几点了？"
+uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant chat
 ```
 
@@ -41,6 +45,9 @@ my_helper_v2/
 │   └── tools.json                 # 工具白名单、插件路径、目录边界与固定命令配置
 ├── plugins/
 │   └── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
+├── evals/
+│   ├── sample_cases.jsonl         # 公开脱敏评测案例集（私人案例放外部目录，不提交 Git）
+│   └── sample_data/               # 公开评测用样例 Markdown 笔记
 ├── docs/
 │   └── mvp-design.md              # 整体设计文档
 ├── personal_assistant/
@@ -51,15 +58,17 @@ my_helper_v2/
 │   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
 │   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
 │   ├── memory.py                  # 核心内置 Markdown 记忆与文件读写工具
+│   ├── eval.py                    # 离线检索评测与端到端 Agent 评测（绑定 Git SHA）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL
 ├── scripts/
 │   └── demo.py                    # 离线演示与单句实测脚本
-├── tests/
+├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
-│   └── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
+│   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
+│   └── test_eval.py               # Eval 评测器自身单元测试
 ├── .env.example
 ├── .gitignore
 ├── LICENSE

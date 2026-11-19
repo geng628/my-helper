@@ -123,10 +123,25 @@ def _extract_terms(query: str) -> tuple[list[str], list[str]]:
     return primary, secondary
 
 
+@dataclass(frozen=True)
+class SearchHit:
+    path: str
+    line: int
+    section: str
+    snippet: str
+    score: float
+
+
 class MemoryStore:
     """Direct Markdown memory, rule storage, and allowlisted file operations."""
 
-    def __init__(self, data_root: Path | str, policy: FilesPolicy | None = None) -> None:
+    def __init__(
+        self,
+        data_root: Path | str,
+        policy: FilesPolicy | None = None,
+        *,
+        create_dirs: bool = True,
+    ) -> None:
         self.data_root = Path(data_root).resolve()
         if policy is None:
             proj = self.data_root.parent
@@ -151,14 +166,15 @@ class MemoryStore:
         self.inbox_dir = self.knowledge_dir / "inbox"
         self.workspace_dir = self.policy.write_root
 
-        for directory in (
-            self.rules_dir,
-            self.inbox_dir,
-            self.workspace_dir,
-            self.workspace_dir / ".backups",
-            self.workspace_dir / ".tmp",
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            for directory in (
+                self.rules_dir,
+                self.inbox_dir,
+                self.workspace_dir,
+                self.workspace_dir / ".backups",
+                self.workspace_dir / ".tmp",
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
         self._roots = self._build_roots()
 
     def _build_roots(self) -> list[tuple[Path, Path, str, str]]:
@@ -185,6 +201,9 @@ class MemoryStore:
             except ValueError:
                 continue
         return raw_root.name, raw_root.name
+
+    def display_path(self, resolved: Path) -> str:
+        return self._to_display_path(resolved)
 
     def _to_display_path(self, resolved: Path) -> str:
         for _, root_resolved, display_prefix, _ in self._roots:
@@ -346,7 +365,7 @@ class MemoryStore:
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
         return "\n".join(found) + suffix
 
-    def search_markdown(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
+    def search_hits(self, query: str, root: str = "data/knowledge", limit: int = 10) -> list[SearchHit]:
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
             raise ValueError("搜索关键词不能为空。")
@@ -366,12 +385,19 @@ class MemoryStore:
                 continue
             candidates.extend(self._score_file(self._to_display_path(resolved), text, primary, secondary))
 
-        if not candidates:
-            return f"未在 {root} 下找到匹配「{query}」的笔记内容。"
         candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [
+            SearchHit(path=path, line=line_no, section=section, snippet=snippet, score=score)
+            for score, path, line_no, section, snippet in candidates[:limit]
+        ]
+
+    def search_markdown(self, query: str, root: str = "data/knowledge", limit: int = 10) -> str:
+        hits = self.search_hits(query, root=root, limit=limit)
+        if not hits:
+            return f"未在 {root} 下找到匹配「{query}」的笔记内容。"
         return "\n\n".join(
-            f"{path}:{line_no} [章节: {section or '正文'}]\n{snippet}"
-            for _, path, line_no, section, snippet in candidates[:limit]
+            f"{hit.path}:{hit.line} [章节: {hit.section or '正文'}]\n{hit.snippet}"
+            for hit in hits
         )
 
     def _score_file(
