@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -50,7 +51,13 @@ def _load_module_tools(file_path: Path) -> list[Tool]:
     if spec is None or spec.loader is None:
         raise ValueError(f"无法加载插件文件：{file_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # 注册到 sys.modules，确保插件内使用 @dataclass + future annotations 时可正常解析模块命名空间
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
 
     found: list[Tool] = []
     seen_in_file: set[str] = set()

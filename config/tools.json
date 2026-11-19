@@ -6,9 +6,32 @@
     "write_file",
     "remember_fact",
     "save_rule",
-    "get_current_time"
+    "get_current_time",
+    "run_command"
   ],
   "plugins": ["plugins"],
+  "shell": {
+    "allowed_executables": [
+      "ls",
+      "find",
+      "grep",
+      "rg",
+      "wc",
+      "head",
+      "tail",
+      "cat",
+      "pwd",
+      "date",
+      "df",
+      "git",
+      "pytest"
+    ],
+    "allowed_git_subcommands": ["status", "log", "diff", "show", "branch", "rev-parse"],
+    "cwd": ".",
+    "timeout": 10,
+    "max_output_bytes": 8192,
+    "reject_segments": [".env", ".ssh", "state", "uploads"]
+  },
   "files": {
     "read_roots": ["data/memory", "data/workspace", "docs"],
     "write_root": "data/workspace",

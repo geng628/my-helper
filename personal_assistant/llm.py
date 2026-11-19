@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -75,22 +77,36 @@ def extract_usage(response: dict[str, object]) -> TokenUsage | None:
     )
 
 
-# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求并解析返回体
+# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求，并对瞬时网络/TLS 抖动自动退避重试
 def default_post_json(
-    url: str, payload: dict[str, object], headers: dict[str, str]
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    *,
+    max_retries: int = 2,
 ) -> dict[str, object]:
-    request = Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "my-helper-v2/0.1",
-            **headers,
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "my-helper-v2/0.1",
+        **headers,
+    }
+    for attempt in range(max_retries + 1):
+        request = Request(url, data=body, headers=req_headers, method="POST")
+        try:
+            with urlopen(request, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            # 4xx 客户端错误（429 限流除外）不重试，直接抛出
+            if error.code < 500 and error.code != 429:
+                raise
+            if attempt >= max_retries:
+                raise
+        except (URLError, TimeoutError, ConnectionError):
+            if attempt >= max_retries:
+                raise
+        time.sleep(0.5 * (2**attempt))
+    raise RuntimeError("请求重试耗尽。")
 
 
 # 大模型客户端抽象基类，供 ReAct 循环调用

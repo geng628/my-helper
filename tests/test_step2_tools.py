@@ -50,7 +50,13 @@ def test_load_real_project_tools_config() -> None:
         Tool("unlisted_tool", "未在白名单的工具", {}, lambda: "nope"),
     ]
     registry = cfg.build_registry(*builtin)
-    assert registry.names == ["search_markdown", "get_current_time", "cmd_git_status", "cmd_disk_usage"]
+    assert registry.names == [
+        "search_markdown",
+        "get_current_time",
+        "run_command",
+        "cmd_git_status",
+        "cmd_disk_usage",
+    ]
     assert "不在白名单中" in registry.execute("unlisted_tool", "{}")
     # Plugin tools not in enabled_tools stay blocked by the allowlist
     assert "不在白名单中" in registry.execute("add_numbers", '{"a": "1", "b": "2"}')

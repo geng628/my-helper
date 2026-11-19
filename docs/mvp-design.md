@@ -41,7 +41,8 @@ my-helper/
 ├── config/
 │   └── tools.json                 # 工具白名单、插件路径、目录安全与固定命令配置
 ├── plugins/
-│   └── custom_tools.py            # 用户可编辑工具插件（@tool 声明，按白名单插入）
+│   ├── custom_tools.py            # 用户可编辑工具插件（@tool 声明，按白名单插入）
+│   └── shell_tools.py             # 受控白名单 Shell 插件（run_command，shlex + shell=False）
 ├── evals/
 │   ├── sample_cases.jsonl         # 公开脱敏评测案例集
 │   └── sample_data/               # 公开评测样例 Markdown 文件

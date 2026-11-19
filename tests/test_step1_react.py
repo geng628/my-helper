@@ -255,3 +255,54 @@ def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sent_payload["model"] == "demo-model"
     assert sent_payload["tool_choice"] == "auto"
     assert json.loads(json.dumps(sent_payload["tools"]))[0]["function"]["name"] == "get_current_time"
+
+
+# 测试 default_post_json 对瞬时 TLS/网络抖动自动重试，但对 HTTP 400 客户端错误绝不重试
+def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch) -> None:
+    import io
+    import ssl
+    from urllib.error import HTTPError, URLError
+
+    from personal_assistant import llm as llm_mod
+
+    # 避免单元测试等待真实退避时间
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda _: None)
+
+    attempts = {"count": 0}
+
+    # 模拟前 2 次遇到 TLS EOF，第 3 次成功返回 JSON
+    def flaky_urlopen(request, timeout=60):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise URLError(ssl.SSLEOFError("EOF occurred in violation of protocol"))
+
+        class _Resp:
+            # 进入上下文返回自身
+            def __enter__(self):
+                return self
+
+            # 退出上下文无操作
+            def __exit__(self, *args):
+                return False
+
+            # 返回成功 JSON 字节串
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        return _Resp()
+
+    monkeypatch.setattr(llm_mod, "urlopen", flaky_urlopen)
+    assert llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
+    assert attempts["count"] == 3
+
+    bad_attempts = {"count": 0}
+
+    # 模拟 400 Bad Request：必须立刻抛出，不重试
+    def bad_request_urlopen(request, timeout=60):
+        bad_attempts["count"] += 1
+        raise HTTPError("https://example.com/v1", 400, "Bad Request", {}, io.BytesIO(b"bad"))
+
+    monkeypatch.setattr(llm_mod, "urlopen", bad_request_urlopen)
+    with pytest.raises(HTTPError):
+        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+    assert bad_attempts["count"] == 1
