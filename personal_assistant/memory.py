@@ -402,7 +402,7 @@ class MemoryStore:
             files.append(resolved)
         return files
 
-    # 按 glob 模式列出允许读取目录内的所有文件路径（最多返回 max_results 条）
+    # 按 glob 模式列出允许读取目录内的所有文件路径（默认排除 data/memory/archive/ 归档目录）
     def list_files(self, root: str = "data/memory", pattern: str = "*.md") -> str:
         if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 200:
             raise ValueError("pattern 必须是 200 字符以内的 glob，例如 *.md。")
@@ -413,7 +413,14 @@ class MemoryStore:
             raise ValueError(f"目录不存在：{root}")
         pat = pattern.strip()
         iterator = target.glob(pat) if ("/" in pat or "**" in pat) else target.rglob(pat)
-        found = [self._to_display_path(p) for p in self._safe_files(target, iterator)[: self.policy.max_results]]
+        archive_resolved = self.archive_dir.resolve()
+        listing_archive = target.is_relative_to(archive_resolved)
+        candidates = [
+            p
+            for p in self._safe_files(target, iterator)
+            if listing_archive or not p.is_relative_to(archive_resolved)
+        ]
+        found = [self._to_display_path(p) for p in candidates[: self.policy.max_results]]
         if not found:
             return "没有匹配的文件。"
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""

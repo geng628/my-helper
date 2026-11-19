@@ -54,6 +54,8 @@ def test_load_real_project_tools_config() -> None:
         "search_markdown",
         "get_current_time",
         "run_command",
+        "web_search",
+        "fetch_webpage",
         "cmd_git_status",
         "cmd_disk_usage",
     ]

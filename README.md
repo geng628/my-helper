@@ -48,7 +48,8 @@ my_helper_v2/
 │   └── tools.json                 # 工具白名单、插件路径、目录边界与固定命令配置
 ├── plugins/
 │   ├── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
-│   └── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
+│   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
+│   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
 ├── evals/
 │   ├── sample_cases.jsonl         # 公开脱敏检索与单轮问答案例集
 │   ├── memory_scenarios.jsonl     # 多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
@@ -80,6 +81,7 @@ my_helper_v2/
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
 │   ├── test_shell_plugin.py       # 受控白名单 Shell 插件安全边界单元测试
+│   ├── test_web_plugin.py         # 联网搜索与防 SSRF 抓网页插件单元测试
 │   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试
 │   ├── test_step4_app.py          # SQLite 历史、前缀冻结与 AssistantApp 编排单元测试
 │   ├── test_cache_metrics.py      # KV 缓存命中与前缀复用率单元测试

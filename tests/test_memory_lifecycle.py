@@ -142,9 +142,11 @@ def test_expiry_boundary_filtering_and_archival(tmp_path: Path) -> None:
     assert "答辩" in archive_text
     assert "facts.md" in archive_text
 
-    # 默认检索 data/memory 不会混入 archive/ 里的陈年旧事，显式搜 data/memory/archive 可追溯
+    # 默认检索与列举 data/memory 不会混入 archive/ 里的陈年旧事，显式指向 data/memory/archive 可追溯
     assert memory.search_hits("答辩", root="data/memory", today=date(2026, 11, 27)) == []
     assert len(memory.search_hits("答辩", root="data/memory/archive", today=date(2026, 11, 27))) == 1
+    assert "archive/" not in memory.list_files("data/memory", "*.md")
+    assert "data/memory/archive/2026-11.md" in memory.list_files("data/memory/archive", "*.md")
     assert any(e["action"] == "archive_expired" for e in memory.audit_entries())
 
 

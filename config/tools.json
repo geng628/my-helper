@@ -7,9 +7,17 @@
     "remember_fact",
     "save_rule",
     "get_current_time",
-    "run_command"
+    "run_command",
+    "web_search",
+    "fetch_webpage"
   ],
   "plugins": ["plugins"],
+  "web": {
+    "timeout": 15,
+    "max_download_bytes": 524288,
+    "max_output_bytes": 8192,
+    "max_results": 5
+  },
   "shell": {
     "allowed_executables": [
       "ls",
