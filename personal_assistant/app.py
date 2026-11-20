@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,9 +39,11 @@ class AssistantApp:
         state: StateStore | None = None,
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: LLMClient | None = None,
+        today_fn: Callable[[], date] | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
+        self._today_fn = today_fn
 
         self.config_path = config_path.resolve() if config_path is not None else None
         self.project_root = (
@@ -90,6 +92,12 @@ class AssistantApp:
         self.background_consolidator.wait(timeout=15.0)
         self.state.close()
 
+    # 返回当前逻辑日期（默认北京时间，评测时可通过 today_fn 注入历史日期）
+    def _today(self) -> date:
+        if self._today_fn is not None:
+            return self._today_fn()
+        return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
     # 为单轮对话构建受白名单管控的工具注册表，并将当前用户消息绑定到 remember_fact
     def build_tools(
         self,
@@ -97,7 +105,7 @@ class AssistantApp:
         message_id: int | None = None,
     ) -> ToolRegistry:
         getter = (lambda: (user_text, message_id)) if user_text else None
-        builtins = memory_tools(self.memory, get_user_message=getter)
+        builtins = memory_tools(self.memory, get_user_message=getter, get_today=self._today)
         if self.tools_config is not None:
             return self.tools_config.build_registry(*builtins)
         return ToolRegistry(*builtins)
@@ -115,7 +123,7 @@ class AssistantApp:
         index = self.memory.read_memory_index()
         if index:
             parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        today = self._today().isoformat()
         parts.append(f"今天是 {today}（北京时间）。")
         return "\n\n".join(parts)
 
@@ -152,7 +160,7 @@ class AssistantApp:
 
     # 每个自然日首次对话时自动扫描归档已过期的临时记忆（纯本地零 Token 耗时 < 1ms）
     def _maybe_archive_expired(self) -> None:
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        today = self._today()
         today_str = today.isoformat()
         with self._prompt_lock:
             if self._last_archive_day == today_str:

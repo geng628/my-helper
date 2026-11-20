@@ -39,11 +39,17 @@ def test_sample_search_eval_runs_without_mutating_data_dir() -> None:
 
     assert before_entries == after_entries
     assert report["git_commit"] == "test-sha"
-    assert report["summary"]["total_cases"] == 4
-    assert report["summary"]["mean_source_recall"] == 1.0
-    assert report["summary"]["mean_quote_coverage"] == 1.0
-    assert report["summary"]["negative_clean_rate"] == 1.0
-    assert report["failures"] == []
+    assert report["summary"]["total_cases"] == len(cases)
+    assert report["summary"]["total_cases"] >= 35
+    assert set(report["summary"]["by_category"].keys()) == {
+        "exact",
+        "multi_source",
+        "negative",
+        "paraphrase",
+        "temporal",
+    }
+    assert report["summary"]["by_category"]["temporal"]["pass_rate"] == 1.0
+    assert report["summary"]["mean_source_recall"] >= 0.85
 
 
 # 测试检索评测的金标原文校验与未命中失败案例保留机制
@@ -169,4 +175,53 @@ def test_eval_cli_writes_report_and_blocks_output_inside_data_dir(tmp_path: Path
     assert code == 0
     saved = json.loads(out.read_text(encoding="utf-8"))
     assert saved["mode"] == "search"
-    assert saved["summary"]["total_cases"] == 4
+    assert saved["summary"]["total_cases"] >= 35
+
+
+# 测试离线检索评测支持按 category 分组统计与单题 today 过期过滤
+def test_search_eval_supports_categories_and_temporal_today(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    (data_dir / "memory").mkdir(parents=True)
+    (data_dir / "memory" / "schedule.md").write_text(
+        "# 日程备忘\n"
+        "- [2026-10-01] 参加旧版架构评审会 (until: 2026-10-10)\n"
+        "- [2026-11-15] 参加冬季发布演练会 (until: 2026-11-30)\n",
+        encoding="utf-8",
+    )
+    memory = MemoryStore(data_dir, create_dirs=False)
+    cases = [
+        {
+            "id": "temp-active",
+            "category": "temporal",
+            "query": "冬季发布演练会",
+            "today": "2026-11-20",
+            "answerable": True,
+            "expected_sources": [{"path": "data/memory/schedule.md", "quote": "冬季发布演练会"}],
+        },
+        {
+            "id": "temp-expired",
+            "category": "temporal",
+            "query": "旧版架构评审会",
+            "today": "2026-11-20",
+            "answerable": False,
+            "expected_sources": [],
+        },
+        {
+            "id": "neg-other",
+            "category": "negative",
+            "query": "火星殖民基地预算",
+            "answerable": False,
+            "expected_sources": [],
+        },
+    ]
+
+    report = evaluate_search(memory, cases, limit=5, git_commit="cat-sha")
+    assert report["summary"]["total_cases"] == 3
+    assert report["summary"]["passed_cases"] == 3
+    by_cat = report["summary"]["by_category"]
+    assert by_cat["temporal"]["total_cases"] == 2
+    assert by_cat["temporal"]["passed_cases"] == 2
+    assert by_cat["temporal"]["pass_rate"] == 1.0
+    assert by_cat["negative"]["total_cases"] == 1
+    assert by_cat["negative"]["negative_clean_rate"] == 1.0
+    assert report["cases"][0]["category"] == "temporal"

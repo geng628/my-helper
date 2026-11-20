@@ -23,22 +23,42 @@ uv sync
 # 2. 运行单元测试（验证代码逻辑，不消耗 API Token）
 uv run pytest -v
 
-# 3. 运行离线检索评测（使用公开样本，零 Token）
+# 3. 运行离线检索评测（40 题内置分类型样本，零 Token）
 uv run python -m personal_assistant.eval --mode search
 
-# 4. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
+# 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 data/evals/）
+uv run python scripts/download_public_evals.py --dataset all
+# 零 Token 跑 200 题公开 LoCoMo 多会话检索基准
+uv run python -m personal_assistant.eval --mode search \
+  --data-dir data/evals/locomo_search_data \
+  --cases data/evals/locomo_search_cases.jsonl
+
+# 5. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
 
-# 5. 配置环境变量并启动真实对话或端到端评测（单轮 agent / 多轮记忆生命周期 memory）
+# 6. 配置环境变量并启动真实对话或端到端评测（单轮 agent / 16 场景 memory / LongMemEval）
 cp .env.example .env
 # 编辑 .env，设置 LLM_MODE=on、LLM_API_KEY、LLM_BASE_URL 与 LLM_MODEL
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
+uv run python -m personal_assistant.eval --mode memory \
+  --cases data/evals/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
 uv run python -m personal_assistant chat
 # 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
 uv run python scripts/web_chat.py --open
 ```
+
+## 评测体系与当前基线
+
+仓库内置两套开箱即复现的评测集，同时通过零依赖适配器接入 **LongMemEval（ICLR 2025，500 题）** 与 **LoCoMo（ACL 2024，1,986 题）** 公开学术数据集（开放题采用与 Agent KV Cache 统计隔离的 `LLM-as-a-Judge` 评分）：
+
+| 评测集 | 类型 | 规模 | 当前基线（`deepseek-chat` / 线性检索） | 暴露的主要待优化项 |
+| --- | --- | --- | --- | --- |
+| `evals/sample_cases.jsonl` | 离线检索（5 分类） | 40 题 | 通过率 **80.0%**（32/40），Recall **96.6%**，MRR **0.908**，0.72 ms/题 | 同义改写漏召回；高相似干扰负例误命中（负例干净度 63.6%） |
+| LoCoMo Search（ACL 2024） | 公开多会话离线检索 | 200 题抽样 | Recall **42.8%**，MRR **0.359**，Quote Cov **33.6%**，29.8 ms/题 | 纯线性词面扫描缺少停用词过滤与 BM25 IDF 加权 |
+| `evals/memory_scenarios.jsonl` | 多轮记忆生命周期（6 分类） | 16 场景 | 通过率 **81.25%**（13/16），KV Cache 命中 **60.4%** / 前缀复用 **90.4%** | 日期未含星期导致相对日期换算失误；替换句残留旧关键词 |
+| LongMemEval（ICLR 2025） | 公开多轮长期记忆（7 分类） | 14 题分层抽样 | 通过率 **71.43%**（10/14，LLM Judge），前缀复用 **82.6%** | 隐式偏好问答未主动检索记忆（`single-session-preference` 0/2） |
 
 ## 当前项目结构（Step 4）
 
@@ -51,9 +71,9 @@ my_helper_v2/
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
 ├── evals/
-│   ├── sample_cases.jsonl         # 公开脱敏检索与单轮问答案例集
-│   ├── memory_scenarios.jsonl     # 多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
-│   └── sample_data/               # 公开评测样例 Markdown 文件
+│   ├── sample_cases.jsonl         # 40 题 5 分类公开脱敏检索与单轮问答案例集
+│   ├── memory_scenarios.jsonl     # 16 场景 6 分类多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
+│   └── sample_data/               # 8 篇主题 Markdown 与规则样例语料
 ├── docs/
 │   └── mvp-design.md              # 整体设计文档
 ├── personal_assistant/
@@ -69,11 +89,12 @@ my_helper_v2/
 │   ├── db.py                      # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
 │   ├── consolidator.py            # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
 │   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
-│   ├── eval/                      # 评测包（common / search_eval / agent_eval / memory_eval / cli）
+│   ├── eval/                      # 评测包（common / search_eval / agent_eval / memory_eval / public_benchmarks / cli）
 │   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
 │   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
 │   ├── demo.py                    # 离线演示与单句实测脚本
+│   ├── download_public_evals.py   # 一键下载并转换 LongMemEval / LoCoMo 公开基准脚本
 │   ├── web_chat.py                # 零依赖本地网页对话服务（标准库 ThreadingHTTPServer）
 │   └── web_ui.html                # 纯 HTML/JS 极简本地对话页面（含工具轨迹与 KV 缓存显示）
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）
@@ -89,6 +110,7 @@ my_helper_v2/
 │   ├── test_memory_lifecycle.py   # 记忆冲突替换与临时事实过期归档单元测试
 │   ├── test_eval.py               # 检索与单轮 Agent 评测器单元测试
 │   ├── test_memory_eval.py        # 多轮记忆与生命周期评测器单元测试
+│   ├── test_public_benchmarks.py  # LongMemEval / LoCoMo 公开基准适配器单元测试
 │   └── test_web_chat.py           # 本地网页对话服务接口单元测试
 ├── .env.example
 ├── .gitignore

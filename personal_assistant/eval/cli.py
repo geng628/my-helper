@@ -1,4 +1,4 @@
-"""评测命令行入口：按 --mode 参数分别调度离线检索评测或端到端 Agent 评测。"""
+"""评测命令行入口：按 --mode 参数分别调度离线检索评测、单轮 Agent 评测或多轮记忆评测。"""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +14,30 @@ from personal_assistant.llm import from_env
 from personal_assistant.memory import MemoryStore
 
 
+# 按可选 category 与 max_cases 对案例/场景列表做筛选与截断
+def _filter_items(
+    items: list[dict[str, object]],
+    *,
+    category: str | None = None,
+    max_cases: int | None = None,
+) -> list[dict[str, object]]:
+    filtered = items
+    if category:
+        target = category.strip().lower()
+        filtered = [
+            item
+            for item in filtered
+            if str(item.get("category") or "uncategorized").strip().lower() == target
+        ]
+    if max_cases is not None:
+        if max_cases < 1:
+            raise ValueError("--max-cases 必须 >= 1。")
+        filtered = filtered[:max_cases]
+    if not filtered:
+        raise ValueError("过滤后的评测案例列表为空，请检查 --category 或案例文件。")
+    return filtered
+
+
 # 解析命令行参数、执行对应模式评测、输出汇总并按需保存 JSON 报告
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(REPO_ROOT / ".env")
@@ -23,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", default=None, help="JSONL 评测集路径（search/agent 默认 sample_cases.jsonl，memory 默认 memory_scenarios.jsonl）")
     parser.add_argument("--root", default="data/memory", help="search 模式检索根目录")
     parser.add_argument("--limit", type=int, default=5, help="search 模式 Top-K 数量")
+    parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
+    parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
+    parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
     parser.add_argument("--config", default=None, help="tools.json 路径（agent/memory 模式使用）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
     args = parser.parse_args(argv)
@@ -33,15 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     cfg_path = Path(args.config) if args.config else None
 
     if args.mode == "search":
-        cases = load_cases(cases_path)
+        cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
         memory = MemoryStore(data_dir, create_dirs=False)
         report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
     elif args.mode == "agent":
-        cases = load_cases(cases_path)
+        cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
         report = evaluate_agent(from_env(), data_dir, cases, config_path=cfg_path)
     else:
-        scenarios = load_scenarios(cases_path)
-        report = evaluate_memory(from_env(), scenarios, config_path=cfg_path)
+        scenarios = _filter_items(load_scenarios(cases_path), category=args.category, max_cases=args.max_cases)
+        llm = from_env()
+        judge = None if args.no_judge else llm
+        report = evaluate_memory(llm, scenarios, config_path=cfg_path, judge_llm=judge)
 
     if args.output:
         safe_write_report(Path(args.output), data_dir, report)
@@ -51,5 +80,6 @@ def main(argv: list[str] | None = None) -> int:
     if report["failures"]:
         print("\nFailed cases:")
         for item in report["failures"]:
-            print(f"  - {item['id']}: {item['reason']}")
+            cat = f"[{item['category']}] " if item.get("category") else ""
+            print(f"  - {cat}{item['id']}: {item['reason']}")
     return 0

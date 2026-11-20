@@ -172,10 +172,170 @@ def test_memory_scenarios_jsonl_loads_cleanly() -> None:
     scenarios_path = repo_root / "evals" / "memory_scenarios.jsonl"
     assert scenarios_path.is_file()
     lines = [line.strip() for line in scenarios_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(lines) >= 4
+    assert len(lines) >= 15
     ids = set()
+    categories = set()
     for line in lines:
         item = json.loads(line)
         assert item["id"] not in ids
         ids.add(item["id"])
+        assert isinstance(item.get("category"), str) and item["category"].strip()
+        categories.add(item["category"])
         assert isinstance(item.get("steps"), list) and item["steps"]
+    assert categories >= {
+        "extraction",
+        "knowledge-update",
+        "temporal",
+        "multi-session",
+        "abstention",
+        "compaction-cache",
+    }
+
+
+# 测试 seed_history 批量注入历史、步骤级 today 时钟覆盖、分类汇总与隔离式 LLM-as-a-Judge 评分
+def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() -> None:
+    scenarios = [
+        {
+            "id": "lme-sample-1",
+            "category": "knowledge-update",
+            "description": "使用历史对话注入、历史日期时钟与 LLM Judge 评测公开题",
+            "policy": {"max_active_messages": 2, "keep_recent_messages": 0, "min_batch_messages": 2},
+            "steps": [
+                {
+                    "action": "seed_history",
+                    "chat_id": "hist-1",
+                    "messages": [
+                        {"role": "user", "content": "My personal best 5K time is now 25:50."},
+                        {"role": "assistant", "content": "Congrats on your new 25:50 5K PR!"},
+                    ],
+                },
+                {"action": "consolidate", "chat_id": "hist-1", "today": "2023-05-27"},
+                {
+                    "action": "ask",
+                    "chat_id": "eval-q",
+                    "today": "2023-06-01",
+                    "message": "What is my personal best 5K time?",
+                    "expect_tools_any": ["search_markdown", "read_markdown"],
+                    "expected_answer": "25 minutes and 50 seconds (or 25:50)",
+                    "is_abstention": False,
+                },
+            ],
+        }
+    ]
+
+    seen_ask_system_prompts: list[str] = []
+
+    # 拦截 ask 阶段的 system prompt 以验证 today 时钟确实生效
+    class ClockCapturingLLM(ScriptedMemoryEvalLLM):
+        # 记录非沉淀阶段的 system prompt 并返回预设回复
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            if tools:
+                seen_ask_system_prompts.append(str(messages[0].get("content") or ""))
+            return super().respond(messages, tools)
+
+    agent_llm = ClockCapturingLLM(
+        [
+            # consolidate
+            (
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "session_summary": "User updated 5K personal best to 25:50.",
+                            "memories": [
+                                {
+                                    "topic": "fitness",
+                                    "title": "运动记录",
+                                    "index_summary": "5K 跑步成绩",
+                                    "operations": [
+                                        {"op": "add", "text": "5K personal best time is 25:50."}
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                },
+                TokenUsage(500, 0, 60),
+            ),
+            # ask -> search_markdown
+            (
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "search_markdown",
+                                "arguments": '{"query": "5K", "root": "data/memory"}',
+                            },
+                        }
+                    ],
+                },
+                TokenUsage(900, 512, 20),
+            ),
+            # ask -> final reply
+            (
+                {"role": "assistant", "content": "Your personal best 5K time is 25:50."},
+                TokenUsage(1050, 896, 20),
+            ),
+        ]
+    )
+
+    judge_llm = ScriptedMemoryEvalLLM(
+        [
+            (
+                {
+                    "role": "assistant",
+                    "content": '{"correct": true, "reason": "Answer matches 25:50 exactly."}',
+                },
+                TokenUsage(300, 0, 15),
+            )
+        ]
+    )
+
+    report = evaluate_memory(agent_llm, scenarios, judge_llm=judge_llm, git_commit="judge-sha")
+    assert report["summary"]["passed_scenarios"] == 1
+    assert report["summary"]["by_category"]["knowledge-update"]["passed_scenarios"] == 1
+    assert report["summary"]["by_category"]["knowledge-update"]["pass_rate"] == 1.0
+    # 确认 ask 阶段注入的是历史日期 2023-06-01
+    assert seen_ask_system_prompts and "2023-06-01" in seen_ask_system_prompts[0]
+    # 确认 Judge 的 LLM 调用没有污染 Agent 的 KV 缓存统计（agent 共 3 次调用）
+    assert report["summary"]["cache"]["llm_calls"] == 3
+    ask_step = report["scenarios"][0]["steps"][-1]
+    assert ask_step["judge"]["correct"] is True
+
+
+# 测试 LLM-as-a-Judge 判错时忠实记录失败原因，不虚报通过
+def test_evaluate_memory_records_judge_failure() -> None:
+    scenarios = [
+        {
+            "id": "lme-abs-fail",
+            "category": "abstention",
+            "description": "应当拒答却胡编，Judge 判错",
+            "steps": [
+                {
+                    "action": "ask",
+                    "chat_id": "s1",
+                    "message": "How many cows did I buy from Peter?",
+                    "expected_answer": "The information provided is not enough.",
+                    "is_abstention": True,
+                }
+            ],
+        }
+    ]
+    agent_llm = ScriptedMemoryEvalLLM(
+        [({"role": "assistant", "content": "You bought three cows from Peter."}, None)]
+    )
+    judge_llm = ScriptedMemoryEvalLLM(
+        [({"role": "assistant", "content": '{"correct": false, "reason": "Hallucinated instead of abstaining."}'}, None)]
+    )
+    report = evaluate_memory(agent_llm, scenarios, judge_llm=judge_llm, git_commit="judge-fail")
+    assert report["summary"]["passed_scenarios"] == 0
+    assert report["summary"]["failed_scenarios"] == 1
+    assert "judge" in str(report["failures"][0]["reason"]).lower()

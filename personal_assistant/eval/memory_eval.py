@@ -1,19 +1,60 @@
-"""多轮记忆与生命周期端到端评测：验证跨会话沉淀回忆、冲突替换、临时事实过期、防幻觉与 KV 缓存。"""
+"""多轮记忆与生命周期端到端评测：验证跨会话沉淀、冲突替换、过期归档、公开基准与 KV 缓存。"""
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
+from zoneinfo import ZoneInfo
 
 from personal_assistant.app import AssistantApp
 from personal_assistant.cache_metrics import CallCacheRecord, summarize_records
 from personal_assistant.cli import REPO_ROOT
-from personal_assistant.consolidator import ConsolidationPolicy, MemoryConsolidator
+from personal_assistant.consolidator import ConsolidationPolicy, MemoryConsolidator, _parse_json_object
 from personal_assistant.eval.common import current_git_commit
 from personal_assistant.llm import LLMClient, NoopLLMClient
+
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict, impartial evaluator grading an AI assistant's answer against a reference answer.\n"
+    "Output ONLY a valid JSON object: {\"correct\": true/false, \"reason\": \"one concise sentence\"}.\n"
+    "Grading rules:\n"
+    "1. For normal questions (is_abstention=false): mark correct=true ONLY if the assistant's response "
+    "clearly states the essential factual content of the reference answer (equivalent wording, units, "
+    "or date formatting are acceptable; extra harmless context is fine; wrong numbers/entities or claiming "
+    "not to know is false).\n"
+    "2. For abstention questions (is_abstention=true): mark correct=true ONLY if the assistant honestly "
+    "acknowledges that the required information is missing/not recorded/insufficient and does NOT fabricate "
+    "the missing fact."
+)
+
+ABSTENTION_MARKERS = (
+    "没有",
+    "未找到",
+    "查不到",
+    "没查到",
+    "无记录",
+    "未记录",
+    "没有记录",
+    "不知道",
+    "未提及",
+    "not enough",
+    "no record",
+    "no information",
+    "don't have",
+    "do not have",
+    "didn't mention",
+    "did not mention",
+    "not mentioned",
+    "cannot find",
+    "couldn't find",
+    "could not find",
+    "unable to find",
+    "not recorded",
+    "insufficient",
+)
 
 
 # 从 JSONL 文件读取多轮记忆评测场景，校验场景 id 唯一且包含非空 steps
@@ -60,12 +101,80 @@ def _build_policy(raw: object) -> ConsolidationPolicy:
     )
 
 
-# 校验单步 ask 的回复内容、工具调用、磁盘记忆文件与缓存命中阈值
+# 提取中英文词元，供无 Judge 时的离线词面兜底评分使用
+def _normalize_tokens(text: str) -> set[str]:
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", lowered))
+    stopwords = {"the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "and", "or"}
+    return {t for t in tokens if t not in stopwords}
+
+
+# 使用独立 LLM-as-a-Judge（或离线词面兜底）评判开放式问答的事实正确性与拒答表现
+def judge_answer(
+    judge_llm: LLMClient | None,
+    question: str,
+    expected_answer: str,
+    reply: str,
+    *,
+    is_abstention: bool = False,
+) -> dict[str, object]:
+    if judge_llm is not None and not isinstance(judge_llm, NoopLLMClient):
+        payload = (
+            f"Question: {question}\n"
+            f"Reference Answer: {expected_answer}\n"
+            f"is_abstention: {str(is_abstention).lower()}\n"
+            f"Assistant Reply: {reply}"
+        )
+        msg = judge_llm.respond(
+            [
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            tools=None,
+        )
+        raw_content = str(msg.get("content") or "")
+        try:
+            parsed = _parse_json_object(raw_content)
+            correct = bool(parsed.get("correct"))
+            reason = str(parsed.get("reason") or "").strip() or "LLM judge verdict"
+            return {"mode": "llm_judge", "correct": correct, "reason": reason}
+        except (ValueError, json.JSONDecodeError) as error:
+            return {
+                "mode": "llm_judge",
+                "correct": False,
+                "reason": f"Judge 输出解析失败：{error} ({raw_content[:120]})",
+            }
+
+    # 无 Judge 时退化为透明的词面兜底校验
+    reply_lower = reply.lower()
+    if is_abstention:
+        matched = any(marker in reply_lower for marker in ABSTENTION_MARKERS)
+        return {
+            "mode": "lexical_fallback",
+            "correct": matched,
+            "reason": "检测到拒答表述" if matched else "未检测到明确拒答表述",
+        }
+    expected_clean = expected_answer.strip().lower()
+    if expected_clean and expected_clean in reply_lower:
+        return {"mode": "lexical_fallback", "correct": True, "reason": "参考答案原文命中"}
+    exp_tokens = _normalize_tokens(expected_answer)
+    rep_tokens = _normalize_tokens(reply)
+    overlap = len(exp_tokens & rep_tokens) / len(exp_tokens) if exp_tokens else 0.0
+    return {
+        "mode": "lexical_fallback",
+        "correct": overlap >= 0.6,
+        "reason": f"词元覆盖率={overlap:.2f}",
+    }
+
+
+# 校验单步 ask 的回复内容、工具调用、磁盘记忆文件、缓存命中阈值与可选 Judge 评判
 def _check_ask_assertions(
     app: AssistantApp,
     step: dict[str, object],
     result: dict[str, object],
-) -> list[str]:
+    *,
+    judge_llm: LLMClient | None = None,
+) -> tuple[list[str], dict[str, object] | None]:
     reasons: list[str] = []
     reply = str(result.get("reply") or "")
     reply_lower = reply.lower()
@@ -121,7 +230,21 @@ def _check_ask_assertions(
         if not isinstance(actual_server, (int, float)) or actual_server < float(min_server):
             reasons.append(f"min_server_cache_hit_rate 不达标：期望 >= {min_server}，实际 {actual_server}")
 
-    return reasons
+    judge_detail: dict[str, object] | None = None
+    expected_answer = str(step.get("expected_answer") or "").strip()
+    if expected_answer:
+        is_abstention = bool(step.get("is_abstention", False))
+        judge_detail = judge_answer(
+            judge_llm,
+            str(step.get("message") or ""),
+            expected_answer,
+            reply,
+            is_abstention=is_abstention,
+        )
+        if not judge_detail["correct"]:
+            reasons.append(f"judge 判定未通过（{judge_detail['mode']}）：{judge_detail['reason']}")
+
+    return reasons, judge_detail
 
 
 # 在完全隔离的临时目录中执行单个端到端记忆场景，返回步骤明细、失败原因与缓存统计
@@ -130,8 +253,11 @@ def _run_single_scenario(
     scenario: dict[str, object],
     cfg_path: Path | None,
     project_root: Path,
+    *,
+    judge_llm: LLMClient | None = None,
 ) -> tuple[dict[str, object], list[CallCacheRecord]]:
     sc_id = str(scenario["id"])
+    category = str(scenario.get("category") or "uncategorized").strip() or "uncategorized"
     policy = _build_policy(scenario.get("policy"))
     steps = list(scenario.get("steps") or [])
     has_explicit_consolidate = any(
@@ -141,6 +267,11 @@ def _run_single_scenario(
     t0 = perf_counter()
     step_logs: list[dict[str, object]] = []
     reasons: list[str] = []
+    clock_day: list[date | None] = [_parse_optional_date(scenario.get("today"))]
+
+    # 返回当前场景逻辑日期（若未指定则回退北京时间当日）
+    def current_today() -> date:
+        return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
     with tempfile.TemporaryDirectory(prefix=f"my-helper-memeval-{sc_id}-") as tmp:
         data_root = Path(tmp) / "data"
@@ -152,6 +283,7 @@ def _run_single_scenario(
             consolidation_policy=policy,
             # 含显式 consolidate 步骤时关闭自动后台线程，保证步骤顺序确定不竞争
             consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+            today_fn=current_today,
         )
         try:
             # 注入场景预设的初始记忆
@@ -171,8 +303,30 @@ def _run_single_scenario(
                     continue
                 action = str(raw_step.get("action") or "").strip().lower()
                 chat_id = str(raw_step.get("chat_id") or "default")
+                step_day = _parse_optional_date(raw_step.get("today"))
+                if step_day is not None and step_day != clock_day[0]:
+                    clock_day[0] = step_day
+                    app.reset_session_prompt(chat_id)
 
-                if action == "chat":
+                if action == "seed_history":
+                    seeded = 0
+                    for msg in raw_step.get("messages") or []:
+                        if not isinstance(msg, dict):
+                            continue
+                        role = str(msg.get("role") or "").strip().lower()
+                        content = str(msg.get("content") or "").strip()
+                        if role in {"user", "assistant"} and content:
+                            app.state.append_message(chat_id, role, content)
+                            seeded += 1
+                    step_logs.append(
+                        {
+                            "step": idx,
+                            "action": "seed_history",
+                            "chat_id": chat_id,
+                            "seeded_messages": seeded,
+                        }
+                    )
+                elif action == "chat":
                     res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
                     step_logs.append(
                         {
@@ -184,7 +338,7 @@ def _run_single_scenario(
                         }
                     )
                 elif action == "consolidate":
-                    ref_day = _parse_optional_date(raw_step.get("today"))
+                    ref_day = step_day or current_today()
                     tracked = app.cache_monitor.wrap(llm, session_key=f"consolidate-{chat_id}")
                     runner = MemoryConsolidator(app.state, app.memory, tracked, policy=policy)
                     c_res = runner.consolidate_once(chat_id, today=ref_day)
@@ -203,12 +357,12 @@ def _run_single_scenario(
                     app.wait_for_consolidation(timeout=30.0)
                     step_logs.append({"step": idx, "action": "wait_consolidation"})
                 elif action == "archive":
-                    ref_day = _parse_optional_date(raw_step.get("today"))
+                    ref_day = step_day or current_today()
                     archived = app.memory.archive_expired_memories(today=ref_day)
                     app.reset_session_prompt()
                     step_logs.append({"step": idx, "action": "archive", "archived": archived})
                 elif action == "check_search":
-                    ref_day = _parse_optional_date(raw_step.get("today"))
+                    ref_day = step_day or current_today()
                     root = str(raw_step.get("root") or "data/memory")
                     query = str(raw_step.get("query") or "")
                     hits = app.memory.search_hits(query, root=root, today=ref_day)
@@ -230,19 +384,22 @@ def _run_single_scenario(
                     )
                 elif action == "ask":
                     res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
-                    step_reasons = _check_ask_assertions(app, raw_step, res)
-                    reasons.extend(f"step#{idx} {r}" for r in step_reasons)
-                    step_logs.append(
-                        {
-                            "step": idx,
-                            "action": "ask",
-                            "chat_id": chat_id,
-                            "tool_calls": [t["tool"] for t in res["tool_calls"]],
-                            "reply": res["reply"],
-                            "cache": res["cache"],
-                            "check_failures": step_reasons,
-                        }
+                    step_reasons, judge_detail = _check_ask_assertions(
+                        app, raw_step, res, judge_llm=judge_llm
                     )
+                    reasons.extend(f"step#{idx} {r}" for r in step_reasons)
+                    entry: dict[str, object] = {
+                        "step": idx,
+                        "action": "ask",
+                        "chat_id": chat_id,
+                        "tool_calls": [t["tool"] for t in res["tool_calls"]],
+                        "reply": res["reply"],
+                        "cache": res["cache"],
+                        "check_failures": step_reasons,
+                    }
+                    if judge_detail is not None:
+                        entry["judge"] = judge_detail
+                    step_logs.append(entry)
                 else:
                     reasons.append(f"step#{idx} 未知 action：{action}")
 
@@ -254,6 +411,7 @@ def _run_single_scenario(
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
     record = {
         "id": sc_id,
+        "category": category,
         "description": str(scenario.get("description") or ""),
         "passed": len(reasons) == 0,
         "reasons": reasons,
@@ -264,12 +422,25 @@ def _run_single_scenario(
     return record, records
 
 
-# 批量运行端到端记忆与生命周期评测，汇总通过率、失败明细与 KV 缓存统计
+# 汇总一组多轮场景的通过率，用于总体 summary 与按 category 分类统计
+def _aggregate_scenario_records(records: list[dict[str, object]]) -> dict[str, object]:
+    total = len(records)
+    passed = sum(1 for item in records if item["passed"])
+    return {
+        "total_scenarios": total,
+        "passed_scenarios": passed,
+        "failed_scenarios": total - passed,
+        "pass_rate": round(passed / total, 4) if total else 0.0,
+    }
+
+
+# 批量运行端到端记忆与生命周期评测，汇总总体/分类型通过率、失败明细与纯净的 Agent KV 缓存统计
 def evaluate_memory(
     llm: LLMClient,
     scenarios: list[dict[str, object]],
     *,
     config_path: Path | None = None,
+    judge_llm: LLMClient | None = None,
     git_commit: str | None = None,
 ) -> dict[str, object]:
     cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
@@ -277,33 +448,38 @@ def evaluate_memory(
 
     per_scenario: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
+    grouped: dict[str, list[dict[str, object]]] = {}
     all_cache_records: list[CallCacheRecord] = []
     latencies: list[float] = []
 
     for scenario in scenarios:
-        record, cache_records = _run_single_scenario(llm, scenario, cfg_path, project_root)
+        record, cache_records = _run_single_scenario(
+            llm,
+            scenario,
+            cfg_path,
+            project_root,
+            judge_llm=judge_llm,
+        )
         per_scenario.append(record)
+        grouped.setdefault(str(record["category"]), []).append(record)
         all_cache_records.extend(cache_records)
         latencies.append(float(record["latency_ms"]))
         if not record["passed"]:
             failures.append(
                 {
                     "id": record["id"],
+                    "category": record["category"],
                     "reason": "; ".join(record["reasons"]),
                     "reasons": record["reasons"],
                 }
             )
 
-    passed = sum(1 for item in per_scenario if item["passed"])
-    total = len(per_scenario)
-    summary = {
-        "total_scenarios": total,
-        "passed_scenarios": passed,
-        "failed_scenarios": len(failures),
-        "pass_rate": round(passed / total, 4) if total else 0.0,
-        "mean_latency_ms": round(mean(latencies), 3) if latencies else 0.0,
-        "cache": summarize_records(all_cache_records),
+    summary = _aggregate_scenario_records(per_scenario)
+    summary["mean_latency_ms"] = round(mean(latencies), 3) if latencies else 0.0
+    summary["by_category"] = {
+        cat: _aggregate_scenario_records(items) for cat, items in sorted(grouped.items())
     }
+    summary["cache"] = summarize_records(all_cache_records)
     return {
         "mode": "memory",
         "git_commit": git_commit or current_git_commit(),

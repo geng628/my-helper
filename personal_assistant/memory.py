@@ -749,7 +749,13 @@ class MemoryStore:
 def memory_tools(
     memory: MemoryStore,
     get_user_message: Callable[[], tuple[str, int | None]] | None = None,
+    get_today: Callable[[], date] | None = None,
 ) -> list[Tool]:
+    # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
+    def search_markdown(query: str, root: str = "data/memory") -> str:
+        ref_day = get_today() if get_today is not None else None
+        return memory.search_markdown(query, root=root, today=ref_day)
+
     # 适配 read_markdown 工具参数（将模型传入的字符串行号转为整数）
     def read_markdown(path: str, start_line: str, end_line: str) -> str:
         try:
@@ -787,7 +793,7 @@ def memory_tools(
             "search_markdown",
             "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
             {"query": "搜索关键词", "root": "搜索目录，如 data/memory、data/workspace、docs"},
-            memory.search_markdown,
+            search_markdown,
         ),
         Tool(
             "read_markdown",
