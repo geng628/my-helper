@@ -9,8 +9,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from personal_assistant.app import AssistantApp
-from personal_assistant.llm import LLMClient, TokenUsage
+from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.ai import LLMClient, TokenUsage
 from scripts.web_chat import create_web_server
 
 

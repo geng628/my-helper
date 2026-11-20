@@ -81,27 +81,34 @@ my_helper_v2/
 │   ├── mvp-design.md              # 整体设计文档
 │   └── dev-log.md                 # 工程演进、真实踩坑根因、评测总账与跨模型交接日志
 ├── AGENTS.md                      # 仓库协作红线、TDD/评测纪律与跨模型续写协议
-├── personal_assistant/
+├── personal_assistant/            # 严格三层依赖漏斗架构（ai → agent → assistant + eval）
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
-│   ├── llm.py                     # 零依赖 OpenAI 兼容客户端（含 Token 与缓存 usage 解析）
-│   ├── cache_metrics.py           # KV 缓存观测（服务端命中率 + 本地前缀复用率）
-│   ├── tools.py                   # Tool、@tool 装饰器与 ToolRegistry 白名单注册表
-│   ├── plugins.py                 # 动态加载 plugins/*.py 插件工具
-│   ├── commands.py                # 固定 argv 命令模板加载与 ToolsConfig 装配
-│   ├── memory.py                  # 核心内置 Markdown 记忆与文件读写工具
-│   ├── memory_lifecycle.py        # 记忆生命周期（冲突替换 add/replace/remove、过期过滤与归档）
-│   ├── db.py                      # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
-│   ├── consolidator.py            # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
-│   ├── app.py                     # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
-│   ├── eval/                      # 评测包（common / search_eval / agent_eval / memory_eval / public_benchmarks / cli）
-│   ├── react.py                   # 极简 ReAct 核心循环（Reason -> Act -> Observe）
-│   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
+│   ├── ai/                        # Layer 1（零内部依赖）：LLM 协议底座，可独立使用
+│   │   ├── types.py               # 最小原子契约：ToolSchema、ToolCall、TokenUsage
+│   │   ├── client.py              # LLMClient 抽象、OpenAICompatibleLLM 与 Provider 注册分发
+│   │   └── cache.py               # KV 缓存观测（服务端 cached_tokens + 本地前缀复用率）
+│   ├── agent/                     # Layer 2（仅依赖 ai）：通用 ReAct 引擎，不含业务假设
+│   │   ├── tools.py               # Tool(ToolSchema) 类型递进扩展、@tool 与白名单 ToolRegistry
+│   │   ├── react.py               # 极简通用 ReAct 核心循环（Reason -> Act -> Observe）
+│   │   └── plugins.py             # 统一插件发现器（TOOLS / RETRIEVERS / LLM_PROVIDERS）
+│   ├── assistant/                 # Layer 3（个人助手业务层）：记忆、历史、沉淀与入口
+│   │   ├── common.py              # 无内部依赖公共底座（REPO_ROOT、load_dotenv、truncate_utf8）
+│   │   ├── prompts.py             # 个人助手专属系统提示词组装（从通用 react.py 剥离）
+│   │   ├── memory.py              # 核心内置 Markdown 记忆与文件读写工具
+│   │   ├── memory_lifecycle.py    # 记忆生命周期（冲突替换 add/replace/remove、过期过滤与归档）
+│   │   ├── db.py                  # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
+│   │   ├── consolidator.py        # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
+│   │   ├── commands.py            # tools.json 解析、固定 argv 命令与检索/Provider 插件装配
+│   │   ├── app.py                 # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
+│   │   └── cli.py                 # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
+│   └── eval/                      # 独立评测包（common / search_eval / agent_eval / memory_eval / public_benchmarks / cli）
 ├── scripts/
 │   ├── demo.py                    # 离线演示与单句实测脚本
 │   ├── web_chat.py                # 零依赖本地网页对话服务（标准库 ThreadingHTTPServer）
 │   └── web_ui.html                # 纯 HTML/JS 极简本地对话页面（含工具轨迹与 KV 缓存显示）
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）
+│   ├── test_architecture.py       # 三层依赖漏斗 AST 守卫、类型递进扩展与子进程独立运行测试
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试

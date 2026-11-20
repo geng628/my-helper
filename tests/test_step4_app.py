@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from personal_assistant.app import AssistantApp
-from personal_assistant.db import StateStore
-from personal_assistant.llm import LLMClient, NoopLLMClient
+from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.assistant.db import StateStore
+from personal_assistant.ai import LLMClient, NoopLLMClient
 
 
 # 可录制每次模型请求的脚本化假模型，用于确定性测试 AssistantApp

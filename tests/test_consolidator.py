@@ -7,15 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.app import AssistantApp
-from personal_assistant.consolidator import (
+from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
     ConsolidationPolicy,
     MemoryConsolidator,
 )
-from personal_assistant.db import StateStore
-from personal_assistant.llm import LLMClient
-from personal_assistant.memory import MemoryStore
+from personal_assistant.assistant.db import StateStore
+from personal_assistant.ai import LLMClient
+from personal_assistant.assistant.memory import MemoryStore
 
 
 # 可录制请求并按预设回复（支持门控同步）的假模型

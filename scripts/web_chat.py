@@ -14,9 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from personal_assistant.app import AssistantApp, build_app
-from personal_assistant.cli import load_dotenv
-from personal_assistant.llm import LLMNotConfigured
+from personal_assistant.ai.client import LLMNotConfigured
+from personal_assistant.assistant.app import AssistantApp, build_app
+from personal_assistant.assistant.common import load_dotenv
 
 UI_HTML_PATH = Path(__file__).resolve().parent / "web_ui.html"
 MAX_REQUEST_BYTES = 256 * 1024

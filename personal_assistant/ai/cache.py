@@ -1,11 +1,12 @@
-"""KV 缓存观测模块：同时统计服务端真实 cached_tokens 命中率与本地前缀复用率。"""
+"""Layer 1 KV 缓存观测模块：统计服务端真实 cached_tokens 命中率与本地前缀复用率。"""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from statistics import mean
 
-from personal_assistant.llm import LLMClient, TokenUsage
+from personal_assistant.ai.client import LLMClient
+from personal_assistant.ai.types import TokenUsage
 
 
 # 将单次请求的 tools 与 messages 序列化为逐行稳定文本，便于精确计算最长公共前缀
@@ -128,7 +129,7 @@ class CacheMonitor:
     def summary(self, since: int = 0) -> dict[str, object]:
         return summarize_records(self.records[since:])
 
-    # 包装任意 LLMClient，在不侵入 ReAct 循环的前提下自动采集缓存统计
+    # 包装任意 LLMClient，在不侵入上层循环的前提下自动采集缓存统计
     def wrap(self, llm: LLMClient, session_key: str = "default") -> "TrackingLLMClient":
         return TrackingLLMClient(llm, self, session_key=session_key)
 

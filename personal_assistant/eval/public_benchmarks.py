@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
-from personal_assistant.cli import REPO_ROOT
+from personal_assistant.assistant.common import REPO_ROOT
 
 LONGMEMEVAL_ORACLE_URL = (
     "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json"

@@ -1,14 +1,16 @@
-"""零第三方依赖的 OpenAI 兼容大模型客户端，支持解析响应中的 Token 与 KV 缓存命中统计。"""
+"""Layer 1 零依赖大模型客户端与 Provider 注册中心（对标 pi-ai）：不感知任何 Agent 或业务模块。"""
 from __future__ import annotations
 
 import json
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from personal_assistant.ai.types import TokenUsage
 
 
 # 当未配置 LLM_MODE=on 或缺少 API Key 时抛出的异常
@@ -17,30 +19,7 @@ class LLMNotConfigured(RuntimeError):
 
 
 PostJson = Callable[[str, dict[str, object], dict[str, str]], dict[str, object]]
-
-
-# 单次大模型调用的 Token 消耗与服务端 KV 缓存命中记录
-@dataclass(frozen=True)
-class TokenUsage:
-    prompt_tokens: int = 0
-    cached_tokens: int = 0
-    completion_tokens: int = 0
-
-    # 计算本次请求的服务端缓存命中率（无输入 token 时返回 None）
-    @property
-    def cache_hit_rate(self) -> float | None:
-        if self.prompt_tokens <= 0:
-            return None
-        return round(self.cached_tokens / self.prompt_tokens, 4)
-
-    # 转换为便于 JSON 序列化的统计字典
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "cached_tokens": self.cached_tokens,
-            "completion_tokens": self.completion_tokens,
-            "cache_hit_rate": self.cache_hit_rate,
-        }
+ProviderFactory = Callable[[Mapping[str, str]], "LLMClient"]
 
 
 # 安全将接口返回的数字字段解析为非负整数
@@ -109,7 +88,7 @@ def default_post_json(
     raise RuntimeError("请求重试耗尽。")
 
 
-# 大模型客户端抽象基类，供 ReAct 循环调用
+# 大模型客户端抽象基类，供上层 Agent 循环或独立脚本调用
 class LLMClient(ABC):
     last_usage: TokenUsage | None = None
 
@@ -170,14 +149,45 @@ class OpenAICompatibleLLM(LLMClient):
         return dict(response["choices"][0]["message"])
 
 
-# 从环境变量读取配置，返回可用的 LLM 客户端（未开启则返回 NoopLLMClient）
-def from_env() -> LLMClient:
-    mode = os.getenv("LLM_MODE", "off").strip().lower() or "off"
-    api_key = os.getenv("LLM_API_KEY", "").strip()
+# 默认内建 OpenAI 兼容 Provider 构造器
+def _build_openai_compatible(env: Mapping[str, str]) -> LLMClient:
+    return OpenAICompatibleLLM(
+        api_key=env.get("LLM_API_KEY", "").strip(),
+        base_url=env.get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+        model=env.get("LLM_MODEL", "deepseek-chat"),
+    )
+
+
+_PROVIDERS: dict[str, ProviderFactory] = {
+    "openai": _build_openai_compatible,
+    "openai_compatible": _build_openai_compatible,
+}
+
+
+# 注册自定义大模型厂商 Provider 工厂（支持外部插件扩展非 OpenAI 原生协议，不改动核心循环）
+def register_provider(name: str, factory: ProviderFactory) -> None:
+    key = name.strip().lower()
+    if not key or not callable(factory):
+        raise ValueError(f"非法 Provider 注册参数：{name!r}")
+    _PROVIDERS[key] = factory
+
+
+# 返回当前所有已注册的 Provider 名称列表
+def available_providers() -> list[str]:
+    return sorted(_PROVIDERS)
+
+
+# 从环境变量读取配置并按 LLM_PROVIDER 分发构造 LLMClient（未开启则返回 NoopLLMClient）
+def from_env(env: Mapping[str, str] | None = None) -> LLMClient:
+    source = os.environ if env is None else env
+    mode = source.get("LLM_MODE", "off").strip().lower() or "off"
+    api_key = source.get("LLM_API_KEY", "").strip()
     if mode != "on" or not api_key:
         return NoopLLMClient()
-    return OpenAICompatibleLLM(
-        api_key=api_key,
-        base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
-        model=os.getenv("LLM_MODEL", "deepseek-chat"),
-    )
+    provider = source.get("LLM_PROVIDER", "openai_compatible").strip().lower() or "openai_compatible"
+    factory = _PROVIDERS.get(provider)
+    if factory is None:
+        raise ValueError(
+            f"未知 LLM_PROVIDER={provider!r}，可用 Provider：{', '.join(available_providers())}"
+        )
+    return factory(source)

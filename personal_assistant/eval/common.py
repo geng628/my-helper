@@ -5,8 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from personal_assistant.cli import REPO_ROOT
-from personal_assistant.memory import MemoryStore
+from personal_assistant.assistant.common import REPO_ROOT
+from personal_assistant.assistant.memory import MemoryStore
 
 
 # 获取当前仓库短 Git Commit SHA（若有未提交改动则追加 -dirty），用于绑定评测基线

@@ -1,0 +1,48 @@
+"""Layer 1 公共导出接口（对标 pi-ai）：可完全脱离 Agent 与业务层独立调用 LLM 与统计 KV Cache。"""
+from personal_assistant.ai.cache import (
+    CacheMonitor,
+    CallCacheRecord,
+    TrackingLLMClient,
+    common_prefix_len,
+    format_cache_summary,
+    serialize_request,
+    summarize_records,
+)
+from personal_assistant.ai.client import (
+    LLMClient,
+    LLMNotConfigured,
+    NoopLLMClient,
+    OpenAICompatibleLLM,
+    PostJson,
+    ProviderFactory,
+    available_providers,
+    default_post_json,
+    extract_usage,
+    from_env,
+    register_provider,
+)
+from personal_assistant.ai.types import TokenUsage, ToolCall, ToolSchema
+
+__all__ = [
+    "CacheMonitor",
+    "CallCacheRecord",
+    "LLMClient",
+    "LLMNotConfigured",
+    "NoopLLMClient",
+    "OpenAICompatibleLLM",
+    "PostJson",
+    "ProviderFactory",
+    "TokenUsage",
+    "ToolCall",
+    "ToolSchema",
+    "TrackingLLMClient",
+    "available_providers",
+    "common_prefix_len",
+    "default_post_json",
+    "extract_usage",
+    "format_cache_summary",
+    "from_env",
+    "register_provider",
+    "serialize_request",
+    "summarize_records",
+]

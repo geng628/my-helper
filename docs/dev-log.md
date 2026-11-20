@@ -31,6 +31,8 @@
 | `5dbed3f`、`6dbf02b`、`1343b0d` | 补齐 3 个高实用外围能力：档位 1 白名单 Shell 插件、零依赖本地网页端、联网搜索与防 SSRF 抓网页插件 | 全部采用外围插件或独立脚本形态，保持核心零膨胀 |
 | `cffbf26`、`552863d` | 扩建四层评测体系（40 题检索 + 16 场景多轮记忆 + LongMemEval/LoCoMo 适配器），并将公开数据与下载入口统一收拢至 `evals/public/` 与 `--mode download` | 原 4 题/5 场景太玩具；扩充后主动保留高难改写、干扰负例与学术公开集，真实暴露短板；修正散落目录，恢复 `data/` 为纯运行时目录 |
 | `d2e20e3` | 扩展 `plugins.py` 支持 `RETRIEVERS` 检索插件，实现零依赖 `plugins/fts5_retriever.py`（SQLite FTS5 + BM25）与 `--retriever` A/B 对比 | 对标重型向量方案后采取“先零依赖 FTS5 BM25 插件打底、后续按需叠 Embedding+RRF 插件”的渐进路线，LoCoMo 200 题 Recall 从 42.8% 跃升至 68.5%，延迟降 3 倍 |
+| `8d1271c` | 新增 `AGENTS.md` 与 `docs/dev-log.md` 跨模型交接文档 | 沉淀全量设计取舍、12 个真实踩坑根因与 Benchmark 总账，支持换任意模型无缝续写 |
+| 本次提交 | 借鉴 Pi 三层架构方法论完成 `ai → agent → assistant + eval` 三层重构，引入 `ToolSchema → Tool` 类型递进扩展、`LLM_PROVIDERS` 插件口与 `tests/test_architecture.py` 守卫测试 | 彻底消灭 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台与 `react.py` 夹带个人业务提示词的问题；通过 AST + 子进程 `sys.modules` 隔离测试验证三层均可剥离上层独立运行 |
 
 ---
 
@@ -115,9 +117,9 @@
 按“投入产出比 + 简历含金量”排序：
 
 ### P1：修复实测暴露的 3 个多轮记忆与提示词问题（目标：拉高 16 场景与 LongMemEval）
-1. **日期注入补上星期几**：[app.py](../personal_assistant/app.py) 与 [consolidator.py](../personal_assistant/consolidator.py) 的日期格式从 `2026-11-16` 改为 `2026-11-16（星期一）`，根治相对日期（如“下周三”）换算不稳。
+1. **日期注入补上星期几**：[prompts.py](../personal_assistant/assistant/prompts.py) 与 [consolidator.py](../personal_assistant/assistant/consolidator.py) 的日期格式从 `2026-11-16` 改为 `2026-11-16（星期一）`，根治相对日期（如“下周三”）换算不稳。
 2. **沉淀替换句去旧词残留**：在 `CONSOLIDATION_SYSTEM_PROMPT` 中明确 `op=replace` 的 `new` 字段只写**当前最新状态**，不要在括号里附带已废弃旧值（根治 `chained-three-step-update`、`partial-attribute-update` 磁盘旧词污染）；同时酌情保留助手曾给出的关键具体建议（改善 LongMemEval `single-session-assistant`）。
-3. **隐式个性化提问主动查记忆**：优化 `SYSTEM_PROMPT`（注意最小改动、验收 KV Cache 不退步），当用户询问带个人偏好/经验色彩的建议（如烘焙建议、活动推荐）且 `MEMORY.md` 存在相关主题时，先检索对应记忆再个性化回答（直击 LongMemEval `single-session-preference` 0/2）。
+3. **隐式个性化提问主动查记忆**：优化 [prompts.py](../personal_assistant/assistant/prompts.py) 的 `SYSTEM_PROMPT`（注意最小改动、验收 KV Cache 不退步），当用户询问带个人偏好/经验色彩的建议（如烘焙建议、活动推荐）且 `MEMORY.md` 存在相关主题时，先检索对应记忆再个性化回答（直击 LongMemEval `single-session-preference` 0/2）。
 - **验收标准**：同口径重跑 16 场景 `memory_scenarios.jsonl` + 14 题 `evals/public/longmemeval_scenarios.jsonl`，对比 `cffbf26` / `d2e20e3` 并追加记录到本文档。
 
 ### P2：新增可选插件 `plugins/hybrid_rrf_retriever.py`（FTS5 BM25 + Embedding API 向量 + RRF 融合）
@@ -145,3 +147,20 @@
   - 退步与未验证项：如实列出。
 - **下一步**：更新最新优先级。
 ```
+
+---
+
+### [2026-11-21] 三层依赖漏斗架构重构（Pi 方法论落地：`ai → agent → assistant + eval`）
+- **目标与思路**：按“依赖漏斗分层法 + 类型递进扩展 + 可独立使用测试”把原本平铺在 `personal_assistant/` 的 12 个模块拆清边界，消灭 AST 扫出的 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台以及 `react.py` 夹带个人记忆提示词的问题；同时补齐 `LLM_PROVIDERS` 插件口，让未来切换非 OpenAI 原生厂商也不触碰通用循环。
+- **改动文件**：
+  - Layer 1 (`personal_assistant/ai/`)：`types.py`（原子 `ToolSchema`、`ToolCall`、`TokenUsage`）、`client.py`（`LLMClient` + `register_provider` / `from_env`）、`cache.py`。
+  - Layer 2 (`personal_assistant/agent/`)：`tools.py`（`Tool(ToolSchema)` 递进继承，`param_enums` 设 `kw_only=True` 保位置参数兼容）、`react.py`（纯通用无业务提示词）、`plugins.py`（一次扫描发现 `TOOLS` / `RETRIEVERS` / `LLM_PROVIDERS`）。
+  - Layer 3 (`personal_assistant/assistant/`)：`common.py`（无依赖底座）、`prompts.py`（个人助手提示词）、`memory.py`、`memory_lifecycle.py`、`db.py`、`consolidator.py`、`commands.py`、`app.py`、`cli.py`。
+  - 架构守卫测试：`tests/test_architecture.py`（AST 依赖漏斗 + 环检测 + 类型递进断言 + 子进程 `sys.modules` 断层隔离实测 + Provider 插件分发）。
+- **踩坑与修复**：`@dataclass(frozen=True)` 继承时，父类带默认值的 `param_enums` 若不设为 `kw_only=True` 会阻塞子类添加位置字段 `handler`；设为 `kw_only=True` 后兼顾了真继承与全量已有调用方兼容。
+- **同口径评测对比（改前 `d2e20e3` → 改后本次提交）**：
+  - 单元测试：**68/68 passed**（+4 条三层架构守卫与子进程隔离测试）。
+  - 离线检索（40 题 / LoCoMo 200 题，`fts5_bm25`）：40 题 **38/40 (95.0%)**、MRR **0.9483**、0.52 ms；LoCoMo 200 题 **105/200 (52.5%)**、Recall **68.51%**、MRR **0.6221**、9.19 ms —— **与 `d2e20e3` 完全持平，零退步**。
+  - 实模多轮记忆：本次为纯模块分层重构，未改动提示词语义、检索算法或沉淀逻辑，未重复消耗 API 重跑（可在 P1 改提示词时一并验收）。
+- **下一步**：继续按第五节 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）推进。
+

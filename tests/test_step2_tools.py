@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.commands import ToolsConfig
-from personal_assistant.llm import LLMClient
-from personal_assistant.react import run_react
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.ai import LLMClient
+from personal_assistant.agent.react import run_react
+from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
 class ScriptedLLM(LLMClient):

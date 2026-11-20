@@ -1,19 +1,17 @@
-"""最小工具定义、插件装饰器与白名单注册表。"""
+"""Layer 2 通用工具抽象与白名单注册表（对标 pi-agent-core）：递进继承 ai.ToolSchema 叠加执行能力。"""
 from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
+from personal_assistant.ai.types import ToolSchema
 
-# 单个工具的数据结构（名称、描述、参数说明、执行函数与可选枚举约束）
+
+# 中层可执行工具：继承底层 ToolSchema，仅叠加 handler 执行回调，不修改底层 Schema 契约
 @dataclass(frozen=True)
-class Tool:
-    name: str
-    description: str
-    parameters: dict[str, str]
+class Tool(ToolSchema):
     handler: Callable[..., str]
-    param_enums: dict[str, tuple[str, ...]] | None = None
 
 
 # 装饰器：把普通 Python 函数标记为 Agent 插件工具，同时不影响函数原本调用方式
@@ -68,32 +66,9 @@ class ToolRegistry:
     def __iter__(self) -> Iterator[Tool]:
         return iter(self._tools.values())
 
-    # 将已注册工具转换成 OpenAI Chat Completions 所需的 tools JSON Schema 列表
+    # 将已注册工具委派给底层 ToolSchema.to_openai_schema 导出标准工具列表
     def definitions(self) -> list[dict[str, object]]:
-        schemas: list[dict[str, object]] = []
-        for item in self._tools.values():
-            properties: dict[str, dict[str, object]] = {}
-            for param, desc in item.parameters.items():
-                prop: dict[str, object] = {"type": "string", "description": desc}
-                if item.param_enums and param in item.param_enums:
-                    prop["enum"] = list(item.param_enums[param])
-                properties[param] = prop
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": item.name,
-                        "description": item.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(item.parameters),
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-        return schemas
+        return [item.to_openai_schema() for item in self._tools.values()]
 
     # 按名称执行白名单内的工具；任何参数或执行错误都转为文本字符串回传给模型自愈
     def execute(self, name: str, raw_arguments: str) -> str:

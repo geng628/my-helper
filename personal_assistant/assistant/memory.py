@@ -13,8 +13,9 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.commands import truncate_utf8
-from personal_assistant.memory_lifecycle import (
+from personal_assistant.agent.tools import Tool
+from personal_assistant.assistant.common import truncate_utf8
+from personal_assistant.assistant.memory_lifecycle import (
     apply_topic_operations,
     archive_expired_topics,
     is_line_expired,
@@ -22,7 +23,6 @@ from personal_assistant.memory_lifecycle import (
     read_topic_snapshots as _read_topic_snapshots,
     today_shanghai as _today_shanghai,
 )
-from personal_assistant.tools import Tool
 
 DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads")
 MAX_SEARCH_FILE_BYTES = 1024 * 1024

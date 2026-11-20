@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from personal_assistant.eval import evaluate_agent, evaluate_search, load_cases, main
-from personal_assistant.llm import LLMClient
-from personal_assistant.memory import MemoryStore
+from personal_assistant.ai import LLMClient
+from personal_assistant.assistant.memory import MemoryStore
 
 
 # 预录回复的假模型，用于确定性测试端到端 Agent 评测器

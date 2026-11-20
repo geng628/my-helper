@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import pytest
 
-from personal_assistant.cache_metrics import (
+from personal_assistant.ai.cache import (
     CacheMonitor,
     format_cache_summary,
     serialize_request,
 )
-from personal_assistant.llm import (
+from personal_assistant.ai import (
     LLMClient,
     LLMNotConfigured,
     NoopLLMClient,

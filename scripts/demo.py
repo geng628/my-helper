@@ -10,11 +10,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from personal_assistant.cli import build_demo_tools, load_dotenv
-from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
-from personal_assistant.plugins import load_plugin_tools
-from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import ToolRegistry
+from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.react import run_react
+from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.assistant.cli import build_demo_tools
+from personal_assistant.assistant.common import load_dotenv
+from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
 # 离线脚本化模拟模型：按预设顺序返回回复，用于零成本演示 ReAct 循环

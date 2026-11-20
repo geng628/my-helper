@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from personal_assistant.commands import ToolsConfig
+from personal_assistant.assistant.commands import ToolsConfig
 from plugins.shell_tools import ShellPolicy, execute_safe_command
 
 

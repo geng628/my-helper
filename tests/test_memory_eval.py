@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from personal_assistant.eval import evaluate_memory, main
-from personal_assistant.llm import LLMClient, TokenUsage
+from personal_assistant.ai import LLMClient, TokenUsage
 
 
 # 可按序返回预设消息与 usage 的脚本化假模型，用于确定性测试 memory_eval

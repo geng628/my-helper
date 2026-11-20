@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.commands import ToolsConfig
+from personal_assistant.assistant.commands import ToolsConfig
 from plugins.web_tools import (
     WebPolicy,
     execute_fetch_webpage,

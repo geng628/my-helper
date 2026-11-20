@@ -1,4 +1,4 @@
-"""动态插件加载器：扫描项目内用户可编辑的 Python 工具与检索插件文件。"""
+"""Layer 2 通用插件发现器：扫描项目内插件文件，统一收集工具（TOOLS）、检索器（RETRIEVERS）与模型提供方（LLM_PROVIDERS）。"""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import ModuleType
 
-from personal_assistant.tools import Tool
+from personal_assistant.agent.tools import Tool
+from personal_assistant.ai.client import ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
 
@@ -46,7 +47,7 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
-# 动态导入单个插件 .py 文件并注册到 sys.modules，供工具与检索插件共用
+# 动态导入单个插件 .py 文件并注册到 sys.modules，确保 @dataclass 等反射特性正常工作
 def _import_plugin_module(file_path: Path) -> ModuleType:
     digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
     module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
@@ -54,7 +55,6 @@ def _import_plugin_module(file_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ValueError(f"无法加载插件文件：{file_path}")
     module = importlib.util.module_from_spec(spec)
-    # 注册到 sys.modules，确保插件内使用 @dataclass + future annotations 时可正常解析模块命名空间
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
@@ -89,35 +89,42 @@ def _extract_module_tools(module: ModuleType, file_path: Path) -> list[Tool]:
     return found
 
 
-# 从已导入插件模块中收集 RETRIEVERS 字典（或 RETRIEVER_NAME + create_retriever）声明的检索后端工厂
-def _extract_module_retrievers(module: ModuleType, file_path: Path) -> dict[str, RetrieverFactory]:
-    found: dict[str, RetrieverFactory] = {}
-
-    exported = getattr(module, "RETRIEVERS", None)
+# 从已导入插件模块中收集字典型工厂映射（如 RETRIEVERS 或 LLM_PROVIDERS）及单对象简写声明
+def _extract_named_factories(
+    module: ModuleType,
+    file_path: Path,
+    *,
+    dict_attr: str,
+    name_attr: str,
+    factory_attr: str,
+) -> dict[str, Callable]:
+    found: dict[str, Callable] = {}
+    exported = getattr(module, dict_attr, None)
     if exported is not None:
         if not isinstance(exported, dict):
-            raise ValueError(f"插件 {file_path.name} 的 RETRIEVERS 必须是字典。")
+            raise ValueError(f"插件 {file_path.name} 的 {dict_attr} 必须是字典。")
         for name, factory in exported.items():
             if not isinstance(name, str) or not name.strip() or not callable(factory):
-                raise ValueError(f"插件 {file_path.name} 的 RETRIEVERS 项格式非法：{name!r}")
+                raise ValueError(f"插件 {file_path.name} 的 {dict_attr} 项格式非法：{name!r}")
             found[name.strip()] = factory
 
-    single_name = getattr(module, "RETRIEVER_NAME", None)
-    single_factory = getattr(module, "create_retriever", None)
+    single_name = getattr(module, name_attr, None)
+    single_factory = getattr(module, factory_attr, None)
     if isinstance(single_name, str) and single_name.strip() and callable(single_factory):
         found.setdefault(single_name.strip(), single_factory)
 
     return found
 
 
-# 一次扫描同时加载插件工具与插件检索后端，避免同一插件模块被重复执行
+# 一次扫描同时加载插件工具、插件检索后端与插件 LLM Provider，避免同一模块被重复执行
 def load_plugins(
     entries: Iterable[str],
     project_root: Path,
-) -> tuple[list[Tool], dict[str, RetrieverFactory]]:
+) -> tuple[list[Tool], dict[str, RetrieverFactory], dict[str, ProviderFactory]]:
     loaded_tools: list[Tool] = []
     seen_tools: set[str] = set()
     loaded_retrievers: dict[str, RetrieverFactory] = {}
+    loaded_providers: dict[str, ProviderFactory] = {}
 
     for file_path in _resolve_plugin_targets(entries, project_root):
         module = _import_plugin_module(file_path)
@@ -126,17 +133,35 @@ def load_plugins(
                 raise ValueError(f"插件工具名称重复：{item.name}（文件：{file_path.name}）")
             seen_tools.add(item.name)
             loaded_tools.append(item)
-        for name, factory in _extract_module_retrievers(module, file_path).items():
+
+        for name, factory in _extract_named_factories(
+            module,
+            file_path,
+            dict_attr="RETRIEVERS",
+            name_attr="RETRIEVER_NAME",
+            factory_attr="create_retriever",
+        ).items():
             if name in loaded_retrievers:
                 raise ValueError(f"检索插件名称重复：{name}（文件：{file_path.name}）")
             loaded_retrievers[name] = factory
 
-    return loaded_tools, loaded_retrievers
+        for name, factory in _extract_named_factories(
+            module,
+            file_path,
+            dict_attr="LLM_PROVIDERS",
+            name_attr="PROVIDER_NAME",
+            factory_attr="create_provider",
+        ).items():
+            if name in loaded_providers:
+                raise ValueError(f"模型 Provider 插件名称重复：{name}（文件：{file_path.name}）")
+            loaded_providers[name] = factory
+
+    return loaded_tools, loaded_retrievers, loaded_providers
 
 
 # 批量加载配置声明的全部插件工具，并禁止跨文件重名
 def load_plugin_tools(entries: Iterable[str], project_root: Path) -> list[Tool]:
-    tools, _ = load_plugins(entries, project_root)
+    tools, _, _ = load_plugins(entries, project_root)
     return tools
 
 
@@ -145,5 +170,14 @@ def load_plugin_retrievers(
     entries: Iterable[str],
     project_root: Path,
 ) -> dict[str, RetrieverFactory]:
-    _, retrievers = load_plugins(entries, project_root)
+    _, retrievers, _ = load_plugins(entries, project_root)
     return retrievers
+
+
+# 批量加载配置声明的全部插件大模型 Provider 工厂（如自定义非 OpenAI 厂商适配器）
+def load_plugin_providers(
+    entries: Iterable[str],
+    project_root: Path,
+) -> dict[str, ProviderFactory]:
+    _, _, providers = load_plugins(entries, project_root)
+    return providers

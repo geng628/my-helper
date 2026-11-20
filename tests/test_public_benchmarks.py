@@ -21,7 +21,7 @@ from personal_assistant.eval.public_benchmarks import (
     write_jsonl,
 )
 from personal_assistant.eval.search_eval import evaluate_search
-from personal_assistant.memory import MemoryStore
+from personal_assistant.assistant.memory import MemoryStore
 
 
 # 测试 LongMemEval 与 LoCoMo 历史日期字符串解析准确性

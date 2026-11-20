@@ -10,8 +10,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from personal_assistant.commands import truncate_utf8
-from personal_assistant.tools import tool
+from personal_assistant.agent.tools import tool
+from personal_assistant.assistant.common import truncate_utf8
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

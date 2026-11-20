@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from personal_assistant.tools import tool
+from personal_assistant.agent.tools import tool
 
 
 # 插件工具：返回当前北京时间字符串

@@ -5,7 +5,9 @@
 ## 核心红线
 
 1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`sqlite3`、`urllib`、`threading`、`http.server` 等）；`pytest` 仅作为开发测试依赖。
-2. **插件优先扩展**：新增工具（`TOOLS` / `@tool`）或检索后端（`RETRIEVERS`）优先写成 `plugins/*.py` 独立插件，并受 `config/tools.json` 白名单/配置开关管控；非必要不动核心 `personal_assistant/react.py`。
+2. **插件优先与三层漏斗架构**：
+   - 严格守住三层单向依赖：`ai`（纯 LLM 协议，零向上依赖） ← `agent`（通用 ReAct 与插件发现，只依赖 `ai`） ← `assistant`（个人助手业务） + `eval`（不反向依赖 `cli.py`），每次改动必须通过 `tests/test_architecture.py` 架构守卫测试。
+   - 新增工具（`TOOLS` / `@tool`）、检索后端（`RETRIEVERS`）或模型厂商适配（`LLM_PROVIDERS`）优先写成 `plugins/*.py` 独立插件；非必要不动核心 `personal_assistant/agent/react.py`。
 3. **安全与隐私边界**：
    - 保持 `write_root = data/workspace`、只读 Shell 白名单、防 SSRF 校验；**禁止**开放让 LLM 无人工审批直接写入 `plugins/` 或 `personal_assistant/`。
    - 严禁提交 `.env`、`data/`、`evals/public/`；不得修改父目录中的旧版仓库。

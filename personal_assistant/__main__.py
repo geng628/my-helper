@@ -1,5 +1,5 @@
 """Package entrypoint for `python -m personal_assistant`."""
-from personal_assistant.cli import main
+from personal_assistant.assistant.cli import main
 
 if __name__ == "__main__":
     main()

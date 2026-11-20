@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from personal_assistant.db import StateStore
-from personal_assistant.llm import LLMClient, NoopLLMClient
-from personal_assistant.memory import MemoryStore
+from personal_assistant.ai.client import LLMClient, NoopLLMClient
+from personal_assistant.assistant.db import StateStore
+from personal_assistant.assistant.memory import MemoryStore
 
 CONSOLIDATION_SYSTEM_PROMPT = (
     "你是个人助手的后台记忆整理器。你会收到当前日期、已有主题记忆内容、MEMORY.md 索引、前情摘要，以及一段即将从活跃窗口移除的历史对话。\n"

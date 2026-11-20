@@ -8,14 +8,15 @@ from pathlib import Path
 from statistics import mean
 from time import perf_counter
 
-from personal_assistant.cache_metrics import CacheMonitor
-from personal_assistant.cli import REPO_ROOT, format_system_prompt
-from personal_assistant.commands import ToolsConfig
+from personal_assistant.agent.react import MAX_TOOL_ROUNDS, run_react
+from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai.cache import CacheMonitor
+from personal_assistant.ai.client import LLMClient
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.common import REPO_ROOT
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.prompts import format_system_prompt
 from personal_assistant.eval.common import current_git_commit, normalize_expected_sources
-from personal_assistant.llm import LLMClient
-from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
-from personal_assistant.react import MAX_TOOL_ROUNDS, run_react
-from personal_assistant.tools import ToolRegistry
 
 
 # 将原始数据目录的 memory/ 与 workspace/ 复制到临时目录，确保评测过程绝不改写生产数据

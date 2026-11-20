@@ -5,16 +5,16 @@ import json
 
 import pytest
 
-from personal_assistant.cli import build_demo_tools
-from personal_assistant.llm import (
+from personal_assistant.assistant.cli import build_demo_tools
+from personal_assistant.ai import (
     LLMClient,
     LLMNotConfigured,
     NoopLLMClient,
     OpenAICompatibleLLM,
     from_env,
 )
-from personal_assistant.react import run_react
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.agent.react import run_react
+from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
 class ScriptedLLM(LLMClient):
@@ -263,7 +263,7 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
     import ssl
     from urllib.error import HTTPError, URLError
 
-    from personal_assistant import llm as llm_mod
+    from personal_assistant.ai import client as llm_mod
 
     # 避免单元测试等待真实退避时间
     monkeypatch.setattr(llm_mod.time, "sleep", lambda _: None)

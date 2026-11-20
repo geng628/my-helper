@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.commands import ToolsConfig
-from personal_assistant.llm import LLMClient
-from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
-from personal_assistant.react import run_react
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.ai import LLMClient
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.agent.react import run_react
 
 
 # 预录回复的假模型，用于确定性验证记忆工具与 ReAct 联动

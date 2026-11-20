@@ -9,20 +9,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from personal_assistant.plugins import RetrieverFactory, load_plugins
-from personal_assistant.tools import Tool, ToolRegistry
+from personal_assistant.agent.plugins import RetrieverFactory, load_plugins
+from personal_assistant.agent.tools import Tool, ToolRegistry
+from personal_assistant.ai.client import register_provider
+from personal_assistant.assistant.common import truncate_utf8
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
 FORBIDDEN_CHARS_RE = re.compile(r"[\x00\r\n]")
-
-
-# 按 UTF-8 字节上限安全截断长文本，避免单次工具输出撑爆上下文
-def truncate_utf8(text: str, max_bytes: int) -> str:
-    data = text.encode("utf-8")
-    if len(data) <= max_bytes:
-        return text
-    return data[:max_bytes].decode("utf-8", errors="ignore") + "\n…（输出已截断）"
 
 
 # 固定命令模板中单个占位符参数的约束规则（描述、枚举白名单、正则格式）
@@ -253,7 +247,9 @@ class ToolsConfig:
             if enabled:
                 commands.append(spec)
 
-        loaded_tools, loaded_retrievers = load_plugins(plugins_raw, root)
+        loaded_tools, loaded_retrievers, loaded_providers = load_plugins(plugins_raw, root)
+        for prov_name, prov_factory in loaded_providers.items():
+            register_provider(prov_name, prov_factory)
 
         return cls(
             enabled_tools=tuple(enabled_raw),

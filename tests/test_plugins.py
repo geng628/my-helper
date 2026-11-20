@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.commands import ToolsConfig
-from personal_assistant.llm import LLMClient
-from personal_assistant.plugins import load_plugin_tools
-from personal_assistant.react import run_react
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.ai import LLMClient
+from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.react import run_react
 
 
 class ScriptedLLM(LLMClient):
@@ -30,7 +30,7 @@ def test_load_plugins_supports_decorator_and_tools_list_and_allowlist(tmp_path: 
     (plugins_dir / "_helper.py").write_text("raise RuntimeError('should be ignored')\n", encoding="utf-8")
     (plugins_dir / "my_tools.py").write_text(
         """
-from personal_assistant.tools import Tool, tool
+from personal_assistant.agent.tools import Tool, tool
 
 @tool(description="反转字符串", parameters={"text": "输入文本"})
 def reverse_text(text: str) -> str:
@@ -83,7 +83,7 @@ def test_plugin_security_rejects_outside_paths_and_duplicates(tmp_path: Path) ->
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     code = """
-from personal_assistant.tools import tool
+from personal_assistant.agent.tools import tool
 
 @tool(description="重复名称")
 def dup_tool() -> str:
@@ -100,7 +100,7 @@ def test_plugin_tool_runs_inside_react_loop(tmp_path: Path) -> None:
     plugins_dir.mkdir()
     (plugins_dir / "math_plugin.py").write_text(
         """
-from personal_assistant.tools import tool
+from personal_assistant.agent.tools import tool
 
 @tool(description="计算两数乘积", parameters={"x": "乘数1", "y": "乘数2"})
 def multiply(x: str, y: str) -> str:

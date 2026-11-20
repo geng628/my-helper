@@ -1,21 +1,12 @@
-"""最小 ReAct 循环（Reason 推理 -> Act 调用工具 -> Observe 观察结果）。"""
+"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：不含任何个人助手业务假设或硬编码提示词。"""
 from __future__ import annotations
 
 from collections.abc import Callable
 
-from personal_assistant.llm import LLMClient
-from personal_assistant.tools import ToolRegistry
+from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai.client import LLMClient
 
 MAX_TOOL_ROUNDS = 4
-
-SYSTEM_PROMPT = (
-    "你是用户的个人助手，用简洁自然的中文交流。\n"
-    "能力严格以本轮提供的工具为准；需要查证事实或借助工具时先调用工具，"
-    "拿到足够证据后直接回答，不要编造未观测到的结果。\n"
-    "系统提示中的 MEMORY.md 仅作记忆目录索引，详细事实与主题文件存放在 data/memory/，"
-    "需要回忆往事或核对细节时请按需调用 search_markdown 或 read_markdown 查阅。\n"
-    "当用户更新偏好或项目事实时直接确认即可，无需用 write_file 写入工作区，也无需让用户手动修改 data/memory/，后台会自动整理沉淀。"
-)
 
 
 # 从模型返回的消息字典中提取纯文本回复，为空时使用兜底文案
@@ -24,7 +15,7 @@ def _extract_reply(message: dict[str, object], fallback: str = "模型没有返�
     return content or fallback
 
 
-# 执行有轮次上限的 ReAct 主循环：原地追加对话与工具消息，并返回最终自然语言回答
+# 执行有轮次上限的通用 ReAct 主循环：原地追加对话与工具消息，并返回最终自然语言回答
 def run_react(
     llm: LLMClient,
     messages: list[dict[str, object]],

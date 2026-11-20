@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.app import AssistantApp
-from personal_assistant.commands import ToolsConfig
+from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.eval import main as eval_main
-from personal_assistant.llm import NoopLLMClient
-from personal_assistant.memory import MemoryStore
-from personal_assistant.plugins import load_plugin_retrievers
+from personal_assistant.ai import NoopLLMClient
+from personal_assistant.assistant.memory import MemoryStore
+from personal_assistant.agent.plugins import load_plugin_retrievers
 
 
 # 测试插件加载器能从 plugins/ 自动发现 fts5_bm25 检索插件，并受 tools.json 的 retrieval 段开关控制

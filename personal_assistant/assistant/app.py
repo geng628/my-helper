@@ -8,18 +8,19 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.cache_metrics import CacheMonitor
-from personal_assistant.commands import ToolsConfig
-from personal_assistant.consolidator import (
+from personal_assistant.agent.react import MAX_TOOL_ROUNDS, run_react
+from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai.cache import CacheMonitor
+from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
     ConsolidationPolicy,
     MemoryConsolidator,
 )
-from personal_assistant.db import StateStore
-from personal_assistant.llm import LLMClient, NoopLLMClient, from_env
-from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
-from personal_assistant.react import MAX_TOOL_ROUNDS, SYSTEM_PROMPT, run_react
-from personal_assistant.tools import ToolRegistry
+from personal_assistant.assistant.db import StateStore
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.prompts import format_system_prompt
 
 MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_ITEM_CHARS = 2000
@@ -113,20 +114,7 @@ class AssistantApp:
 
     # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用
     def build_system_prompt(self, registry: ToolRegistry) -> str:
-        tool_list = "、".join(registry.names) or "（无）"
-        parts = [
-            SYSTEM_PROMPT,
-            f"【可用白名单工具】\n{tool_list}",
-        ]
-        rules = self.memory.read_rules_summary()
-        if rules:
-            parts.append(f"【行为规则 (data/memory/rules/)】\n{rules}")
-        index = self.memory.read_memory_index()
-        if index:
-            parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-        today = self._today().isoformat()
-        parts.append(f"今天是 {today}（北京时间）。")
-        return "\n\n".join(parts)
+        return format_system_prompt(self.memory, tool_names=registry.names, today=self._today())
 
     # 获取指定会话冻结的系统提示词：整场会话复用首次快照，防止中途改写记忆打穿 KV Cache
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:

@@ -1,38 +1,21 @@
-"""最小终端交互（REPL）入口，基于 AssistantApp 提供持久化对话与快捷斜杠命令。"""
+"""Layer 3 终端交互（REPL）入口，基于 AssistantApp 提供持久化对话与快捷斜杠命令。"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from personal_assistant.app import AssistantApp, build_app
-from personal_assistant.cache_metrics import format_cache_summary
-from personal_assistant.commands import ToolsConfig
-from personal_assistant.llm import LLMClient, LLMNotConfigured, from_env
-from personal_assistant.memory import FilesPolicy, MemoryStore, memory_tools
-from personal_assistant.plugins import load_plugin_tools
-from personal_assistant.react import SYSTEM_PROMPT, run_react
-from personal_assistant.tools import ToolRegistry
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-# 读取本地 .env 文件并将未设置的 KEY=VALUE 注入当前进程环境变量
-def load_dotenv(path: Path = Path(".env")) -> None:
-    if not path.is_file():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            os.environ.setdefault(key, value)
+from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.react import run_react
+from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai.cache import format_cache_summary
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.assistant.app import AssistantApp, build_app
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
 # 从可编辑插件文件加载演示用时间工具（不硬编码工具实现）
@@ -54,26 +37,12 @@ def build_repl_tools(
     if cfg_path.is_file():
         cfg = ToolsConfig.load(cfg_path, project_root=project_root)
         policy = FilesPolicy.from_dict(cfg.files, project_root=project_root, data_root=data_dir)
-        memory = MemoryStore(data_dir, policy=policy)
+        memory = MemoryStore(data_dir, policy=policy, retriever=cfg.build_retriever())
         registry = cfg.build_registry(*memory_tools(memory, get_user_message=get_user_message))
         return registry, memory
 
     memory = MemoryStore(data_dir)
     return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message)), memory
-
-
-# 组装系统提示词：静态指令与规则在前、目录索引与日期在后（供离线评测与独立调用复用）
-def format_system_prompt(memory: MemoryStore) -> str:
-    parts = [SYSTEM_PROMPT]
-    rules = memory.read_rules_summary()
-    if rules:
-        parts.append(f"【行为规则 (data/memory/rules/)】\n{rules}")
-    index = memory.read_memory_index()
-    if index:
-        parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    parts.append(f"今天是 {today}（北京时间）。")
-    return "\n\n".join(parts)
 
 
 # 终端回调函数：实时打印每一步工具调用（Act）与观察结果（Observe）

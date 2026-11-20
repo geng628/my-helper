@@ -10,12 +10,16 @@ from statistics import mean
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
-from personal_assistant.app import AssistantApp
-from personal_assistant.cache_metrics import CallCacheRecord, summarize_records
-from personal_assistant.cli import REPO_ROOT
-from personal_assistant.consolidator import ConsolidationPolicy, MemoryConsolidator, _parse_json_object
+from personal_assistant.ai.cache import CallCacheRecord, summarize_records
+from personal_assistant.ai.client import LLMClient, NoopLLMClient
+from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.assistant.common import REPO_ROOT
+from personal_assistant.assistant.consolidator import (
+    ConsolidationPolicy,
+    MemoryConsolidator,
+    _parse_json_object,
+)
 from personal_assistant.eval.common import current_git_commit
-from personal_assistant.llm import LLMClient, NoopLLMClient
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict, impartial evaluator grading an AI assistant's answer against a reference answer.\n"

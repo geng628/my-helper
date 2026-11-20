@@ -16,8 +16,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from personal_assistant.commands import truncate_utf8
-from personal_assistant.tools import tool
+from personal_assistant.agent.tools import tool
+from personal_assistant.assistant.common import truncate_utf8
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_USER_AGENT = (

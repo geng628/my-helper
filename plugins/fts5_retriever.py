@@ -9,11 +9,11 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from personal_assistant.memory import SearchHit
-from personal_assistant.memory_lifecycle import UNTIL_PATTERN, today_shanghai
+from personal_assistant.assistant.memory import SearchHit
+from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN, today_shanghai
 
 if TYPE_CHECKING:
-    from personal_assistant.memory import MemoryStore
+    from personal_assistant.assistant.memory import MemoryStore
 
 RETRIEVER_NAME = "fts5_bm25"
 
