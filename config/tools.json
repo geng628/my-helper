@@ -44,7 +44,7 @@
     "cwd": ".",
     "timeout": 10,
     "max_output_bytes": 8192,
-    "reject_segments": [".env", ".ssh", "state", "uploads"]
+    "reject_segments": [".env", ".ssh", "state", "uploads", "models.dsl", "models.json"]
   },
   "files": {
     "read_roots": ["data/memory", "data/workspace", "docs"],
@@ -53,7 +53,7 @@
     "max_write_bytes": 65536,
     "max_lines": 400,
     "max_results": 100,
-    "reject_segments": [".env", ".git", "state", ".ssh", "uploads"]
+    "reject_segments": [".env", ".git", "state", ".ssh", "uploads", "models.dsl", "models.json"]
   },
   "commands": [
     {

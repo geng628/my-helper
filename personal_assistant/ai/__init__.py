@@ -19,15 +19,19 @@ from personal_assistant.ai.client import (
     default_post_json,
     extract_usage,
     from_env,
+    from_model_profile,
+    from_models_dict,
     register_provider,
 )
-from personal_assistant.ai.types import TokenUsage, ToolCall, ToolSchema
+from personal_assistant.ai.types import ModelProfile, ModelsConfig, TokenUsage, ToolCall, ToolSchema
 
 __all__ = [
     "CacheMonitor",
     "CallCacheRecord",
     "LLMClient",
     "LLMNotConfigured",
+    "ModelProfile",
+    "ModelsConfig",
     "NoopLLMClient",
     "OpenAICompatibleLLM",
     "PostJson",
@@ -42,6 +46,8 @@ __all__ = [
     "extract_usage",
     "format_cache_summary",
     "from_env",
+    "from_model_profile",
+    "from_models_dict",
     "register_provider",
     "serialize_request",
     "summarize_records",

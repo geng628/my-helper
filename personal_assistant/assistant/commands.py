@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from personal_assistant.agent.plugins import RetrieverFactory, load_plugins
+from personal_assistant.agent.plugins import ConfigCompiler, RetrieverFactory, load_plugins
 from personal_assistant.agent.tools import Tool, ToolRegistry
-from personal_assistant.ai.client import register_provider
+from personal_assistant.ai.client import (
+    LLMClient,
+    from_env,
+    from_model_profile,
+    register_provider,
+)
+from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.common import truncate_utf8
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
@@ -197,7 +205,24 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     return spec, enabled
 
 
-# config/tools.json 的完整配置对象（管理白名单、插件工具、检索插件、文件策略与固定命令）
+# 以 0600 仅属主可读权限原子落盘私密 JSON 配置（如编译后的 config/models.json），防误泄露
+def _atomic_write_private_json(target: Path, data: dict[str, object]) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-models-", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target)
+        os.chmod(target, 0o600)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+# config/tools.json 的完整配置对象（管理白名单、插件工具、检索/配置编译插件、文件策略与固定命令）
 @dataclass(frozen=True)
 class ToolsConfig:
     enabled_tools: tuple[str, ...]
@@ -207,8 +232,9 @@ class ToolsConfig:
     plugin_tools: tuple[Tool, ...] = ()
     retrieval: dict[str, object] = field(default_factory=dict)
     plugin_retrievers: tuple[tuple[str, RetrieverFactory], ...] = ()
+    plugin_compilers: tuple[tuple[str, ConfigCompiler], ...] = ()
 
-    # 从 tools.json 读取并校验白名单配置，同时自动扫描加载 plugins 目录中的工具与检索插件
+    # 从 tools.json 读取并校验白名单配置，同时自动扫描加载 plugins 目录中的全部插件
     @classmethod
     def load(cls, config_path: Path, project_root: Path | None = None) -> "ToolsConfig":
         resolved_cfg = config_path.resolve()
@@ -247,7 +273,9 @@ class ToolsConfig:
             if enabled:
                 commands.append(spec)
 
-        loaded_tools, loaded_retrievers, loaded_providers = load_plugins(plugins_raw, root)
+        loaded_tools, loaded_retrievers, loaded_providers, loaded_compilers = load_plugins(
+            plugins_raw, root
+        )
         for prov_name, prov_factory in loaded_providers.items():
             register_provider(prov_name, prov_factory)
 
@@ -259,7 +287,45 @@ class ToolsConfig:
             plugin_tools=tuple(loaded_tools),
             retrieval=dict(retrieval_raw),
             plugin_retrievers=tuple(sorted(loaded_retrievers.items())),
+            plugin_compilers=tuple(sorted(loaded_compilers.items())),
         )
+
+    # 加载模型配置：优先通过 models_dsl 插件编译 models.dsl（可选原子落盘为 0600 权限的 models.json），否则直接读 models.json
+    def load_models_config(
+        self,
+        config_dir: Path,
+        *,
+        write_json: bool = False,
+    ) -> ModelsConfig | None:
+        cfg_dir = config_dir.resolve()
+        dsl_path = cfg_dir / "models.dsl"
+        json_path = cfg_dir / "models.json"
+        if dsl_path.is_file():
+            compilers = dict(self.plugin_compilers)
+            compiler = compilers.get("models_dsl")
+            if compiler is None:
+                raise ValueError("发现 config/models.dsl，但未加载 models_dsl 编译插件。")
+            compiled = compiler(dsl_path.read_text(encoding="utf-8"), dsl_path.name)
+            models_cfg = ModelsConfig.from_dict(compiled)
+            if write_json:
+                _atomic_write_private_json(json_path, compiled)
+            return models_cfg
+        if json_path.is_file():
+            raw = json.loads(json_path.read_text(encoding="utf-8"))
+            return ModelsConfig.from_dict(raw)
+        return None
+
+    # 基于 models.dsl / models.json 构造 LLMClient；若均不存在则回退到环境变量 from_env()
+    def build_llm(
+        self,
+        config_dir: Path,
+        *,
+        model_name: str | None = None,
+    ) -> LLMClient:
+        models_cfg = self.load_models_config(config_dir)
+        if models_cfg is not None:
+            return from_model_profile(models_cfg.get_profile(model_name))
+        return from_env()
 
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
     def build_retriever(self, override_name: str | None = None) -> object | None:

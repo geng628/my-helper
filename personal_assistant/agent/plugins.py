@@ -12,6 +12,7 @@ from personal_assistant.agent.tools import Tool
 from personal_assistant.ai.client import ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
+ConfigCompiler = Callable[..., dict[str, object]]
 
 
 # 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
@@ -116,15 +117,21 @@ def _extract_named_factories(
     return found
 
 
-# 一次扫描同时加载插件工具、插件检索后端与插件 LLM Provider，避免同一模块被重复执行
+# 一次扫描同时加载插件工具、插件检索后端、插件 LLM Provider 与配置编译器插件，避免重复执行模块
 def load_plugins(
     entries: Iterable[str],
     project_root: Path,
-) -> tuple[list[Tool], dict[str, RetrieverFactory], dict[str, ProviderFactory]]:
+) -> tuple[
+    list[Tool],
+    dict[str, RetrieverFactory],
+    dict[str, ProviderFactory],
+    dict[str, ConfigCompiler],
+]:
     loaded_tools: list[Tool] = []
     seen_tools: set[str] = set()
     loaded_retrievers: dict[str, RetrieverFactory] = {}
     loaded_providers: dict[str, ProviderFactory] = {}
+    loaded_compilers: dict[str, ConfigCompiler] = {}
 
     for file_path in _resolve_plugin_targets(entries, project_root):
         module = _import_plugin_module(file_path)
@@ -156,12 +163,23 @@ def load_plugins(
                 raise ValueError(f"模型 Provider 插件名称重复：{name}（文件：{file_path.name}）")
             loaded_providers[name] = factory
 
-    return loaded_tools, loaded_retrievers, loaded_providers
+        for name, compiler in _extract_named_factories(
+            module,
+            file_path,
+            dict_attr="CONFIG_COMPILERS",
+            name_attr="COMPILER_NAME",
+            factory_attr="compile_config",
+        ).items():
+            if name in loaded_compilers:
+                raise ValueError(f"配置编译器插件名称重复：{name}（文件：{file_path.name}）")
+            loaded_compilers[name] = compiler
+
+    return loaded_tools, loaded_retrievers, loaded_providers, loaded_compilers
 
 
 # 批量加载配置声明的全部插件工具，并禁止跨文件重名
 def load_plugin_tools(entries: Iterable[str], project_root: Path) -> list[Tool]:
-    tools, _, _ = load_plugins(entries, project_root)
+    tools, _, _, _ = load_plugins(entries, project_root)
     return tools
 
 
@@ -170,7 +188,7 @@ def load_plugin_retrievers(
     entries: Iterable[str],
     project_root: Path,
 ) -> dict[str, RetrieverFactory]:
-    _, retrievers, _ = load_plugins(entries, project_root)
+    _, retrievers, _, _ = load_plugins(entries, project_root)
     return retrievers
 
 
@@ -179,5 +197,14 @@ def load_plugin_providers(
     entries: Iterable[str],
     project_root: Path,
 ) -> dict[str, ProviderFactory]:
-    _, _, providers = load_plugins(entries, project_root)
+    _, _, providers, _ = load_plugins(entries, project_root)
     return providers
+
+
+# 批量加载配置声明的全部外部配置编译器插件（如 models_dsl -> models.json）
+def load_plugin_compilers(
+    entries: Iterable[str],
+    project_root: Path,
+) -> dict[str, ConfigCompiler]:
+    _, _, _, compilers = load_plugins(entries, project_root)
+    return compilers

@@ -1,4 +1,6 @@
 .env
+config/models.dsl
+config/models.json
 .venv/
 .uv-cache/
 .pytest_cache/

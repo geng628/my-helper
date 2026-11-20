@@ -140,10 +140,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="启动 My Helper 本地网页对话界面（纯标准库，无需额外插件）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
+    parser.add_argument("--model", default=None, help="指定 config/models.dsl 或 models.json 中的模型名称")
     parser.add_argument("--open", action="store_true", help="启动后自动打开系统默认浏览器")
     args = parser.parse_args(argv)
 
-    app = build_app()
+    app = build_app(model_name=args.model)
     server = create_web_server(app, host=args.host, port=args.port)
     url = f"http://{args.host}:{server.server_port}"
     print(f"My Helper 本地网页对话已启动：{url}")

@@ -37,17 +37,21 @@ uv run python -m personal_assistant.eval --mode search \
 # 5. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
 
-# 6. 配置环境变量并启动真实对话或端到端评测（单轮 agent / 16 场景 memory / LongMemEval）
+# 6. 配置模型并启动真实对话（方式 A：极简 DSL 免配环境变量；方式 B：沿用 .env）
+cp config/models.example.dsl config/models.dsl
+# 直接在 config/models.dsl 里填 api_key（已默认 .gitignore + 0600 权限 + Agent 工具沙箱屏蔽）
+uv run python -m personal_assistant compile-config   # 可选：显式编译导出 config/models.json 并查看脱敏配置
+uv run python -m personal_assistant chat             # 或 `--model local_qwen` 一键切模型
+# 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
+uv run python scripts/web_chat.py --open
+
+# 方式 B：也可以沿用 .env 环境变量运行端到端评测（单轮 agent / 16 场景 memory / LongMemEval）
 cp .env.example .env
-# 编辑 .env，设置 LLM_MODE=on、LLM_API_KEY、LLM_BASE_URL 与 LLM_MODEL
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
 uv run python -m personal_assistant.eval --mode memory \
   --cases evals/public/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
-uv run python -m personal_assistant chat
-# 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
-uv run python scripts/web_chat.py --open
 ```
 
 ## 评测体系与当前基线
@@ -66,10 +70,12 @@ uv run python scripts/web_chat.py --open
 ```text
 my_helper_v2/
 ├── config/
-│   └── tools.json                 # 工具白名单、插件路径、检索后端配置、目录边界与固定命令
+│   ├── tools.json                 # 工具白名单、插件路径、检索后端配置、目录边界与固定命令
+│   └── models.example.dsl         # 极简模型配置 DSL 示例（复制为 config/models.dsl 直填 api_key，自动防泄漏）
 ├── plugins/
 │   ├── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
 │   ├── fts5_retriever.py          # SQLite FTS5 + BM25 检索后端插件（受 tools.json 的 retrieval 段管控）
+│   ├── models_dsl.py              # 极简模型配置 DSL 外部编译插件（Lexer -> 递归下降 AST -> 语义校验 -> JSON）
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
 ├── evals/
@@ -112,6 +118,7 @@ my_helper_v2/
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
+│   ├── test_models_dsl.py         # 模型配置 DSL 编译插件、直写密钥与系统级防泄漏单元测试
 │   ├── test_fts5_plugin.py        # SQLite FTS5 + BM25 检索插件单元测试
 │   ├── test_shell_plugin.py       # 受控白名单 Shell 插件安全边界单元测试
 │   ├── test_web_plugin.py         # 联网搜索与防 SSRF 抓网页插件单元测试

@@ -133,18 +133,32 @@ def run_repl(
             active_app.close()
 
 
-# 命令行总入口：加载 .env 并解析子命令（默认进入 chat 交互模式）
+# 命令行总入口：加载 .env 并解析子命令（支持 chat 对话与 compile-config 编译 models.dsl）
 def main(argv: list[str] | None = None) -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="my-helper")
     parser.add_argument("--data", default=None, help="数据目录路径（默认读取 MY_HELPER_DATA 或 data）")
     parser.add_argument("--config", default=None, help="配置目录路径（默认读取 MY_HELPER_CONFIG 或 config）")
+    parser.add_argument("--model", default=None, help="指定 models.dsl / models.json 中定义的模型档案名称")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
+    subparsers.add_parser("compile-config", help="将 config/models.dsl 编译为 0600 权限的标准 config/models.json")
     args = parser.parse_args(argv)
+    cfg_dir = (Path(args.config) if args.config else Path(os.getenv("MY_HELPER_CONFIG", "config"))).resolve()
+    if args.command == "compile-config":
+        tools_json = cfg_dir / "tools.json"
+        tcfg = ToolsConfig.load(tools_json, project_root=cfg_dir.parent)
+        compiled = tcfg.load_models_config(cfg_dir, write_json=True)
+        if compiled is None:
+            print(f"未在 {cfg_dir} 下找到 models.dsl 或 models.json（可复制 config/models.example.dsl 为 config/models.dsl）。")
+            return
+        print(f"已编译并写入：{cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 保护）")
+        print(json.dumps(compiled.redacted_dict(), ensure_ascii=False, indent=2))
+        return
     if args.command in (None, "chat"):
         app = build_app(
             data_root=Path(args.data) if args.data else None,
-            config_root=Path(args.config) if args.config else None,
+            config_root=cfg_dir,
+            model_name=args.model,
         )
         run_repl(app)

@@ -41,6 +41,7 @@ class AssistantApp:
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: LLMClient | None = None,
         today_fn: Callable[[], date] | None = None,
+        model_name: str | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -72,7 +73,12 @@ class AssistantApp:
             self.memory = MemoryStore(self.data_root)
 
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
-        self.llm = llm or from_env()
+        if llm is not None:
+            self.llm = llm
+        elif self.tools_config is not None and self.config_path is not None:
+            self.llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
+        else:
+            self.llm = from_env()
         self._prompt_lock = threading.Lock()
         self._session_prompts: dict[str, str] = {}
         self._last_archive_day = ""
@@ -261,18 +267,27 @@ class AssistantApp:
         }
 
 
-# 按环境变量或显式路径构建默认 AssistantApp 实例
+# 按环境变量或显式路径构建默认 AssistantApp 实例（自动优先加载 models.dsl / models.json）
 def build_app(
     data_root: Path | None = None,
     config_root: Path | None = None,
     llm: LLMClient | None = None,
+    *,
+    project_root: Path | None = None,
+    model_name: str | None = None,
 ) -> AssistantApp:
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
     cfg_dir = (config_root or Path(os.getenv("MY_HELPER_CONFIG", "config"))).resolve()
     tools_json = cfg_dir / "tools.json"
+    proj = (
+        project_root.resolve()
+        if project_root is not None
+        else (cfg_dir.parent if tools_json.is_file() else data_dir.parent)
+    )
     return AssistantApp(
         data_root=data_dir,
         config_path=tools_json if tools_json.is_file() else None,
-        project_root=cfg_dir.parent if tools_json.is_file() else data_dir.parent,
+        project_root=proj,
         llm=llm,
+        model_name=model_name,
     )

@@ -31,7 +31,7 @@ DEFAULT_ALLOWED_EXECUTABLES = (
     "pytest",
 )
 DEFAULT_GIT_SUBCOMMANDS = ("status", "log", "diff", "show", "branch", "rev-parse")
-DEFAULT_REJECT_SEGMENTS = (".env", ".ssh", "state", "uploads")
+DEFAULT_REJECT_SEGMENTS = (".env", ".ssh", "state", "uploads", "models.dsl", "models.json")
 DANGEROUS_FIND_FLAGS = frozenset(
     {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
 )

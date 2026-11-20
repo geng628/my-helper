@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from personal_assistant.ai.types import TokenUsage
+from personal_assistant.ai.types import ModelProfile, ModelsConfig, TokenUsage
 
 
 # 当未配置 LLM_MODE=on 或缺少 API Key 时抛出的异常
@@ -151,10 +151,13 @@ class OpenAICompatibleLLM(LLMClient):
 
 # 默认内建 OpenAI 兼容 Provider 构造器
 def _build_openai_compatible(env: Mapping[str, str]) -> LLMClient:
+    raw_temp = env.get("LLM_TEMPERATURE", "").strip()
+    temp = float(raw_temp) if raw_temp else 0.2
     return OpenAICompatibleLLM(
         api_key=env.get("LLM_API_KEY", "").strip(),
         base_url=env.get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
         model=env.get("LLM_MODEL", "deepseek-chat"),
+        temperature=temp,
     )
 
 
@@ -191,3 +194,42 @@ def from_env(env: Mapping[str, str] | None = None) -> LLMClient:
             f"未知 LLM_PROVIDER={provider!r}，可用 Provider：{', '.join(available_providers())}"
         )
     return factory(source)
+
+
+# 根据单个 ModelProfile 构造对应的 LLMClient（统一复用已注册 Provider，支持直写密钥免配环境变量）
+def from_model_profile(
+    profile: ModelProfile,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> LLMClient:
+    api_key = profile.resolve_api_key(env)
+    if not api_key:
+        return NoopLLMClient()
+    factory = _PROVIDERS.get(profile.provider)
+    if factory is None:
+        raise ValueError(
+            f"模型 {profile.name!r} 使用了未知 provider={profile.provider!r}，可用：{', '.join(available_providers())}"
+        )
+    merged: dict[str, str] = dict(os.environ if env is None else env)
+    merged.update(
+        {
+            "LLM_MODE": "on",
+            "LLM_PROVIDER": profile.provider,
+            "LLM_API_KEY": api_key,
+            "LLM_BASE_URL": profile.base_url,
+            "LLM_MODEL": profile.model,
+            "LLM_TEMPERATURE": str(profile.temperature),
+        }
+    )
+    return factory(merged)
+
+
+# 从标准 models.json 字典与可选模型名直接构造 LLMClient
+def from_models_dict(
+    raw: dict[str, object],
+    *,
+    profile_name: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> LLMClient:
+    cfg = ModelsConfig.from_dict(raw)
+    return from_model_profile(cfg.get_profile(profile_name), env=env)

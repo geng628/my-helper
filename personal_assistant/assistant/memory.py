@@ -24,7 +24,7 @@ from personal_assistant.assistant.memory_lifecycle import (
     today_shanghai as _today_shanghai,
 )
 
-DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads")
+DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads", "models.dsl", "models.json")
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
 
 

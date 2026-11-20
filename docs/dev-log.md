@@ -32,7 +32,8 @@
 | `cffbf26`、`552863d` | 扩建四层评测体系（40 题检索 + 16 场景多轮记忆 + LongMemEval/LoCoMo 适配器），并将公开数据与下载入口统一收拢至 `evals/public/` 与 `--mode download` | 原 4 题/5 场景太玩具；扩充后主动保留高难改写、干扰负例与学术公开集，真实暴露短板；修正散落目录，恢复 `data/` 为纯运行时目录 |
 | `d2e20e3` | 扩展 `plugins.py` 支持 `RETRIEVERS` 检索插件，实现零依赖 `plugins/fts5_retriever.py`（SQLite FTS5 + BM25）与 `--retriever` A/B 对比 | 对标重型向量方案后采取“先零依赖 FTS5 BM25 插件打底、后续按需叠 Embedding+RRF 插件”的渐进路线，LoCoMo 200 题 Recall 从 42.8% 跃升至 68.5%，延迟降 3 倍 |
 | `8d1271c` | 新增 `AGENTS.md` 与 `docs/dev-log.md` 跨模型交接文档 | 沉淀全量设计取舍、12 个真实踩坑根因与 Benchmark 总账，支持换任意模型无缝续写 |
-| 本次提交 | 借鉴 Pi 三层架构方法论完成 `ai → agent → assistant + eval` 三层重构，引入 `ToolSchema → Tool` 类型递进扩展、`LLM_PROVIDERS` 插件口与 `tests/test_architecture.py` 守卫测试 | 彻底消灭 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台与 `react.py` 夹带个人业务提示词的问题；通过 AST + 子进程 `sys.modules` 隔离测试验证三层均可剥离上层独立运行 |
+| `3510a16` | 借鉴 Pi 三层架构方法论完成 `ai → agent → assistant + eval` 三层重构，引入 `ToolSchema → Tool` 类型递进扩展、`LLM_PROVIDERS` 插件口与 `tests/test_architecture.py` 守卫测试 | 彻底消灭 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台与 `react.py` 夹带个人业务提示词的问题；通过 AST + 子进程 `sys.modules` 隔离测试验证三层均可剥离上层独立运行 |
+| 本次提交 | 新增外部配置 DSL 编译插件 `plugins/models_dsl.py` + `CONFIG_COMPILERS` 第 4 类插件扩展点 + 系统级零心智防泄漏保护 | 核心层依然只认识标准 JSON（`ModelProfile` / `ModelsConfig`）；用户可在 `config/models.dsl` 直接写 `api_key` 免配环境变量，防泄漏由系统默认兜底（`.gitignore`、`0600` 落盘权限、文件与 Shell 沙箱屏蔽、全自动脱敏） |
 
 ---
 
@@ -163,4 +164,21 @@
   - 离线检索（40 题 / LoCoMo 200 题，`fts5_bm25`）：40 题 **38/40 (95.0%)**、MRR **0.9483**、0.52 ms；LoCoMo 200 题 **105/200 (52.5%)**、Recall **68.51%**、MRR **0.6221**、9.19 ms —— **与 `d2e20e3` 完全持平，零退步**。
   - 实模多轮记忆：本次为纯模块分层重构，未改动提示词语义、检索算法或沉淀逻辑，未重复消耗 API 重跑（可在 P1 改提示词时一并验收）。
 - **下一步**：继续按第五节 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）推进。
+
+---
+
+### [2026-11-21] 极简模型配置 DSL 外部编译插件与系统级防泄漏保护
+- **目标与思路**：支持通过 JSON 管理多模型配置档案（`models.json`）并一键切换 `--model`，同时解决“手写 JSON 繁琐 + 普通用户不懂配环境变量”的痛点：在 `plugins/models_dsl.py` 手写零依赖编译器前端（Lexer → 递归下降 AST → 语义校验 → 标准 JSON），允许用户直接把 `api_key` 写进极简 `config/models.dsl`；把防泄漏职责完全收归系统，而不是甩给用户。
+- **改动文件**：
+  - Layer 1 (`personal_assistant/ai/types.py`, `client.py`, `__init__.py`)：新增 `ModelProfile`、`ModelsConfig`（带 `redacted_dict()` 脱敏）、`from_model_profile()`、`from_models_dict()`，仅识别标准 JSON 字典，对 DSL 零感知。
+  - Layer 2 (`personal_assistant/agent/plugins.py`, `__init__.py`)：新增第 4 类统一插件扩展点 `CONFIG_COMPILERS` / `load_plugin_compilers()`。
+  - Layer 3 (`personal_assistant/assistant/commands.py`, `app.py`, `cli.py`, `memory.py`)：`ToolsConfig.load_models_config()`（优先编译 `models.dsl`，支持原子写入 `0600` 权限 `models.json`，无 DSL 时直读 `models.json`，均无时兼容回退 `.env`）、新增 CLI `--model` 与 `compile-config` 子命令；`scripts/web_chat.py` 同步支持 `--model`。
+  - 外部编译插件与安全防护：`plugins/models_dsl.py`、`config/models.example.dsl`、`.gitignore` 屏蔽 `config/models.dsl` 与 `config/models.json`、`config/tools.json` + `memory.py` + `plugins/shell_tools.py` 默认拦截读取密钥配置文件。
+  - 单元测试：`tests/test_models_dsl.py`（4 条完整测试，覆盖语法/语义行列报错、直写密钥零环境变量启动、`0600` 权限、脱敏、`.gitignore` 与文件/Shell 双沙箱拦截）。
+- **验证与回归**：
+  - 单元测试：**72/72 passed**（含三层漏斗守卫 `tests/test_architecture.py` 全绿），AST 中文注释零缺失。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**，零退步。
+  - 实模多轮记忆：本次未改动检索算法与提示词语义，未重复消耗 API 重跑。
+- **下一步**：继续按第五节 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）推进。
+
 
