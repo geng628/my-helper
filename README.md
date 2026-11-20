@@ -2,7 +2,7 @@
 
 一个**零第三方运行依赖**的纯 Python 个人 AI Agent 最小 MVP。不套用黑盒框架，从最基础的 ReAct 循环开始，一步步搭起白名单工具沙箱、插件加载器、纯 Markdown 记忆系统与轻量评测模块。
 
-> 详细架构与演进规划见 [docs/mvp-design.md](docs/mvp-design.md)。
+> 详细架构设计见 [docs/mvp-design.md](docs/mvp-design.md)；完整的工程演进、排坑复盘、Benchmark 演进总账与跨模型交接路线图见 [docs/dev-log.md](docs/dev-log.md) 与 [AGENTS.md](AGENTS.md)。
 
 ## 核心原则
 
@@ -78,7 +78,9 @@ my_helper_v2/
 │   ├── sample_data/               # 8 篇主题 Markdown 与规则样例语料
 │   └── public/                    # （gitignore）下载转换的 LongMemEval / LoCoMo 公开学术基准
 ├── docs/
-│   └── mvp-design.md              # 整体设计文档
+│   ├── mvp-design.md              # 整体设计文档
+│   └── dev-log.md                 # 工程演进、真实踩坑根因、评测总账与跨模型交接日志
+├── AGENTS.md                      # 仓库协作红线、TDD/评测纪律与跨模型续写协议
 ├── personal_assistant/
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
