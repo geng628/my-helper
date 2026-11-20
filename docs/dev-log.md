@@ -33,7 +33,8 @@
 | `d2e20e3` | 扩展 `plugins.py` 支持 `RETRIEVERS` 检索插件，实现零依赖 `plugins/fts5_retriever.py`（SQLite FTS5 + BM25）与 `--retriever` A/B 对比 | 对标重型向量方案后采取“先零依赖 FTS5 BM25 插件打底、后续按需叠 Embedding+RRF 插件”的渐进路线，LoCoMo 200 题 Recall 从 42.8% 跃升至 68.5%，延迟降 3 倍 |
 | `8d1271c` | 新增 `AGENTS.md` 与 `docs/dev-log.md` 跨模型交接文档 | 沉淀全量设计取舍、12 个真实踩坑根因与 Benchmark 总账，支持换任意模型无缝续写 |
 | `3510a16` | 借鉴 Pi 三层架构方法论完成 `ai → agent → assistant + eval` 三层重构，引入 `ToolSchema → Tool` 类型递进扩展、`LLM_PROVIDERS` 插件口与 `tests/test_architecture.py` 守卫测试 | 彻底消灭 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台与 `react.py` 夹带个人业务提示词的问题；通过 AST + 子进程 `sys.modules` 隔离测试验证三层均可剥离上层独立运行 |
-| 本次提交 | 新增外部配置 DSL 编译插件 `plugins/models_dsl.py` + `CONFIG_COMPILERS` 第 4 类插件扩展点 + 系统级零心智防泄漏保护 | 核心层依然只认识标准 JSON（`ModelProfile` / `ModelsConfig`）；用户可在 `config/models.dsl` 直接写 `api_key` 免配环境变量，防泄漏由系统默认兜底（`.gitignore`、`0600` 落盘权限、文件与 Shell 沙箱屏蔽、全自动脱敏） |
+| `35cc8ea` | 新增外部配置 DSL 编译插件 `plugins/models_dsl.py` + `CONFIG_COMPILERS` 第 4 类插件扩展点 + 系统级零心智防泄漏保护 | 核心层依然只认识标准 JSON（`ModelProfile` / `ModelsConfig`）；用户可在 `config/models.dsl` 直接写 `api_key` 免配环境变量，防泄漏由系统默认兜底（`.gitignore`、`0600` 落盘权限、文件与 Shell 沙箱屏蔽、全自动脱敏） |
+| 本次提交 | 面向零代码用户的极简一行预设语法（`use deepseek sk-...`）+ 终端一键向导 `setup` + 网页端「模型设置」自动生成与热切换 | 把“编程味”彻底降为零：内置 7 大主流厂商预设自动补全 URL/模型名/协议/温度，终端与网页均可 10 秒点选自动生成 `models.dsl` 与 `models.json`（均 0600 权限）并即时热生效 |
 
 ---
 
@@ -180,5 +181,21 @@
   - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**，零退步。
   - 实模多轮记忆：本次未改动检索算法与提示词语义，未重复消耗 API 重跑。
 - **下一步**：继续按第五节 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）推进。
+
+---
+
+### [2026-11-21] 零代码模型配置体验升级（一行预设语法 + 终端 `setup` 向导 + 网页端热切换表单）
+- **目标与思路**：站在完全不懂代码的普通用户视角，去掉 `provider`、`base_url`、`temp` 和 `{ }` 花括号的编程心智负担；把主流厂商预设与自动生成能力全部收敛在 `plugins/models_dsl.py` 内，做到“能点就不写，要写也只写一行 `use deepseek sk-xxx`”。
+- **改动文件**：
+  - `plugins/models_dsl.py`：新增 7 大厂商内置预设（DeepSeek / 通义千问 / Kimi / 智谱 GLM / OpenAI / 硅基流动 / 本地免密钥 Ollama）、中英文别名识别、极简一行语句 `use/add <厂商> [模型名] [api_key]`，以及挂在编译器上的 `presets()` 与 `render()` 自动生成器（核心层零直接 import 插件）。
+  - `personal_assistant/assistant/commands.py` & `app.py`：新增 `save_model_setup()`（先内存编译校验再 0600 原子写入 `models.dsl` + `models.json`）、`reload_llm()`、`configure_model()`、`models_overview()`。
+  - `personal_assistant/assistant/cli.py`：新增 `run_setup_wizard()` 与 `setup` 子命令（终端选编号 + 隐藏输入粘贴 Key 自动生成配置），并在未配模型运行 `chat` 时给出一步引导提示。
+  - `scripts/web_chat.py` & `scripts/web_ui.html`：新增 `GET /api/models`、`POST /api/models/setup` 与右上角「模型设置」非技术表单弹窗（选厂商、贴 Key、保存即热生效，Ollama 自动隐藏 Key 输入框）。
+  - `config/models.example.dsl`：更新为一行 `use deepseek` 极简示例。
+- **验证与回归**：
+  - 单元测试：**75/75 passed**（含 `tests/test_models_dsl.py`、`tests/test_web_chat.py`、`tests/test_architecture.py`），AST 中文注释零缺失。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**，零退步。
+- **下一步**：继续按第五节 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）推进。
+
 
 

@@ -83,6 +83,7 @@ class AssistantApp:
         self._session_prompts: dict[str, str] = {}
         self._last_archive_day = ""
         self.cache_monitor = CacheMonitor()
+        self._custom_consolidator_llm = consolidator_llm is not None
         self.consolidator = MemoryConsolidator(
             self.state,
             self.memory,
@@ -90,6 +91,60 @@ class AssistantApp:
             policy=consolidation_policy,
         )
         self.background_consolidator = BackgroundConsolidator(self.consolidator)
+
+    # 返回内置模型厂商预设目录，供零代码向导与网页设置表单展示
+    def model_presets(self) -> list[dict[str, object]]:
+        if self.tools_config is None:
+            return []
+        return self.tools_config.model_presets()
+
+    # 返回当前模型预设与已配置模型的脱敏视图（绝不包含明文 api_key）
+    def models_overview(self) -> dict[str, object]:
+        configured: dict[str, object] | None = None
+        if self.tools_config is not None and self.config_path is not None:
+            cfg = self.tools_config.load_models_config(self.config_path.parent)
+            if cfg is not None:
+                configured = cfg.redacted_dict()
+        return {
+            "presets": self.model_presets(),
+            "configured": configured,
+            "llm_configured": not isinstance(self.llm, NoopLLMClient),
+        }
+
+    # 按最新 models.dsl / models.json 热切换当前运行中的 LLMClient（无需重启服务）
+    def reload_llm(self, model_name: str | None = None) -> None:
+        if self.tools_config is not None and self.config_path is not None:
+            new_llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
+        else:
+            new_llm = from_env()
+        self.llm = new_llm
+        if not self._custom_consolidator_llm:
+            self.consolidator.llm = new_llm
+
+    # 零代码自动生成 models.dsl 与 models.json（0600 权限）并立即热生效，返回脱敏摘要
+    def configure_model(
+        self,
+        *,
+        preset: str,
+        api_key: str = "",
+        model: str = "",
+        base_url: str = "",
+        name: str = "",
+        temperature: float = 0.2,
+    ) -> dict[str, object]:
+        if self.tools_config is None or self.config_path is None:
+            raise ValueError("当前实例未加载 config/tools.json，无法写入模型配置。")
+        models_cfg = self.tools_config.save_model_setup(
+            self.config_path.parent,
+            preset=preset,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            name=name,
+            temperature=temperature,
+        )
+        self.reload_llm(model_name=models_cfg.default)
+        return models_cfg.redacted_dict()
 
     # 等待所有在途后台沉淀任务完成（供退出收尾或测试调用）
     def wait_for_consolidation(self, timeout: float = 15.0) -> None:

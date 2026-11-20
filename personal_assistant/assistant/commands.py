@@ -205,21 +205,26 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     return spec, enabled
 
 
-# 以 0600 仅属主可读权限原子落盘私密 JSON 配置（如编译后的 config/models.json），防误泄露
-def _atomic_write_private_json(target: Path, data: dict[str, object]) -> None:
+# 以 0600 仅属主可读权限原子落盘私密文本文件（如 models.dsl / models.json），防误泄露
+def _atomic_write_private_text(target: Path, content: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp-models-", dir=str(target.parent))
     tmp_path = Path(tmp_name)
     try:
         os.chmod(tmp_path, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            handle.write(content)
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, target)
         os.chmod(target, 0o600)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+# 以 0600 仅属主可读权限原子落盘私密 JSON 配置（如编译后的 config/models.json），防误泄露
+def _atomic_write_private_json(target: Path, data: dict[str, object]) -> None:
+    _atomic_write_private_text(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 # config/tools.json 的完整配置对象（管理白名单、插件工具、检索/配置编译插件、文件策略与固定命令）
@@ -314,6 +319,46 @@ class ToolsConfig:
             raw = json.loads(json_path.read_text(encoding="utf-8"))
             return ModelsConfig.from_dict(raw)
         return None
+
+    # 获取 models_dsl 插件暴露的内置厂商预设目录，供终端向导与网页设置表单展示
+    def model_presets(self) -> list[dict[str, object]]:
+        compiler = dict(self.plugin_compilers).get("models_dsl")
+        presets_fn = getattr(compiler, "presets", None)
+        if callable(presets_fn):
+            return list(presets_fn())
+        return []
+
+    # 自动生成极简 config/models.dsl 并编译落盘为 0600 权限的 config/models.json（零手写代码）
+    def save_model_setup(
+        self,
+        config_dir: Path,
+        *,
+        preset: str,
+        api_key: str = "",
+        model: str = "",
+        base_url: str = "",
+        name: str = "",
+        temperature: float = 0.2,
+    ) -> ModelsConfig:
+        compiler = dict(self.plugin_compilers).get("models_dsl")
+        render_fn = getattr(compiler, "render", None)
+        if compiler is None or not callable(render_fn):
+            raise ValueError("未加载 models_dsl 配置插件，无法自动生成模型配置。")
+        dsl_text = render_fn(
+            preset=preset,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            name=name,
+            temperature=temperature,
+        )
+        # 先在内存中编译校验，确认无任何语法或语义错误后再原子落盘
+        compiled = compiler(dsl_text, "models.dsl")
+        models_cfg = ModelsConfig.from_dict(compiled)
+        cfg_dir = config_dir.resolve()
+        _atomic_write_private_text(cfg_dir / "models.dsl", dsl_text)
+        _atomic_write_private_json(cfg_dir / "models.json", compiled)
+        return models_cfg
 
     # 基于 models.dsl / models.json 构造 LLMClient；若均不存在则回退到环境变量 from_env()
     def build_llm(

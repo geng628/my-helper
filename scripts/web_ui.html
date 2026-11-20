@@ -75,6 +75,22 @@
       align-items: center;
       gap: 8px;
     }
+    .setup-form { display: flex; flex-direction: column; gap: 12px; font-family: inherit; white-space: normal; }
+    .setup-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text); }
+    .setup-form select, .setup-form input {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    .setup-form select:focus, .setup-form input:focus { border-color: var(--accent); }
+    .setup-hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .setup-msg { font-size: 12.5px; min-height: 18px; }
+    .setup-msg.ok { color: var(--ok); }
+    .setup-msg.err { color: var(--err); }
     button {
       background: var(--panel-2);
       color: var(--text);
@@ -271,6 +287,7 @@
       <span id="cachePill" class="pill">KV 缓存: 待统计</span>
     </div>
     <div class="actions">
+      <button id="btnModelSetup">模型设置</button>
       <button id="btnMemory">查看记忆</button>
       <button id="btnRefresh">刷新索引</button>
       <button id="btnNewSession">新会话</button>
@@ -479,6 +496,97 @@
     inputEl.addEventListener("input", () => {
       inputEl.style.height = "44px";
       inputEl.style.height = Math.min(160, inputEl.scrollHeight) + "px";
+    });
+
+    document.getElementById("btnModelSetup").addEventListener("click", async () => {
+      modalTitle.textContent = "模型设置（选厂商 + 贴密钥，自动生成配置）";
+      modalBody.textContent = "加载中…";
+      modal.classList.add("open");
+      try {
+        const res = await fetch("/api/models");
+        const data = await res.json();
+        const presets = data.presets || [];
+        const optionsHtml = presets
+          .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}（默认：${escapeHtml(p.default_model)}）</option>`)
+          .join("") + `<option value="custom">自定义 OpenAI 兼容接口</option>`;
+        const configuredText = data.configured
+          ? `当前已生效默认模型：${escapeHtml(data.configured.default)}`
+          : "尚未配置模型，填好下面两项即可直接使用。";
+
+        modalBody.innerHTML = `
+          <form id="modelSetupForm" class="setup-form">
+            <div class="setup-hint">${configuredText}<br/>密钥将自动以 0600 权限保存在本机（已由 .gitignore 与沙箱隔离，不会上传或泄露）。</div>
+            <label>
+              选择模型厂商
+              <select id="presetSelect">${optionsHtml}</select>
+            </label>
+            <label id="apiKeyRow">
+              API Key（粘贴即可）
+              <input id="apiKeyInput" type="password" autocomplete="off" placeholder="例如 sk-..." />
+            </label>
+            <details>
+              <summary style="cursor:pointer;color:var(--muted);font-size:12px;">高级选项（一般不用填）</summary>
+              <div style="display:flex;flex-direction:column;gap:10px;margin-top:10px;">
+                <label>
+                  自定义模型名（留空使用厂商默认）
+                  <input id="modelNameInput" type="text" placeholder="留空即可" />
+                </label>
+                <label id="baseUrlRow" style="display:none;">
+                  自定义接口地址 (base_url)
+                  <input id="baseUrlInput" type="text" placeholder="https://api.example.com/v1" />
+                </label>
+              </div>
+            </details>
+            <div id="setupMsg" class="setup-msg"></div>
+            <div><button type="submit" class="primary">保存并立即生效</button></div>
+          </form>
+        `;
+
+        const presetSel = document.getElementById("presetSelect");
+        const apiKeyRow = document.getElementById("apiKeyRow");
+        const baseUrlRow = document.getElementById("baseUrlRow");
+        const syncVisibility = () => {
+          const picked = presets.find((p) => p.id === presetSel.value);
+          apiKeyRow.style.display = picked && !picked.needs_key ? "none" : "flex";
+          baseUrlRow.style.display = presetSel.value === "custom" ? "flex" : "none";
+        };
+        presetSel.addEventListener("change", syncVisibility);
+        syncVisibility();
+
+        document.getElementById("modelSetupForm").addEventListener("submit", async (ev) => {
+          ev.preventDefault();
+          const msgEl = document.getElementById("setupMsg");
+          msgEl.className = "setup-msg";
+          msgEl.textContent = "正在生成配置并切换…";
+          try {
+            const resp = await fetch("/api/models/setup", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                preset: presetSel.value,
+                api_key: document.getElementById("apiKeyInput").value.trim(),
+                model: document.getElementById("modelNameInput").value.trim(),
+                base_url: document.getElementById("baseUrlInput").value.trim(),
+              }),
+            });
+            const out = await resp.json();
+            if (!resp.ok) {
+              msgEl.className = "setup-msg err";
+              msgEl.textContent = out.error || "保存失败";
+              return;
+            }
+            msgEl.className = "setup-msg ok";
+            msgEl.textContent = `已自动生成配置并热生效（默认模型：${out.configured.default}），现在可以直接对话！`;
+            document.getElementById("apiKeyInput").value = "";
+            refreshStatus();
+          } catch (err) {
+            msgEl.className = "setup-msg err";
+            msgEl.textContent = `请求异常：${err}`;
+          }
+        });
+      } catch (err) {
+        modalBody.textContent = `读取模型预设失败：${err}`;
+      }
     });
 
     document.getElementById("btnMemory").addEventListener("click", async () => {

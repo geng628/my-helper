@@ -1,21 +1,9 @@
-# 极简模型配置 DSL 示例（复制本文件为 config/models.dsl 后直接填入你的 api_key 即可使用）
-# 系统已默认将 config/models.dsl 与编译产物 config/models.json 加入 .gitignore、0600 权限与工具沙箱屏蔽，无需手动折腾环境变量
+# 极简模型配置示例（不懂代码可直接运行 `uv run python -m personal_assistant setup` 自动生成，或在网页端点击「模型设置」）
+# 若手动编辑：复制为 config/models.dsl，只写下面一行即可，网址/协议/默认模型/温度全部自动补全！
+# 系统已默认将 config/models.dsl 与 config/models.json 加入 .gitignore、0600 权限与 Agent 工具沙箱屏蔽。
 
-default deepseek
+use deepseek sk-替换为你的真实密钥
 
-model deepseek {
-  provider openai_compatible
-  base_url https://api.deepseek.com/v1
-  model    deepseek-chat
-  api_key  sk-替换为你的真实密钥
-  temp     0.2
-}
-
-# 可按需定义多个模型，运行时用 `--model local_qwen` 一键切换
-model local_qwen {
-  provider openai_compatible
-  base_url http://127.0.0.1:11434/v1
-  model    qwen2.5:7b
-  api_key  ollama
-  temp     0.1
-}
+# 可选：用 add 追加更多备用模型（内置支持 deepseek / qwen(通义千问) / kimi / glm(智谱) / openai / siliconflow / ollama）
+# add 通义千问 sk-你的通义千问密钥
+# add ollama

@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.plugins import load_plugin_tools
 from personal_assistant.agent.react import run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import format_cache_summary
-from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient, from_env
+from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
@@ -133,7 +136,64 @@ def run_repl(
             active_app.close()
 
 
-# 命令行总入口：加载 .env 并解析子命令（支持 chat 对话与 compile-config 编译 models.dsl）
+# 零代码终端交互配置向导：只需选厂商编号并粘贴 API Key，自动生成 0600 权限的 models.dsl 与 models.json
+def run_setup_wizard(
+    config_dir: Path,
+    *,
+    project_root: Path = REPO_ROOT,
+    input_fn: Callable[[str], str] = input,
+    secret_fn: Callable[[str], str] = getpass.getpass,
+    print_fn: Callable[[str], None] = print,
+) -> ModelsConfig | None:
+    cfg_dir = config_dir.resolve()
+    tools_json = cfg_dir / "tools.json"
+    tcfg = ToolsConfig.load(tools_json, project_root=project_root)
+    presets = tcfg.model_presets()
+
+    print_fn("=== My Helper 一键模型配置向导（零代码，10 秒配好）===")
+    for idx, item in enumerate(presets, start=1):
+        print_fn(f"  {idx}. {item['label']}（默认模型：{item['default_model']}）")
+    custom_idx = len(presets) + 1
+    print_fn(f"  {custom_idx}. 自定义 OpenAI 兼容接口（手动填写网址与模型名）")
+
+    raw_choice = input_fn(f"请选择编号 [1-{custom_idx}]（直接回车默认选 1）：").strip() or "1"
+    try:
+        choice = int(raw_choice)
+    except ValueError as error:
+        raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。") from error
+    if not (1 <= choice <= custom_idx):
+        raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。")
+
+    if choice == custom_idx:
+        name = input_fn("给这个模型起个简短名字（如 my_model）：").strip() or "custom"
+        base_url = input_fn("接口地址（例如 https://api.deepseek.com/v1）：").strip()
+        model = input_fn("模型名称（例如 deepseek-chat）：").strip()
+        api_key = secret_fn("API Key（输入不回显，自动本地加密权限保存）：").strip()
+        saved = tcfg.save_model_setup(
+            cfg_dir, preset="custom", name=name, base_url=base_url, model=model, api_key=api_key
+        )
+    else:
+        picked = presets[choice - 1]
+        api_key = ""
+        if picked["needs_key"]:
+            api_key = secret_fn(f"请粘贴 {picked['label']} 的 API Key（输入不回显）：").strip()
+            if not api_key:
+                raise ValueError("API Key 不能为空。")
+        model = input_fn(f"模型名（直接回车使用默认 {picked['default_model']}）：").strip()
+        saved = tcfg.save_model_setup(
+            cfg_dir,
+            preset=str(picked["id"]),
+            api_key=api_key,
+            model=model,
+        )
+
+    print_fn(f"\n配置已自动生成：{cfg_dir / 'models.dsl'} 与 {cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 与沙箱自动保护）")
+    print_fn(json.dumps(saved.redacted_dict(), ensure_ascii=False, indent=2))
+    print_fn("现在可以直接运行 `uv run python -m personal_assistant chat` 开始对话！")
+    return saved
+
+
+# 命令行总入口：加载 .env 并解析子命令（支持 setup 一键向导、chat 对话与 compile-config 编译）
 def main(argv: list[str] | None = None) -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="my-helper")
@@ -142,15 +202,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model", default=None, help="指定 models.dsl / models.json 中定义的模型档案名称")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
+    subparsers.add_parser("setup", help="10 秒零代码交互式向导：选厂商 + 贴密钥，自动生成模型配置")
     subparsers.add_parser("compile-config", help="将 config/models.dsl 编译为 0600 权限的标准 config/models.json")
     args = parser.parse_args(argv)
     cfg_dir = (Path(args.config) if args.config else Path(os.getenv("MY_HELPER_CONFIG", "config"))).resolve()
+    if args.command == "setup":
+        run_setup_wizard(cfg_dir, project_root=cfg_dir.parent if (cfg_dir / "tools.json").is_file() else REPO_ROOT)
+        return
     if args.command == "compile-config":
         tools_json = cfg_dir / "tools.json"
         tcfg = ToolsConfig.load(tools_json, project_root=cfg_dir.parent)
         compiled = tcfg.load_models_config(cfg_dir, write_json=True)
         if compiled is None:
-            print(f"未在 {cfg_dir} 下找到 models.dsl 或 models.json（可复制 config/models.example.dsl 为 config/models.dsl）。")
+            print(f"未在 {cfg_dir} 下找到 models.dsl 或 models.json（运行 `uv run python -m personal_assistant setup` 可 10 秒自动生成）。")
             return
         print(f"已编译并写入：{cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 保护）")
         print(json.dumps(compiled.redacted_dict(), ensure_ascii=False, indent=2))
@@ -161,4 +225,6 @@ def main(argv: list[str] | None = None) -> None:
             config_root=cfg_dir,
             model_name=args.model,
         )
+        if isinstance(app.llm, NoopLLMClient):
+            print("提示：当前尚未配置大模型。运行 `uv run python -m personal_assistant setup` 可 10 秒零代码一键配置。")
         run_repl(app)

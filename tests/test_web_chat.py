@@ -136,3 +136,57 @@ def test_web_chat_server_end_to_end(tmp_path: Path) -> None:
         server.server_close()
         thread.join(timeout=3.0)
         app.close()
+
+
+# 测试网页端零代码模型向导接口（/api/models 与 /api/models/setup）：自动生成配置、热切换且不回显密钥
+def test_web_chat_model_setup_api_auto_generates_and_hot_reloads(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    repo_root = Path(__file__).resolve().parent.parent
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "tools.json").write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=cfg_dir / "tools.json",
+        project_root=repo_root,
+    )
+    server = create_web_server(app, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, body = _http_request(f"{base_url}/api/models")
+        assert status == 200
+        info = json.loads(body)
+        preset_ids = [p["id"] for p in info["presets"]]
+        assert "deepseek" in preset_ids and "ollama" in preset_ids
+
+        status, body = _http_request(
+            f"{base_url}/api/models/setup",
+            method="POST",
+            body={"preset": "deepseek", "api_key": "sk-web-secret-888"},
+        )
+        assert status == 200
+        res = json.loads(body)
+        assert res["ok"] is True
+        assert res["status"]["llm_configured"] is True
+        assert "sk-web-secret-888" not in body
+        assert (cfg_dir / "models.dsl").is_file()
+        assert (cfg_dir / "models.json").is_file()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        app.close()

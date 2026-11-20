@@ -215,3 +215,94 @@ def test_system_owned_leak_prevention_gitignore_and_tool_sandboxes(tmp_path: Pat
     res_json = reg.execute("run_command", '{"command": "cat config/models.json"}')
     assert "敏感" in res_dsl or "拒绝" in res_dsl or "禁止" in res_dsl
     assert "敏感" in res_json or "拒绝" in res_json or "禁止" in res_json
+
+
+# 测试极简一行预设语法（免写大括号、网址、provider、temp），支持中英文厂商别名与本地免密钥 Ollama
+def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    compile_fn = load_plugin_compilers(["plugins"], REPO_ROOT)["models_dsl"]
+    dsl = """
+    # 非程序员极简写法：一行自动补全网址、默认模型、provider 与 temperature
+    use deepseek sk-ds-one-line
+    add 通义千问 sk-qwen-one-line
+    add ollama
+    add openai gpt-4o sk-oa-override
+    """
+    compiled = compile_fn(dsl, "simple.dsl")
+    assert compiled["default"] == "deepseek"
+    assert compiled["models"]["deepseek"]["base_url"] == "https://api.deepseek.com/v1"
+    assert compiled["models"]["deepseek"]["model"] == "deepseek-chat"
+    assert compiled["models"]["deepseek"]["api_key"] == "sk-ds-one-line"
+    assert compiled["models"]["qwen"]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert compiled["models"]["qwen"]["model"] == "qwen-plus"
+    assert compiled["models"]["ollama"]["base_url"] == "http://127.0.0.1:11434/v1"
+    assert compiled["models"]["ollama"]["api_key"] == "ollama"
+    assert compiled["models"]["openai"]["model"] == "gpt-4o"
+    assert compiled["models"]["openai"]["api_key"] == "sk-oa-override"
+
+    # 测试自动生成向导底层 save_model_setup：自动生成 0600 权限的 models.dsl + models.json，并支持 app.reload_llm 热切换
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    tools_json = cfg_dir / "tools.json"
+    tools_json.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = build_app(data_root=tmp_path / "data", config_root=cfg_dir, project_root=REPO_ROOT)
+    try:
+        assert app.status()["llm_configured"] is False
+        saved = app.configure_model(preset="deepseek", api_key="sk-auto-generated-key")
+        assert saved["default"] == "deepseek"
+        assert "sk-auto-generated-key" not in json.dumps(saved, ensure_ascii=False)
+        assert app.status()["llm_configured"] is True
+        assert isinstance(app.llm, OpenAICompatibleLLM)
+        assert app.llm.api_key == "sk-auto-generated-key"
+        assert app.consolidator.llm is app.llm
+        assert stat.S_IMODE((cfg_dir / "models.dsl").stat().st_mode) == 0o600
+        assert stat.S_IMODE((cfg_dir / "models.json").stat().st_mode) == 0o600
+        assert "use deepseek" in (cfg_dir / "models.dsl").read_text(encoding="utf-8")
+    finally:
+        app.close()
+
+
+# 测试终端一键向导 run_setup_wizard：纯小白选编号 + 粘贴密钥即可自动生成配置
+def test_cli_setup_wizard_generates_config_for_non_programmers(tmp_path: Path) -> None:
+    from personal_assistant.assistant.cli import run_setup_wizard
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "tools.json").write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    answers = iter(["1", "sk-wizard-key-999", ""])
+    messages: list[str] = []
+    cfg = run_setup_wizard(
+        cfg_dir,
+        project_root=REPO_ROOT,
+        input_fn=lambda _: next(answers),
+        secret_fn=lambda _: next(answers),
+        print_fn=messages.append,
+    )
+    assert cfg is not None
+    assert cfg.default == "deepseek"
+    assert (cfg_dir / "models.dsl").is_file()
+    assert (cfg_dir / "models.json").is_file()
+    # 输出文案绝不回显明文密钥
+    assert "sk-wizard-key-999" not in "\n".join(messages)

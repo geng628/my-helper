@@ -78,6 +78,9 @@ def create_web_server(
             if parsed.path == "/api/memory":
                 self._send_json(HTTPStatus.OK, {"overview": app.memory_overview()})
                 return
+            if parsed.path == "/api/models":
+                self._send_json(HTTPStatus.OK, app.models_overview())
+                return
             if parsed.path == "/api/history":
                 qs = parse_qs(parsed.query)
                 chat_id = (qs.get("chat_id") or ["web"])[0].strip() or "web"
@@ -127,6 +130,24 @@ def create_web_server(
                 chat_id = str(body.get("chat_id") or "web").strip() or "web"
                 app.reset_session_prompt(chat_id)
                 self._send_json(HTTPStatus.OK, {"ok": True, "chat_id": chat_id})
+                return
+
+            if parsed.path == "/api/models/setup":
+                try:
+                    configured = app.configure_model(
+                        preset=str(body.get("preset") or ""),
+                        api_key=str(body.get("api_key") or ""),
+                        model=str(body.get("model") or ""),
+                        base_url=str(body.get("base_url") or ""),
+                        name=str(body.get("name") or ""),
+                    )
+                except ValueError as error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "configured": configured, "status": app.status()},
+                )
                 return
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": f"未知接口：{parsed.path}"})

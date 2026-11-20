@@ -1,4 +1,4 @@
-"""极简模型配置 DSL 外部编译插件（零第三方依赖）：词法分析 -> 递归下降 AST -> 语义校验 -> 标准 JSON。"""
+"""极简模型配置 DSL 外部编译插件（零第三方依赖）：支持一行预设语法（免写网址/大括号）与完整块语法。"""
 from __future__ import annotations
 
 import re
@@ -8,6 +8,129 @@ COMPILER_NAME = "models_dsl"
 
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 _ALLOWED_FIELDS = frozenset({"provider", "base_url", "model", "api_key", "key_env", "temp", "temperature"})
+
+
+# 内置主流大模型厂商预设：普通用户只需选名字 + 填密钥，网址/默认模型/协议由系统自动补全
+@dataclass(frozen=True)
+class ModelPreset:
+    id: str
+    label: str
+    base_url: str
+    default_model: str
+    needs_key: bool = True
+    aliases: tuple[str, ...] = ()
+
+    # 导出给终端向导与网页下拉框使用的展示字典
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "base_url": self.base_url,
+            "default_model": self.default_model,
+            "needs_key": self.needs_key,
+        }
+
+
+MODEL_PRESETS: tuple[ModelPreset, ...] = (
+    ModelPreset("deepseek", "DeepSeek（推荐）", "https://api.deepseek.com/v1", "deepseek-chat", True, ("ds",)),
+    ModelPreset(
+        "qwen",
+        "通义千问 (Qwen)",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "qwen-plus",
+        True,
+        ("tongyi", "千问", "通义千问", "dashscope"),
+    ),
+    ModelPreset("kimi", "Kimi (Moonshot)", "https://api.moonshot.cn/v1", "moonshot-v1-8k", True, ("moonshot",)),
+    ModelPreset("glm", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash", True, ("zhipu", "智谱")),
+    ModelPreset("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini", True, ("gpt",)),
+    ModelPreset(
+        "siliconflow",
+        "硅基流动 (SiliconFlow)",
+        "https://api.siliconflow.cn/v1",
+        "deepseek-ai/DeepSeek-V3",
+        True,
+        ("硅基流动",),
+    ),
+    ModelPreset("ollama", "本地 Ollama（免费免密钥）", "http://127.0.0.1:11434/v1", "qwen2.5:7b", False, ("local",)),
+)
+
+
+# 按预设 ID 或中英文别名查找内置厂商预设，未匹配时返回 None
+def resolve_preset(raw_name: str) -> ModelPreset | None:
+    key = raw_name.strip().lower()
+    for preset in MODEL_PRESETS:
+        if key == preset.id or key in {a.lower() for a in preset.aliases}:
+            return preset
+    return None
+
+
+# 返回所有内置预设的目录列表（供终端向导与网页配置表单直接渲染）
+def list_presets() -> list[dict[str, object]]:
+    return [preset.to_dict() for preset in MODEL_PRESETS]
+
+
+# 为 DSL 文本安全格式化取值（含空格或特殊字符时自动加双引号）
+def _format_dsl_value(value: str) -> str:
+    clean = value.strip()
+    if not clean:
+        return '""'
+    if any(ch in clean for ch in (" ", "\t", "#", "{", "}", '"', "'")):
+        escaped = clean.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return clean
+
+
+# 根据小白向导/网页表单输入自动生成极简可读的 models.dsl 文本
+def render_models_dsl(
+    *,
+    preset: str,
+    api_key: str = "",
+    model: str = "",
+    base_url: str = "",
+    name: str = "",
+    temperature: float = 0.2,
+) -> str:
+    header = "# 由 My Helper 自动生成（已默认 .gitignore + 0600 权限 + 沙箱屏蔽保护）\n"
+    matched = resolve_preset(preset)
+    clean_key = api_key.strip()
+    clean_model = model.strip()
+    clean_url = base_url.strip()
+
+    if matched is not None and not clean_url and temperature == 0.2:
+        if matched.needs_key:
+            if not clean_key:
+                raise ValueError(f"使用 {matched.label} 需要填写 API Key。")
+            if clean_model and clean_model != matched.default_model:
+                return f"{header}use {matched.id} {_format_dsl_value(clean_model)} {_format_dsl_value(clean_key)}\n"
+            return f"{header}use {matched.id} {_format_dsl_value(clean_key)}\n"
+        if clean_model and clean_model != matched.default_model:
+            return f"{header}use {matched.id} {_format_dsl_value(clean_model)}\n"
+        return f"{header}use {matched.id}\n"
+
+    # 自定义接口或高级覆盖模式：生成清晰的标准 model 块
+    profile_name = (name.strip() or (matched.id if matched else "custom")).lower()
+    final_url = clean_url or (matched.base_url if matched else "")
+    final_model = clean_model or (matched.default_model if matched else "")
+    final_key = clean_key or ("" if (matched is None or matched.needs_key) else "ollama")
+    if not final_url:
+        raise ValueError("自定义模型必须填写接口地址（base_url）。")
+    if not final_model:
+        raise ValueError("自定义模型必须填写模型名称（model）。")
+    lines = [
+        header.rstrip("\n"),
+        f"default {profile_name}",
+        "",
+        f"model {profile_name} {{",
+        f"  base_url {_format_dsl_value(final_url)}",
+        f"  model    {_format_dsl_value(final_model)}",
+    ]
+    if final_key:
+        lines.append(f"  api_key  {_format_dsl_value(final_key)}")
+    if temperature != 0.2:
+        lines.append(f"  temp     {temperature}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 # DSL 编译期异常：继承 ValueError 并附带精确来源文件名、行号与列号
@@ -124,7 +247,7 @@ def tokenize_dsl(text: str, *, source: str = "models.dsl") -> list[Token]:
     return tokens
 
 
-# 递归下降语法分析器：将 Token 流解析为结构化 ModelsDSLProgram AST
+# 递归下降语法分析器：支持极简一行预设语句（use/add）与完整 model { ... } 代码块
 class _DSLParser:
     # 初始化 Token 流与游标
     def __init__(self, tokens: list[Token], *, source: str) -> None:
@@ -169,6 +292,14 @@ class _DSLParser:
             col=tok.col,
         )
 
+    # 读取同一行剩余的全部 WORD 参数，供一行预设语法 `use/add` 使用
+    def _read_line_words(self) -> list[Token]:
+        words: list[Token] = []
+        while self._peek().kind == "WORD":
+            words.append(self._advance())
+        self._expect_line_end()
+        return words
+
     # 解析整篇 DSL 文件，产出 ModelsDSLProgram AST
     def parse(self) -> ModelsDSLProgram:
         default_decl: tuple[str, int, int] | None = None
@@ -179,7 +310,7 @@ class _DSLParser:
             tok = self._peek()
             if tok.kind != "WORD":
                 raise DSLCompileError(
-                    f"顶层期望 default 或 model 声明，实际遇到 {tok.value!r}。",
+                    f"顶层期望 use、add、default 或 model 声明，实际遇到 {tok.value!r}。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -191,11 +322,23 @@ class _DSLParser:
                     raise DSLCompileError("不允许重复声明 default。", source=self._source, line=tok.line, col=tok.col)
                 default_decl = (target.value, target.line, target.col)
                 self._expect_line_end()
+            elif tok.value in {"use", "add"}:
+                decl, is_default = self._parse_preset_line()
+                models.append(decl)
+                if is_default:
+                    if default_decl is not None:
+                        raise DSLCompileError(
+                            "已设置默认模型，请勿重复使用 default 或多个 use（备用模型请改用 add）。",
+                            source=self._source,
+                            line=tok.line,
+                            col=tok.col,
+                        )
+                    default_decl = (decl.name, decl.line, decl.col)
             elif tok.value == "model":
                 models.append(self._parse_model_block())
             else:
                 raise DSLCompileError(
-                    f"未知顶层指令 {tok.value!r}（仅支持 default 与 model）。",
+                    f"未知顶层指令 {tok.value!r}（支持 use、add、default 与 model）。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -204,7 +347,71 @@ class _DSLParser:
 
         return ModelsDSLProgram(default_model=default_decl, models=tuple(models))
 
-    # 解析单个 `model <name> { ... }` 代码块
+    # 解析极简一行预设语句：`use/add <厂商> [模型名] [api_key]`，自动展开为完整 ModelDecl AST
+    def _parse_preset_line(self) -> tuple[ModelDecl, bool]:
+        kw = self._advance()
+        is_default = kw.value == "use"
+        preset_tok = self._expect("WORD", f"{kw.value} 后请填写厂商名，例如：{kw.value} deepseek sk-你的密钥")
+        preset = resolve_preset(preset_tok.value)
+        if preset is None:
+            names = "、".join(p.id for p in MODEL_PRESETS)
+            raise DSLCompileError(
+                f"未知内置厂商预设 {preset_tok.value!r}（支持：{names}；自定义网址请用 model 块）。",
+                source=self._source,
+                line=preset_tok.line,
+                col=preset_tok.col,
+            )
+
+        args = self._read_line_words()
+        if len(args) > 2:
+            raise DSLCompileError(
+                f"{kw.value} {preset.id} 参数过多（最多传 [模型名] [API Key] 两个参数）。",
+                source=self._source,
+                line=args[2].line,
+                col=args[2].col,
+            )
+
+        model_val = preset.default_model
+        model_loc = (preset_tok.line, preset_tok.col)
+        api_key_val = ""
+        key_loc = (preset_tok.line, preset_tok.col)
+
+        if preset.needs_key:
+            if not args:
+                raise DSLCompileError(
+                    f"使用 {preset.id} 预设需要提供 API Key，例如：{kw.value} {preset.id} sk-你的密钥",
+                    source=self._source,
+                    line=preset_tok.line,
+                    col=preset_tok.col,
+                )
+            if len(args) == 1:
+                api_key_val = args[0].value
+                key_loc = (args[0].line, args[0].col)
+            else:
+                model_val = args[0].value
+                model_loc = (args[0].line, args[0].col)
+                api_key_val = args[1].value
+                key_loc = (args[1].line, args[1].col)
+        else:
+            api_key_val = "ollama"
+            if len(args) == 1:
+                model_val = args[0].value
+                model_loc = (args[0].line, args[0].col)
+            elif len(args) == 2:
+                model_val = args[0].value
+                model_loc = (args[0].line, args[0].col)
+                api_key_val = args[1].value
+                key_loc = (args[1].line, args[1].col)
+
+        fields: dict[str, tuple[str, int, int]] = {
+            "provider": ("openai_compatible", preset_tok.line, preset_tok.col),
+            "base_url": (preset.base_url, preset_tok.line, preset_tok.col),
+            "model": (model_val, model_loc[0], model_loc[1]),
+            "api_key": (api_key_val, key_loc[0], key_loc[1]),
+        }
+        return ModelDecl(name=preset.id, fields=fields, line=preset_tok.line, col=preset_tok.col), is_default
+
+    # 解析单个 `model <name> { ... }` 高级代码块
     def _parse_model_block(self) -> ModelDecl:
         kw = self._advance()
         name_tok = self._expect("WORD", "model 后必须跟模型名称，例如 `model deepseek {`。")
@@ -247,12 +454,12 @@ class _DSLParser:
         return ModelDecl(name=name_tok.value, fields=fields, line=name_tok.line, col=name_tok.col)
 
 
-# 解析并编译极简模型配置 DSL 文本为标准 models.json 字典（支持直接写 api_key 或 key_env）
+# 解析并编译极简模型配置 DSL 文本为标准 models.json 字典（支持一行预设与完整 model 块）
 def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, object]:
     tokens = tokenize_dsl(text, source=source)
     program = _DSLParser(tokens, source=source).parse()
     if not program.models:
-        raise DSLCompileError("至少需要定义一个 model 代码块。", source=source, line=1, col=1)
+        raise DSLCompileError("至少需要定义一个模型（例如：use deepseek sk-你的密钥）。", source=source, line=1, col=1)
 
     emitted_models: dict[str, dict[str, object]] = {}
     for decl in program.models:
@@ -333,7 +540,7 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
         default_name = next(iter(emitted_models))
     else:
         raise DSLCompileError(
-            "定义了多个模型时必须在文件顶部通过 `default <名称>` 指定默认模型。",
+            "定义了多个模型时请用 `use <厂商>` 或在顶部用 `default <名称>` 指定默认模型。",
             source=source,
             line=1,
             col=1,
@@ -344,6 +551,10 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
         "models": emitted_models,
     }
 
+
+# 在编译器函数上挂载预设目录与自动生成函数，核心层无需直接 import 插件文件
+compile_models_dsl.presets = list_presets  # type: ignore[attr-defined]
+compile_models_dsl.render = render_models_dsl  # type: ignore[attr-defined]
 
 CONFIG_COMPILERS = {
     COMPILER_NAME: compile_models_dsl,

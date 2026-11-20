@@ -37,16 +37,16 @@ uv run python -m personal_assistant.eval --mode search \
 # 5. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
 
-# 6. 配置模型并启动真实对话（方式 A：极简 DSL 免配环境变量；方式 B：沿用 .env）
-cp config/models.example.dsl config/models.dsl
-# 直接在 config/models.dsl 里填 api_key（已默认 .gitignore + 0600 权限 + Agent 工具沙箱屏蔽）
-uv run python -m personal_assistant compile-config   # 可选：显式编译导出 config/models.json 并查看脱敏配置
-uv run python -m personal_assistant chat             # 或 `--model local_qwen` 一键切模型
-# 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
+# 6. 配置模型并启动真实对话（三种门槛从低到高，任选其一，均内置自动防泄漏）
+# 方式 A（最简单，完全不懂代码）：终端一键向导，选厂商 + 贴密钥，自动生成 models.dsl 与 models.json
+uv run python -m personal_assistant setup
+uv run python -m personal_assistant chat
+
+# 方式 B（网页零代码）：直接启动本地网页端，点右上角「模型设置」选厂商贴密钥，保存即热生效
 uv run python scripts/web_chat.py --open
 
-# 方式 B：也可以沿用 .env 环境变量运行端到端评测（单轮 agent / 16 场景 memory / LongMemEval）
-cp .env.example .env
+# 方式 C（极简一行手写）：复制 config/models.example.dsl 为 config/models.dsl，只写一行 `use deepseek sk-你的密钥`
+# （网址/默认模型/温度全自动补全；也支持老 .env 环境变量跑端到端评测）
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
