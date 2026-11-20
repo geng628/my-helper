@@ -26,12 +26,12 @@ uv run pytest -v
 # 3. 运行离线检索评测（40 题内置分类型样本，零 Token）
 uv run python -m personal_assistant.eval --mode search
 
-# 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 data/evals/）
-uv run python scripts/download_public_evals.py --dataset all
+# 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 evals/public/）
+uv run python -m personal_assistant.eval --mode download --dataset all
 # 零 Token 跑 200 题公开 LoCoMo 多会话检索基准
 uv run python -m personal_assistant.eval --mode search \
-  --data-dir data/evals/locomo_search_data \
-  --cases data/evals/locomo_search_cases.jsonl
+  --data-dir evals/public/locomo_search_data \
+  --cases evals/public/locomo_search_cases.jsonl
 
 # 5. 零配置离线演示 ReAct 循环（不用 API Key 即可查看完整调用轨迹）
 uv run python scripts/demo.py --show-messages
@@ -43,7 +43,7 @@ uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
 uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
 uv run python -m personal_assistant.eval --mode memory \
-  --cases data/evals/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
+  --cases evals/public/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
 uv run python -m personal_assistant chat
 # 或者启动本地网页对话界面（纯标准库，默认 http://127.0.0.1:8765）
 uv run python scripts/web_chat.py --open
@@ -73,7 +73,8 @@ my_helper_v2/
 ├── evals/
 │   ├── sample_cases.jsonl         # 40 题 5 分类公开脱敏检索与单轮问答案例集
 │   ├── memory_scenarios.jsonl     # 16 场景 6 分类多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
-│   └── sample_data/               # 8 篇主题 Markdown 与规则样例语料
+│   ├── sample_data/               # 8 篇主题 Markdown 与规则样例语料
+│   └── public/                    # （gitignore）下载转换的 LongMemEval / LoCoMo 公开学术基准
 ├── docs/
 │   └── mvp-design.md              # 整体设计文档
 ├── personal_assistant/
@@ -94,7 +95,6 @@ my_helper_v2/
 │   └── cli.py                     # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
 │   ├── demo.py                    # 离线演示与单句实测脚本
-│   ├── download_public_evals.py   # 一键下载并转换 LongMemEval / LoCoMo 公开基准脚本
 │   ├── web_chat.py                # 零依赖本地网页对话服务（标准库 ThreadingHTTPServer）
 │   └── web_ui.html                # 纯 HTML/JS 极简本地对话页面（含工具轨迹与 KV 缓存显示）
 ├── tests/                         # 确定性代码单元测试（独立于 evals/，CI 每次必跑）

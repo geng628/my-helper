@@ -8,6 +8,8 @@ from personal_assistant.eval.public_benchmarks import (
     convert_longmemeval_dataset,
     convert_longmemeval_item,
     export_locomo_for_search,
+    prepare_public_datasets,
+    validate_public_out_dir,
 )
 from personal_assistant.eval.search_eval import evaluate_search
 
@@ -24,5 +26,7 @@ __all__ = [
     "load_cases",
     "load_scenarios",
     "main",
+    "prepare_public_datasets",
     "safe_write_report",
+    "validate_public_out_dir",
 ]

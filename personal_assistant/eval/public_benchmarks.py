@@ -7,8 +7,11 @@ import random
 import re
 import shutil
 import urllib.request
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
+
+from personal_assistant.cli import REPO_ROOT
 
 LONGMEMEVAL_ORACLE_URL = (
     "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json"
@@ -428,3 +431,78 @@ def download_dataset(url: str, dest: Path, *, force: bool = False, timeout: floa
         tmp_path.unlink(missing_ok=True)
         raise
     return dest
+
+
+# 校验公开大型数据集输出目录：允许 gitignore 保护的 evals/public 及仓库外目录，禁止直接写入受 Git 追踪的 evals/ 路径
+def validate_public_out_dir(out_dir: Path, *, repo_root: Path = REPO_ROOT) -> Path:
+    resolved = out_dir.resolve()
+    evals_tracked = (repo_root / "evals").resolve()
+    allowed_public = (evals_tracked / "public").resolve()
+    if resolved == allowed_public or resolved.is_relative_to(allowed_public):
+        return resolved
+    if resolved == evals_tracked or resolved.is_relative_to(evals_tracked):
+        raise ValueError("公开大型数据集禁止直接写入受 Git 追踪的 evals/ 目录，请放到 evals/public。")
+    return resolved
+
+
+# 按需下载并转换 LongMemEval / LoCoMo 数据集到指定目录，返回各子集的导出路径与分类统计
+def prepare_public_datasets(
+    out_dir: Path,
+    *,
+    dataset: str = "all",
+    longmemeval_limit: int = 35,
+    locomo_search_limit: int = 200,
+    locomo_memory_limit: int = 25,
+    seed: int = 42,
+    force: bool = False,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, dict[str, object]]:
+    resolved_out = validate_public_out_dir(out_dir, repo_root=repo_root)
+    raw_dir = resolved_out / "raw"
+    result: dict[str, dict[str, object]] = {}
+
+    if dataset in {"longmemeval", "all"}:
+        raw_lme = download_dataset(
+            LONGMEMEVAL_ORACLE_URL, raw_dir / "longmemeval_oracle.json", force=force
+        )
+        raw_items = json.loads(raw_lme.read_text(encoding="utf-8"))
+        limit = None if longmemeval_limit == 0 else longmemeval_limit
+        scenarios = convert_longmemeval_dataset(raw_items, limit=limit, seed=seed)
+        lme_out = resolved_out / "longmemeval_scenarios.jsonl"
+        write_jsonl(lme_out, scenarios)
+        result["longmemeval"] = {
+            "source_total": len(raw_items),
+            "exported": len(scenarios),
+            "path": str(lme_out),
+            "categories": dict(sorted(Counter(str(s["category"]) for s in scenarios).items())),
+        }
+
+    if dataset in {"locomo", "all"}:
+        raw_loc = download_dataset(LOCOMO10_URL, raw_dir / "locomo10.json", force=force)
+        raw_convs = json.loads(raw_loc.read_text(encoding="utf-8"))
+
+        search_data_dir = resolved_out / "locomo_search_data"
+        search_limit = None if locomo_search_limit == 0 else locomo_search_limit
+        search_cases = export_locomo_for_search(
+            raw_convs, search_data_dir, limit=search_limit, seed=seed
+        )
+        search_out = resolved_out / "locomo_search_cases.jsonl"
+        write_jsonl(search_out, search_cases)
+        result["locomo_search"] = {
+            "exported": len(search_cases),
+            "data_dir": str(search_data_dir),
+            "path": str(search_out),
+            "categories": dict(sorted(Counter(str(c["category"]) for c in search_cases).items())),
+        }
+
+        mem_limit = None if locomo_memory_limit == 0 else locomo_memory_limit
+        mem_scenarios = convert_locomo_for_memory(raw_convs, limit=mem_limit, seed=seed)
+        mem_out = resolved_out / "locomo_memory_scenarios.jsonl"
+        write_jsonl(mem_out, mem_scenarios)
+        result["locomo_memory"] = {
+            "exported": len(mem_scenarios),
+            "path": str(mem_out),
+            "categories": dict(sorted(Counter(str(s["category"]) for s in mem_scenarios).items())),
+        }
+
+    return result

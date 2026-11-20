@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from personal_assistant.eval import main as eval_main
 from personal_assistant.eval.memory_eval import load_scenarios
 from personal_assistant.eval.public_benchmarks import (
     convert_locomo_for_memory,
@@ -15,6 +16,8 @@ from personal_assistant.eval.public_benchmarks import (
     export_locomo_for_search,
     parse_locomo_date,
     parse_longmemeval_datetime,
+    prepare_public_datasets,
+    validate_public_out_dir,
     write_jsonl,
 )
 from personal_assistant.eval.search_eval import evaluate_search
@@ -208,14 +211,81 @@ def test_convert_locomo_for_memory_handles_speakers_and_adversarial() -> None:
     assert by_cat["adversarial"]["steps"][-1]["is_abstention"] is True
 
 
-# 测试下载脚本拒绝把大型公开数据集直接写入受 Git 追踪的 evals/ 目录
-def test_download_script_blocks_tracked_evals_dir() -> None:
-    import importlib.util
+# 测试公开数据集路径校验：允许 evals/public，拒绝写入受 Git 追踪的 evals/ 根目录或 sample_data
+def test_eval_cli_download_mode_validates_out_dir_and_prepares_datasets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    # 允许 gitignore 保护的 evals/public 目录
+    assert validate_public_out_dir(repo_root / "evals" / "public", repo_root=repo_root) == (
+        repo_root / "evals" / "public"
+    ).resolve()
+    # 拒绝直接写入受 Git 追踪的 evals/ 或 evals/sample_data
+    with pytest.raises(ValueError, match="evals/public"):
+        eval_main(["--mode", "download", "--out-dir", str(repo_root / "evals")])
+    with pytest.raises(ValueError, match="evals/public"):
+        eval_main(["--mode", "download", "--out-dir", str(repo_root / "evals" / "sample_data")])
 
-    script_path = Path(__file__).resolve().parent.parent / "scripts" / "download_public_evals.py"
-    spec = importlib.util.spec_from_file_location("download_public_evals_test", script_path)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    with pytest.raises(ValueError, match="禁止直接写入"):
-        mod.main(["--out-dir", "evals"])
+    # 使用预先放入 raw/ 的本地样例验证 prepare_public_datasets 与 --mode download 闭环
+    out_dir = tmp_path / "public"
+    raw_dir = out_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "longmemeval_oracle.json").write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "single-session-user",
+                    "question": "What color is my bike?",
+                    "answer": "blue",
+                    "question_date": "2023/06/01 (Thu) 09:00",
+                    "haystack_dates": ["2023/05/20 (Sat) 10:00"],
+                    "haystack_sessions": [[{"role": "user", "content": "I bought a blue bike."}]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (raw_dir / "locomo10.json").write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-1",
+                    "conversation": {
+                        "speaker_a": "Alice",
+                        "speaker_b": "Bob",
+                        "session_1_date_time": "10:00 am on 1 May, 2023",
+                        "session_1": [
+                            {"speaker": "Alice", "dia_id": "D1:1", "text": "I love hiking in Kyoto."},
+                        ],
+                    },
+                    "qa": [
+                        {
+                            "question": "Where does Alice love hiking?",
+                            "answer": "Kyoto",
+                            "evidence": ["D1:1"],
+                            "category": 4,
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = prepare_public_datasets(
+        out_dir,
+        dataset="all",
+        longmemeval_limit=5,
+        locomo_search_limit=5,
+        locomo_memory_limit=5,
+        repo_root=repo_root,
+    )
+    assert summary["longmemeval"]["exported"] == 1
+    assert summary["locomo_search"]["exported"] == 1
+    assert summary["locomo_memory"]["exported"] == 1
+    assert (out_dir / "longmemeval_scenarios.jsonl").is_file()
+    assert (out_dir / "locomo_search_cases.jsonl").is_file()
+    assert (out_dir / "locomo_memory_scenarios.jsonl").is_file()
+
+    # 通过统一 CLI --mode download 再跑一次（命中已有缓存文件，不联网）
+    code = eval_main(["--mode", "download", "--dataset", "all", "--out-dir", str(out_dir)])
+    assert code == 0
