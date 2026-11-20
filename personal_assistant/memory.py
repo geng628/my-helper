@@ -149,15 +149,17 @@ class SearchHit:
 
 # 纯 Markdown 记忆与本地文件管理类：直接读写磁盘 .md/.txt 文件
 class MemoryStore:
-    # 初始化数据目录与安全策略；create_dirs=False 时以只读方式打开（供 eval 使用）
+    # 初始化数据目录、安全策略与可选外挂检索插件；create_dirs=False 时以只读方式打开（供 eval 使用）
     def __init__(
         self,
         data_root: Path | str,
         policy: FilesPolicy | None = None,
         *,
         create_dirs: bool = True,
+        retriever: object | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
+        self.retriever = retriever
         if policy is None:
             proj = self.data_root.parent
             self.policy = FilesPolicy(
@@ -426,7 +428,69 @@ class MemoryStore:
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
         return "\n".join(found) + suffix
 
-    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（默认跳过归档与已过期记忆）
+    # 安全枚举允许检索的 Markdown/文本文件列表（os.scandir 快速遍历，同时严格守住白名单、敏感段、软链接与归档隔离）
+    def iter_searchable_files(
+        self, root: str = "data/memory"
+    ) -> tuple[list[tuple[Path, str, bool]], bool]:
+        target = self.resolve_path(root, write=False)
+        if not target.is_dir():
+            raise ValueError(f"目录不存在：{root}")
+        archive_resolved = self.archive_dir.resolve()
+        memory_resolved = self.memory_dir.resolve()
+        searching_archive = target.is_relative_to(archive_resolved)
+        reject = set(self.policy.reject_segments)
+
+        files: list[tuple[Path, str, bool]] = []
+        stack: list[Path] = [target]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except OSError:
+                continue
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or name in reject:
+                    continue
+                is_link = entry.is_symlink()
+                entry_path = Path(entry.path)
+                if is_link:
+                    try:
+                        resolved = entry_path.resolve()
+                    except OSError:
+                        continue
+                    if not resolved.is_relative_to(target):
+                        continue
+                    rel_parts = resolved.relative_to(target).parts
+                    if any(p in reject or p.startswith(".") for p in rel_parts):
+                        continue
+                else:
+                    resolved = entry_path
+
+                if not searching_archive and resolved == archive_resolved:
+                    continue
+                if resolved.is_dir():
+                    if not is_link:
+                        stack.append(resolved)
+                    continue
+                if resolved.suffix.lower() not in {".md", ".txt"}:
+                    continue
+                if not searching_archive and resolved.is_relative_to(archive_resolved):
+                    continue
+                try:
+                    st = resolved.stat() if is_link else entry.stat(follow_symlinks=False)
+                    if st.st_size > MAX_SEARCH_FILE_BYTES:
+                        continue
+                except OSError:
+                    continue
+                is_memory = not searching_archive and resolved.is_relative_to(memory_resolved)
+                files.append((resolved, self._to_display_path(resolved), is_memory))
+
+        files.sort(key=lambda item: item[1])
+        return files, searching_archive
+
+    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（优先委派已启用的检索插件）
     def search_hits(
         self,
         query: str,
@@ -435,34 +499,27 @@ class MemoryStore:
         *,
         today: date | None = None,
     ) -> list[SearchHit]:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("搜索关键词不能为空。")
+        ref_day = today or _today_shanghai()
+        if self.retriever is not None and hasattr(self.retriever, "search_hits"):
+            return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day))
+
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
             raise ValueError("搜索关键词不能为空。")
-        target = self.resolve_path(root, write=False)
-        if not target.is_dir():
-            raise ValueError(f"目录不存在：{root}")
-
-        ref_day = today or _today_shanghai()
-        archive_resolved = self.archive_dir.resolve()
-        memory_resolved = self.memory_dir.resolve()
-        searching_archive = target.is_relative_to(archive_resolved)
+        searchable, _ = self.iter_searchable_files(root)
 
         candidates: list[tuple[float, str, int, str, str]] = []
-        for resolved in self._safe_files(target, target.rglob("*")):
-            if resolved.suffix.lower() not in {".md", ".txt"}:
-                continue
-            if not searching_archive and resolved.is_relative_to(archive_resolved):
-                continue
+        for resolved, display_path, is_memory in searchable:
             try:
-                if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
-                    continue
                 text = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            skip_expired = ref_day if (not searching_archive and resolved.is_relative_to(memory_resolved)) else None
+            skip_expired = ref_day if is_memory else None
             candidates.extend(
                 self._score_file(
-                    self._to_display_path(resolved),
+                    display_path,
                     text,
                     primary,
                     secondary,

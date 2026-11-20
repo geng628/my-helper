@@ -1,13 +1,16 @@
-"""动态插件加载器：扫描项目内用户可编辑的 Python 工具文件。"""
+"""动态插件加载器：扫描项目内用户可编辑的 Python 工具与检索插件文件。"""
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from types import ModuleType
 
 from personal_assistant.tools import Tool
+
+RetrieverFactory = Callable[[dict[str, object]], object]
 
 
 # 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
@@ -43,8 +46,8 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
-# 动态导入单个插件 .py 文件，收集其中的 TOOLS 列表以及被 @tool 装饰的函数
-def _load_module_tools(file_path: Path) -> list[Tool]:
+# 动态导入单个插件 .py 文件并注册到 sys.modules，供工具与检索插件共用
+def _import_plugin_module(file_path: Path) -> ModuleType:
     digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
     module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
     spec = importlib.util.spec_from_file_location(module_name, file_path)
@@ -58,7 +61,11 @@ def _load_module_tools(file_path: Path) -> list[Tool]:
     except Exception:
         sys.modules.pop(module_name, None)
         raise
+    return module
 
+
+# 从已导入插件模块中收集 TOOLS 列表以及被 @tool 装饰的函数
+def _extract_module_tools(module: ModuleType, file_path: Path) -> list[Tool]:
     found: list[Tool] = []
     seen_in_file: set[str] = set()
 
@@ -82,14 +89,61 @@ def _load_module_tools(file_path: Path) -> list[Tool]:
     return found
 
 
+# 从已导入插件模块中收集 RETRIEVERS 字典（或 RETRIEVER_NAME + create_retriever）声明的检索后端工厂
+def _extract_module_retrievers(module: ModuleType, file_path: Path) -> dict[str, RetrieverFactory]:
+    found: dict[str, RetrieverFactory] = {}
+
+    exported = getattr(module, "RETRIEVERS", None)
+    if exported is not None:
+        if not isinstance(exported, dict):
+            raise ValueError(f"插件 {file_path.name} 的 RETRIEVERS 必须是字典。")
+        for name, factory in exported.items():
+            if not isinstance(name, str) or not name.strip() or not callable(factory):
+                raise ValueError(f"插件 {file_path.name} 的 RETRIEVERS 项格式非法：{name!r}")
+            found[name.strip()] = factory
+
+    single_name = getattr(module, "RETRIEVER_NAME", None)
+    single_factory = getattr(module, "create_retriever", None)
+    if isinstance(single_name, str) and single_name.strip() and callable(single_factory):
+        found.setdefault(single_name.strip(), single_factory)
+
+    return found
+
+
+# 一次扫描同时加载插件工具与插件检索后端，避免同一插件模块被重复执行
+def load_plugins(
+    entries: Iterable[str],
+    project_root: Path,
+) -> tuple[list[Tool], dict[str, RetrieverFactory]]:
+    loaded_tools: list[Tool] = []
+    seen_tools: set[str] = set()
+    loaded_retrievers: dict[str, RetrieverFactory] = {}
+
+    for file_path in _resolve_plugin_targets(entries, project_root):
+        module = _import_plugin_module(file_path)
+        for item in _extract_module_tools(module, file_path):
+            if item.name in seen_tools:
+                raise ValueError(f"插件工具名称重复：{item.name}（文件：{file_path.name}）")
+            seen_tools.add(item.name)
+            loaded_tools.append(item)
+        for name, factory in _extract_module_retrievers(module, file_path).items():
+            if name in loaded_retrievers:
+                raise ValueError(f"检索插件名称重复：{name}（文件：{file_path.name}）")
+            loaded_retrievers[name] = factory
+
+    return loaded_tools, loaded_retrievers
+
+
 # 批量加载配置声明的全部插件工具，并禁止跨文件重名
 def load_plugin_tools(entries: Iterable[str], project_root: Path) -> list[Tool]:
-    loaded: list[Tool] = []
-    seen_names: set[str] = set()
-    for file_path in _resolve_plugin_targets(entries, project_root):
-        for item in _load_module_tools(file_path):
-            if item.name in seen_names:
-                raise ValueError(f"插件工具名称重复：{item.name}（文件：{file_path.name}）")
-            seen_names.add(item.name)
-            loaded.append(item)
-    return loaded
+    tools, _ = load_plugins(entries, project_root)
+    return tools
+
+
+# 批量加载配置声明的全部插件检索后端工厂（如 fts5_bm25），并禁止跨文件重名
+def load_plugin_retrievers(
+    entries: Iterable[str],
+    project_root: Path,
+) -> dict[str, RetrieverFactory]:
+    _, retrievers = load_plugins(entries, project_root)
+    return retrievers

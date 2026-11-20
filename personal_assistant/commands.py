@@ -6,10 +6,10 @@ import re
 import shutil
 import subprocess
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from personal_assistant.plugins import load_plugin_tools
+from personal_assistant.plugins import RetrieverFactory, load_plugins
 from personal_assistant.tools import Tool, ToolRegistry
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
@@ -203,7 +203,7 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     return spec, enabled
 
 
-# config/tools.json 的完整配置对象（管理白名单、插件、文件策略与固定命令）
+# config/tools.json 的完整配置对象（管理白名单、插件工具、检索插件、文件策略与固定命令）
 @dataclass(frozen=True)
 class ToolsConfig:
     enabled_tools: tuple[str, ...]
@@ -211,8 +211,10 @@ class ToolsConfig:
     commands: tuple[CommandSpec, ...]
     plugins: tuple[str, ...] = ()
     plugin_tools: tuple[Tool, ...] = ()
+    retrieval: dict[str, object] = field(default_factory=dict)
+    plugin_retrievers: tuple[tuple[str, RetrieverFactory], ...] = ()
 
-    # 从 tools.json 读取并校验白名单配置，同时自动扫描加载 plugins 目录中的插件工具
+    # 从 tools.json 读取并校验白名单配置，同时自动扫描加载 plugins 目录中的工具与检索插件
     @classmethod
     def load(cls, config_path: Path, project_root: Path | None = None) -> "ToolsConfig":
         resolved_cfg = config_path.resolve()
@@ -233,6 +235,10 @@ class ToolsConfig:
         if not isinstance(files_raw, dict):
             raise ValueError("files 必须是 JSON 对象。")
 
+        retrieval_raw = raw.get("retrieval", {})
+        if not isinstance(retrieval_raw, dict):
+            raise ValueError("retrieval 必须是 JSON 对象。")
+
         commands_raw = raw.get("commands", [])
         if not isinstance(commands_raw, list):
             raise ValueError("commands 必须是数组。")
@@ -247,15 +253,29 @@ class ToolsConfig:
             if enabled:
                 commands.append(spec)
 
-        loaded_plugins = tuple(load_plugin_tools(plugins_raw, root))
+        loaded_tools, loaded_retrievers = load_plugins(plugins_raw, root)
 
         return cls(
             enabled_tools=tuple(enabled_raw),
             files=dict(files_raw),
             commands=tuple(commands),
             plugins=tuple(plugins_raw),
-            plugin_tools=loaded_plugins,
+            plugin_tools=tuple(loaded_tools),
+            retrieval=dict(retrieval_raw),
+            plugin_retrievers=tuple(sorted(loaded_retrievers.items())),
         )
+
+    # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
+    def build_retriever(self, override_name: str | None = None) -> object | None:
+        raw_name = override_name if override_name is not None else self.retrieval.get("plugin")
+        plugin_name = str(raw_name or "").strip()
+        if not plugin_name or plugin_name == "linear":
+            return None
+        registry = dict(self.plugin_retrievers)
+        if plugin_name not in registry:
+            available = "、".join(sorted(registry)) or "（无）"
+            raise ValueError(f"未找到检索插件 {plugin_name!r}，当前已加载：{available}")
+        return registry[plugin_name](dict(self.retrieval))
 
     # 将全部已启用的固定命令转换为 Tool 列表
     def command_tools(self) -> list[Tool]:

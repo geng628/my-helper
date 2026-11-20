@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from personal_assistant.cli import REPO_ROOT, load_dotenv
+from personal_assistant.commands import ToolsConfig
 from personal_assistant.eval.agent_eval import evaluate_agent
 from personal_assistant.eval.common import load_cases, safe_write_report
 from personal_assistant.eval.memory_eval import evaluate_memory, load_scenarios
@@ -54,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", default="data/memory", help="search 模式检索根目录")
     parser.add_argument("--limit", type=int, default=5, help="search 模式 Top-K 数量")
+    parser.add_argument("--retriever", default="auto", help="search 模式检索后端：auto（按 tools.json）/ linear / 插件名如 fts5_bm25")
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
@@ -89,7 +91,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "search":
         cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
-        memory = MemoryStore(data_dir, create_dirs=False)
+        retriever = None
+        if args.retriever != "linear":
+            tools_cfg_path = (cfg_path or (REPO_ROOT / "config" / "tools.json")).resolve()
+            if tools_cfg_path.is_file():
+                proj = tools_cfg_path.parent.parent
+                loaded_cfg = ToolsConfig.load(tools_cfg_path, project_root=proj)
+                override = None if args.retriever == "auto" else args.retriever
+                retriever = loaded_cfg.build_retriever(override_name=override)
+            elif args.retriever != "auto":
+                raise ValueError(f"无法加载检索插件 {args.retriever!r}：未找到配置文件 {tools_cfg_path}")
+        memory = MemoryStore(data_dir, create_dirs=False, retriever=retriever)
         report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
     elif args.mode == "agent":
         cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
@@ -103,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         safe_write_report(Path(args.output), data_dir, report)
 
-    print(f"Eval mode={report['mode']}  git={report['git_commit']}")
+    extra = f"  retriever={report['retriever']}" if "retriever" in report else ""
+    print(f"Eval mode={report['mode']}{extra}  git={report['git_commit']}")
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     if report["failures"]:
         print("\nFailed cases:")

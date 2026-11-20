@@ -23,12 +23,13 @@ uv sync
 # 2. 运行单元测试（验证代码逻辑，不消耗 API Token）
 uv run pytest -v
 
-# 3. 运行离线检索评测（40 题内置分类型样本，零 Token）
-uv run python -m personal_assistant.eval --mode search
+# 3. 运行离线检索评测（40 题内置分类型样本，零 Token；支持 --retriever linear / fts5_bm25 做 A/B 对比）
+uv run python -m personal_assistant.eval --mode search --retriever linear
+uv run python -m personal_assistant.eval --mode search --retriever fts5_bm25
 
 # 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 evals/public/）
 uv run python -m personal_assistant.eval --mode download --dataset all
-# 零 Token 跑 200 题公开 LoCoMo 多会话检索基准
+# 零 Token 跑 200 题公开 LoCoMo 多会话检索基准（默认自动启用 config/tools.json 的 fts5_bm25 插件）
 uv run python -m personal_assistant.eval --mode search \
   --data-dir evals/public/locomo_search_data \
   --cases evals/public/locomo_search_cases.jsonl
@@ -53,21 +54,22 @@ uv run python scripts/web_chat.py --open
 
 仓库内置两套开箱即复现的评测集，同时通过零依赖适配器接入 **LongMemEval（ICLR 2025，500 题）** 与 **LoCoMo（ACL 2024，1,986 题）** 公开学术数据集（开放题采用与 Agent KV Cache 统计隔离的 `LLM-as-a-Judge` 评分）：
 
-| 评测集 | 类型 | 规模 | 当前基线（`deepseek-chat` / 线性检索） | 暴露的主要待优化项 |
-| --- | --- | --- | --- | --- |
-| `evals/sample_cases.jsonl` | 离线检索（5 分类） | 40 题 | 通过率 **80.0%**（32/40），Recall **96.6%**，MRR **0.908**，0.72 ms/题 | 同义改写漏召回；高相似干扰负例误命中（负例干净度 63.6%） |
-| LoCoMo Search（ACL 2024） | 公开多会话离线检索 | 200 题抽样 | Recall **42.8%**，MRR **0.359**，Quote Cov **33.6%**，29.8 ms/题 | 纯线性词面扫描缺少停用词过滤与 BM25 IDF 加权 |
-| `evals/memory_scenarios.jsonl` | 多轮记忆生命周期（6 分类） | 16 场景 | 通过率 **81.25%**（13/16），KV Cache 命中 **60.4%** / 前缀复用 **90.4%** | 日期未含星期导致相对日期换算失误；替换句残留旧关键词 |
-| LongMemEval（ICLR 2025） | 公开多轮长期记忆（7 分类） | 14 题分层抽样 | 通过率 **71.43%**（10/14，LLM Judge），前缀复用 **82.6%** | 隐式偏好问答未主动检索记忆（`single-session-preference` 0/2） |
+| 评测集 | 类型 | 规模 | 线性基线（`552863d`） | 插件 `fts5_bm25` 改后 | 关键变化 |
+| --- | --- | --- | --- | --- | --- |
+| `evals/sample_cases.jsonl` | 离线检索（5 分类） | 40 题 | 通过 **80.0%**（32/40），MRR **0.908**，负例干净度 **63.6%** | 通过 **95.0%**（38/40），MRR **0.948**，负例干净度 **100%** | **+15.0pp**，+6 改善 / 0 退步；仅剩纯语义同义改写待向量/RRF |
+| LoCoMo Search（ACL 2024） | 公开多会话离线检索 | 200 题抽样 | 通过 **28.5%**，Recall **42.8%**，MRR **0.359**，29.0 ms/题 | 通过 **52.5%**，Recall **68.5%**，MRR **0.622**，9.5 ms/题 | Recall **+25.8pp**，MRR **+0.263**，提速 **~3x**（+51 / -3） |
+| `evals/memory_scenarios.jsonl` | 多轮记忆生命周期（6 分类） | 16 场景 | 通过 **81.25%**（13/16），KV Cache 命中 **60.4%** / 前缀复用 **90.4%** | 通过 **81.25%**（13/16），KV Cache 命中 **77.0%** / 前缀复用 **87.9%** | 无检索退步；`temporal` 3/3，待优化替换句旧词残留 |
+| LongMemEval（ICLR 2025） | 公开多轮长期记忆（7 分类） | 14 题分层抽样 | 通过 **71.43%**（10/14，LLM Judge），前缀复用 **82.6%** | 未重跑（仅改动检索插件） | 待优化：隐式偏好问答主动检索（`single-session-preference` 0/2） |
 
 ## 当前项目结构（Step 4）
 
 ```text
 my_helper_v2/
 ├── config/
-│   └── tools.json                 # 工具白名单、插件路径、目录边界与固定命令配置
+│   └── tools.json                 # 工具白名单、插件路径、检索后端配置、目录边界与固定命令
 ├── plugins/
 │   ├── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
+│   ├── fts5_retriever.py          # SQLite FTS5 + BM25 检索后端插件（受 tools.json 的 retrieval 段管控）
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
 ├── evals/
@@ -101,6 +103,7 @@ my_helper_v2/
 │   ├── test_step1_react.py        # ReAct 循环与客户端单元测试
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
+│   ├── test_fts5_plugin.py        # SQLite FTS5 + BM25 检索插件单元测试
 │   ├── test_shell_plugin.py       # 受控白名单 Shell 插件安全边界单元测试
 │   ├── test_web_plugin.py         # 联网搜索与防 SSRF 抓网页插件单元测试
 │   ├── test_step3_memory.py       # Markdown 记忆、检索与目录边界单元测试

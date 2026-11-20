@@ -65,7 +65,8 @@ class AssistantApp:
                 project_root=self.project_root,
                 data_root=self.data_root,
             )
-            self.memory = MemoryStore(self.data_root, policy=policy)
+            retriever = self.tools_config.build_retriever()
+            self.memory = MemoryStore(self.data_root, policy=policy, retriever=retriever)
         else:
             self.memory = MemoryStore(self.data_root)
 
@@ -266,6 +267,7 @@ class AssistantApp:
             "messages": self.state.count_messages(),
             "tools": registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],
+            "retriever": str(getattr(self.memory.retriever, "name", "linear")),
             "cache": self.cache_monitor.summary(),
             "consolidation": self.background_consolidator.status(),
         }
