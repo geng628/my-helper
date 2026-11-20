@@ -4,13 +4,35 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
-  pytest:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.12
       - run: uv sync --frozen
-      - run: uv run pytest -v
+      - name: Run unit & architecture tests
+        run: uv run pytest -v
+      - name: Run offline retrieval benchmark smoke check
+        run: uv run python -m personal_assistant.eval --mode search --retriever fts5_bm25
+      - name: Verify Chinese comments above functions and classes
+        run: |
+          uv run python - <<'EOF'
+          import ast, pathlib
+          missing = []
+          for root in ("personal_assistant", "plugins", "scripts"):
+              for p in sorted(pathlib.Path(root).rglob("*.py")):
+                  lines = p.read_text(encoding="utf-8").splitlines()
+                  tree = ast.parse("\n".join(lines), filename=str(p))
+                  for node in ast.walk(tree):
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                          idx = (node.decorator_list[0].lineno if node.decorator_list else node.lineno) - 2
+                          if idx < 0 or not lines[idx].strip().startswith("#"):
+                              missing.append(f"{p}:{node.lineno} {node.name}")
+          if missing:
+              raise SystemExit(f"Missing Chinese # comments: {missing}")
+          print("All core/plugin/script classes and functions have Chinese comments.")
+          EOF

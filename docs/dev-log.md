@@ -199,3 +199,15 @@
 
 
 
+
+---
+
+### [2026-11-21] 正规化 GitHub Issue → 分支 → CI → PR 研发流程
+- **目标与思路**：从直接推送 `main` 切换为工业级“Issue 立项 → 功能分支开发 → TDD 与同口径 Benchmark 验收 → PR + CI 守卫 → 合并”流程，既保障 `main` 稳定，也在 GitHub 仓库留下完整可查的工程协作记录。
+- **改动文件**：
+  - `.github/ISSUE_TEMPLATE/feature_or_improvement.md` & `bug_report.md`：标准化功能/优化与缺陷立项模板（强制含改前基线与验收标准）。
+  - `.github/PULL_REQUEST_TEMPLATE.md`：标准化 PR 模板（`Closes #`、改前→改后 Benchmark 对比表、安全与架构 Checklist）。
+  - `.github/workflows/test.yml`：CI 升级为三步守卫（`pytest -v` 含三层架构测试 + 40 题 `fts5_bm25` 离线检索验证 + AST 中文注释校验）。
+  - `AGENTS.md`：固化标准 Issue/Branch/PR 流程（所有未来模型自动遵守）。
+- **验证**：75/75 单元测试通过，40 题检索 38/40，AST 注释零缺失；本改动本身以分支 `chore/pr-workflow-templates` 推送供发起首个正式 PR。
+- **下一步**：合并本 PR 并安装配置 `gh` CLI（登录大号 `geng628`），随后按正规流程为 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）开 Issue #1 并提交 PR。
