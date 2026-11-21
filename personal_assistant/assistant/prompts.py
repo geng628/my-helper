@@ -5,6 +5,8 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from personal_assistant.assistant.common import format_date_with_weekday
+
 if TYPE_CHECKING:
     from personal_assistant.assistant.memory import MemoryStore
 
@@ -35,6 +37,6 @@ def format_system_prompt(
     index = memory.read_memory_index()
     if index:
         parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-    day_str = (today or datetime.now(ZoneInfo("Asia/Shanghai")).date()).isoformat()
-    parts.append(f"今天是 {day_str}（北京时间）。")
+    ref_day = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    parts.append(f"今天是 {format_date_with_weekday(ref_day)}。")
     return "\n\n".join(parts)
