@@ -36,7 +36,8 @@
 | `35cc8ea` | 新增外部配置 DSL 编译插件 `plugins/models_dsl.py` + `CONFIG_COMPILERS` 第 4 类插件扩展点 + 系统级零心智防泄漏保护 | 核心层依然只认识标准 JSON（`ModelProfile` / `ModelsConfig`）；用户可在 `config/models.dsl` 直接写 `api_key` 免配环境变量，防泄漏由系统默认兜底（`.gitignore`、`0600` 落盘权限、文件与 Shell 沙箱屏蔽、全自动脱敏） |
 | 本次提交 | 面向零代码用户的极简一行预设语法（`use deepseek sk-...`）+ 终端一键向导 `setup` + 网页端「模型设置」自动生成与热切换 | 把“编程味”彻底降为零：内置 7 大主流厂商预设自动补全 URL/模型名/协议/温度，终端与网页均可 10 秒点选自动生成 `models.dsl` 与 `models.json`（均 0600 权限）并即时热生效 |
 | `efe8568` | 正规化 GitHub Issue → 分支 → CI → PR 研发流程（`#1` / `#2`） | 补齐 Issue/PR 模板与 CI 三步守卫（`pytest` + 40 题 `fts5_bm25` + AST 中文注释校验），彻底告别裸推 `main` |
-| Issue `#3` | 将 `personal_assistant/eval/` 整体迁移合并至顶层 `evals/` 包并统一 `python -m evals` | 让 `personal_assistant/` 只保留纯净三层产品代码（`ai`/`agent`/`assistant`），评测代码与评测数据统一收拢至顶层 `evals/`，并用 AST 守卫双向防反向依赖 |
+| `263cf37` | 将 `personal_assistant/eval/` 整体迁移合并至顶层 `evals/` 包并统一 `python -m evals`（`#3` / `#4`） | 让 `personal_assistant/` 只保留纯净三层产品代码（`ai`/`agent`/`assistant`），评测代码与评测数据统一收拢至顶层 `evals/`，并用 AST 守卫双向防反向依赖 |
+| Issue `#5` | 评测引擎支持 `--workers` 多线程并发、LoCoMo 共享长记忆模式与 Layer 1/2 并发线程安全补强 | 用纯标准库 `ThreadPoolExecutor` 与 `shared_setup` 彻底打通大样本实模评测（70~500 题 LongMemEval + 完整 19–32 会话 LoCoMo 共享沉淀免重复计费），同步修复 `last_usage` / `CacheMonitor` / 插件加载多线程竞态 |
 
 ---
 
@@ -113,6 +114,7 @@
 | --- | --- | --- | --- |
 | `cffbf26` | **13/16 (81.25%)**；服务端 KV 命中 60.4% / 前缀复用 90.4% | **10/14 (71.43%)**；服务端 KV 命中 26.2% / 前缀复用 82.6% | 暴露：无星期致相对日期算错；替换句残留旧词；LongMemEval `single-session-preference` 0/2 未主动查记忆 |
 | `d2e20e3`（启用 `fts5_bm25`） | **13/16 (81.25%)**；服务端 KV 命中 **77.0%** / 前缀复用 87.9% | 未重跑（仅改检索后端） | 无检索退步；`temporal` 3/3；`rolling-multi-compaction` 实答“企业微信机器人”正确但未命中严苛子串“企微” |
+| `263cf37`（`evals/` 统一 + `fts5_bm25`） | **14/16 (87.5%)**；服务端 KV 命中 **76.1%** / 前缀复用 87.2% | **12/14 (85.71%)**；服务端 KV 命中 **55.1%** / 前缀复用 83.9% | 16 场景仅剩 2 例 `op=replace` 残留旧词（`chained-three-step-update`、`partial-attribute-update`）；LongMemEval 仅剩 `lme-35a27287`（未查偏好记忆）与 `lme-gpt4_2312f94c`（先后口径矛盾） |
 
 ---
 
@@ -230,3 +232,23 @@
   - AST 中文注释校验（`personal_assistant/`、`evals/`、`plugins/`、`scripts/`）：**0 缺失**。
   - 退步与未验证项：无退步；本次为纯目录与包边界重构，未改动提示词、记忆生命周期或检索算法，未重复消耗 API 重跑 16 场景 / LongMemEval 实模多轮记忆评测。
 - **下一步**：待 PR CI 全绿并确认合并后，按第五节继续推进 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）。
+
+---
+
+### [2026-11-21] 评测引擎并发加速（`--workers`）与 LoCoMo 共享长记忆评测模式（Issue `#5`）
+- **目标与思路**：解决大样本实模评测的两大瓶颈——单线程串行耗时过长，以及 LoCoMo 多轮记忆原先硬截断 4 个会话且每道 QA 重复从头沉淀导致的 10×+ 算力浪费；同时补齐多线程共用 `OpenAICompatibleLLM` / `CacheMonitor` / 插件加载器时的并发安全底座，让 70~500 题 LongMemEval 与完整 19–32 会话的 LoCoMo 共享长记忆评测均可稳定快跑。
+- **改动文件**：
+  - Layer 1 & 2 并发安全：`personal_assistant/ai/client.py`（`OpenAICompatibleLLM.last_usage` 改为 `threading.local()` 线程隔离）、`personal_assistant/ai/cache.py`（`CacheMonitor` 加 `threading.Lock()`）、`personal_assistant/agent/plugins.py`（`_import_plugin_module()` 加 `_PLUGIN_IMPORT_LOCK` 防止并发竞争 `sys.modules`）。
+  - 顶层 `evals/`：`evals/memory_eval.py`（`evaluate_memory()` 支持 `workers >= 1` 并发且严格按原顺序输出、`on_progress` / `on_setup_done` 实时回调、`shared_group` 共享长记忆快照一次沉淀+逐 QA 拷贝隔离目录复用）、`evals/public_benchmarks.py`（`convert_locomo_for_memory()` 默认保留全量会话并支持 `max_convs` 与 `shared_group`，新增紧凑去重写出 `write_scenarios_jsonl()`，100 题完整 19 会话仅 136 KB）、`evals/cli.py`（新增 `--workers`、`--locomo-max-sessions`、`--locomo-max-convs` 与 `stderr` 实时进度）、`evals/__init__.py`。
+  - 测试与文档：`tests/test_cache_metrics.py`、`tests/test_memory_eval.py`、`tests/test_public_benchmarks.py`、`README.md`、`docs/dev-log.md`。
+- **踩坑与修复**：
+  1. **多线程共用客户端 `last_usage` 竞态**：先写并发竞态单测即复现线程 B 覆盖线程 A 的 `prompt_tokens`（222 覆盖 111）；改为 `threading.local()` 后彻底消除。
+  2. **共享记忆 QA 误触发后台沉淀**：TDD 单测 `test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa` 捕获到 `consolidate_calls == 3`（预期 1）——剥离 `setup_steps` 后，QA 侧剩余步骤只有 `ask`，`_run_single_scenario` 误判“无显式 `consolidate`”而按 `max_active_messages=1` 开启了后台沉淀；修复为将共享前缀是否含显式 `consolidate` 透传给 `disable_auto_consolidation`，彻底消除冗余调用与状态污染。
+- **同口径评测对比（改前 `263cf37` → 改后 `feat/issue-5-eval-workers-shared-locomo`）**：
+  - 单元测试：**76/76 → 80/80 passed**（+4 条并发线程安全、多 worker 保序、共享记忆隔离与紧凑 JSONL 单测）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**、0.507 ms，零退步。
+  - 公开检索（LoCoMo 200 题 `fts5_bm25`）：保持 **105/200 (52.5%)**、Recall **0.6851**、MRR **0.6221**、8.736 ms，零退步。
+  - 实模并发烟测（`--mode memory --workers 4 --max-cases 4`，`deepseek-chat`）：**4/4 PASS**，总墙钟时间 **25.8 s**（对比串行累计 87 s 提速 **~3.4×**），服务端 KV 命中 **78.73%** / 前缀复用 **92.74%**。
+  - AST 中文注释校验：**0 缺失**。
+  - 退步与未验证项：无退步；本次为评测并发与共享记忆基建升级，未改动提示词、检索算法与记忆沉淀逻辑，完整大样本实模基线（LongMemEval 70 题 + LoCoMo 共享记忆 100 题）将在合并后用于下一轮 P1 优化的改前/改后同口径对比。
+- **下一步**：合并本 PR 后，用 `--workers 6` 跑大样本实模基线（LongMemEval 70 题 + LoCoMo 共享记忆 100 题 + 自建 16 场景），再按 P1 逐项优化提示词与记忆生命周期并同口径复测。

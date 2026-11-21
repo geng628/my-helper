@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from personal_assistant.ai.client import from_env
@@ -59,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
+    parser.add_argument("--workers", type=int, default=1, help="memory 模式并发工作线程数（默认 1 串行；大样本推荐 4~6）")
     parser.add_argument("--config", default=None, help="tools.json 路径（agent/memory 模式使用）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
     # 以下参数专用于 --mode download 下载并转换公开学术基准（默认落盘到 evals/public）
@@ -67,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--longmemeval-limit", type=int, default=35, help="LongMemEval 分层抽样题数（0 表示全量 500 题）")
     parser.add_argument("--locomo-search-limit", type=int, default=200, help="LoCoMo 离线检索抽样题数（0 表示全量）")
     parser.add_argument("--locomo-memory-limit", type=int, default=25, help="LoCoMo 多轮记忆抽样题数（0 表示全量）")
+    parser.add_argument("--locomo-max-sessions", type=int, default=0, help="LoCoMo 每段对话最多保留的会话数（0 表示保留完整全部会话）")
+    parser.add_argument("--locomo-max-convs", type=int, default=0, help="LoCoMo 多轮记忆最多导出的对话段数（0 表示全部对话）")
     parser.add_argument("--seed", type=int, default=42, help="download 模式分层抽样随机种子")
     parser.add_argument("--force", action="store_true", help="download 模式强制重新下载原始 JSON")
     args = parser.parse_args(argv)
@@ -78,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
             longmemeval_limit=args.longmemeval_limit,
             locomo_search_limit=args.locomo_search_limit,
             locomo_memory_limit=args.locomo_memory_limit,
+            locomo_max_sessions=args.locomo_max_sessions,
+            locomo_max_convs=args.locomo_max_convs,
             seed=args.seed,
             force=args.force,
         )
@@ -110,12 +116,36 @@ def main(argv: list[str] | None = None) -> int:
         scenarios = _filter_items(load_scenarios(cases_path), category=args.category, max_cases=args.max_cases)
         llm = from_env()
         judge = None if args.no_judge else llm
-        report = evaluate_memory(llm, scenarios, config_path=cfg_path, judge_llm=judge)
+
+        # 向 stderr 输出共享长对话沉淀完成进度
+        def _report_setup_done(setup_rep: dict[str, object]) -> None:
+            sec = float(setup_rep.get("latency_ms") or 0.0) / 1000.0
+            gid = setup_rep.get("shared_group")
+            steps_n = setup_rep.get("steps_executed")
+            print(f"[setup] {gid} ready ({steps_n} steps, {sec:.1f}s)", file=sys.stderr, flush=True)
+
+        # 向 stderr 输出单题完成进度，避免长跑大样本评测时终端无反馈且不污染 stdout 汇总
+        def _report_progress(done: int, total: int, rec: dict[str, object]) -> None:
+            status = "PASS" if rec.get("passed") else "FAIL"
+            sec = float(rec.get("latency_ms") or 0.0) / 1000.0
+            print(f"[{done}/{total}] {status} {rec.get('id')} ({sec:.1f}s)", file=sys.stderr, flush=True)
+
+        report = evaluate_memory(
+            llm,
+            scenarios,
+            config_path=cfg_path,
+            judge_llm=judge,
+            workers=args.workers,
+            on_progress=_report_progress,
+            on_setup_done=_report_setup_done,
+        )
 
     if args.output:
         safe_write_report(Path(args.output), data_dir, report)
 
     extra = f"  retriever={report['retriever']}" if "retriever" in report else ""
+    if int(report.get("workers") or 1) > 1:
+        extra += f"  workers={report['workers']}"
     print(f"Eval mode={report['mode']}{extra}  git={report['git_commit']}")
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     if report["failures"]:

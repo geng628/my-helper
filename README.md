@@ -28,7 +28,8 @@ uv run python -m evals --mode search --retriever linear
 uv run python -m evals --mode search --retriever fts5_bm25
 
 # 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 evals/public/）
-uv run python -m evals --mode download --dataset all
+# （--*-limit 0 表示全量导出；LoCoMo 多轮记忆自动采用 shared_setup 共享长对话沉淀，免重复沉淀）
+uv run python -m evals --mode download --dataset all --longmemeval-limit 70 --locomo-memory-limit 100 --locomo-max-convs 1
 # 零 Token 跑 200 题公开 LoCoMo 多会话检索基准（默认自动启用 config/tools.json 的 fts5_bm25 插件）
 uv run python -m evals --mode search \
   --data-dir evals/public/locomo_search_data \
@@ -49,9 +50,11 @@ uv run python scripts/web_chat.py --open
 # （网址/默认模型/温度全自动补全；也支持老 .env 环境变量跑端到端评测）
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m evals --mode agent --output /tmp/eval-agent.json
-uv run python -m evals --mode memory --output /tmp/eval-memory.json
+uv run python -m evals --mode memory --workers 4 --output /tmp/eval-memory.json
 uv run python -m evals --mode memory \
-  --cases evals/public/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
+  --cases evals/public/longmemeval_scenarios.jsonl --workers 6 --output /tmp/eval-lme.json
+uv run python -m evals --mode memory \
+  --cases evals/public/locomo_memory_scenarios.jsonl --workers 6 --output /tmp/eval-locomo-mem.json
 ```
 
 ## 评测体系与当前基线
