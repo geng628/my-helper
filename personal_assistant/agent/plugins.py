@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
-import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import ModuleType
@@ -14,7 +13,6 @@ from personal_assistant.ai.client import ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
 ConfigCompiler = Callable[..., dict[str, object]]
-_PLUGIN_IMPORT_LOCK = threading.Lock()
 
 
 # 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
@@ -50,22 +48,21 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
-# 动态导入单个插件 .py 文件并注册到 sys.modules（加锁防多线程并发导入竞争）
+# 动态导入单个插件 .py 文件并注册到 sys.modules，确保 @dataclass 等反射特性正常工作
 def _import_plugin_module(file_path: Path) -> ModuleType:
     digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
     module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
-    with _PLUGIN_IMPORT_LOCK:
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        if spec is None or spec.loader is None:
-            raise ValueError(f"无法加载插件文件：{file_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        return module
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"无法加载插件文件：{file_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 # 从已导入插件模块中收集 TOOLS 列表以及被 @tool 装饰的函数

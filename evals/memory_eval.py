@@ -5,9 +5,7 @@ import json
 import re
 import shutil
 import tempfile
-import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import mean
@@ -590,7 +588,7 @@ def _aggregate_scenario_records(records: list[dict[str, object]]) -> dict[str, o
     }
 
 
-# 批量运行端到端记忆与生命周期评测（支持 workers 并发与 shared_group 共享沉淀复用）
+# 批量运行端到端记忆与生命周期评测（单线程确定性执行，支持 shared_group 共享长记忆沉淀复用与实时进度回调）
 def evaluate_memory(
     llm: LLMClient,
     scenarios: list[dict[str, object]],
@@ -598,13 +596,9 @@ def evaluate_memory(
     config_path: Path | None = None,
     judge_llm: LLMClient | None = None,
     git_commit: str | None = None,
-    workers: int = 1,
     on_progress: ProgressCallback | None = None,
     on_setup_done: SetupDoneCallback | None = None,
 ) -> dict[str, object]:
-    if workers < 1:
-        raise ValueError("workers 必须 >= 1。")
-
     cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
     project_root = cfg_path.parent.parent if cfg_path.is_file() else REPO_ROOT
 
@@ -619,59 +613,30 @@ def evaluate_memory(
 
     shared_setups_report: dict[str, dict[str, object]] = {}
     setup_cache_records: list[CallCacheRecord] = []
+    per_scenario: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    grouped: dict[str, list[dict[str, object]]] = {}
+    all_cache_records: list[CallCacheRecord] = []
+    latencies: list[float] = []
     total = len(prepared_items)
-    ordered_results: list[tuple[dict[str, object], list[CallCacheRecord]] | None] = [None] * total
 
     with tempfile.TemporaryDirectory(prefix="my-helper-shared-eval-") as shared_tmp:
         shared_dirs: dict[str, Path] = {}
-        if shared_specs:
-            group_order = list(shared_specs.keys())
-            for idx, gid in enumerate(group_order):
-                safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
-                shared_dirs[gid] = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
+        for idx, (gid, spec) in enumerate(shared_specs.items()):
+            safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
+            target_dir = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
+            shared_dirs[gid] = target_dir
+            s_rep, s_recs = _build_shared_setup(
+                llm, gid, spec, target_dir, cfg_path, project_root
+            )
+            if on_setup_done is not None:
+                on_setup_done(s_rep)
+            shared_setups_report[gid] = s_rep
+            setup_cache_records.extend(s_recs)
 
-            if workers > 1 and len(group_order) > 1:
-                built: dict[str, tuple[dict[str, object], list[CallCacheRecord]]] = {}
-                with ThreadPoolExecutor(max_workers=min(workers, len(group_order))) as pool:
-                    fut_map = {
-                        pool.submit(
-                            _build_shared_setup,
-                            llm,
-                            gid,
-                            shared_specs[gid],
-                            shared_dirs[gid],
-                            cfg_path,
-                            project_root,
-                        ): gid
-                        for gid in group_order
-                    }
-                    for fut in as_completed(fut_map):
-                        gid = fut_map[fut]
-                        s_rep, s_recs = fut.result()
-                        built[gid] = (s_rep, s_recs)
-                        if on_setup_done is not None:
-                            on_setup_done(s_rep)
-                for gid in group_order:
-                    s_rep, s_recs = built[gid]
-                    shared_setups_report[gid] = s_rep
-                    setup_cache_records.extend(s_recs)
-            else:
-                for gid in group_order:
-                    s_rep, s_recs = _build_shared_setup(
-                        llm, gid, shared_specs[gid], shared_dirs[gid], cfg_path, project_root
-                    )
-                    if on_setup_done is not None:
-                        on_setup_done(s_rep)
-                    shared_setups_report[gid] = s_rep
-                    setup_cache_records.extend(s_recs)
+        all_cache_records.extend(setup_cache_records)
 
-        progress_lock = threading.Lock()
-        done_count = 0
-
-        # 执行单条场景并在完成后线程安全地上报实时进度
-        def _run_indexed(idx: int) -> tuple[int, dict[str, object], list[CallCacheRecord]]:
-            nonlocal done_count
-            scenario, gid, qa_steps = prepared_items[idx]
+        for idx, (scenario, gid, qa_steps) in enumerate(prepared_items, start=1):
             base_dir = shared_dirs.get(gid) if gid else None
             setup_has_consolidate = bool(
                 gid
@@ -680,7 +645,7 @@ def evaluate_memory(
                     for s in (shared_specs.get(gid, {}).get("steps") or [])
                 )
             )
-            rec, c_recs = _run_single_scenario(
+            record, cache_records = _run_single_scenario(
                 llm,
                 scenario,
                 cfg_path,
@@ -691,45 +656,20 @@ def evaluate_memory(
                 disable_auto_consolidation=setup_has_consolidate,
             )
             if on_progress is not None:
-                with progress_lock:
-                    done_count += 1
-                    current_done = done_count
-                on_progress(current_done, total, rec)
-            return idx, rec, c_recs
-
-        if workers > 1 and total > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
-                futures = [pool.submit(_run_indexed, idx) for idx in range(total)]
-                for fut in as_completed(futures):
-                    idx, rec, c_recs = fut.result()
-                    ordered_results[idx] = (rec, c_recs)
-        else:
-            for idx in range(total):
-                _, rec, c_recs = _run_indexed(idx)
-                ordered_results[idx] = (rec, c_recs)
-
-    per_scenario: list[dict[str, object]] = []
-    failures: list[dict[str, object]] = []
-    grouped: dict[str, list[dict[str, object]]] = {}
-    all_cache_records: list[CallCacheRecord] = list(setup_cache_records)
-    latencies: list[float] = []
-
-    for item in ordered_results:
-        assert item is not None
-        record, cache_records = item
-        per_scenario.append(record)
-        grouped.setdefault(str(record["category"]), []).append(record)
-        all_cache_records.extend(cache_records)
-        latencies.append(float(record["latency_ms"]))
-        if not record["passed"]:
-            failures.append(
-                {
-                    "id": record["id"],
-                    "category": record["category"],
-                    "reason": "; ".join(record["reasons"]),
-                    "reasons": record["reasons"],
-                }
-            )
+                on_progress(idx, total, record)
+            per_scenario.append(record)
+            grouped.setdefault(str(record["category"]), []).append(record)
+            all_cache_records.extend(cache_records)
+            latencies.append(float(record["latency_ms"]))
+            if not record["passed"]:
+                failures.append(
+                    {
+                        "id": record["id"],
+                        "category": record["category"],
+                        "reason": "; ".join(record["reasons"]),
+                        "reasons": record["reasons"],
+                    }
+                )
 
     summary = _aggregate_scenario_records(per_scenario)
     summary["mean_latency_ms"] = round(mean(latencies), 3) if latencies else 0.0
@@ -739,7 +679,6 @@ def evaluate_memory(
     summary["cache"] = summarize_records(all_cache_records)
     report: dict[str, object] = {
         "mode": "memory",
-        "workers": workers,
         "git_commit": git_commit or current_git_commit(),
         "timestamp": datetime.now(UTC).isoformat(),
         "summary": summary,

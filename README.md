@@ -50,11 +50,11 @@ uv run python scripts/web_chat.py --open
 # （网址/默认模型/温度全自动补全；也支持老 .env 环境变量跑端到端评测）
 uv run python scripts/demo.py --ask "现在几点了？"
 uv run python -m evals --mode agent --output /tmp/eval-agent.json
-uv run python -m evals --mode memory --workers 4 --output /tmp/eval-memory.json
+uv run python -m evals --mode memory --output /tmp/eval-memory.json
 uv run python -m evals --mode memory \
-  --cases evals/public/longmemeval_scenarios.jsonl --workers 6 --output /tmp/eval-lme.json
+  --cases evals/public/longmemeval_scenarios.jsonl --output /tmp/eval-lme.json
 uv run python -m evals --mode memory \
-  --cases evals/public/locomo_memory_scenarios.jsonl --workers 6 --output /tmp/eval-locomo-mem.json
+  --cases evals/public/locomo_memory_scenarios.jsonl --output /tmp/eval-locomo-mem.json
 ```
 
 ## 评测体系与当前基线

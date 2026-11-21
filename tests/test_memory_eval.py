@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -345,31 +343,8 @@ def test_evaluate_memory_records_judge_failure() -> None:
     assert "judge" in str(report["failures"][0]["reason"]).lower()
 
 
-# 测试 evaluate_memory 支持 workers 多线程并发，严格保持原始场景顺序并触发实时进度回调
-def test_evaluate_memory_parallel_workers_preserves_order_and_reports_progress() -> None:
-    # 线程安全假模型：前几题人为延迟更长，验证并发乱序完成但报告顺序严格稳定
-    class DelayedParallelLLM(LLMClient):
-        # 初始化线程局部 usage 存储
-        def __init__(self) -> None:
-            self._local = threading.local()
-
-        # 读取当前线程的最近一次 usage
-        @property
-        def last_usage(self) -> TokenUsage | None:
-            return getattr(self._local, "usage", None)
-
-        # 按题目编号反向延迟后返回确定性答复
-        def respond(
-            self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            user_text = str(messages[-1].get("content") or "")
-            idx = int(user_text.split("#")[-1])
-            time.sleep(0.04 * (3 - idx))
-            self._local.usage = TokenUsage(prompt_tokens=100 + idx, cached_tokens=50, completion_tokens=10)
-            return {"role": "assistant", "content": f"ok-{idx}"}
-
+# 测试 evaluate_memory 按序执行全部场景并触发单题实时进度回调
+def test_evaluate_memory_reports_progress_in_order() -> None:
     scenarios = [
         {
             "id": f"sc-{idx}",
@@ -383,50 +358,38 @@ def test_evaluate_memory_parallel_workers_preserves_order_and_reports_progress()
                 }
             ],
         }
-        for idx in range(4)
+        for idx in range(3)
     ]
-
-    with pytest.raises(ValueError, match="workers"):
-        evaluate_memory(DelayedParallelLLM(), scenarios, workers=0)
+    llm = ScriptedMemoryEvalLLM(
+        [
+            ({"role": "assistant", "content": f"ok-{idx}"}, TokenUsage(100 + idx, 50, 10))
+            for idx in range(3)
+        ]
+    )
 
     progress_events: list[tuple[int, int, str]] = []
 
-    # 收集并发回调的完成进度事件
+    # 收集每题完成时的进度回调事件
     def on_progress(done: int, total: int, record: dict[str, object]) -> None:
         progress_events.append((done, total, str(record["id"])))
 
-    report = evaluate_memory(
-        DelayedParallelLLM(),
-        scenarios,
-        workers=3,
-        on_progress=on_progress,
-        git_commit="par-sha",
-    )
-    assert report["workers"] == 3
-    assert [item["id"] for item in report["scenarios"]] == ["sc-0", "sc-1", "sc-2", "sc-3"]
-    assert report["summary"]["passed_scenarios"] == 4
-    assert report["summary"]["cache"]["llm_calls"] == 4
-    assert report["summary"]["cache"]["prompt_tokens"] == 100 + 101 + 102 + 103
-    assert len(progress_events) == 4
-    assert [ev[0] for ev in progress_events] == [1, 2, 3, 4]
-    assert all(ev[1] == 4 for ev in progress_events)
+    report = evaluate_memory(llm, scenarios, on_progress=on_progress, git_commit="prog-sha")
+    assert [item["id"] for item in report["scenarios"]] == ["sc-0", "sc-1", "sc-2"]
+    assert report["summary"]["passed_scenarios"] == 3
+    assert report["summary"]["cache"]["llm_calls"] == 3
+    assert report["summary"]["cache"]["prompt_tokens"] == 303
+    assert progress_events == [(1, 3, "sc-0"), (2, 3, "sc-1"), (3, 3, "sc-2")]
 
 
-# 测试 shared_group 共享长记忆模式：同一对话只沉淀一次，每道 QA 在独立隔离副本上并发运行不串状态
+# 测试 shared_group 共享长记忆模式：同一对话只沉淀一次，每道 QA 在独立隔离副本上运行且不串状态
 def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp_path: Path) -> None:
-    lock = threading.Lock()
     consolidate_calls = 0
 
-    # 根据请求内容区分沉淀调用与 QA 问答调用的线程安全假模型
+    # 根据请求内容区分沉淀调用与 QA 问答调用的确定性假模型
     class SharedGroupMockLLM(LLMClient):
-        # 初始化线程局部 usage
+        # 初始化最近一次 usage 记录
         def __init__(self) -> None:
-            self._local = threading.local()
-
-        # 读取当前线程最近一次 usage
-        @property
-        def last_usage(self) -> TokenUsage | None:
-            return getattr(self._local, "usage", None)
+            self.last_usage: TokenUsage | None = None
 
         # 沉淀阶段写入 pets.md；QA1 故意调 remember_fact 写入隔离标记；QA2 仅读 pets.md 验证无串台
         def respond(
@@ -437,9 +400,8 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
             nonlocal consolidate_calls
             sys_text = str(messages[0].get("content") or "")
             if tools is None and "后台记忆整理器" in sys_text:
-                with lock:
-                    consolidate_calls += 1
-                self._local.usage = TokenUsage(prompt_tokens=400, cached_tokens=0, completion_tokens=50)
+                consolidate_calls += 1
+                self.last_usage = TokenUsage(prompt_tokens=400, cached_tokens=0, completion_tokens=50)
                 return {
                     "role": "assistant",
                     "content": json.dumps(
@@ -463,7 +425,7 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
                 (str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"),
                 "",
             )
-            self._local.usage = TokenUsage(prompt_tokens=300, cached_tokens=150, completion_tokens=20)
+            self.last_usage = TokenUsage(prompt_tokens=300, cached_tokens=150, completion_tokens=20)
             if "QA1_MUTATE" in user_prompt and last_role == "user":
                 return {
                     "role": "assistant",
@@ -542,8 +504,15 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
     assert loaded[0]["shared_group"] == "conv-shared"
     assert "shared_setup" in loaded[0]
 
-    report = evaluate_memory(SharedGroupMockLLM(), loaded, workers=2, git_commit="shared-sha")
+    setup_events: list[str] = []
+    report = evaluate_memory(
+        SharedGroupMockLLM(),
+        loaded,
+        on_setup_done=lambda rep: setup_events.append(str(rep["shared_group"])),
+        git_commit="shared-sha",
+    )
     assert consolidate_calls == 1
+    assert setup_events == ["conv-shared"]
     assert report["summary"]["passed_scenarios"] == 2
     assert report["summary"]["failed_scenarios"] == 0
     assert "conv-shared" in report["shared_setups"]

@@ -60,7 +60,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
-    parser.add_argument("--workers", type=int, default=1, help="memory 模式并发工作线程数（默认 1 串行；大样本推荐 4~6）")
     parser.add_argument("--config", default=None, help="tools.json 路径（agent/memory 模式使用）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
     # 以下参数专用于 --mode download 下载并转换公开学术基准（默认落盘到 evals/public）
@@ -135,7 +134,6 @@ def main(argv: list[str] | None = None) -> int:
             scenarios,
             config_path=cfg_path,
             judge_llm=judge,
-            workers=args.workers,
             on_progress=_report_progress,
             on_setup_done=_report_setup_done,
         )
@@ -144,8 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         safe_write_report(Path(args.output), data_dir, report)
 
     extra = f"  retriever={report['retriever']}" if "retriever" in report else ""
-    if int(report.get("workers") or 1) > 1:
-        extra += f"  workers={report['workers']}"
     print(f"Eval mode={report['mode']}{extra}  git={report['git_commit']}")
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     if report["failures"]:
