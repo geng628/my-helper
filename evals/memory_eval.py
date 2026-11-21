@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import mean
@@ -20,6 +22,9 @@ from personal_assistant.assistant.consolidator import (
     _parse_json_object,
 )
 from evals.common import current_git_commit
+
+ProgressCallback = Callable[[int, int, dict[str, object]], None]
+SetupDoneCallback = Callable[[dict[str, object]], None]
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict, impartial evaluator grading an AI assistant's answer against a reference answer.\n"
@@ -61,10 +66,11 @@ ABSTENTION_MARKERS = (
 )
 
 
-# 从 JSONL 文件读取多轮记忆评测场景，校验场景 id 唯一且包含非空 steps
+# 从 JSONL 文件读取多轮记忆评测场景（支持 record_type=shared_setup 共享长记忆前缀绑定）
 def load_scenarios(path: Path) -> list[dict[str, object]]:
     scenarios: list[dict[str, object]] = []
     seen_ids: set[str] = set()
+    shared_setups: dict[str, dict[str, object]] = {}
     for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         text = raw_line.strip()
         if not text:
@@ -72,6 +78,18 @@ def load_scenarios(path: Path) -> list[dict[str, object]]:
         item = json.loads(text)
         if not isinstance(item, dict):
             raise ValueError(f"{path.name}:{line_no} 必须是 JSON 对象。")
+        if str(item.get("record_type") or "").strip().lower() == "shared_setup":
+            group_id = str(item.get("shared_group") or "").strip()
+            setup_steps = item.get("steps")
+            if not group_id:
+                raise ValueError(f"{path.name}:{line_no} shared_setup 缺少非空 shared_group。")
+            if group_id in shared_setups:
+                raise ValueError(f"重复的 shared_group 定义：{group_id}")
+            if not isinstance(setup_steps, list) or not setup_steps:
+                raise ValueError(f"shared_setup {group_id} 必须包含非空 steps 数组。")
+            shared_setups[group_id] = item
+            continue
+
         sc_id = str(item.get("id") or f"scenario-{line_no}").strip()
         if sc_id in seen_ids:
             raise ValueError(f"重复的场景 id：{sc_id}")
@@ -83,6 +101,18 @@ def load_scenarios(path: Path) -> list[dict[str, object]]:
         scenarios.append(item)
     if not scenarios:
         raise ValueError("场景文件为空。")
+
+    # 将紧凑格式中引用 shared_group 的场景与对应 shared_setup 定义绑定，便于后续过滤与并发复用
+    for item in scenarios:
+        group_id = str(item.get("shared_group") or "").strip()
+        if not group_id:
+            continue
+        has_inline = isinstance(item.get("setup_step_count"), int) and int(item["setup_step_count"]) > 0
+        if isinstance(item.get("shared_setup"), dict) or has_inline:
+            continue
+        if group_id not in shared_setups:
+            raise ValueError(f"场景 {item['id']} 引用了未定义的 shared_group：{group_id}")
+        item["shared_setup"] = shared_setups[group_id]
     return scenarios
 
 
@@ -251,7 +281,222 @@ def _check_ask_assertions(
     return reasons, judge_detail
 
 
-# 在完全隔离的临时目录中执行单个端到端记忆场景，返回步骤明细、失败原因与缓存统计
+# 将已完成沉淀的共享基准 data/ 目录完整复制到独立临时目录（隔离记忆、工作区与状态库）
+def _copy_data_snapshot(src_data: Path, dst_data: Path) -> None:
+    dst_data.mkdir(parents=True, exist_ok=True)
+    for sub in ("memory", "workspace", "state"):
+        src_sub = src_data / sub
+        if src_sub.is_dir():
+            shutil.copytree(src_sub, dst_data / sub, symlinks=False)
+
+
+# 提取场景的共享前缀信息，返回 (group_id, setup_spec, qa_steps)
+def _split_shared_setup(
+    scenario: dict[str, object],
+) -> tuple[str | None, dict[str, object] | None, list[dict[str, object]]]:
+    steps = list(scenario.get("steps") or [])
+    group_id = str(scenario.get("shared_group") or "").strip()
+    if not group_id:
+        return None, None, steps
+    raw_setup = scenario.get("shared_setup")
+    if isinstance(raw_setup, dict):
+        return group_id, raw_setup, steps
+    raw_count = scenario.get("setup_step_count")
+    if isinstance(raw_count, int) and raw_count > 0:
+        setup_spec: dict[str, object] = {
+            "shared_group": group_id,
+            "policy": scenario.get("policy"),
+            "seed_memories": scenario.get("seed_memories"),
+            "today": scenario.get("today"),
+            "steps": steps[:raw_count],
+        }
+        return group_id, setup_spec, steps[raw_count:]
+    return None, None, steps
+
+
+# 在指定 AssistantApp 实例上顺序执行一组评测步骤，返回步骤日志与失败原因列表
+def _execute_steps(
+    app: AssistantApp,
+    llm: LLMClient,
+    steps: list[dict[str, object]],
+    policy: ConsolidationPolicy,
+    clock_day: list[date | None],
+    current_today: Callable[[], date],
+    *,
+    judge_llm: LLMClient | None = None,
+) -> tuple[list[dict[str, object]], list[str]]:
+    step_logs: list[dict[str, object]] = []
+    reasons: list[str] = []
+
+    for idx, raw_step in enumerate(steps, start=1):
+        if not isinstance(raw_step, dict):
+            continue
+        action = str(raw_step.get("action") or "").strip().lower()
+        chat_id = str(raw_step.get("chat_id") or "default")
+        step_day = _parse_optional_date(raw_step.get("today"))
+        if step_day is not None and step_day != clock_day[0]:
+            clock_day[0] = step_day
+            app.reset_session_prompt(chat_id)
+
+        if action == "seed_history":
+            seeded = 0
+            for msg in raw_step.get("messages") or []:
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role") or "").strip().lower()
+                content = str(msg.get("content") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    app.state.append_message(chat_id, role, content)
+                    seeded += 1
+            step_logs.append(
+                {
+                    "step": idx,
+                    "action": "seed_history",
+                    "chat_id": chat_id,
+                    "seeded_messages": seeded,
+                }
+            )
+        elif action == "chat":
+            res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
+            step_logs.append(
+                {
+                    "step": idx,
+                    "action": "chat",
+                    "chat_id": chat_id,
+                    "tool_calls": [t["tool"] for t in res["tool_calls"]],
+                    "reply": res["reply"],
+                }
+            )
+        elif action == "consolidate":
+            ref_day = step_day or current_today()
+            tracked = app.cache_monitor.wrap(llm, session_key=f"consolidate-{chat_id}")
+            runner = MemoryConsolidator(app.state, app.memory, tracked, policy=policy)
+            c_res = runner.consolidate_once(chat_id, today=ref_day)
+            app.reset_session_prompt(chat_id)
+            if c_res is None:
+                reasons.append(f"step#{idx} consolidate 未触发（请检查消息数与 policy 阈值）")
+            step_logs.append(
+                {
+                    "step": idx,
+                    "action": "consolidate",
+                    "chat_id": chat_id,
+                    "result": c_res.to_dict() if c_res else None,
+                }
+            )
+        elif action == "wait_consolidation":
+            app.wait_for_consolidation(timeout=30.0)
+            step_logs.append({"step": idx, "action": "wait_consolidation"})
+        elif action == "archive":
+            ref_day = step_day or current_today()
+            archived = app.memory.archive_expired_memories(today=ref_day)
+            app.reset_session_prompt()
+            step_logs.append({"step": idx, "action": "archive", "archived": archived})
+        elif action == "check_search":
+            ref_day = step_day or current_today()
+            root = str(raw_step.get("root") or "data/memory")
+            query = str(raw_step.get("query") or "")
+            hits = app.memory.search_hits(query, root=root, today=ref_day)
+            expect_empty = bool(raw_step.get("expect_empty", False))
+            if expect_empty and hits:
+                reasons.append(f"step#{idx} check_search({query!r}) 期望为空，实际命中 {len(hits)} 条")
+            must_hit = raw_step.get("must_include")
+            if isinstance(must_hit, str) and must_hit:
+                joined = "\n".join(h.snippet for h in hits)
+                if must_hit.lower() not in joined.lower():
+                    reasons.append(f"step#{idx} check_search({query!r}) 未包含 {must_hit!r}")
+            step_logs.append(
+                {
+                    "step": idx,
+                    "action": "check_search",
+                    "query": query,
+                    "hit_count": len(hits),
+                }
+            )
+        elif action == "ask":
+            res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
+            step_reasons, judge_detail = _check_ask_assertions(
+                app, raw_step, res, judge_llm=judge_llm
+            )
+            reasons.extend(f"step#{idx} {r}" for r in step_reasons)
+            entry: dict[str, object] = {
+                "step": idx,
+                "action": "ask",
+                "chat_id": chat_id,
+                "tool_calls": [t["tool"] for t in res["tool_calls"]],
+                "reply": res["reply"],
+                "cache": res["cache"],
+                "check_failures": step_reasons,
+            }
+            if judge_detail is not None:
+                entry["judge"] = judge_detail
+            step_logs.append(entry)
+        else:
+            reasons.append(f"step#{idx} 未知 action：{action}")
+
+    return step_logs, reasons
+
+
+# 为共享长记忆组执行一次前置历史注入与沉淀，产出可供多道 QA 并发拷贝复用的基准目录快照
+def _build_shared_setup(
+    llm: LLMClient,
+    group_id: str,
+    setup_spec: dict[str, object],
+    base_data_dir: Path,
+    cfg_path: Path | None,
+    project_root: Path,
+) -> tuple[dict[str, object], list[CallCacheRecord]]:
+    policy = _build_policy(setup_spec.get("policy"))
+    steps = list(setup_spec.get("steps") or [])
+    has_explicit_consolidate = any(
+        isinstance(s, dict) and s.get("action") == "consolidate" for s in steps
+    )
+    t0 = perf_counter()
+    clock_day: list[date | None] = [_parse_optional_date(setup_spec.get("today"))]
+
+    # 返回当前共享前置构建的逻辑日期
+    def current_today() -> date:
+        return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+    app = AssistantApp(
+        data_root=base_data_dir,
+        config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
+        project_root=project_root,
+        llm=llm,
+        consolidation_policy=policy,
+        consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+        today_fn=current_today,
+    )
+    try:
+        for seed in setup_spec.get("seed_memories") or []:
+            if not isinstance(seed, dict):
+                continue
+            app.memory.apply_memory_operations(
+                str(seed.get("topic") or "facts"),
+                str(seed.get("title") or "预置记忆"),
+                str(seed.get("index_summary") or "预置主题记忆"),
+                list(seed.get("operations") or []),
+                today=_parse_optional_date(seed.get("today")),
+            )
+        step_logs, reasons = _execute_steps(
+            app, llm, steps, policy, clock_day, current_today, judge_llm=None
+        )
+        records = list(app.cache_monitor.records)
+        cache_summary = app.cache_monitor.summary()
+    finally:
+        app.close()
+
+    elapsed_ms = round((perf_counter() - t0) * 1000, 3)
+    summary = {
+        "shared_group": group_id,
+        "steps_executed": len(step_logs),
+        "errors": reasons,
+        "latency_ms": elapsed_ms,
+        "cache": cache_summary,
+    }
+    return summary, records
+
+
+# 在完全隔离的临时目录中执行单个端到端记忆场景（支持从共享沉淀快照拷贝初始状态）
 def _run_single_scenario(
     llm: LLMClient,
     scenario: dict[str, object],
@@ -259,18 +504,19 @@ def _run_single_scenario(
     project_root: Path,
     *,
     judge_llm: LLMClient | None = None,
+    base_data_dir: Path | None = None,
+    steps_override: list[dict[str, object]] | None = None,
+    disable_auto_consolidation: bool = False,
 ) -> tuple[dict[str, object], list[CallCacheRecord]]:
     sc_id = str(scenario["id"])
     category = str(scenario.get("category") or "uncategorized").strip() or "uncategorized"
     policy = _build_policy(scenario.get("policy"))
-    steps = list(scenario.get("steps") or [])
-    has_explicit_consolidate = any(
+    steps = list(steps_override) if steps_override is not None else list(scenario.get("steps") or [])
+    has_explicit_consolidate = disable_auto_consolidation or any(
         isinstance(s, dict) and s.get("action") == "consolidate" for s in steps
     )
 
     t0 = perf_counter()
-    step_logs: list[dict[str, object]] = []
-    reasons: list[str] = []
     clock_day: list[date | None] = [_parse_optional_date(scenario.get("today"))]
 
     # 返回当前场景逻辑日期（若未指定则回退北京时间当日）
@@ -279,6 +525,8 @@ def _run_single_scenario(
 
     with tempfile.TemporaryDirectory(prefix=f"my-helper-memeval-{sc_id}-") as tmp:
         data_root = Path(tmp) / "data"
+        if base_data_dir is not None:
+            _copy_data_snapshot(base_data_dir, data_root)
         app = AssistantApp(
             data_root=data_root,
             config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
@@ -290,130 +538,29 @@ def _run_single_scenario(
             today_fn=current_today,
         )
         try:
-            # 注入场景预设的初始记忆
-            for seed in scenario.get("seed_memories") or []:
-                if not isinstance(seed, dict):
-                    continue
-                app.memory.apply_memory_operations(
-                    str(seed.get("topic") or "facts"),
-                    str(seed.get("title") or "预置记忆"),
-                    str(seed.get("index_summary") or "预置主题记忆"),
-                    list(seed.get("operations") or []),
-                    today=_parse_optional_date(seed.get("today")),
-                )
+            # 非共享快照场景下，注入场景预设的初始记忆
+            if base_data_dir is None:
+                for seed in scenario.get("seed_memories") or []:
+                    if not isinstance(seed, dict):
+                        continue
+                    app.memory.apply_memory_operations(
+                        str(seed.get("topic") or "facts"),
+                        str(seed.get("title") or "预置记忆"),
+                        str(seed.get("index_summary") or "预置主题记忆"),
+                        list(seed.get("operations") or []),
+                        today=_parse_optional_date(seed.get("today")),
+                    )
 
-            for idx, raw_step in enumerate(steps, start=1):
-                if not isinstance(raw_step, dict):
-                    continue
-                action = str(raw_step.get("action") or "").strip().lower()
-                chat_id = str(raw_step.get("chat_id") or "default")
-                step_day = _parse_optional_date(raw_step.get("today"))
-                if step_day is not None and step_day != clock_day[0]:
-                    clock_day[0] = step_day
-                    app.reset_session_prompt(chat_id)
-
-                if action == "seed_history":
-                    seeded = 0
-                    for msg in raw_step.get("messages") or []:
-                        if not isinstance(msg, dict):
-                            continue
-                        role = str(msg.get("role") or "").strip().lower()
-                        content = str(msg.get("content") or "").strip()
-                        if role in {"user", "assistant"} and content:
-                            app.state.append_message(chat_id, role, content)
-                            seeded += 1
-                    step_logs.append(
-                        {
-                            "step": idx,
-                            "action": "seed_history",
-                            "chat_id": chat_id,
-                            "seeded_messages": seeded,
-                        }
-                    )
-                elif action == "chat":
-                    res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
-                    step_logs.append(
-                        {
-                            "step": idx,
-                            "action": "chat",
-                            "chat_id": chat_id,
-                            "tool_calls": [t["tool"] for t in res["tool_calls"]],
-                            "reply": res["reply"],
-                        }
-                    )
-                elif action == "consolidate":
-                    ref_day = step_day or current_today()
-                    tracked = app.cache_monitor.wrap(llm, session_key=f"consolidate-{chat_id}")
-                    runner = MemoryConsolidator(app.state, app.memory, tracked, policy=policy)
-                    c_res = runner.consolidate_once(chat_id, today=ref_day)
-                    app.reset_session_prompt(chat_id)
-                    if c_res is None:
-                        reasons.append(f"step#{idx} consolidate 未触发（请检查消息数与 policy 阈值）")
-                    step_logs.append(
-                        {
-                            "step": idx,
-                            "action": "consolidate",
-                            "chat_id": chat_id,
-                            "result": c_res.to_dict() if c_res else None,
-                        }
-                    )
-                elif action == "wait_consolidation":
-                    app.wait_for_consolidation(timeout=30.0)
-                    step_logs.append({"step": idx, "action": "wait_consolidation"})
-                elif action == "archive":
-                    ref_day = step_day or current_today()
-                    archived = app.memory.archive_expired_memories(today=ref_day)
-                    app.reset_session_prompt()
-                    step_logs.append({"step": idx, "action": "archive", "archived": archived})
-                elif action == "check_search":
-                    ref_day = step_day or current_today()
-                    root = str(raw_step.get("root") or "data/memory")
-                    query = str(raw_step.get("query") or "")
-                    hits = app.memory.search_hits(query, root=root, today=ref_day)
-                    expect_empty = bool(raw_step.get("expect_empty", False))
-                    if expect_empty and hits:
-                        reasons.append(f"step#{idx} check_search({query!r}) 期望为空，实际命中 {len(hits)} 条")
-                    must_hit = raw_step.get("must_include")
-                    if isinstance(must_hit, str) and must_hit:
-                        joined = "\n".join(h.snippet for h in hits)
-                        if must_hit.lower() not in joined.lower():
-                            reasons.append(f"step#{idx} check_search({query!r}) 未包含 {must_hit!r}")
-                    step_logs.append(
-                        {
-                            "step": idx,
-                            "action": "check_search",
-                            "query": query,
-                            "hit_count": len(hits),
-                        }
-                    )
-                elif action == "ask":
-                    res = app.chat(str(raw_step.get("message") or ""), chat_id=chat_id)
-                    step_reasons, judge_detail = _check_ask_assertions(
-                        app, raw_step, res, judge_llm=judge_llm
-                    )
-                    reasons.extend(f"step#{idx} {r}" for r in step_reasons)
-                    entry: dict[str, object] = {
-                        "step": idx,
-                        "action": "ask",
-                        "chat_id": chat_id,
-                        "tool_calls": [t["tool"] for t in res["tool_calls"]],
-                        "reply": res["reply"],
-                        "cache": res["cache"],
-                        "check_failures": step_reasons,
-                    }
-                    if judge_detail is not None:
-                        entry["judge"] = judge_detail
-                    step_logs.append(entry)
-                else:
-                    reasons.append(f"step#{idx} 未知 action：{action}")
-
+            step_logs, reasons = _execute_steps(
+                app, llm, steps, policy, clock_day, current_today, judge_llm=judge_llm
+            )
             records = list(app.cache_monitor.records)
             cache_summary = app.cache_monitor.summary()
         finally:
             app.close()
 
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
-    record = {
+    record: dict[str, object] = {
         "id": sc_id,
         "category": category,
         "description": str(scenario.get("description") or ""),
@@ -423,6 +570,9 @@ def _run_single_scenario(
         "cache": cache_summary,
         "steps": step_logs,
     }
+    group_id = str(scenario.get("shared_group") or "").strip()
+    if group_id:
+        record["shared_group"] = group_id
     return record, records
 
 
@@ -438,7 +588,7 @@ def _aggregate_scenario_records(records: list[dict[str, object]]) -> dict[str, o
     }
 
 
-# 批量运行端到端记忆与生命周期评测，汇总总体/分类型通过率、失败明细与纯净的 Agent KV 缓存统计
+# 批量运行端到端记忆与生命周期评测（单线程确定性执行，支持 shared_group 共享长记忆沉淀复用与实时进度回调）
 def evaluate_memory(
     llm: LLMClient,
     scenarios: list[dict[str, object]],
@@ -446,37 +596,80 @@ def evaluate_memory(
     config_path: Path | None = None,
     judge_llm: LLMClient | None = None,
     git_commit: str | None = None,
+    on_progress: ProgressCallback | None = None,
+    on_setup_done: SetupDoneCallback | None = None,
 ) -> dict[str, object]:
     cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
     project_root = cfg_path.parent.parent if cfg_path.is_file() else REPO_ROOT
 
+    # 识别本轮所有待构建的共享长记忆组，并保留每个场景剥离前置后的独立执行步骤
+    shared_specs: dict[str, dict[str, object]] = {}
+    prepared_items: list[tuple[dict[str, object], str | None, list[dict[str, object]]]] = []
+    for scenario in scenarios:
+        group_id, setup_spec, qa_steps = _split_shared_setup(scenario)
+        if group_id and setup_spec is not None:
+            shared_specs.setdefault(group_id, setup_spec)
+        prepared_items.append((scenario, group_id if setup_spec is not None else None, qa_steps))
+
+    shared_setups_report: dict[str, dict[str, object]] = {}
+    setup_cache_records: list[CallCacheRecord] = []
     per_scenario: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
     grouped: dict[str, list[dict[str, object]]] = {}
     all_cache_records: list[CallCacheRecord] = []
     latencies: list[float] = []
+    total = len(prepared_items)
 
-    for scenario in scenarios:
-        record, cache_records = _run_single_scenario(
-            llm,
-            scenario,
-            cfg_path,
-            project_root,
-            judge_llm=judge_llm,
-        )
-        per_scenario.append(record)
-        grouped.setdefault(str(record["category"]), []).append(record)
-        all_cache_records.extend(cache_records)
-        latencies.append(float(record["latency_ms"]))
-        if not record["passed"]:
-            failures.append(
-                {
-                    "id": record["id"],
-                    "category": record["category"],
-                    "reason": "; ".join(record["reasons"]),
-                    "reasons": record["reasons"],
-                }
+    with tempfile.TemporaryDirectory(prefix="my-helper-shared-eval-") as shared_tmp:
+        shared_dirs: dict[str, Path] = {}
+        for idx, (gid, spec) in enumerate(shared_specs.items()):
+            safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
+            target_dir = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
+            shared_dirs[gid] = target_dir
+            s_rep, s_recs = _build_shared_setup(
+                llm, gid, spec, target_dir, cfg_path, project_root
             )
+            if on_setup_done is not None:
+                on_setup_done(s_rep)
+            shared_setups_report[gid] = s_rep
+            setup_cache_records.extend(s_recs)
+
+        all_cache_records.extend(setup_cache_records)
+
+        for idx, (scenario, gid, qa_steps) in enumerate(prepared_items, start=1):
+            base_dir = shared_dirs.get(gid) if gid else None
+            setup_has_consolidate = bool(
+                gid
+                and any(
+                    isinstance(s, dict) and s.get("action") == "consolidate"
+                    for s in (shared_specs.get(gid, {}).get("steps") or [])
+                )
+            )
+            record, cache_records = _run_single_scenario(
+                llm,
+                scenario,
+                cfg_path,
+                project_root,
+                judge_llm=judge_llm,
+                base_data_dir=base_dir,
+                steps_override=qa_steps,
+                disable_auto_consolidation=setup_has_consolidate,
+            )
+            if on_progress is not None:
+                on_progress(idx, total, record)
+            per_scenario.append(record)
+            grouped.setdefault(str(record["category"]), []).append(record)
+            all_cache_records.extend(cache_records)
+            latencies.append(float(record["latency_ms"]))
+            if not record["passed"]:
+                failures.append(
+                    {
+                        "id": record["id"],
+                        "category": record["category"],
+                        "reason": "; ".join(record["reasons"]),
+                        "reasons": record["reasons"],
+                    }
+                )
 
     summary = _aggregate_scenario_records(per_scenario)
     summary["mean_latency_ms"] = round(mean(latencies), 3) if latencies else 0.0
@@ -484,7 +677,7 @@ def evaluate_memory(
         cat: _aggregate_scenario_records(items) for cat, items in sorted(grouped.items())
     }
     summary["cache"] = summarize_records(all_cache_records)
-    return {
+    report: dict[str, object] = {
         "mode": "memory",
         "git_commit": git_commit or current_git_commit(),
         "timestamp": datetime.now(UTC).isoformat(),
@@ -492,3 +685,6 @@ def evaluate_memory(
         "failures": failures,
         "scenarios": per_scenario,
     }
+    if shared_setups_report:
+        report["shared_setups"] = shared_setups_report
+    return report

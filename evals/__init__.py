@@ -10,6 +10,7 @@ from evals.public_benchmarks import (
     export_locomo_for_search,
     prepare_public_datasets,
     validate_public_out_dir,
+    write_scenarios_jsonl,
 )
 from evals.search_eval import evaluate_search
 
@@ -29,4 +30,5 @@ __all__ = [
     "prepare_public_datasets",
     "safe_write_report",
     "validate_public_out_dir",
+    "write_scenarios_jsonl",
 ]

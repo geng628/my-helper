@@ -305,16 +305,18 @@ def export_locomo_for_search(
     return stratified_sample(all_cases, limit=limit, seed=seed)
 
 
-# 将 LoCoMo 对话与 QA 转换为多轮记忆端到端场景（按最大会话数控制成本并保留全部 5 类题型）
+# 将 LoCoMo 对话与 QA 转换为共享长记忆多轮评测场景（默认保留完整全部会话并标记 shared_group 避免重复沉淀）
 def convert_locomo_for_memory(
     conversations: list[dict[str, object]],
     *,
     limit: int | None = None,
-    max_sessions_per_conv: int = 4,
+    max_sessions_per_conv: int | None = None,
+    max_convs: int | None = None,
     seed: int = 42,
 ) -> list[dict[str, object]]:
+    target_convs = conversations[:max_convs] if (max_convs is not None and max_convs > 0) else conversations
     scenarios: list[dict[str, object]] = []
-    for conv_idx, item in enumerate(conversations, start=1):
+    for conv_idx, item in enumerate(target_convs, start=1):
         if not isinstance(item, dict):
             continue
         sample_id = _safe_slug(str(item.get("sample_id") or f"conv_{conv_idx}"))
@@ -325,7 +327,11 @@ def convert_locomo_for_memory(
         sessions = _extract_locomo_sessions(conv)
         if not sessions:
             continue
-        kept_sessions = sessions[:max_sessions_per_conv]
+        kept_sessions = (
+            sessions[:max_sessions_per_conv]
+            if (max_sessions_per_conv is not None and max_sessions_per_conv > 0)
+            else sessions
+        )
         kept_nums = {num for num, _, _ in kept_sessions}
 
         session_steps: list[dict[str, object]] = []
@@ -352,6 +358,7 @@ def convert_locomo_for_memory(
         if not session_steps:
             continue
         eval_day = (last_day or date(2023, 6, 1)).isoformat()
+        group_id = f"locomo-{sample_id}"
 
         for qa_idx, qa in enumerate(item.get("qa") or [], start=1):
             if not isinstance(qa, dict):
@@ -384,6 +391,8 @@ def convert_locomo_for_memory(
                 {
                     "id": f"locomo-{sample_id}-q{qa_idx:03d}",
                     "source": "locomo",
+                    "shared_group": group_id,
+                    "setup_step_count": len(session_steps),
                     "category": category,
                     "description": f"LoCoMo ({category}): {question[:80]}",
                     "policy": {
@@ -414,6 +423,45 @@ def write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n"
     path.write_text(content, encoding="utf-8")
+
+
+# 将多轮记忆场景写出为紧凑 JSONL：自动提取相同 shared_group 的共享前置步骤，避免巨量冗余复制
+def write_scenarios_jsonl(path: Path, scenarios: list[dict[str, object]]) -> None:
+    setup_records: dict[str, dict[str, object]] = {}
+    compact_scenarios: list[dict[str, object]] = []
+    for sc in scenarios:
+        group_id = str(sc.get("shared_group") or "").strip()
+        raw_count = sc.get("setup_step_count")
+        raw_setup = sc.get("shared_setup")
+        steps = list(sc.get("steps") or [])
+        if group_id and isinstance(raw_count, int) and raw_count > 0:
+            if group_id not in setup_records:
+                setup_entry: dict[str, object] = {
+                    "record_type": "shared_setup",
+                    "shared_group": group_id,
+                    "policy": sc.get("policy"),
+                    "steps": steps[:raw_count],
+                }
+                if sc.get("seed_memories"):
+                    setup_entry["seed_memories"] = sc.get("seed_memories")
+                if sc.get("today"):
+                    setup_entry["today"] = sc.get("today")
+                setup_records[group_id] = setup_entry
+            slim = {
+                k: v
+                for k, v in sc.items()
+                if k not in {"setup_step_count", "shared_setup"}
+            }
+            slim["steps"] = steps[raw_count:]
+            compact_scenarios.append(slim)
+        elif group_id and isinstance(raw_setup, dict):
+            if group_id not in setup_records:
+                setup_records[group_id] = dict(raw_setup, record_type="shared_setup", shared_group=group_id)
+            slim = {k: v for k, v in sc.items() if k != "shared_setup"}
+            compact_scenarios.append(slim)
+        else:
+            compact_scenarios.append(sc)
+    write_jsonl(path, [*setup_records.values(), *compact_scenarios])
 
 
 # 使用纯标准库安全下载远端公开数据集到本地缓存（原子落盘，避免残缺文件）
@@ -453,6 +501,8 @@ def prepare_public_datasets(
     longmemeval_limit: int = 35,
     locomo_search_limit: int = 200,
     locomo_memory_limit: int = 25,
+    locomo_max_sessions: int = 0,
+    locomo_max_convs: int = 0,
     seed: int = 42,
     force: bool = False,
     repo_root: Path = REPO_ROOT,
@@ -496,11 +546,21 @@ def prepare_public_datasets(
         }
 
         mem_limit = None if locomo_memory_limit == 0 else locomo_memory_limit
-        mem_scenarios = convert_locomo_for_memory(raw_convs, limit=mem_limit, seed=seed)
+        max_sess = None if locomo_max_sessions == 0 else locomo_max_sessions
+        max_convs_opt = None if locomo_max_convs == 0 else locomo_max_convs
+        mem_scenarios = convert_locomo_for_memory(
+            raw_convs,
+            limit=mem_limit,
+            max_sessions_per_conv=max_sess,
+            max_convs=max_convs_opt,
+            seed=seed,
+        )
         mem_out = resolved_out / "locomo_memory_scenarios.jsonl"
-        write_jsonl(mem_out, mem_scenarios)
+        write_scenarios_jsonl(mem_out, mem_scenarios)
+        shared_groups = sorted({str(s["shared_group"]) for s in mem_scenarios if s.get("shared_group")})
         result["locomo_memory"] = {
             "exported": len(mem_scenarios),
+            "shared_groups": len(shared_groups),
             "path": str(mem_out),
             "categories": dict(sorted(Counter(str(s["category"]) for s in mem_scenarios).items())),
         }

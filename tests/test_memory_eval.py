@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from evals import evaluate_memory, main
+import pytest
+
+from evals import evaluate_memory, load_scenarios, main, write_scenarios_jsonl
 from personal_assistant.ai import LLMClient, TokenUsage
 
 
@@ -339,3 +341,190 @@ def test_evaluate_memory_records_judge_failure() -> None:
     assert report["summary"]["passed_scenarios"] == 0
     assert report["summary"]["failed_scenarios"] == 1
     assert "judge" in str(report["failures"][0]["reason"]).lower()
+
+
+# 测试 evaluate_memory 按序执行全部场景并触发单题实时进度回调
+def test_evaluate_memory_reports_progress_in_order() -> None:
+    scenarios = [
+        {
+            "id": f"sc-{idx}",
+            "category": "extraction",
+            "steps": [
+                {
+                    "action": "ask",
+                    "chat_id": f"c-{idx}",
+                    "message": f"question #{idx}",
+                    "must_include": [f"ok-{idx}"],
+                }
+            ],
+        }
+        for idx in range(3)
+    ]
+    llm = ScriptedMemoryEvalLLM(
+        [
+            ({"role": "assistant", "content": f"ok-{idx}"}, TokenUsage(100 + idx, 50, 10))
+            for idx in range(3)
+        ]
+    )
+
+    progress_events: list[tuple[int, int, str]] = []
+
+    # 收集每题完成时的进度回调事件
+    def on_progress(done: int, total: int, record: dict[str, object]) -> None:
+        progress_events.append((done, total, str(record["id"])))
+
+    report = evaluate_memory(llm, scenarios, on_progress=on_progress, git_commit="prog-sha")
+    assert [item["id"] for item in report["scenarios"]] == ["sc-0", "sc-1", "sc-2"]
+    assert report["summary"]["passed_scenarios"] == 3
+    assert report["summary"]["cache"]["llm_calls"] == 3
+    assert report["summary"]["cache"]["prompt_tokens"] == 303
+    assert progress_events == [(1, 3, "sc-0"), (2, 3, "sc-1"), (3, 3, "sc-2")]
+
+
+# 测试 shared_group 共享长记忆模式：同一对话只沉淀一次，每道 QA 在独立隔离副本上运行且不串状态
+def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp_path: Path) -> None:
+    consolidate_calls = 0
+
+    # 根据请求内容区分沉淀调用与 QA 问答调用的确定性假模型
+    class SharedGroupMockLLM(LLMClient):
+        # 初始化最近一次 usage 记录
+        def __init__(self) -> None:
+            self.last_usage: TokenUsage | None = None
+
+        # 沉淀阶段写入 pets.md；QA1 故意调 remember_fact 写入隔离标记；QA2 仅读 pets.md 验证无串台
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            nonlocal consolidate_calls
+            sys_text = str(messages[0].get("content") or "")
+            if tools is None and "后台记忆整理器" in sys_text:
+                consolidate_calls += 1
+                self.last_usage = TokenUsage(prompt_tokens=400, cached_tokens=0, completion_tokens=50)
+                return {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "session_summary": "用户养了一只叫 Max 的金毛。",
+                            "memories": [
+                                {
+                                    "topic": "pets",
+                                    "title": "宠物记录",
+                                    "index_summary": "宠物名字与品种",
+                                    "operations": [{"op": "add", "text": "Alice adopted a golden retriever named Max."}],
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+
+            last_role = str(messages[-1].get("role") or "")
+            user_prompt = next(
+                (str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            self.last_usage = TokenUsage(prompt_tokens=300, cached_tokens=150, completion_tokens=20)
+            if "QA1_MUTATE" in user_prompt and last_role == "user":
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_mut",
+                            "type": "function",
+                            "function": {"name": "remember_fact", "arguments": "{}"},
+                        }
+                    ],
+                }
+            return {"role": "assistant", "content": "The golden retriever is named Max."}
+
+    setup_steps = [
+        {
+            "action": "seed_history",
+            "chat_id": "conv-s1",
+            "messages": [
+                {"role": "user", "content": "I adopted a golden retriever named Max."},
+                {"role": "assistant", "content": "Max is a great name!"},
+            ],
+        },
+        {"action": "consolidate", "chat_id": "conv-s1", "today": "2023-05-01"},
+    ]
+    raw_scenarios = [
+        {
+            "id": "qa-1",
+            "category": "single-hop",
+            "shared_group": "conv-shared",
+            "setup_step_count": len(setup_steps),
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [
+                *setup_steps,
+                {
+                    "action": "ask",
+                    "chat_id": "eval-query",
+                    "today": "2023-05-10",
+                    "message": "QA1_MUTATE: What is Alice's dog's name?",
+                    "must_include": ["Max"],
+                    "file_checks": [
+                        {"path": "data/memory/pets.md", "must_include": ["Max"]},
+                        {"path": "data/memory/facts.md", "must_include": ["QA1_MUTATE"]},
+                    ],
+                },
+            ],
+        },
+        {
+            "id": "qa-2",
+            "category": "multi-hop",
+            "shared_group": "conv-shared",
+            "setup_step_count": len(setup_steps),
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [
+                *setup_steps,
+                {
+                    "action": "ask",
+                    "chat_id": "eval-query",
+                    "today": "2023-05-10",
+                    "message": "QA2_CLEAN: What breed is Max?",
+                    "must_include": ["Max"],
+                    "file_checks": [
+                        {"path": "data/memory/pets.md", "must_include": ["Max"]},
+                        {"path": "data/memory/facts.md", "must_not_include": ["QA1_MUTATE"]},
+                    ],
+                },
+            ],
+        },
+    ]
+
+    # 先通过紧凑 JSONL 写出再读回，验证 shared_setup 序列化与加载往返
+    jsonl_path = tmp_path / "shared_scenarios.jsonl"
+    write_scenarios_jsonl(jsonl_path, raw_scenarios)
+    loaded = load_scenarios(jsonl_path)
+    assert len(loaded) == 2
+    assert loaded[0]["shared_group"] == "conv-shared"
+    assert "shared_setup" in loaded[0]
+
+    setup_events: list[str] = []
+    report = evaluate_memory(
+        SharedGroupMockLLM(),
+        loaded,
+        on_setup_done=lambda rep: setup_events.append(str(rep["shared_group"])),
+        git_commit="shared-sha",
+    )
+    assert consolidate_calls == 1
+    assert setup_events == ["conv-shared"]
+    assert report["summary"]["passed_scenarios"] == 2
+    assert report["summary"]["failed_scenarios"] == 0
+    assert "conv-shared" in report["shared_setups"]
+    # 缓存统计：setup 1 次 + QA1 2 次（含工具调用） + QA2 1 次 = 4 次，无重复计入
+    assert report["summary"]["cache"]["llm_calls"] == 4
+    assert report["summary"]["cache"]["prompt_tokens"] == 400 + 300 + 300 + 300
+
+    # 引用不存在的 shared_group 应在加载阶段立刻报错
+    bad_path = tmp_path / "bad_shared.jsonl"
+    bad_path.write_text(
+        json.dumps({"id": "orphan", "shared_group": "missing-group", "steps": [{"action": "ask", "message": "hi"}]}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing-group"):
+        load_scenarios(bad_path)

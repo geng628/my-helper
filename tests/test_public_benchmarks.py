@@ -19,6 +19,7 @@ from evals.public_benchmarks import (
     prepare_public_datasets,
     validate_public_out_dir,
     write_jsonl,
+    write_scenarios_jsonl,
 )
 from evals.search_eval import evaluate_search
 from personal_assistant.assistant.memory import MemoryStore
@@ -289,3 +290,70 @@ def test_eval_cli_download_mode_validates_out_dir_and_prepares_datasets(tmp_path
     # 通过统一 CLI --mode download 再跑一次（命中已有缓存文件，不联网）
     code = eval_main(["--mode", "download", "--dataset", "all", "--out-dir", str(out_dir)])
     assert code == 0
+
+
+# 测试 LoCoMo 共享长记忆转换：默认保留全量会话、支持 max_convs 限制、紧凑写出 shared_setup 且支持按分类过滤
+def test_locomo_shared_memory_full_sessions_max_convs_and_compact_jsonl_roundtrip(tmp_path: Path) -> None:
+    # 构造 2 段各含 6 个会话的 LoCoMo 对话，其中 QA 证据落在第 6 个会话（验证不再硬截断前 4 会话）
+    def _make_conv(sample_id: str, fact_word: str) -> dict[str, object]:
+        conv: dict[str, object] = {"speaker_a": "Alice", "speaker_b": "Bob"}
+        for s in range(1, 7):
+            conv[f"session_{s}_date_time"] = f"10:00 am on {s} May, 2023"
+            text = f"I finally visited {fact_word} today." if s == 6 else f"Casual chat session {s}."
+            conv[f"session_{s}"] = [{"speaker": "Alice", "dia_id": f"D{s}:1", "text": text}]
+        return {
+            "sample_id": sample_id,
+            "conversation": conv,
+            "qa": [
+                {"question": f"Where did Alice visit in {sample_id}?", "answer": fact_word, "evidence": ["D6:1"], "category": 4},
+                {"question": f"What did Alice cook in {sample_id}?", "adversarial_answer": "pasta", "evidence": ["D6:1"], "category": 5},
+            ],
+        }
+
+    fake_locomo = [_make_conv("conv-1", "Kyoto"), _make_conv("conv-2", "Reykjavik")]
+
+    # max_convs=1 且不截断会话（None）时，只取 conv-1 但完整保留全部 6 个会话与第 6 会话证据题
+    scenarios = convert_locomo_for_memory(fake_locomo, limit=10, max_sessions_per_conv=None, max_convs=1, seed=42)
+    assert len(scenarios) == 2
+    assert all(sc["shared_group"] == "locomo-conv-1" for sc in scenarios)
+    assert all(sc["setup_step_count"] == 12 for sc in scenarios)
+
+    out_path = tmp_path / "locomo_compact.jsonl"
+    write_scenarios_jsonl(out_path, scenarios)
+    raw_records = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # 首行为 1 条 shared_setup，后接 2 条轻量 QA（仅含 1 步 ask，不再重复 12 步历史）
+    assert len(raw_records) == 3
+    assert raw_records[0]["record_type"] == "shared_setup"
+    assert raw_records[0]["shared_group"] == "locomo-conv-1"
+    assert len(raw_records[0]["steps"]) == 12
+    assert all(len(rec["steps"]) == 1 and rec["steps"][0]["action"] == "ask" for rec in raw_records[1:])
+
+    reloaded = load_scenarios(out_path)
+    assert len(reloaded) == 2
+    assert reloaded[0]["shared_setup"]["shared_group"] == "locomo-conv-1"
+    assert len(reloaded[0]["shared_setup"]["steps"]) == 12
+
+    # 通过 CLI 参数 --locomo-max-convs 与 --locomo-max-sessions 验证端到端下载导出路径
+    out_dir = tmp_path / "pub"
+    (out_dir / "raw").mkdir(parents=True)
+    (out_dir / "raw" / "locomo10.json").write_text(json.dumps(fake_locomo), encoding="utf-8")
+    code = eval_main(
+        [
+            "--mode",
+            "download",
+            "--dataset",
+            "locomo",
+            "--out-dir",
+            str(out_dir),
+            "--locomo-max-convs",
+            "1",
+            "--locomo-max-sessions",
+            "0",
+            "--locomo-memory-limit",
+            "0",
+        ]
+    )
+    assert code == 0
+    exported = load_scenarios(out_dir / "locomo_memory_scenarios.jsonl")
+    assert len(exported) == 2
+    assert all(sc["shared_group"] == "locomo-conv-1" for sc in exported)
