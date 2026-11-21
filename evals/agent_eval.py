@@ -16,7 +16,7 @@ from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
 from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
 from personal_assistant.assistant.prompts import format_system_prompt
-from personal_assistant.eval.common import current_git_commit, normalize_expected_sources
+from evals.common import current_git_commit, normalize_expected_sources
 
 
 # 将原始数据目录的 memory/ 与 workspace/ 复制到临时目录，确保评测过程绝不改写生产数据

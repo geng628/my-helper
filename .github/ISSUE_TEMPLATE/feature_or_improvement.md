@@ -10,7 +10,7 @@ labels: enhancement
 
 ## 设计思路与落点
 - 是否做成 `plugins/` 独立插件？（是 / 否，说明原因）
-- 涉及哪些层级？（Layer 1 `ai` / Layer 2 `agent` / Layer 3 `assistant` / `eval`）
+- 涉及哪些层级？（Layer 1 `ai` / Layer 2 `agent` / Layer 3 `assistant` / `evals`）
 - 潜在安全或 KV Cache 风险评估：
 
 ## 改前基线（必填，涉及检索/记忆/提示词/性能时）

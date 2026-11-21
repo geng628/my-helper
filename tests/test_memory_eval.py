@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from personal_assistant.eval import evaluate_memory, main
+from evals import evaluate_memory, main
 from personal_assistant.ai import LLMClient, TokenUsage
 
 

@@ -9,7 +9,7 @@ import pytest
 
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.eval import main as eval_main
+from evals import main as eval_main
 from personal_assistant.ai import NoopLLMClient
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.agent.plugins import load_plugin_retrievers

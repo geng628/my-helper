@@ -35,6 +35,8 @@
 | `3510a16` | 借鉴 Pi 三层架构方法论完成 `ai → agent → assistant + eval` 三层重构，引入 `ToolSchema → Tool` 类型递进扩展、`LLM_PROVIDERS` 插件口与 `tests/test_architecture.py` 守卫测试 | 彻底消灭 `eval/* → cli.py` 反向依赖、`memory.py → commands.py` 横向串台与 `react.py` 夹带个人业务提示词的问题；通过 AST + 子进程 `sys.modules` 隔离测试验证三层均可剥离上层独立运行 |
 | `35cc8ea` | 新增外部配置 DSL 编译插件 `plugins/models_dsl.py` + `CONFIG_COMPILERS` 第 4 类插件扩展点 + 系统级零心智防泄漏保护 | 核心层依然只认识标准 JSON（`ModelProfile` / `ModelsConfig`）；用户可在 `config/models.dsl` 直接写 `api_key` 免配环境变量，防泄漏由系统默认兜底（`.gitignore`、`0600` 落盘权限、文件与 Shell 沙箱屏蔽、全自动脱敏） |
 | 本次提交 | 面向零代码用户的极简一行预设语法（`use deepseek sk-...`）+ 终端一键向导 `setup` + 网页端「模型设置」自动生成与热切换 | 把“编程味”彻底降为零：内置 7 大主流厂商预设自动补全 URL/模型名/协议/温度，终端与网页均可 10 秒点选自动生成 `models.dsl` 与 `models.json`（均 0600 权限）并即时热生效 |
+| `efe8568` | 正规化 GitHub Issue → 分支 → CI → PR 研发流程（`#1` / `#2`） | 补齐 Issue/PR 模板与 CI 三步守卫（`pytest` + 40 题 `fts5_bm25` + AST 中文注释校验），彻底告别裸推 `main` |
+| Issue `#3` | 将 `personal_assistant/eval/` 整体迁移合并至顶层 `evals/` 包并统一 `python -m evals` | 让 `personal_assistant/` 只保留纯净三层产品代码（`ai`/`agent`/`assistant`），评测代码与评测数据统一收拢至顶层 `evals/`，并用 AST 守卫双向防反向依赖 |
 
 ---
 
@@ -211,3 +213,20 @@
   - `AGENTS.md`：固化标准 Issue/Branch/PR 流程（所有未来模型自动遵守）。
 - **验证**：75/75 单元测试通过，40 题检索 38/40，AST 注释零缺失；本改动本身以分支 `chore/pr-workflow-templates` 推送供发起首个正式 PR。
 - **下一步**：合并本 PR 并安装配置 `gh` CLI（登录大号 `geng628`），随后按正规流程为 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）开 Issue #1 并提交 PR。
+
+---
+
+### [2026-11-21] 将 `personal_assistant/eval/` 评测引擎统一迁移至顶层 `evals/` 包（Issue `#3`）
+- **目标与思路**：消除评测引擎代码（原 `personal_assistant/eval/`）与评测数据（顶层 `evals/`）分离的割裂感，让 `personal_assistant/` 成为完全纯净的三层产品包（`ai/`、`agent/`、`assistant/`），顶层 `evals/` 与 `tests/`、`plugins/` 平级并统一通过 `uv run python -m evals ...` 调用；同步强化 AST 架构守卫，同时封死 `personal_assistant/ -> evals/` 与 `evals/ -> personal_assistant/assistant/cli.py` 双向反向依赖。
+- **改动文件**：
+  - 顶层 `evals/`：通过 `git mv` 迁入 `__init__.py`、`__main__.py`、`cli.py`、`common.py`、`search_eval.py`、`agent_eval.py`、`memory_eval.py`、`public_benchmarks.py`，更新包内导入为 `evals.*`；完整保留 `evals/sample_data/`、`evals/sample_cases.jsonl`、`evals/memory_scenarios.jsonl` 与 gitignore 的 `evals/public/` 数据不变。
+  - 架构与单元测试：`tests/test_architecture.py`（新增纯三层子包断言、产品包零依赖 `evals/` 断言、`evals/` 零依赖 `assistant/cli.py` 断言、`from personal_assistant.assistant import cli` 子模块级 AST 提取校验、`python -m evals` 子进程隔离验证）、`tests/test_eval.py`、`tests/test_memory_eval.py`、`tests/test_public_benchmarks.py`、`tests/test_fts5_plugin.py`。
+  - CI 与文档：`.github/workflows/test.yml`（改为 `uv run python -m evals` 并将 `evals/` 纳入 AST 中文注释校验）、`.github/ISSUE_TEMPLATE/feature_or_improvement.md`、`README.md`、`AGENTS.md`、`docs/dev-log.md`。
+- **踩坑与修复**：AST 依赖提取器原本只读取 `ImportFrom.module`，若有人写 `from personal_assistant.assistant import cli` 则 `node.module` 仅为 `personal_assistant.assistant` 从而漏检；本次升级为同时检测 `ImportFrom` 的子模块名（核对 `.py` 文件或目录存在性）与相对导入，并用独立单测 `test_architecture_import_extractor_catches_evals_and_cli_backedges` 锁死该守卫。
+- **同口径评测对比（改前 `efe8568` → 改后 `refactor/issue-3-unify-evals`）**：
+  - 单元测试：**75/75 → 76/76 passed**（+1 条 AST 反向依赖提取守卫单测，并扩展了子进程 `python -m evals` 与三层隔离校验）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、Recall **0.9483**、MRR **0.9483**、Quote **0.9483**、负例干净 **100%**、0.522 ms（失败项仍为既有 `para-search-fallback`、`multi-honest-eval-discipline`，零退步）。
+  - 公开检索（LoCoMo 200 题 `fts5_bm25`）：保持 **105/200 (52.5%)**、Recall **0.6851**、MRR **0.6221**、Quote **0.6017**、8.911 ms（与 `efe8568` 完全持平，零退步）。
+  - AST 中文注释校验（`personal_assistant/`、`evals/`、`plugins/`、`scripts/`）：**0 缺失**。
+  - 退步与未验证项：无退步；本次为纯目录与包边界重构，未改动提示词、记忆生命周期或检索算法，未重复消耗 API 重跑 16 场景 / LongMemEval 实模多轮记忆评测。
+- **下一步**：待 PR CI 全绿并确认合并后，按第五节继续推进 P1（补星期 + 沉淀去旧词 + 隐式个性化主动查记忆）或 P2（`hybrid_rrf_retriever` 向量融合插件）。

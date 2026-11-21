@@ -1,9 +1,9 @@
-"""评测包统一导出接口，方便外部按 `from personal_assistant.eval import ...` 引用。"""
-from personal_assistant.eval.agent_eval import evaluate_agent
-from personal_assistant.eval.cli import main
-from personal_assistant.eval.common import current_git_commit, load_cases, safe_write_report
-from personal_assistant.eval.memory_eval import evaluate_memory, judge_answer, load_scenarios
-from personal_assistant.eval.public_benchmarks import (
+"""评测包统一导出接口，方便外部按 `from evals import ...` 引用。"""
+from evals.agent_eval import evaluate_agent
+from evals.cli import main
+from evals.common import current_git_commit, load_cases, safe_write_report
+from evals.memory_eval import evaluate_memory, judge_answer, load_scenarios
+from evals.public_benchmarks import (
     convert_locomo_for_memory,
     convert_longmemeval_dataset,
     convert_longmemeval_item,
@@ -11,7 +11,7 @@ from personal_assistant.eval.public_benchmarks import (
     prepare_public_datasets,
     validate_public_out_dir,
 )
-from personal_assistant.eval.search_eval import evaluate_search
+from evals.search_eval import evaluate_search
 
 __all__ = [
     "convert_locomo_for_memory",
