@@ -283,3 +283,21 @@
   - AST 中文注释校验：**0 缺失**。
   - 退步与未验证项：无退步；本 PR 仅新增底层原语，未改动任何插件行为、提示词或记忆沉淀逻辑，未重复消耗 API 重跑实模多轮记忆评测。
 - **下一步**：合并本 PR 后，依次推进 Issue `#11`（`fetch_webpage` 接入 TOAST 并解除 512 KB 静默截断）与 Issue `#12`（`run_command` 与固定命令接入 Head+Tail TOAST）。
+
+---
+
+### [2026-11-21] `fetch_webpage` 接入 TOAST 输出卸载并解除 512 KB 静默截断（Issue `#11`）
+- **目标与思路**：解决 `fetch_webpage` 抓长文章的两道硬截断痛点——第一道 512 KB HTML 静默截断、第二道 8 KB UTF-8（中文约 2,600 字）直接丢弃后半篇且无法续读；复用 `#10` 的 `truncate_or_offload(..., mode="head")`，零改动核心 Layer 1/2/3 代码。
+- **改动文件**：
+  - `config/tools.json`：`web.max_download_bytes` 从 `524288`（512 KB）提升至 `2097152`（2 MB）。
+  - `plugins/web_tools.py`：`WebPolicy` 同步提升默认下载上限至 2 MB 并支持可选 `offload_dir`；`_default_http_get` 多读 1 字节探测超限并在响应头部显式标注源码截断；新增 `_format_json_text()` 美化压缩 JSON 便于按行分页；`execute_fetch_webpage` 接入 `truncate_or_offload(..., tag="webpage", mode="head")` 并按 `min(DEFAULT_SOFT_WRAP_CHARS, max(32, max_output_bytes // 6))` 保障单段落长中文在预览中也稳定可见。
+  - `tests/test_web_plugin.py`：新增 `test_fetch_webpage_toast_offload_download_cap_notice_and_json_pretty`（覆盖 2 MB 配置、长文章 TOAST 落盘 + `MemoryStore.read_markdown` 分页续读 + `FTS5Retriever.search_markdown` 检索、超下载上限显式提示与压缩 JSON 自动换行），并隔离已有测试的 `offload_dir`。
+- **踩坑与修复**：
+  - 既有单测 `max_output_bytes=200` 且 `<p>` 单段中文 960 字节（320 字 < 1000 字符默认折行阈值），整行贪心选取在前 3 行头部后即停止，导致正文预览为空；通过按 `max_output_bytes // 6` 动态收窄软折行字符上限（保证 3 字节汉字单行不超过预算一半），8 KB 生产配置不受影响而小预算/超长单段场景均稳定保留正文预览。
+- **同口径评测对比（改前 `d674d33` → 改后 `feat/issue-11-web-toast-offload`）**：
+  - 单元测试：**88/88 → 89/89 passed**（+1 项多场景网页 TOAST 集成单测，三层架构守卫全绿）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**、0.533 ms（零退步）。
+  - 公开检索（LoCoMo 200 题 `fts5_bm25`）：保持 **105/200 (52.5%)**、Recall **0.6851**、MRR **0.6221**、9.078 ms（零退步）。
+  - AST 中文注释校验：**0 缺失**。
+  - 退步与未验证项：无退步；仅改动外围网页抓取插件，未改检索算法或记忆提示词，未重复消耗 API 重跑实模多轮记忆评测。
+- **下一步**：与并行 PR（Issue `#12`）一并合并至 `main`，随后按需排期 Issue `#13`（活跃上下文与工具轮次调优）。
