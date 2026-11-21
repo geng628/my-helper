@@ -9,11 +9,11 @@ from personal_assistant.ai.client import from_env
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.eval.agent_eval import evaluate_agent
-from personal_assistant.eval.common import load_cases, safe_write_report
-from personal_assistant.eval.memory_eval import evaluate_memory, load_scenarios
-from personal_assistant.eval.public_benchmarks import prepare_public_datasets
-from personal_assistant.eval.search_eval import evaluate_search
+from evals.agent_eval import evaluate_agent
+from evals.common import load_cases, safe_write_report
+from evals.memory_eval import evaluate_memory, load_scenarios
+from evals.public_benchmarks import prepare_public_datasets
+from evals.search_eval import evaluate_search
 
 
 # 按可选 category 与 max_cases 对案例/场景列表做筛选与截断

@@ -6,7 +6,7 @@ from statistics import mean
 from time import perf_counter
 
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.eval.common import current_git_commit, normalize_expected_sources
+from evals.common import current_git_commit, normalize_expected_sources
 
 
 # 安全解析可选的 ISO 日期字符串（YYYY-MM-DD），供单题时间过期过滤使用

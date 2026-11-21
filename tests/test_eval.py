@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.eval import evaluate_agent, evaluate_search, load_cases, main
+from evals import evaluate_agent, evaluate_search, load_cases, main
 from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.memory import MemoryStore
 

@@ -24,13 +24,13 @@ uv sync
 uv run pytest -v
 
 # 3. 运行离线检索评测（40 题内置分类型样本，零 Token；支持 --retriever linear / fts5_bm25 做 A/B 对比）
-uv run python -m personal_assistant.eval --mode search --retriever linear
-uv run python -m personal_assistant.eval --mode search --retriever fts5_bm25
+uv run python -m evals --mode search --retriever linear
+uv run python -m evals --mode search --retriever fts5_bm25
 
 # 4. 下载并运行公开学术基准（LongMemEval ICLR 2025 + LoCoMo ACL 2024，自动存放在 gitignore 的 evals/public/）
-uv run python -m personal_assistant.eval --mode download --dataset all
+uv run python -m evals --mode download --dataset all
 # 零 Token 跑 200 题公开 LoCoMo 多会话检索基准（默认自动启用 config/tools.json 的 fts5_bm25 插件）
-uv run python -m personal_assistant.eval --mode search \
+uv run python -m evals --mode search \
   --data-dir evals/public/locomo_search_data \
   --cases evals/public/locomo_search_cases.jsonl
 
@@ -48,9 +48,9 @@ uv run python scripts/web_chat.py --open
 # 方式 C（极简一行手写）：复制 config/models.example.dsl 为 config/models.dsl，只写一行 `use deepseek sk-你的密钥`
 # （网址/默认模型/温度全自动补全；也支持老 .env 环境变量跑端到端评测）
 uv run python scripts/demo.py --ask "现在几点了？"
-uv run python -m personal_assistant.eval --mode agent --output /tmp/eval-agent.json
-uv run python -m personal_assistant.eval --mode memory --output /tmp/eval-memory.json
-uv run python -m personal_assistant.eval --mode memory \
+uv run python -m evals --mode agent --output /tmp/eval-agent.json
+uv run python -m evals --mode memory --output /tmp/eval-memory.json
+uv run python -m evals --mode memory \
   --cases evals/public/longmemeval_scenarios.jsonl --max-cases 14 --output /tmp/eval-lme.json
 ```
 
@@ -78,7 +78,15 @@ my_helper_v2/
 │   ├── models_dsl.py              # 极简模型配置 DSL 外部编译插件（Lexer -> 递归下降 AST -> 语义校验 -> JSON）
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
-├── evals/
+├── evals/                         # 顶层统一评测包（与 tests/、plugins/ 平级，统一 `python -m evals`）
+│   ├── __init__.py                # 统一导出评测 API
+│   ├── __main__.py                # `python -m evals` 入口
+│   ├── cli.py                     # --mode search / agent / memory / download 命令行调度
+│   ├── common.py                  # JSONL 案例加载、金标引文校验、Git SHA 与报告写出
+│   ├── search_eval.py             # 离线检索评测器（Recall / MRR / Quote / 负例干净度）
+│   ├── agent_eval.py              # 单轮隔离 Agent 评测器
+│   ├── memory_eval.py             # 多轮记忆生命周期与 LLM-as-a-Judge 评测器
+│   ├── public_benchmarks.py       # LongMemEval / LoCoMo 公开学术基准下载与适配器
 │   ├── sample_cases.jsonl         # 40 题 5 分类公开脱敏检索与单轮问答案例集
 │   ├── memory_scenarios.jsonl     # 16 场景 6 分类多轮记忆沉淀、冲突替换、过期归档与 KV 缓存场景集
 │   ├── sample_data/               # 8 篇主题 Markdown 与规则样例语料
@@ -87,7 +95,7 @@ my_helper_v2/
 │   ├── mvp-design.md              # 整体设计文档
 │   └── dev-log.md                 # 工程演进、真实踩坑根因、评测总账与跨模型交接日志
 ├── AGENTS.md                      # 仓库协作红线、TDD/评测纪律与跨模型续写协议
-├── personal_assistant/            # 严格三层依赖漏斗架构（ai → agent → assistant + eval）
+├── personal_assistant/            # 纯净三层依赖漏斗产品包（ai → agent → assistant，绝不依赖 evals/）
 │   ├── __init__.py
 │   ├── __main__.py                # `python -m personal_assistant` 入口
 │   ├── ai/                        # Layer 1（零内部依赖）：LLM 协议底座，可独立使用
@@ -97,18 +105,17 @@ my_helper_v2/
 │   ├── agent/                     # Layer 2（仅依赖 ai）：通用 ReAct 引擎，不含业务假设
 │   │   ├── tools.py               # Tool(ToolSchema) 类型递进扩展、@tool 与白名单 ToolRegistry
 │   │   ├── react.py               # 极简通用 ReAct 核心循环（Reason -> Act -> Observe）
-│   │   └── plugins.py             # 统一插件发现器（TOOLS / RETRIEVERS / LLM_PROVIDERS）
-│   ├── assistant/                 # Layer 3（个人助手业务层）：记忆、历史、沉淀与入口
-│   │   ├── common.py              # 无内部依赖公共底座（REPO_ROOT、load_dotenv、truncate_utf8）
-│   │   ├── prompts.py             # 个人助手专属系统提示词组装（从通用 react.py 剥离）
-│   │   ├── memory.py              # 核心内置 Markdown 记忆与文件读写工具
-│   │   ├── memory_lifecycle.py    # 记忆生命周期（冲突替换 add/replace/remove、过期过滤与归档）
-│   │   ├── db.py                  # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
-│   │   ├── consolidator.py        # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
-│   │   ├── commands.py            # tools.json 解析、固定 argv 命令与检索/Provider 插件装配
-│   │   ├── app.py                 # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
-│   │   └── cli.py                 # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
-│   └── eval/                      # 独立评测包（common / search_eval / agent_eval / memory_eval / public_benchmarks / cli）
+│   │   └── plugins.py             # 统一插件发现器（TOOLS / RETRIEVERS / LLM_PROVIDERS / CONFIG_COMPILERS）
+│   └── assistant/                 # Layer 3（个人助手业务层）：记忆、历史、沉淀与入口
+│       ├── common.py              # 无内部依赖公共底座（REPO_ROOT、load_dotenv、truncate_utf8）
+│       ├── prompts.py             # 个人助手专属系统提示词组装（从通用 react.py 剥离）
+│       ├── memory.py              # 核心内置 Markdown 记忆与文件读写工具
+│       ├── memory_lifecycle.py    # 记忆生命周期（冲突替换 add/replace/remove、过期过滤与归档）
+│       ├── db.py                  # 线程安全 SQLite 存储（messages 历史 + session_compactions 压缩状态）
+│       ├── consolidator.py        # 阈值触发后台记忆沉淀与上下文压缩器（标准库 threading）
+│       ├── commands.py            # tools.json 解析、固定 argv 命令与检索/Provider/DSL 插件装配
+│       ├── app.py                 # AssistantApp 核心编排（串联历史、记忆、工具、后台沉淀与 ReAct）
+│       └── cli.py                 # 终端交互 REPL（支持 /status、/memory、/search、/refresh）
 ├── scripts/
 │   ├── demo.py                    # 离线演示与单句实测脚本
 │   ├── web_chat.py                # 零依赖本地网页对话服务（标准库 ThreadingHTTPServer）
@@ -142,7 +149,7 @@ my_helper_v2/
 - [x] **Step 1**：最小 ReAct 核心循环（`llm.py`, `tools.py`, `react.py`, `cli.py`）与终端 REPL
 - [x] **Step 2**：白名单工具系统与固定 `argv` 命令模板（`config/tools.json`, `tools.py`, `commands.py`, `plugins.py`）
 - [x] **Step 3**：纯 Markdown 记忆与安全文件读写工具（`memory.py`）
-- [x] **Eval**：离线检索与端到端 Agent 评测包（`eval/`）
+- [x] **Eval**：离线检索与端到端 Agent 评测包（`evals/`）
 - [x] **Step 4**：SQLite 会话历史与核心编排（`db.py`, `app.py`）
 - [ ] **Step 5**：轻量本地 HTTP API 服务（`server.py`，可选）
 

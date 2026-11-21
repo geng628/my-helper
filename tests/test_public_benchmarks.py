@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.eval import main as eval_main
-from personal_assistant.eval.memory_eval import load_scenarios
-from personal_assistant.eval.public_benchmarks import (
+from evals import main as eval_main
+from evals.memory_eval import load_scenarios
+from evals.public_benchmarks import (
     convert_locomo_for_memory,
     convert_longmemeval_dataset,
     convert_longmemeval_item,
@@ -20,7 +20,7 @@ from personal_assistant.eval.public_benchmarks import (
     validate_public_out_dir,
     write_jsonl,
 )
-from personal_assistant.eval.search_eval import evaluate_search
+from evals.search_eval import evaluate_search
 from personal_assistant.assistant.memory import MemoryStore
 
 

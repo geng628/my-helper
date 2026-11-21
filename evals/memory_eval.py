@@ -19,7 +19,7 @@ from personal_assistant.assistant.consolidator import (
     MemoryConsolidator,
     _parse_json_object,
 )
-from personal_assistant.eval.common import current_git_commit
+from evals.common import current_git_commit
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict, impartial evaluator grading an AI assistant's answer against a reference answer.\n"

@@ -6,7 +6,7 @@
 
 1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`sqlite3`、`urllib`、`threading`、`http.server` 等）；`pytest` 仅作为开发测试依赖。
 2. **插件优先与三层漏斗架构**：
-   - 严格守住三层单向依赖：`ai`（纯 LLM 协议，零向上依赖） ← `agent`（通用 ReAct 与插件发现，只依赖 `ai`） ← `assistant`（个人助手业务） + `eval`（不反向依赖 `cli.py`），每次改动必须通过 `tests/test_architecture.py` 架构守卫测试。
+   - 严格守住三层单向依赖：`personal_assistant/` 仅保留纯净三层产品代码——`ai`（纯 LLM 协议，零向上依赖） ← `agent`（通用 ReAct 与插件发现，只依赖 `ai`） ← `assistant`（个人助手业务）；顶层评测包 `evals/` 与 `tests/`、`plugins/` 平级（`personal_assistant/` 绝不反向依赖 `evals/`，且 `evals/` 绝不反向依赖 `assistant/cli.py`），每次改动必须通过 `tests/test_architecture.py` 架构守卫测试。
    - 新增工具（`TOOLS` / `@tool`）、检索后端（`RETRIEVERS`）、模型厂商适配（`LLM_PROVIDERS`）或配置编译器（`CONFIG_COMPILERS`）优先写成 `plugins/*.py` 独立插件；非必要不动核心 `personal_assistant/agent/react.py`。
 3. **安全与隐私边界**：
    - 保持 `write_root = data/workspace`、只读 Shell 白名单、防 SSRF 校验；**禁止**开放让 LLM 无人工审批直接写入 `plugins/` 或 `personal_assistant/`。
@@ -21,7 +21,7 @@
 
 1. **改前基线 → 改后同口径对比**：涉及检索、记忆、提示词、上下文或模型的改动，必须先留改前基线，再用同一组案例和可比配置跑改后评测，并绑定具体 Git Commit SHA。
 2. **不挑拣、不删失败题**：完整报告改善、持平、退步与未验证项；检索 benchmark（`--mode search`）与真实模型多轮评测（`--mode memory`）分别验收，发现真退步先定位修复再重跑。
-3. **评测路径统一**：所有评测数据放 `evals/`（公开大型数据集由 `python -m personal_assistant.eval --mode download` 下载到 gitignore 的 `evals/public/`），所有评测命令统一走 `python -m personal_assistant.eval`。
+3. **评测路径统一**：评测引擎代码与评测数据统一收拢在顶层 `evals/`（公开大型数据集由 `python -m evals --mode download` 下载到 gitignore 的 `evals/public/`），所有评测命令统一走 `uv run python -m evals`。
 
 ## 标准 GitHub 研发流程（Issue → 分支 → TDD 与评测 → PR → 合并）
 
