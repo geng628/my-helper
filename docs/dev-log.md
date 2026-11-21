@@ -319,3 +319,17 @@
   - AST 中文注释校验：**0 缺失**。
   - 退步与未验证项：无退步；仅改动命令行输出格式化路径，未改检索算法或记忆提示词，未重复消耗 API 重跑实模多轮记忆评测。
 - **下一步**：TOAST 输出卸载三部曲（`#10` / `#11` / `#12`）全部落地；待 Issue `#9` 合并后，再独立推进 Issue `#13`（活跃上下文与工具轮次调优）。
+
+---
+
+### [2026-11-21] 修复 `run_command` 在软链虚拟环境中找不到 `pytest` 的老 Bug（Issue `#17`）
+- **目标与思路**：合并后本地端到端实测 `execute_safe_command("pytest -v", ...)` 暴露了 `139dc32e` 引入的历史 Bug——`Path(sys.executable).resolve().parent` 穿透 `.venv/bin/python` 软链接跳出虚拟环境目录，导致找不到 `.venv/bin/pytest`。
+- **改动文件**：
+  - `plugins/shell_tools.py`：将 `Path(sys.executable).resolve().parent` 改为 `Path(sys.executable).absolute().parent`，保留软链接所在的 `.venv/bin/` 目录以便正确定位虚拟环境工具。
+  - `tests/test_shell_plugin.py`：新增 TDD 单测 `test_shell_plugin_finds_pytest_inside_symlinked_venv`（构造软链虚拟环境 + 真实 `.venv` 实跑 `pytest --version`）。
+- **同口径评测对比（改前 `973d4f0` → 改后 `fix/issue-17-venv-pytest-path`）**：
+  - 单元测试：**91/91 → 92/92 passed**（+1 条软链 venv 定位回归单测，三层架构守卫通过）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**（零退步）。
+  - 真机端到端验证：`execute_safe_command("pytest -v", ...)` 成功跑完全部 92 项测试并按 8 KB 预算触发 Head+Tail TOAST 卸载（保留首部环境头与尾部 `92 passed` 汇总，中间省略 14 行落盘可查）。
+  - AST 中文注释校验：**0 缺失**。
+- **下一步**：CI 全绿并经确认合并后，待 `#9` 收尾再按需推进 `#13`。
