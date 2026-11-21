@@ -37,8 +37,7 @@
 | 本次提交 | 面向零代码用户的极简一行预设语法（`use deepseek sk-...`）+ 终端一键向导 `setup` + 网页端「模型设置」自动生成与热切换 | 把“编程味”彻底降为零：内置 7 大主流厂商预设自动补全 URL/模型名/协议/温度，终端与网页均可 10 秒点选自动生成 `models.dsl` 与 `models.json`（均 0600 权限）并即时热生效 |
 | `efe8568` | 正规化 GitHub Issue → 分支 → CI → PR 研发流程（`#1` / `#2`） | 补齐 Issue/PR 模板与 CI 三步守卫（`pytest` + 40 题 `fts5_bm25` + AST 中文注释校验），彻底告别裸推 `main` |
 | `263cf37` | 将 `personal_assistant/eval/` 整体迁移合并至顶层 `evals/` 包并统一 `python -m evals`（`#3` / `#4`） | 让 `personal_assistant/` 只保留纯净三层产品代码（`ai`/`agent`/`assistant`），评测代码与评测数据统一收拢至顶层 `evals/`，并用 AST 守卫双向防反向依赖 |
-| `2ca2580` | LoCoMo 共享长记忆评测模式、紧凑 `shared_setup` JSONL、完整会话导出与实时进度（`#5` / `#6`，纯 `evals/` 单线程，零改动 `personal_assistant/`） | 消除 LoCoMo 多轮评测的重复沉淀浪费与 4 会话硬截断，保持极简单线程确定性且绝不因评测触碰产品核心代码 |
-| Issue `#7` | PR A 纯确定性代码小修：`_parse_json_object()` 改用 `raw_decode()` + 日期注入统一补齐星期几 | 先做零 Prompt 语义风险的确定性修复，消除 `q016` 尾部多余文本 JSON 解析崩溃，并根治跨周相对日期心算偏移 |
+| Issue `#5` | LoCoMo 共享长记忆评测模式、紧凑 `shared_setup` JSONL、完整会话导出与实时进度（纯 `evals/` 单线程，零改动 `personal_assistant/`） | 消除 LoCoMo 多轮评测的重复沉淀浪费与 4 会话硬截断，保持极简单线程确定性且绝不因评测触碰产品核心代码 |
 
 ---
 
