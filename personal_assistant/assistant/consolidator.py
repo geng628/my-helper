@@ -10,6 +10,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from personal_assistant.ai.client import LLMClient, NoopLLMClient
+from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
 
@@ -69,20 +70,36 @@ class ConsolidationResult:
         }
 
 
-# 从模型输出文本中稳健提取 JSON 对象（兼容 Markdown 代码块包裹）
+# 从模型输出文本中稳健提取首个完整 JSON 对象（兼容 Markdown 代码块、前置说明与尾部多余内容）
 def _parse_json_object(raw: str) -> dict[str, object]:
     text = raw.strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+    candidates: list[str] = []
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
     if fence:
-        text = fence.group(1)
-    elif not text.startswith("{"):
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
-            text = text[start : end + 1]
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        raise ValueError("沉淀结果必须是 JSON 对象。")
-    return parsed
+        candidates.append(fence.group(1).strip())
+    candidates.append(text)
+
+    decoder = json.JSONDecoder()
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        pos = 0
+        while True:
+            start = candidate.find("{", pos)
+            if start == -1:
+                break
+            try:
+                parsed, _ = decoder.raw_decode(candidate, start)
+            except json.JSONDecodeError as error:
+                last_error = error
+                pos = start + 1
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            pos = start + 1
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("沉淀结果必须是 JSON 对象。")
 
 
 # 将待沉淀的历史消息格式化为紧凑文本，供整理模型阅读
@@ -153,7 +170,7 @@ class MemoryConsolidator:
         topic_snapshots = self.memory.read_topic_snapshots() or "（暂无已有主题记忆）"
         transcript = _format_transcript(batch)
         user_payload = (
-            f"【当前日期】{ref_day.isoformat()}（北京时间）\n\n"
+            f"【当前日期】{format_date_with_weekday(ref_day)}\n\n"
             f"【当前 MEMORY.md 索引】\n{index_text}\n\n"
             f"【已有主题记忆（用于识别冲突与 replace/remove）】\n{topic_snapshots}\n\n"
             f"【已有前情摘要】\n{existing_summary or '（无）'}\n\n"

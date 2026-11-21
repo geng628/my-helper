@@ -249,3 +249,19 @@
   - AST 中文注释校验：**0 缺失**；`personal_assistant/` 产品代码 **0 行改动**。
   - 退步与未验证项：无退步；本次仅升级顶层 `evals/` 评测器，未改动任何提示词、检索算法与记忆沉淀逻辑。
 - **下一步**：合并本 PR 后，基于已确认的 `263cf37` 实模基线（16 场景 14/16 + LongMemEval 12/14，可按需扩大至 70 题或 LoCoMo 共享记忆）推进 P1 记忆生命周期与提示词优化。
+
+---
+
+### [2026-11-21] PR A：稳健化 JSON 解析与日期注入统一补星期几（Issue `#7`）
+- **目标与思路**：按“先纯代码确定性小修、再做极简提示词微调”的正交拆分路线，先修 `2ca2580` LoCoMo 50 题基线（39/50）与多轮评测暴露的两处确定性代码缺陷，不改动任何业务提示词语义规则，避免多变量混杂。
+- **改动文件**：
+  - `personal_assistant/assistant/common.py`：新增零内部依赖函数 `format_date_with_weekday(day)`（输出 `2026-11-16（星期一，北京时间）`）。
+  - `personal_assistant/assistant/prompts.py` & `personal_assistant/assistant/consolidator.py`：对话系统提示词与后台沉淀器统一注入带星期几的日期；`_parse_json_object()` 升级为标准库 `json.JSONDecoder().raw_decode()`，稳健提取首个完整 JSON 对象，容忍模型尾部多余说明或重复输出（根治 `q016` `Extra data` 解析崩溃）。
+  - `tests/test_consolidator.py`：新增 2 条 TDD 单测覆盖 `raw_decode` 边界与星期几一致性注入。
+- **同口径评测对比（改前 `2ca2580` → 改后 `fix/issue-7-json-parse-and-weekday`）**：
+  - 单元测试：**79/79 → 81/81 passed**（+2 条 TDD 单测，含三层架构守卫）。
+  - 离线检索（40 题 / LoCoMo 200 题 `fts5_bm25`）：保持 **38/40 (95.0%)** 与 **105/200 (52.5%)**，零退步。
+  - 16 场景实模回归（`deepseek-chat`）：严格字面判定 **12/16**（实质语义正确仍为 **14/16**，与 `263cf37` 一致；2 例字面未命中经逐例核查均为纯排版/同义波动：`expiry-boundary-same-day` 实答“下午 3 点”因空格未命中 `3点`，`rolling-multi-compaction` 实答“企业微信机器人”未命中缩写 `企微`；`relative-date-resolution` 准确算出 `2026-11-25（周三）`）；本地前缀复用率 **90.41%**（改前 87.24%），服务端 KV 命中 59.54%（新日期后缀首次冷启动正常波动）。
+  - AST 中文注释校验：**0 缺失**。
+  - 退步与未验证项：无真实行为退步；既有 2 例 `op=replace` 旧词残留留待下一步 PR B 解决；LongMemEval / LoCoMo 50 题 + 盲测集将在 PR B 完成后一并做全套同口径实模对比。
+- **下一步**：合并 PR A 后推进 **PR B**（极简沉淀洁净与提示词微调 + 5 项制衡指标与 Held-out 盲测验收）。

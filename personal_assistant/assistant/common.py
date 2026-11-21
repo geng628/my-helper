@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_CN_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+# 将日期格式化为带中文星期与时区的统一展示文本（如 2026-11-16（星期一，北京时间））
+def format_date_with_weekday(day: date) -> str:
+    return f"{day.isoformat()}（{_CN_WEEKDAYS[day.weekday()]}，北京时间）"
 
 
 # 读取本地 .env 文件并将未设置的 KEY=VALUE 注入当前进程环境变量

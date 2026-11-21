@@ -3,19 +3,23 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from personal_assistant.assistant.app import AssistantApp
+from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
     ConsolidationPolicy,
     MemoryConsolidator,
+    _parse_json_object,
 )
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.memory import MemoryStore
+from personal_assistant.assistant.prompts import format_system_prompt
 
 
 # 可录制请求并按预设回复（支持门控同步）的假模型
@@ -234,3 +238,45 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
     finally:
         gate.set()
         app.close()
+
+
+# 测试 _parse_json_object 稳健容忍尾部多余文本与重复输出第二个 JSON，同时拒绝非法内容
+def test_parse_json_object_tolerates_trailing_text_and_duplicate_json() -> None:
+    # 复现真实评测 q016：模型输出合法 JSON 后多吐了一段换行说明或第二个 JSON 对象
+    dup = '{"correct": true, "reason": "all matched"}\n\n{"correct": true, "reason": "duplicate"}'
+    assert _parse_json_object(dup) == {"correct": True, "reason": "all matched"}
+
+    trailing = '以下为结果（参考 {非JSON}）：\n{"session_summary": "ok", "memories": []}\n说明：整理完成。'
+    assert _parse_json_object(trailing) == {"session_summary": "ok", "memories": []}
+
+    fenced_extra = '```json\n{"a": {"b": 1}}\n```\n额外备注'
+    assert _parse_json_object(fenced_extra) == {"a": {"b": 1}}
+
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        _parse_json_object("[1, 2, 3]")
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        _parse_json_object("纯文本无 JSON")
+
+
+# 测试对话系统提示词与后台记忆沉淀器均统一注入带中文星期几的北京时间日期
+def test_weekday_injected_consistently_in_system_prompt_and_consolidator(tmp_path: Path) -> None:
+    monday = date(2026, 11, 16)
+    sunday = date(2026, 11, 22)
+    assert format_date_with_weekday(monday) == "2026-11-16（星期一，北京时间）"
+    assert format_date_with_weekday(sunday) == "2026-11-22（星期日，北京时间）"
+
+    memory = MemoryStore(tmp_path / "data")
+    prompt = format_system_prompt(memory, today=monday)
+    assert "今天是 2026-11-16（星期一，北京时间）。" in prompt
+
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    try:
+        state.append_message("s-day", "user", "下周三提交季度架构评审报告。")
+        state.append_message("s-day", "assistant", "收到。")
+        llm = ControlledLLM([json.dumps({"session_summary": "ok", "memories": []})])
+        policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        runner.consolidate_once("s-day", today=monday)
+        assert "【当前日期】2026-11-16（星期一，北京时间）" in str(llm.requests[0][1]["content"])
+    finally:
+        state.close()
