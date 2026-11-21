@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.memory import MemoryStore
@@ -220,3 +223,34 @@ def test_shell_plugin_disabled_when_removed_from_enabled_tools(tmp_path: Path) -
     registry = cfg.build_registry()
     assert "run_command" not in registry.names
     assert "不在白名单中" in registry.execute("run_command", '{"command": "ls"}')
+
+
+# 测试在软链接虚拟环境（如 uv .venv）中能定位 .venv/bin/pytest，不因 .resolve() 跳出 venv
+def test_shell_plugin_finds_pytest_inside_symlinked_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1. 构造与 uv 一致的软链接虚拟环境（bin/python -> 真实解释器，bin/pytest 仅存在于该 venv）
+    venv_bin = tmp_path / "fake_venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_python = venv_bin / "python"
+    os.symlink(Path(sys.executable).resolve(), fake_python)
+    fake_pytest = venv_bin / "pytest"
+    fake_pytest.write_text("#!/bin/sh\necho fake-venv-pytest-ok\n", encoding="utf-8")
+    fake_pytest.chmod(0o755)
+
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("pytest",),
+        offload_dir=tmp_path / "workspace" / "tool_outputs",
+    )
+    with monkeypatch.context() as mp:
+        mp.setattr(sys, "executable", str(fake_python))
+        out_fake = execute_safe_command("pytest", policy)
+    assert "退出码：0" in out_fake
+    assert "fake-venv-pytest-ok" in out_fake
+
+    # 2. 真实当前 .venv 环境下也能直接定位并运行 pytest --version
+    out_real = execute_safe_command("pytest --version", policy)
+    assert "退出码：0" in out_real
+    assert "pytest" in out_real.lower()

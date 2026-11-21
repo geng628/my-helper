@@ -232,7 +232,8 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
         return f"错误：{error}"
 
     final_argv = _augment_safe_argv(argv, policy)
-    venv_bin = str(Path(sys.executable).resolve().parent)
+    # 使用 absolute() 而非 resolve()，保留 .venv/bin/python 软链所在目录以便定位 .venv/bin/pytest
+    venv_bin = str(Path(sys.executable).absolute().parent)
     safe_path = f"{venv_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     executable = shutil.which(final_argv[0], path=safe_path)
     if not executable:
