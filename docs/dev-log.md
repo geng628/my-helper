@@ -301,3 +301,21 @@
   - AST 中文注释校验：**0 缺失**。
   - 退步与未验证项：无退步；仅改动外围网页抓取插件，未改检索算法或记忆提示词，未重复消耗 API 重跑实模多轮记忆评测。
 - **下一步**：与并行 PR（Issue `#12`）一并合并至 `main`，随后按需排期 Issue `#13`（活跃上下文与工具轮次调优）。
+
+---
+
+### [2026-11-21] `run_command` 与固定白名单命令接入 Head+Tail TOAST 输出卸载（Issue `#12`）
+- **目标与思路**：解决 `pytest`、`git diff`、`rg` 等命令超 8 KB 输出时直接截断后半段导致模型看不到尾部失败汇总（`short test summary`）与完整日志的痛点；统一接入 `#10` 的 `truncate_or_offload(..., mode="head_tail")`，主输出始终保留退出码与头尾预览，中间省略行号与落盘路径供 `read_markdown` / `search_markdown` 按需深挖。
+- **改动文件**：
+  - `plugins/shell_tools.py`：`ShellPolicy` 新增可选 `offload_dir`；抽离 `_format_command_output()` 合并 `stdout` / `stderr` 并接入 `truncate_or_offload(..., mode="head_tail", tag=f"shell-{exe}")`，保留首行 `退出码` 不被切碎。
+  - `personal_assistant/assistant/commands.py`：`CommandSpec` 新增可选 `offload_dir`（默认值 `None` 完全兼容现有位置/关键字构造），`CommandSpec.run()` 同步接入 `truncate_or_offload(..., mode="head_tail", tag=f"cmd-{self.name}")`。
+  - `tests/test_shell_plugin.py` & `tests/test_step2_tools.py`：新增 2 条 TDD 单测验证 `run_command` 与固定命令超长 `stdout` / `stderr` 的 Head+Tail 首尾预览保留、中间省略行经 `MemoryStore.read_markdown` 完整回查及短输出零落盘，并为已有截断测试做好 `offload_dir` / `MY_HELPER_DATA` 隔离。
+- **踩坑与修复**：
+  - `CommandSpec` 的安全校验禁止 `argv` 中包含换行符，TDD 单测里的内联 Python `-c` 脚本改为单行语句即可真实复现多行 `stdout` + `stderr` 合并卸载场景。
+- **同口径评测对比（改前 `f44392b` → 改后 `feat/issue-12-shell-toast-offload`）**：
+  - 单元测试：**89/89 → 91/91 passed**（+2 条命令行 Head+Tail TOAST 集成单测，三层架构守卫全绿）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、MRR **0.9483**（零退步）。
+  - 公开检索（LoCoMo 200 题 `fts5_bm25`）：保持 **105/200 (52.5%)**、Recall **0.6851**、MRR **0.6221**（零退步）。
+  - AST 中文注释校验：**0 缺失**。
+  - 退步与未验证项：无退步；仅改动命令行输出格式化路径，未改检索算法或记忆提示词，未重复消耗 API 重跑实模多轮记忆评测。
+- **下一步**：TOAST 输出卸载三部曲（`#10` / `#11` / `#12`）全部落地；待 Issue `#9` 合并后，再独立推进 Issue `#13`（活跃上下文与工具轮次调优）。

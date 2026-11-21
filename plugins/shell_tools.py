@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from personal_assistant.agent.tools import tool
-from personal_assistant.assistant.common import truncate_utf8
+from personal_assistant.assistant.common import truncate_or_offload
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -59,6 +59,7 @@ class ShellPolicy:
     reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS
     timeout: float = 10.0
     max_output_bytes: int = 8192
+    offload_dir: Path | None = None
 
     # 从 config/tools.json 读取 shell 白名单配置，缺失时回退到安全默认值
     @classmethod
@@ -179,7 +180,36 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
     return [argv[0], *excludes, *argv[1:]]
 
 
-# 在安全策略护栏内执行单条受控命令（shell=False、脱敏环境、超时与输出截断）
+# 合并 stdout/stderr 并接入 Head+Tail TOAST 输出卸载，保持退出码始终位于首行
+def _format_command_output(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    *,
+    max_output_bytes: int,
+    tag: str,
+    offload_dir: Path | None,
+) -> str:
+    clean_out = (stdout or "").strip()
+    clean_err = (stderr or "").strip()
+    sections: list[str] = []
+    if clean_out:
+        sections.append(clean_out)
+    if clean_err:
+        sections.append(f"stderr:\n{clean_err}")
+    if not sections:
+        return f"退出码：{returncode}"
+    body = truncate_or_offload(
+        "\n".join(sections),
+        max_output_bytes,
+        tag=tag,
+        mode="head_tail",
+        offload_dir=offload_dir,
+    )
+    return f"退出码：{returncode}\n{body}"
+
+
+# 在安全策略护栏内执行单条受控命令（shell=False、脱敏环境、超时与 Head+Tail TOAST 卸载）
 def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     try:
         argv = _parse_single_command(command)
@@ -231,14 +261,14 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     except OSError as error:
         return f"错误：命令启动失败（{error}）。"
 
-    out = truncate_utf8((done.stdout or "").strip(), policy.max_output_bytes)
-    err = truncate_utf8((done.stderr or "").strip(), policy.max_output_bytes)
-    lines = [f"退出码：{done.returncode}"]
-    if out:
-        lines.append(out)
-    if err:
-        lines.append(f"stderr:\n{err}")
-    return "\n".join(lines)
+    return _format_command_output(
+        done.returncode,
+        done.stdout or "",
+        done.stderr or "",
+        max_output_bytes=policy.max_output_bytes,
+        tag=f"shell-{final_argv[0]}",
+        offload_dir=policy.offload_dir,
+    )
 
 
 # 插件工具入口：受 config/tools.json 的 shell 段白名单管控执行单条只读/受控命令
@@ -246,7 +276,8 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     name="run_command",
     description=(
         "在项目目录内执行单条受白名单保护的本地命令（如 ls、find、grep、rg、wc、head、tail、"
-        "cat、pwd、date、df、git 只读子命令、pytest）。不支持管道或命令拼接，禁止访问 .env 等敏感路径。"
+        "cat、pwd、date、df、git 只读子命令、pytest）。不支持管道或命令拼接，禁止访问 .env 等敏感路径；"
+        "超长输出保留头尾预览并自动保存至 data/workspace/tool_outputs/ 供分页读取。"
     ),
     parameters={"command": "要执行的单条命令字符串，例如 'ls -la' 或 'git log -n 5 --oneline'"},
 )

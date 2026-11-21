@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.memory import MemoryStore
 from plugins.shell_tools import ShellPolicy, execute_safe_command
 
 
@@ -130,6 +132,7 @@ def test_shell_plugin_sanitizes_env_truncates_output_and_handles_timeout(
         allowed_executables=("env", "yes", "sleep", "cat"),
         timeout=0.3,
         max_output_bytes=120,
+        offload_dir=tmp_path / "workspace" / "tool_outputs",
     )
 
     # 环境变量白名单必须剥离父进程中的 LLM_API_KEY
@@ -137,14 +140,66 @@ def test_shell_plugin_sanitizes_env_truncates_output_and_handles_timeout(
     assert "退出码：0" in env_out
     assert "sk-super-secret-value" not in env_out
 
-    # 超长输出按字节上限安全截断
+    # 超长输出按字节上限安全截断并落盘
     (tmp_path / "big.txt").write_text("A" * 500 + "\n", encoding="utf-8")
     trunc_out = execute_safe_command("cat big.txt", env_policy)
     assert "输出已截断" in trunc_out
+    assert "data/workspace/tool_outputs/" in trunc_out
 
     # 超时命令被终止并友好报错
     timeout_out = execute_safe_command("sleep 2", env_policy)
     assert "超时" in timeout_out
+
+
+# 测试 run_command 超长输出走 Head+Tail TOAST 卸载：主输出保留头尾汇总，中间省略内容可按行回查
+def test_shell_plugin_offloads_long_output_with_head_tail_preview(tmp_path: Path) -> None:
+    offload_dir = tmp_path / "workspace" / "tool_outputs"
+    log_lines = ["=== test session starts ===", "collecting ... collected 80 items"]
+    log_lines.extend(f"trace detail line {idx:03d}: intermediate assertion context_{idx}" for idx in range(1, 55))
+    log_lines.append("FAILED tests/test_core.py::test_edge_case - AssertionError: mismatch")
+    log_lines.append("=== 1 failed, 79 passed in 1.42s ===")
+    (tmp_path / "pytest_out.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("cat",),
+        max_output_bytes=520,
+        offload_dir=offload_dir,
+    )
+    out = execute_safe_command("cat pytest_out.txt", policy)
+    assert "退出码：0" in out
+    assert "=== test session starts ===" in out
+    assert "FAILED tests/test_core.py::test_edge_case" in out
+    assert "=== 1 failed, 79 passed in 1.42s ===" in out
+    assert "输出已截断" in out
+    assert "trace detail line 025" not in out
+
+    omit_match = re.search(r"中间省略第 (\d+)-(\d+) 行", out)
+    path_match = re.search(r"(data/workspace/tool_outputs/[A-Za-z0-9._-]+\.txt)", out)
+    assert omit_match is not None and path_match is not None
+
+    memory = MemoryStore(tmp_path)
+    middle = memory.read_markdown(
+        path_match.group(1),
+        start_line=int(omit_match.group(1)),
+        end_line=int(omit_match.group(2)),
+    )
+    assert "trace detail line 025" in middle
+
+    # 短输出零落盘
+    short_dir = tmp_path / "short_out"
+    short_policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("cat",),
+        max_output_bytes=4096,
+        offload_dir=short_dir,
+    )
+    (tmp_path / "tiny.txt").write_text("ok\n", encoding="utf-8")
+    tiny_out = execute_safe_command("cat tiny.txt", short_policy)
+    assert tiny_out == "退出码：0\nok"
+    assert not short_dir.exists()
 
 
 # 测试从 config/tools.json 的 enabled_tools 移除 run_command 后，插件立即彻底关闭
