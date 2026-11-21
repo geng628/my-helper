@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.memory import MemoryStore
+from plugins.fts5_retriever import FTS5Retriever
 from plugins.web_tools import (
     WebPolicy,
     execute_fetch_webpage,
@@ -118,9 +121,10 @@ def test_extract_text_from_html_strips_scripts_styles_and_extracts_title() -> No
     assert "版权所有" not in text
 
 
-# 测试 fetch_webpage 的正常抓取、二进制拦截、截断保护与私网重定向拦截
-def test_fetch_webpage_parses_html_enforces_limits_and_blocks_binary() -> None:
-    policy = WebPolicy(timeout=5.0, max_download_bytes=4096, max_output_bytes=200)
+# 测试 fetch_webpage 的正常抓取、二进制拦截、TOAST 卸载保护与私网重定向拦截
+def test_fetch_webpage_parses_html_enforces_limits_and_blocks_binary(tmp_path: Path) -> None:
+    offload_dir = tmp_path / "workspace" / "tool_outputs"
+    policy = WebPolicy(timeout=5.0, max_download_bytes=4096, max_output_bytes=200, offload_dir=offload_dir)
 
     # 固定公网 DNS
     def public_dns(host: str, port: object, *args: object):
@@ -141,6 +145,7 @@ def test_fetch_webpage_parses_html_enforces_limits_and_blocks_binary() -> None:
     assert "标题：示例" in out_html
     assert "正文内容" in out_html
     assert "输出已截断" in out_html
+    assert "data/workspace/tool_outputs/" in out_html
 
     # 2. 二进制文件（如 PDF/图片）应明确拒绝
     out_bin = execute_fetch_webpage(
@@ -167,6 +172,78 @@ def test_fetch_webpage_parses_html_enforces_limits_and_blocks_binary() -> None:
     )
     assert out_ssrf.startswith("错误：")
     assert called["flag"] is False
+
+
+# 测试 fetch_webpage 的 TOAST 卸载分页续读、2MB 下载上限与超限显式提醒、以及 JSON 自动美化
+def test_fetch_webpage_toast_offload_download_cap_notice_and_json_pretty(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    default_policy = WebPolicy.from_config(repo_root / "config" / "tools.json")
+    assert default_policy.max_download_bytes >= 2 * 1024 * 1024
+
+    offload_dir = tmp_path / "workspace" / "tool_outputs"
+    policy = WebPolicy(timeout=5.0, max_download_bytes=64 * 1024, max_output_bytes=450, offload_dir=offload_dir)
+
+    # 固定公网 DNS
+    def public_dns(host: str, port: object, *args: object):
+        return [(0, 0, 0, "", ("93.184.216.34", 0))]
+
+    # 1. 长文章触发 TOAST 卸载：主输出保留开头预览，后半段可通过 read_markdown 与 search_markdown 完整读取
+    paragraphs = [f"<p>第 {i:02d} 段：分布式存储与一致性协议的详细工程说明。</p>" for i in range(1, 35)]
+    paragraphs[29] = "<p>第 30 段：隐藏在文章尾部的核心基准指标 TOAST_ARTICLE_MARKER_881。</p>"
+    article_html = f"<html><head><title>长文测试</title></head><body>{''.join(paragraphs)}</body></html>"
+    out = execute_fetch_webpage(
+        "https://example.com/long-post",
+        policy,
+        resolve_dns=public_dns,
+        http_get=lambda url, headers, timeout, max_bytes: (
+            url,
+            "text/html; charset=utf-8",
+            article_html.encode("utf-8"),
+        ),
+    )
+    assert "标题：长文测试" in out
+    assert "输出已截断" in out
+    assert "TOAST_ARTICLE_MARKER_881" not in out
+    path_match = re.search(r"(data/workspace/tool_outputs/[A-Za-z0-9._-]+\.txt)", out)
+    next_match = re.search(r"start_line=(\d+)", out)
+    assert path_match is not None and next_match is not None
+
+    memory = MemoryStore(tmp_path, retriever=FTS5Retriever())
+    rest = memory.read_markdown(path_match.group(1), start_line=int(next_match.group(1)), end_line=100)
+    assert "TOAST_ARTICLE_MARKER_881" in rest
+    hits = memory.search_markdown("TOAST_ARTICLE_MARKER_881", root="data/workspace/tool_outputs")
+    assert path_match.group(1) in hits
+
+    # 2. 原始响应超过 max_download_bytes 时必须显式提示源码已截断（不再静默截半）
+    small_cap_policy = WebPolicy(timeout=5.0, max_download_bytes=120, max_output_bytes=4096, offload_dir=offload_dir)
+    oversized_html = ("<html><body><p>" + ("超长源码" * 60) + "</p></body></html>").encode("utf-8")
+    out_dl_cap = execute_fetch_webpage(
+        "https://example.com/huge",
+        small_cap_policy,
+        resolve_dns=public_dns,
+        http_get=lambda url, headers, timeout, max_bytes: (url, "text/html; charset=utf-8", oversized_html),
+    )
+    assert "下载上限" in out_dl_cap
+
+    # 3. 压缩单行 JSON 响应自动缩进换行，便于按行阅读与分页
+    minified_json = json.dumps(
+        {"items": [{"id": idx, "name": f"entry_{idx}", "detail": "x" * 20} for idx in range(25)]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    out_json = execute_fetch_webpage(
+        "https://api.example.com/data",
+        policy,
+        resolve_dns=public_dns,
+        http_get=lambda url, headers, timeout, max_bytes: (url, "application/json", minified_json),
+    )
+    assert "输出已截断" in out_json
+    json_path_match = re.search(r"(data/workspace/tool_outputs/[A-Za-z0-9._-]+\.txt)", out_json)
+    assert json_path_match is not None
+    saved_json_lines = (tmp_path / "workspace" / "tool_outputs" / Path(json_path_match.group(1)).name).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(saved_json_lines) > 50
+    assert any('"name": "entry_24"' in line for line in saved_json_lines)
 
 
 # 测试 web_search：DuckDuckGo HTML 解包与优先搜索、Bing RSS 兜底、Tavily/Brave 切换以及空查询拦截

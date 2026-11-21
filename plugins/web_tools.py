@@ -17,7 +17,11 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from personal_assistant.agent.tools import tool
-from personal_assistant.assistant.common import truncate_utf8
+from personal_assistant.assistant.common import (
+    DEFAULT_SOFT_WRAP_CHARS,
+    truncate_or_offload,
+    truncate_utf8,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_USER_AGENT = (
@@ -41,9 +45,10 @@ HttpPostJsonFn = Callable[[str, dict[str, object], dict[str, str], float], dict[
 @dataclass(frozen=True)
 class WebPolicy:
     timeout: float = 15.0
-    max_download_bytes: int = 512 * 1024
+    max_download_bytes: int = 2 * 1024 * 1024
     max_output_bytes: int = 8192
     max_results: int = 5
+    offload_dir: Path | None = None
 
     # 从 config/tools.json 读取 web 配置段，缺省时使用安全默认值
     @classmethod
@@ -60,7 +65,7 @@ class WebPolicy:
                 web_cfg = raw["web"]
         return cls(
             timeout=float(web_cfg.get("timeout", 15.0)),
-            max_download_bytes=int(web_cfg.get("max_download_bytes", 512 * 1024)),
+            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
             max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
             max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
         )
@@ -191,7 +196,7 @@ def _extract_charset(content_type: str) -> str:
     return match.group(1) if match else "utf-8"
 
 
-# 使用标准库 urllib 安全发起 HTTP GET（校验重定向并严格限制最大下载字节数）
+# 使用标准库 urllib 安全发起 HTTP GET（校验重定向，多读 1 字节用于探测是否触达下载上限）
 def _default_http_get(
     url: str,
     headers: dict[str, str],
@@ -205,8 +210,20 @@ def _default_http_get(
     with opener.open(req, timeout=timeout) as resp:
         final_url = resp.geturl()
         content_type = resp.headers.get("Content-Type", "text/plain")
-        data = resp.read(max_bytes)
+        data = resp.read(max_bytes + 1)
         return final_url, content_type, data
+
+
+# 尝试将压缩 JSON 响应格式化为多行缩进文本，便于按行阅读与分页检索
+def _format_json_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+    return json.dumps(parsed, ensure_ascii=False, indent=2)
 
 
 # 使用标准库 urllib 发送 JSON POST 请求（供 Tavily 搜索接口使用）
@@ -260,12 +277,34 @@ def execute_fetch_webpage(
     if mime and not mime.startswith(ALLOWED_CONTENT_PREFIXES):
         return f"错误：不支持抓取该内容类型（{mime}），仅支持网页与纯文本/JSON。"
 
+    download_truncated = len(raw_bytes) > policy.max_download_bytes
+    if download_truncated:
+        raw_bytes = raw_bytes[: policy.max_download_bytes]
+    trunc_note = (
+        f"注意：原始响应超过下载上限（{policy.max_download_bytes} 字节），已仅解析前部内容。\n"
+        if download_truncated
+        else ""
+    )
+
     text = raw_bytes.decode(_extract_charset(content_type), errors="replace")
     if "html" in mime:
         title, body = extract_text_from_html(text)
-        header = f"网页：{final_url}\n" + (f"标题：{title}\n\n" if title else "\n")
-        return truncate_utf8(header + (body or "（页面未提取到可见正文）"), policy.max_output_bytes)
-    return truncate_utf8(f"网页：{final_url}\n\n{text.strip()}", policy.max_output_bytes)
+        header = f"网页：{final_url}\n" + (f"标题：{title}\n" if title else "") + trunc_note + "\n"
+        content = header + (body or "（页面未提取到可见正文）")
+    elif "json" in mime:
+        content = f"网页：{final_url}\n{trunc_note}\n{_format_json_text(text)}"
+    else:
+        content = f"网页：{final_url}\n{trunc_note}\n{text.strip()}"
+
+    wrap_chars = min(DEFAULT_SOFT_WRAP_CHARS, max(32, policy.max_output_bytes // 6))
+    return truncate_or_offload(
+        content,
+        policy.max_output_bytes,
+        tag="webpage",
+        mode="head",
+        offload_dir=policy.offload_dir,
+        soft_wrap_chars=wrap_chars,
+    )
 
 
 # 解包 DuckDuckGo 跳转链接中的真实目标 URL（提取 uddg 参数）
@@ -430,10 +469,13 @@ def web_search(query: str) -> str:
     return execute_web_search(query, WebPolicy.from_config())
 
 
-# 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文
+# 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文（超长自动落盘分页）
 @tool(
     name="fetch_webpage",
-    description="抓取指定公开 http/https 网页链接并提取标题与纯文本正文，适合阅读文章或核对 web_search 返回的页面细节。",
+    description=(
+        "抓取指定公开 http/https 网页链接并提取标题与纯文本正文，适合阅读文章或核对 web_search 返回的页面细节；"
+        "超长正文会自动保存至 data/workspace/tool_outputs/ 供 read_markdown 分页续读。"
+    ),
     parameters={"url": "完整的公开 http/https 网址"},
 )
 def fetch_webpage(url: str) -> str:

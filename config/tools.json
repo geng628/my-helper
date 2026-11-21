@@ -20,7 +20,7 @@
   },
   "web": {
     "timeout": 15,
-    "max_download_bytes": 524288,
+    "max_download_bytes": 2097152,
     "max_output_bytes": 8192,
     "max_results": 5
   },
