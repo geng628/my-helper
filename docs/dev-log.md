@@ -265,3 +265,21 @@
   - AST 中文注释校验：**0 缺失**。
   - 退步与未验证项：无真实行为退步；既有 2 例 `op=replace` 旧词残留留待下一步 PR B 解决；LongMemEval / LoCoMo 50 题 + 盲测集将在 PR B 完成后一并做全套同口径实模对比。
 - **下一步**：合并 PR A 后推进 **PR B**（极简沉淀洁净与提示词微调 + 5 项制衡指标与 Held-out 盲测验收）。
+
+---
+
+### [2026-11-21] 新增极简 TOAST 工具输出卸载原语 `truncate_or_offload`（Issue `#10`）
+- **目标与思路**：在不新增工具、不碰 Layer 1/2 核心循环、保持零第三方依赖的前提下，先在 Layer 3 零内部依赖底座 `common.py` 提供通用的极简 TOAST 输出卸载原语，为后续 Issue `#11`（`fetch_webpage`）与 Issue `#12`（`run_command` / 固定命令）统一复用，做到每个 PR 只做一件事。
+- **改动文件**：
+  - `personal_assistant/assistant/common.py`：新增 `truncate_or_offload()` 及 `default_offload_dir()`（仅依赖标准库 `hashlib`、`os`、`re`、`tempfile`、`time`），支持短文本零落盘直通、超长单行软折行、严格 1 MB 落盘上限（对齐 `MemoryStore.MAX_SEARCH_FILE_BYTES`）、原子写盘 + 懒清理（保留最近 20 个 / 24h TTL）、tag 路径穿越清洗、`head` / `head_tail` 整行边界预览（带精确行号、`read_markdown` 续读起点与 `search_markdown(root="data/workspace/tool_outputs")` 指引），以及磁盘不可写时安全回退 `truncate_utf8`。
+  - `tests/test_toast_offload.py`：新增 7 条 TDD 单元测试（覆盖直通校验、`head` 模式与 `MemoryStore` + `FTS5Retriever` 联调、`head_tail` 首尾摘要保留与中间行回查、单行软折行与 1 MB 落盘硬上限、懒清理与 tag 清洗、超预算多字节首末行安全切片、`MY_HELPER_DATA` 路径隔离与 `OSError` 优雅回退）。
+- **踩坑与修复**：
+  - 提示语初版写了 `query=...`，其中 `...` 包含子串 `..`，误触路径穿越断言；改为明确的中文占位 `query="关键词"`，对模型更清晰且避免歧义。
+  - 懒清理单测最初将 `utime` 设到未来时间戳导致新文件反而比旧文件更旧，改为严格递增的过去时间戳并用正则核对刚写入的文件内容，准确验证保留最新 2 个批次。
+- **同口径评测对比（改前 `debeda2` → 改后 `feat/issue-10-toast-offload-primitive`）**：
+  - 单元测试：**81/81 → 88/88 passed**（+7 条 TDD 单测，含 `tests/test_architecture.py` 对 `common.py` 零内部依赖守卫）。
+  - 离线检索（40 题 `fts5_bm25`）：保持 **38/40 (95.0%)**、Recall **0.9483**、MRR **0.9483**、Quote **0.9483**、负例干净 **100%**、0.527 ms（零退步）。
+  - 公开检索（LoCoMo 200 题 `fts5_bm25`）：保持 **105/200 (52.5%)**、Recall **0.6851**、MRR **0.6221**、Quote **0.6017**、9.274 ms（零退步）。
+  - AST 中文注释校验：**0 缺失**。
+  - 退步与未验证项：无退步；本 PR 仅新增底层原语，未改动任何插件行为、提示词或记忆沉淀逻辑，未重复消耗 API 重跑实模多轮记忆评测。
+- **下一步**：合并本 PR 后，依次推进 Issue `#11`（`fetch_webpage` 接入 TOAST 并解除 512 KB 静默截断）与 Issue `#12`（`run_command` 与固定命令接入 Head+Tail TOAST）。
