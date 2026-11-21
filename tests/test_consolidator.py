@@ -11,6 +11,7 @@ import pytest
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.consolidator import (
+    CONSOLIDATION_SYSTEM_PROMPT,
     BackgroundConsolidator,
     ConsolidationPolicy,
     MemoryConsolidator,
@@ -19,7 +20,7 @@ from personal_assistant.assistant.consolidator import (
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.assistant.prompts import format_system_prompt
+from personal_assistant.assistant.prompts import SYSTEM_PROMPT, format_system_prompt
 
 
 # 可录制请求并按预设回复（支持门控同步）的假模型
@@ -280,3 +281,17 @@ def test_weekday_injected_consistently_in_system_prompt_and_consolidator(tmp_pat
         assert "【当前日期】2026-11-16（星期一，北京时间）" in str(llm.requests[0][1]["content"])
     finally:
         state.close()
+
+
+# 守卫系统提示词字数硬上限（<= 300 字符，原基线 261 字符）、防幻觉红线与沉淀洁净通用规范
+def test_prompt_and_consolidation_hygiene_guardrails() -> None:
+    assert len(SYSTEM_PROMPT) <= 300, f"SYSTEM_PROMPT 超出 300 字符精简预算：{len(SYSTEM_PROMPT)}"
+    assert "不要编造未观测到的结果" in SYSTEM_PROMPT
+    assert "建议/推荐/规划" in SYSTEM_PROMPT
+
+    assert "只写当前最新有效状态" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "一律用 op=add 保留" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "精确绝对日期" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "专有名词" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "优先完整记录用户自身的事实" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "不抄录长段通用科普或教程" in CONSOLIDATION_SYSTEM_PROMPT
