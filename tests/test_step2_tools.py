@@ -86,6 +86,7 @@ def test_command_runner_sanitizes_env_validates_params_and_truncates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("LLM_API_KEY", "super-secret-key-should-not-leak")
+    monkeypatch.setenv("MY_HELPER_DATA", str(tmp_path / "data"))
 
     cfg_file = tmp_path / "tools.json"
     cfg_file.write_text(
@@ -142,6 +143,10 @@ def test_command_runner_sanitizes_env_validates_params_and_truncates(
 
     truncated = registry.execute("cmd_long_out", "{}")
     assert "输出已截断" in truncated
+    assert "data/workspace/tool_outputs/" in truncated
+    offloaded_files = list((tmp_path / "data" / "workspace" / "tool_outputs").glob("*.txt"))
+    assert len(offloaded_files) == 1
+    assert "A" * 100 in offloaded_files[0].read_text(encoding="utf-8")
 
     # Injection / out-of-enum value rejected cleanly
     bad = registry.execute("cmd_show_mode", '{"mode": "fast; rm -rf /"}')
@@ -236,3 +241,47 @@ def test_tool_registry_accepts_numeric_arguments_and_rejects_booleans() -> None:
     assert "错误" in bad_bool
     bad_empty = registry.execute("slice_lines", '{"path": "a.md", "start_line": " ", "end_line": 40}')
     assert "错误" in bad_empty
+
+
+# 测试固定白名单命令超长输出接入 Head+Tail TOAST 卸载（同时合并 stdout 与 stderr）
+def test_command_spec_offloads_long_stdout_and_stderr_with_head_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MY_HELPER_DATA", str(tmp_path / "data"))
+    script = (
+        "import sys; "
+        "print('HEAD_BANNER_START'); "
+        "[print(f'body line {i:02d}: detail_payload_{i}') for i in range(1, 45)]; "
+        "print('TAIL_SUMMARY_OK'); "
+        "print('FINAL_STDERR_LINE', file=sys.stderr)"
+    )
+    cfg_file = tmp_path / "tools.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "enabled_tools": [],
+                "commands": [
+                    {
+                        "name": "verbose_job",
+                        "description": "多行输出与错误汇总测试",
+                        "enabled": True,
+                        "argv": [sys.executable, "-c", script],
+                        "max_output_bytes": 380,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolsConfig.load(cfg_file, project_root=tmp_path).build_registry()
+    out = registry.execute("cmd_verbose_job", "{}")
+    assert "退出码：0" in out
+    assert "HEAD_BANNER_START" in out
+    assert "FINAL_STDERR_LINE" in out
+    assert "输出已截断" in out
+    assert "body line 20" not in out
+    offloaded = list((tmp_path / "data" / "workspace" / "tool_outputs").glob("*.txt"))
+    assert len(offloaded) == 1
+    full_saved = offloaded[0].read_text(encoding="utf-8")
+    assert "body line 20" in full_saved
+    assert "FINAL_STDERR_LINE" in full_saved

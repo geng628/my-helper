@@ -20,7 +20,7 @@ from personal_assistant.ai.client import (
     register_provider,
 )
 from personal_assistant.ai.types import ModelsConfig
-from personal_assistant.assistant.common import truncate_utf8
+from personal_assistant.assistant.common import truncate_or_offload
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
@@ -56,6 +56,7 @@ class CommandSpec:
     cwd: Path
     timeout: float = 10.0
     max_output_bytes: int = 8192
+    offload_dir: Path | None = None
 
     # 返回注册到工具表中的统一名称（带 cmd_ 前缀）
     @property
@@ -107,14 +108,23 @@ class CommandSpec:
         except OSError as error:
             return f"错误：命令启动失败（{error}）。"
 
-        out = truncate_utf8((done.stdout or "").strip(), self.max_output_bytes)
-        err = truncate_utf8((done.stderr or "").strip(), self.max_output_bytes)
-        lines = [f"退出码：{done.returncode}"]
-        if out:
-            lines.append(out)
-        if err:
-            lines.append(f"stderr:\n{err}")
-        return "\n".join(lines)
+        clean_out = (done.stdout or "").strip()
+        clean_err = (done.stderr or "").strip()
+        sections: list[str] = []
+        if clean_out:
+            sections.append(clean_out)
+        if clean_err:
+            sections.append(f"stderr:\n{clean_err}")
+        if not sections:
+            return f"退出码：{done.returncode}"
+        body = truncate_or_offload(
+            "\n".join(sections),
+            self.max_output_bytes,
+            tag=f"cmd-{self.name}",
+            mode="head_tail",
+            offload_dir=self.offload_dir,
+        )
+        return f"退出码：{done.returncode}\n{body}"
 
     # 将当前命令规格转换成可供 ToolRegistry 注册的 Tool 对象
     def to_tool(self) -> Tool:
