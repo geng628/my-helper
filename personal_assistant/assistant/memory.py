@@ -672,7 +672,7 @@ class MemoryStore:
             if self.memory_file.is_file()
             else "# 记忆索引 (MEMORY.md)\n\n"
         )
-        if target_path in existing or Path(target_path).name in existing:
+        if target_path in existing or f"/{Path(target_path).name})" in existing:
             return
         sep = "" if not existing or existing.endswith("\n") else "\n"
         _atomic_write(self.memory_file, f"{existing}{sep}{entry_line}\n")
@@ -701,7 +701,7 @@ class MemoryStore:
         self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
         return "data/memory/facts.md"
 
-    # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突并登记 MEMORY.md 索引
+    # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
         self,
         topic: str,
@@ -720,6 +720,7 @@ class MemoryStore:
             write_fn=_atomic_write,
             ensure_index_fn=self._ensure_index_entry,
             audit_fn=self.record_audit,
+            archive_dir=self.archive_dir,
             today=today,
         )
 
@@ -743,6 +744,7 @@ class MemoryStore:
             self.archive_dir,
             write_fn=_atomic_write,
             audit_fn=self.record_audit,
+            ensure_index_fn=self._ensure_index_entry,
             today=today,
         )
 
@@ -865,7 +867,7 @@ class MemoryToolsetProvider(ToolsetProvider):
             (
                 "list_files",
                 "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
-                {"root": "目录起点，如 data/memory、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
+                {"root": "目录起点，如 data/memory、data/memory/archive、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
                 memory.list_files,
                 "read",
                 None,
@@ -873,7 +875,7 @@ class MemoryToolsetProvider(ToolsetProvider):
             (
                 "search_markdown",
                 "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
-                {"query": "搜索关键词", "root": "搜索目录，如 data/memory、data/workspace、docs"},
+                {"query": "搜索关键词", "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs"},
                 search_markdown,
                 "read",
                 None,

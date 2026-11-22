@@ -13,6 +13,12 @@ ECHOED_PREFIX_PATTERN = re.compile(
     r"^(?:-\s+)?(?:\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*)*(?:\(until:\s*\d{4}-\d{2}-\d{2}\)\s*)?"
 )
 RESERVED_MEMORY_TOPICS = frozenset({"memory", "audit", "rules", "archive"})
+ARCHIVE_INDEX_PATH = "data/memory/archive"
+ARCHIVE_INDEX_LINE = (
+    "- [历史归档与变更账本](data/memory/archive) — "
+    "存放已过期日程与被 replace/remove 软退休（superseded）的历史旧事实及替代链；"
+    '仅当追问最初/以前/曾经或对比历史演进时，使用 search_markdown(root="data/memory/archive") 查阅'
+)
 
 WriteFn = Callable[[Path, str], None]
 IndexFn = Callable[[str, str], None]
@@ -86,7 +92,36 @@ def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
     return "\n\n".join(chunks)
 
 
-# 对指定主题记忆文件执行 add / replace / remove 操作，写入期消解冲突并登记索引与审计日志
+# 将被 replace/remove 软退休的旧事实及替代链追加写入 archive/YYYY-MM.md（跳过正在规范化的 msg# 裸原话）
+def _append_superseded_records(
+    archive_dir: Path,
+    source_name: str,
+    retired: list[tuple[str, str]],
+    *,
+    write_fn: WriteFn,
+    ref_day: date,
+) -> str:
+    effective = [(old_line, repl) for old_line, repl in retired if not MSG_TAG_PATTERN.search(old_line)]
+    if not effective:
+        return ""
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_name = f"{ref_day.strftime('%Y-%m')}.md"
+    archive_path = archive_dir / archive_name
+    existing_archive = (
+        archive_path.read_text(encoding="utf-8")
+        if archive_path.is_file()
+        else f"# 记忆归档与历史变更账本 ({ref_day.strftime('%Y-%m')})\n\n"
+    )
+    sep = "" if not existing_archive or existing_archive.endswith("\n") else "\n"
+    moved = "".join(
+        f"- [superseded {ref_day.isoformat()} | from: {source_name}] {old_line} -> superseded_by: {repl}\n"
+        for old_line, repl in effective
+    )
+    write_fn(archive_path, f"{existing_archive}{sep}{moved}")
+    return f"data/memory/archive/{archive_name}"
+
+
+# 对指定主题记忆文件执行 add / replace / remove 操作，写入期消解冲突并将退场旧事实软退休进 archive 账本
 def apply_topic_operations(
     memory_dir: Path,
     *,
@@ -97,6 +132,7 @@ def apply_topic_operations(
     write_fn: WriteFn,
     ensure_index_fn: IndexFn,
     audit_fn: AuditFn,
+    archive_dir: Path | None = None,
     today: date | None = None,
 ) -> str | None:
     slug = re.sub(r"[^a-z0-9_-]+", "-", topic.strip().lower()).strip("-_")[:40]
@@ -119,6 +155,7 @@ def apply_topic_operations(
     changed = False
     removed_log: list[str] = []
     added_log: list[str] = []
+    superseded_records: list[tuple[str, str]] = []
 
     for op_entry in operations:
         if not isinstance(op_entry, dict):
@@ -159,6 +196,7 @@ def apply_topic_operations(
                 first_idx = matched_indices[0]
                 for idx in matched_indices:
                     removed_log.append(lines[idx])
+                    superseded_records.append((lines[idx], formatted))
                 lines[first_idx] = formatted
                 for idx in reversed(matched_indices[1:]):
                     lines.pop(idx)
@@ -177,6 +215,7 @@ def apply_topic_operations(
             for line in lines:
                 if line.lstrip().startswith("- ") and old_key.lower() in line.lower():
                     removed_log.append(line)
+                    superseded_records.append((line, "(removed)"))
                     changed = True
                 else:
                     kept.append(line)
@@ -188,6 +227,16 @@ def apply_topic_operations(
     write_fn(target, "\n".join(lines).rstrip() + "\n")
     summary_line = " ".join(index_summary.split()) or f"自动沉淀的 {clean_title} 记录，请按需检索"
     ensure_index_fn(rel_path, f"- [{clean_title}]({rel_path}) — {summary_line}")
+    if archive_dir is not None and superseded_records:
+        archive_rel = _append_superseded_records(
+            archive_dir,
+            f"{slug}.md",
+            superseded_records,
+            write_fn=write_fn,
+            ref_day=ref_day,
+        )
+        if archive_rel:
+            ensure_index_fn(ARCHIVE_INDEX_PATH, ARCHIVE_INDEX_LINE)
     audit_fn(
         action="consolidate_memory",
         actor="consolidator",
@@ -205,6 +254,7 @@ def archive_expired_topics(
     *,
     write_fn: WriteFn,
     audit_fn: AuditFn,
+    ensure_index_fn: IndexFn | None = None,
     today: date | None = None,
 ) -> dict[str, int]:
     if not memory_dir.is_dir():
@@ -253,6 +303,8 @@ def archive_expired_topics(
             old_value="; ".join(expired_lines),
             new_value=archive_rel,
         )
+    if archived_counts and ensure_index_fn is not None:
+        ensure_index_fn(ARCHIVE_INDEX_PATH, ARCHIVE_INDEX_LINE)
     return archived_counts
 
 

@@ -393,3 +393,27 @@
   - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调（`git=931514e`）：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/20261122-130428-shell-pytest-b8524bb3.txt")` 精准读出被省略的第 30 行测试名 `test_fts5_retriever_bm25_ranking_hard_negatives_and_diversity`，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。
   - 退步与未验证项：无退步；`--mode agent` 剩余 5 例未命中 `expected_tools=["search_markdown"]` 中，1 例（`exact-pref-style`）为模型根据 `MEMORY.md` 索引直接一步调 `read_markdown` 读对文件，3 例为 `answerable=False` 的领域外负例直接拒答，仅 `para-tool-self-heal` 1 例未查记忆直接按通用知识作答。
 - **下一步**：合并本 PR 后，视需要评估 Issue `#13`（活跃上下文与工具轮次调优）或下一阶段检索/记忆优化。
+
+
+---
+
+### [2026-11-22] `op="replace"` / `op="remove"` 软退休归档与 `superseded_by` 替代链（Issue `#22`）
+- **目标与思路**：按小步单一职责原则，聚焦解决 `apply_topic_operations()` 执行 `op="replace"` / `op="remove"` 时直接物理硬删除旧事实、导致“历史初值 vs 当前状态”类问题（如 LongMemEval Held-out 21 的 `lme-031748ae`）丢失旧值且误删不可回溯的缺陷；**本次不改动 `CONSOLIDATION_SYSTEM_PROMPT` 与 `SYSTEM_PROMPT`**，以便独立检验冷账本机制的纯增量收益：
+  1. **热记忆层保持纯净**：`data/memory/<topic>.md` 仍只原地保留最新有效事实，默认 `search_markdown(root="data/memory")` 继续隔离 `archive/`（零旧值干扰）。
+  2. **冷账本层自动软退休 + 替代链**：`replace` 退下的旧行追加写入 `data/memory/archive/YYYY-MM.md`，格式为 `- [superseded YYYY-MM-DD | from: <topic>.md] <old_line> -> superseded_by: <new_line>`；`remove` 标记 `-> superseded_by: (removed)`；并自动跳过 `facts.md` 中正在规范化的 `(msg#...)` 临时裸原话，防止污染归档。
+  3. **KV Cache 友好的幂等索引与工具可发现性**：首次向 `data/memory/archive/` 写入时在 `MEMORY.md` 幂等登记一次固定冷账本入口指针，并在 `list_files` / `search_markdown` 的 `root` 参数描述中注明 `data/memory/archive`。
+- **改动文件（Issue `#22`，代码提交 `ed9cdd8`）**：
+  - `personal_assistant/assistant/memory_lifecycle.py`：新增 `ARCHIVE_INDEX_PATH` / `ARCHIVE_INDEX_LINE` 与 `_append_superseded_records()`，`apply_topic_operations()` 接收可选 `archive_dir` 并在发生实质替换/删除时写入替代链及登记索引；`archive_expired_topics()` 同步支持首次归档时幂等登记索引。
+  - `personal_assistant/assistant/memory.py`：收紧 `_ensure_index_entry()` 幂等判定（匹配 `target_path` 或 `/{name})`）；`apply_memory_operations()` / `archive_expired_memories()` 传入 `archive_dir` 与 `_ensure_index_entry`；更新 `MemoryToolsetProvider.tools()` 中 `list_files` 与 `search_markdown` 的 `root` 说明。
+  - `tests/test_memory_lifecycle.py`：新增 `test_replace_and_remove_soft_retire_with_superseded_chain_and_fts5_traceability`，覆盖 `replace`/`remove` 替代链格式、`MEMORY.md` 二次归档零改写（KV Cache 稳定）、FTS5 与线性默认热检索零污染、显式 `root="data/memory/archive"` 追溯以及 `(msg#...)` 跳过保护。
+- **同口径评测对比（改前 `main` `4d18252` / `b6b93f4` → 改后 `ed9cdd8`）**：
+  - 单元测试：**98/98 → 99/99 passed (2.91s)**（+1 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
+  - 16 场景多轮记忆 Dev（`issue22_memory16.json`）：**16/16 (100.0%) → 15/16 (93.75%)**；全部 4 例 `knowledge-update`（含 `conflict-update`、`chained-three-step-update`、`explicit-forget-remove`）与 `abstention` / `extraction` / `multi-session` / `temporal` 均 **100%**；唯一未命中字面词为 `rolling-multi-compaction` 实答“企业微信机器人”未命中缩写 `'企微'`；`completion_tokens` **12,778 → 11,897 (-6.9%)**，本地前缀复用 **87.44% → 86.54%**，服务端 KV 命中 `73.13% → 64.06%`。
+  - **LongMemEval 35 题（Dev 14 + 盲测 Held-out 21，同一代码 `ed9cdd8` 实跑，`issue22_lme35.json`）**：
+    - 总计：**28/35 (80.00%) → 29/35 (82.86%)**（**+2.86pp**），服务端 KV 命中 **56.49% → 57.41%**，本地前缀复用 **82.94%**，总 `completion_tokens` **34,706 → 34,827 (+0.3%)**。
+    - 分集：**Dev 14 `10/14 (71.43%) → 11/14 (78.57%)`（+7.14pp）**；**Held-out 21 `18/21 (85.71%) → 18/21 (85.71%)`**。
+    - 分类（35 题）：`knowledge-update` **5/5 (100%)**、`abstention` **5/5 (100%)**、`single-session-user` **5/5 (100%)**、`multi-session` **4/5 (80%)**、`temporal-reasoning` **4/5 (80%)**、`single-session-assistant` **3/5 (60%)**、`single-session-preference` **3/5 (60%)**。
+    - 改善（`Fail → Pass`，3 例）：① **`lme-031748ae`（Held-out 21 `knowledge-update` 目标修复题）**：助手经由 `MEMORY.md` 索引与 `search_markdown`/`list_files` 成功查回冷账本，精准答出“May 11, 2023 入职时带领 **4 名工程师**，Oct 24, 2023 更新后带领 **5 名工程师**”；② `lme-1d4da289`（Dev 14）；③ `lme-4adc0475`（Held-out 21）。
+    - 退步与遗留（`Pass → Fail`，2 例，均未触发 `archive/`，属未改沉淀提示词前的沉淀提炼随机波动）：`lme-0e5e2d1a`（`single-session-assistant`，对话沉淀返回 `saved_files: []`，漏提助手答复的 38 名受试者）与 `lme-caf03d32`（`single-session-preference`，`preferences.md` 沉淀侧重植物饮食，漏提慢炖锅炖牛肉与酸奶需求）；另 `lme-a346bb18`、`lme-gpt4_2312f94c`、`lme-35a27287`、`lme-cc539528` 待下一独立 Issue 定向优化沉淀提示词与检索策略。
+- **下一步**：合并本 PR 后，单开下一个小 Issue 集中解决 `CONSOLIDATION_SYSTEM_PROMPT` 的“局部互补 `merge` vs 完全失效、显式事件发生日时间锚点与问答核心实体索引”。
