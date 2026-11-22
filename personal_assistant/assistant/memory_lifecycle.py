@@ -1,4 +1,4 @@
-"""记忆生命周期模块：负责有效期判断、主题冲突替换（add/replace/remove）与过期归档。"""
+"""记忆生命周期模块：负责有效期判断、主题冲突替换（add/merge/replace/remove）与过期归档。"""
 from __future__ import annotations
 
 import re
@@ -78,15 +78,38 @@ def _find_matching_indices(lines: list[str], old_key: str) -> list[int]:
     ]
 
 
+# 判断已有记忆行正文是否已包含目标补充子句（兼容多次 merge 剥离尾部标点，同时避免子串边界误判）
+def _bullet_contains_clause(line: str, clause: str) -> bool:
+    body = clean_memory_body(line).lower()
+    core = clean_memory_body(clause).rstrip("。；;.").strip().lower()
+    if not core:
+        return True
+    pattern = rf"(?:^|[。；;，,]\s*|\.\s+){re.escape(core)}[。；;.]*(?:$|\s*[；;，,。]|\.\s+)"
+    return re.search(pattern, body) is not None
+
+
 # 将补充维度无损拼接至已有记忆行尾部，保留原日期、原正文与既有 until 标记
-def _merge_memory_bullet(existing_line: str, addition: str, until_day: date | None = None) -> str:
+def _merge_memory_bullet(
+    existing_line: str,
+    addition: str,
+    *,
+    stamp_day: date,
+    until_day: date | None = None,
+) -> str:
     clean_addition = clean_memory_body(addition)
     base = existing_line.rstrip()
     if until_day is not None and not UNTIL_PATTERN.search(base):
         until_tag = f"(until: {until_day.isoformat()}) "
-        base = re.sub(r"^(-\s+\[\d{4}-\d{2}-\d{2}\]\s+)", rf"\1{until_tag}", base, count=1)
+        base = re.sub(
+            r"^(\s*-\s+\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s+)",
+            rf"\1{until_tag}",
+            base,
+            count=1,
+        )
         if until_tag not in base:
-            base = f"- [{until_day.isoformat()}] {until_tag}{base.lstrip('- ').strip()}"
+            indent = base[: len(base) - len(base.lstrip())]
+            stripped_body = re.sub(r"^\s*-\s+", "", base).strip()
+            base = f"{indent}- [{stamp_day.isoformat()}] {until_tag}{stripped_body}"
     sep = "；" if re.search(r"[\u4e00-\u9fff]", base + clean_addition) else "; "
     base = base.rstrip("。；;.")
     return f"{base}{sep}{clean_addition}"
@@ -147,7 +170,7 @@ def _append_superseded_records(
     return f"data/memory/archive/{archive_name}"
 
 
-# 对指定主题记忆文件执行 add / replace / remove 操作，写入期消解冲突并将退场旧事实软退休进 archive 账本
+# 对指定主题记忆文件执行 add / merge / replace / remove 操作，写入期消解冲突并将退场旧事实软退休进 archive 账本
 def apply_topic_operations(
     memory_dir: Path,
     *,
@@ -212,12 +235,18 @@ def apply_topic_operations(
             if matched_indices:
                 idx = matched_indices[0]
                 existing_line = lines[idx]
-                if addition.lower() in existing_line.lower():
+                if _bullet_contains_clause(existing_line, addition):
                     continue
-                lines[idx] = _merge_memory_bullet(existing_line, addition, until_day)
+                lines[idx] = _merge_memory_bullet(
+                    existing_line, addition, stamp_day=ref_day, until_day=until_day
+                )
                 added_log.append(addition)
                 changed = True
-            elif not any(addition.lower() in existing_line.lower() for existing_line in lines):
+            elif not any(
+                existing_line.lstrip().startswith("- ")
+                and _bullet_contains_clause(existing_line, addition)
+                for existing_line in lines
+            ):
                 lines.append(format_memory_bullet(addition, ref_day, until_day))
                 added_log.append(addition)
                 changed = True

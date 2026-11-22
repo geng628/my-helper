@@ -173,7 +173,7 @@ class MemoryConsolidator:
         user_payload = (
             f"【当前日期】{format_date_with_weekday(ref_day)}\n\n"
             f"【当前 MEMORY.md 索引】\n{index_text}\n\n"
-            f"【已有主题记忆（用于识别冲突与 replace/remove）】\n{topic_snapshots}\n\n"
+            f"【已有主题记忆（用于识别冲突与 merge/replace/remove）】\n{topic_snapshots}\n\n"
             f"【已有前情摘要】\n{existing_summary or '（无）'}\n\n"
             f"【待沉淀与压缩的早期对话（共 {len(batch)} 条）】\n{transcript}"
         )
@@ -222,10 +222,15 @@ class MemoryConsolidator:
                     if saved not in saved_files:
                         saved_files.append(saved)
                     for op_item in ops:
-                        if str(op_item.get("op") or "add").lower() in {"add", "merge", "replace"}:
+                        op_name = str(op_item.get("op") or "add").strip().lower()
+                        if op_name in {"add", "merge"}:
+                            val = str(op_item.get("text") or op_item.get("new") or "").strip()
+                        elif op_name == "replace":
                             val = str(op_item.get("new") or op_item.get("text") or "").strip()
-                            if val:
-                                written_texts.append(val)
+                        else:
+                            val = ""
+                        if val:
+                            written_texts.append(val)
 
         # 兜底清理 facts.md 中已被本次沉淀规范化的原始 (msg#...) 幽灵行，避免临时事实漏过期
         batch_ids = {int(msg["id"]) for msg in batch if msg.get("id") is not None}
