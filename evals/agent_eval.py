@@ -14,7 +14,11 @@ from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.memory import (
+    FilesPolicy,
+    MemoryStore,
+    MemoryToolsetProvider,
+)
 from personal_assistant.assistant.prompts import format_system_prompt
 from evals.common import current_git_commit, normalize_expected_sources
 
@@ -61,12 +65,12 @@ def evaluate_agent(
     with tempfile.TemporaryDirectory(prefix="my-helper-eval-") as tmp:
         memory = _prepare_isolated_memory(data_dir, Path(tmp), cfg, project_root)
         current_user: list[tuple[str, int | None]] = [("", None)]
-        builtins = memory_tools(memory, get_user_message=lambda: current_user[0])
-        registry = (
-            cfg.build_registry(*builtins, data_root=memory.data_root)
-            if cfg is not None
-            else ToolRegistry(*builtins)
-        )
+        provider = MemoryToolsetProvider(memory, get_user_message=lambda: current_user[0])
+        if cfg is not None:
+            registry = cfg.build_registry(providers=[provider], data_root=memory.data_root)
+        else:
+            registry = ToolRegistry()
+            registry.register_provider(provider)
         # 评测批次内冻结系统提示词，确保跨题前缀一致且与真实会话行为对齐
         frozen_system_prompt = format_system_prompt(memory)
 

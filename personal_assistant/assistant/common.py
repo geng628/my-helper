@@ -6,9 +6,6 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -20,7 +17,6 @@ DEFAULT_SOFT_WRAP_CHARS = 1000
 DEFAULT_OFFLOAD_MAX_FILES = 20
 DEFAULT_OFFLOAD_TTL_SECONDS = 24 * 3600
 _OFFLOAD_CAP_NOTICE = "…（原始输出超过落盘上限，后续字节未保存）"
-_ACTIVE_DATA_ROOT: ContextVar[Path | None] = ContextVar("_ACTIVE_DATA_ROOT", default=None)
 
 
 # 将日期格式化为带中文星期与时区的统一展示文本（如 2026-11-16（星期一，北京时间））
@@ -51,21 +47,9 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
     return data[:max_bytes].decode("utf-8", errors="ignore") + "\n…（输出已截断）"
 
 
-# 在当前调用上下文内绑定活跃 data_root，使插件工具的 TOAST 落盘自动对齐当前实例的数据目录
-@contextmanager
-def bind_data_root(data_root: Path | None) -> Iterator[None]:
-    resolved = data_root.resolve() if data_root is not None else None
-    token = _ACTIVE_DATA_ROOT.set(resolved)
-    try:
-        yield
-    finally:
-        _ACTIVE_DATA_ROOT.reset(token)
-
-
-# 返回默认工具大输出落盘目录（优先取当前实例绑定的 data_root，其次遵循 MY_HELPER_DATA 环境变量，最后回退仓库 data/）
+# 返回默认工具大输出落盘目录（遵循 MY_HELPER_DATA 环境变量，回退至仓库 data/workspace/tool_outputs）
 def default_offload_dir() -> Path:
-    active = _ACTIVE_DATA_ROOT.get()
-    data_root = active if active is not None else Path(os.getenv("MY_HELPER_DATA", str(REPO_ROOT / "data"))).resolve()
+    data_root = Path(os.getenv("MY_HELPER_DATA", str(REPO_ROOT / "data"))).resolve()
     return data_root / "workspace" / OFFLOAD_SUBDIR
 
 

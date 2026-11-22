@@ -8,10 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from personal_assistant.agent.tools import tool
+from personal_assistant.agent.tools import Tool, build_dynamic_plugin_tool, tool
 from personal_assistant.assistant.common import truncate_or_offload
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,21 +63,15 @@ class ShellPolicy:
     max_output_bytes: int = 8192
     offload_dir: Path | None = None
 
-    # 从 config/tools.json 读取 shell 白名单配置，缺失时回退到安全默认值
+    # 从已解析的 shell 配置字典与上下文路径直接构建 ShellPolicy（支持绑定实例专属 offload_dir）
     @classmethod
-    def from_config(cls, config_path: Path | None = None) -> "ShellPolicy":
-        cfg_file = (
-            config_path
-            if config_path is not None
-            else Path(os.getenv("MY_HELPER_CONFIG", str(REPO_ROOT / "config"))) / "tools.json"
-        ).resolve()
-        project_root = cfg_file.parent.parent if cfg_file.is_file() else REPO_ROOT
-        shell_cfg: dict[str, object] = {}
-        if cfg_file.is_file():
-            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("shell"), dict):
-                shell_cfg = raw["shell"]
-
+    def from_dict(
+        cls,
+        shell_cfg: Mapping[str, object],
+        *,
+        project_root: Path = REPO_ROOT,
+        offload_dir: Path | None = None,
+    ) -> "ShellPolicy":
         cwd_raw = str(shell_cfg.get("cwd") or ".").strip()
         cwd_rel = Path(cwd_raw)
         if cwd_rel.is_absolute() or ".." in cwd_rel.parts:
@@ -99,7 +94,29 @@ class ShellPolicy:
             reject_segments=tuple(str(x) for x in rejects),
             timeout=timeout,
             max_output_bytes=max_output,
+            offload_dir=offload_dir,
         )
+
+    # 从 config/tools.json 读取 shell 白名单配置，缺失时回退到安全默认值
+    @classmethod
+    def from_config(
+        cls,
+        config_path: Path | None = None,
+        *,
+        offload_dir: Path | None = None,
+    ) -> "ShellPolicy":
+        cfg_file = (
+            config_path
+            if config_path is not None
+            else Path(os.getenv("MY_HELPER_CONFIG", str(REPO_ROOT / "config"))) / "tools.json"
+        ).resolve()
+        project_root = cfg_file.parent.parent if cfg_file.is_file() else REPO_ROOT
+        shell_cfg: dict[str, object] = {}
+        if cfg_file.is_file():
+            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("shell"), dict):
+                shell_cfg = raw["shell"]
+        return cls.from_dict(shell_cfg, project_root=project_root, offload_dir=offload_dir)
 
 
 # 词法解析单条命令并拦截未引用的管道/分号/重定向/命令替换等壳元字符
@@ -282,7 +299,34 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
         "超长输出保留头尾预览并自动保存至 data/workspace/tool_outputs/ 供分页读取。"
     ),
     parameters={"command": "要执行的单条命令字符串，例如 'ls -la' 或 'git log -n 5 --oneline'"},
+    risk="exec",
 )
 def run_command(command: str) -> str:
     policy = ShellPolicy.from_config()
     return execute_safe_command(command, policy)
+
+
+# 由 PluginManager 调用的上下文感知工具构建入口：一次性注入实例 project_root / offload_dir 与 shell 配置
+def build_plugin_tools(context: Mapping[str, object]) -> list[Tool]:
+    project_root = Path(str(context.get("project_root") or REPO_ROOT)).resolve()
+    raw_offload = context.get("offload_dir")
+    offload_dir = Path(str(raw_offload)).resolve() if isinstance(raw_offload, (str, Path)) else None
+    raw_shell = context.get("shell")
+    shell_cfg = raw_shell if isinstance(raw_shell, Mapping) else {}
+    policy = ShellPolicy.from_dict(shell_cfg, project_root=project_root, offload_dir=offload_dir)
+    base_tool: Tool = getattr(run_command, "__agent_tool__")
+
+    # 执行已绑定当前实例 ShellPolicy（含专属 offload_dir）的受控命令
+    def _bound_run_command(command: str) -> str:
+        return execute_safe_command(command, policy)
+
+    return [
+        build_dynamic_plugin_tool(
+            _bound_run_command,
+            name=base_tool.name,
+            description=base_tool.description,
+            parameters=base_tool.parameters,
+            risk="exec",
+            source_name="shell_tools",
+        )
+    ]

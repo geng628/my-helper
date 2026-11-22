@@ -363,8 +363,12 @@
 
 ---
 
-### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与 3 处跨模块接缝缺陷修复（Issue `#20`）
-- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调，并针对联调揪出的 3 处确定性跨模块接缝缺陷做极简、零全局变量耦合修复。
+### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与统一 `ToolRegistry` 多源工具架构重构（Issue `#20`）
+- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调；针对联调暴露的“内置工具与插件工具走两条不同配置/目录路径”以及 `ContextVar` / `os.getenv` 暗道问题，将工具体系重构为统一的多源汇聚架构：
+  1. **内核内置工具 (`MemoryToolsetProvider(ToolsetProvider)`)** ──▶ `BuiltinTool(Tool)` 子类
+  2. **插件 `@tool` (`PluginManager`)** ──▶ 动态 `type()` `Tool` 子类（在入表时一次性注入实例 `project_root`、`offload_dir` 与 `shell`/`web` 配置）
+  3. **配置命令包装 (`CommandSpec.to_tool`)** ──▶ `CommandToolWrapper(Tool)` 子类
+  三者统一汇入**同一个 `ToolRegistry._tools[name]` + `_metadata[name]` (`risk` / `always_on`) + `_documents[name]` (`source_type` / `source_name`)** 并按需激活，彻底废弃 `ContextVar` 暗道。
 - **`main` (`4d18252`) 全量 5 套 141 题实模基线重测记录**：
   - 16 场景多轮记忆（`memory_scenarios.jsonl`）：**16/16 (100.0%)**（全类 100%，0 失败），KV 命中 `73.13%`、本地前缀复用 `87.44%`。
   - LongMemEval Dev 14：**10/14 (71.43%)**（`abstention` 2/2、`knowledge-update` 2/2、`single-session-user` 2/2），KV 命中 `54.52%`、本地前缀复用 `82.48%`。
@@ -372,13 +376,14 @@
   - LoCoMo 50 题 19 会话共享记忆：自动 Judge **38/50 (76.0%)**（`temporal` **9/10**、`open-domain` **7/10**、`completion_tokens` 20,075 较基线 `-2.1%`；`q176` 实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”属准确纠偏零幻觉，核查有效 **39/50**）。
   - 全量 40 题 `--mode agent`（`sample_cases.jsonl`）：**31/40 (77.5%)**，KV 命中 `77.85%`、本地前缀复用 `77.07%`（暴露 `agent_eval.py` 漏挂 `fts5_bm25` 检索插件）。
 - **改动文件（Issue `#20`）**：
-  - `personal_assistant/assistant/common.py`：用标准库 `contextvars.ContextVar` 新增 `bind_data_root(data_root)`，`default_offload_dir()` 优先取当前上下文绑定的 `data_root`，再回退 `MY_HELPER_DATA` 与 `REPO_ROOT/data`，不改插件 `@tool` 签名且天然支持多实例/多线程隔离。
-  - `personal_assistant/assistant/commands.py`、`app.py`、`cli.py`：`ToolsConfig.build_registry(..., data_root=...)` 自动通过 `_bind_tool_data_root()` 绑定实例 `data_root`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
-  - `plugins/shell_tools.py`：`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`，彻底消除通过 `run_command` 跑 `pytest` 在 Git 仓库根目录遗留 `pytest-of-*` 脏目录的问题。
-  - `evals/agent_eval.py`：`_prepare_isolated_memory()` 挂载 `retriever = cfg.build_retriever()`，`evaluate_agent()` 调用 `cfg.build_registry(*builtins, data_root=memory.data_root)`。
-  - `tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 3 条 TDD 单测分别锁死自定义 `data_root` 无环境变量下的 TOAST 落盘续读闭环、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
+  - `personal_assistant/agent/tools.py` & `plugins.py` & `__init__.py`：`Tool` 支持 `run()` 多态重写；新增 `ToolMetadata(risk, always_on)`、`ToolDocument(source_type, source_name)`、`ToolsetProvider`、`build_dynamic_plugin_tool()`（基于动态 `type()` 构造 `Tool` 子类）与 `PluginManager`；`ToolRegistry` 统一维护 `_all_tools` / `_tools` / `_metadata` / `_documents` 并支持 `register_provider()` 与 `activate()` 按需加载。
+  - `personal_assistant/assistant/memory.py`：新增 `BuiltinTool(Tool)` 与 `MemoryToolsetProvider(ToolsetProvider)`（`source_type="builtin"`, `source_name="memory"`）。
+  - `personal_assistant/assistant/commands.py`、`app.py`、`cli.py`：新增 `CommandToolWrapper(Tool)`（`source_type="command"`, `source_name="tools.json"`）；`ToolsConfig.build_registry(providers=..., data_root=...)` 统一汇聚三类工具源并向 `PluginManager` 与 `CommandToolWrapper` 注入实例专属 `offload_dir`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `plugins/shell_tools.py` & `plugins/web_tools.py`：新增 `ShellPolicy.from_dict` / `WebPolicy.from_dict` 与 `build_plugin_tools(context)`，入表时直接绑定实例 `offload_dir` 与配置；`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `evals/agent_eval.py`：挂载 `retriever = cfg.build_retriever()` 并通过 `MemoryToolsetProvider` 统一构建工具表。
+  - `tests/test_step2_tools.py`、`tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 4 条 TDD 单测覆盖三源 `Tool` 子类统一汇聚与 `_metadata`/`_documents` 校验、无环境变量自定义 `data_root` 下 TOAST 落盘续读、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
 - **同口径评测对比（改前 `4d18252` → 改后 `fix/issue-20-toast-data-root-tmpdir-agent-retriever`）**：
-  - 单元测试：**93/93 → 96/96 passed (3.31s)**（+3 条跨模块 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+  - 单元测试：**93/93 → 97/97 passed (5.40s)**（+4 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
   - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；29 道可答题目标源文档命中率从 **26/29 (89.7%) → 28/29 (96.6%)**），KV 命中 **77.85% → 80.69%**，本地前缀复用 **77.07% → 82.94%**，总 Prompt Tokens **-7.7%**。
   - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/...")` 精准读出被省略中间行测试名，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。

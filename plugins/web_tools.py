@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from personal_assistant.agent.tools import tool
+from personal_assistant.agent.tools import Tool, build_dynamic_plugin_tool, tool
 from personal_assistant.assistant.common import (
     DEFAULT_SOFT_WRAP_CHARS,
     truncate_or_offload,
@@ -50,9 +50,30 @@ class WebPolicy:
     max_results: int = 5
     offload_dir: Path | None = None
 
+    # 从已解析的 web 配置字典直接构建 WebPolicy（支持绑定实例专属 offload_dir）
+    @classmethod
+    def from_dict(
+        cls,
+        web_cfg: Mapping[str, object],
+        *,
+        offload_dir: Path | None = None,
+    ) -> "WebPolicy":
+        return cls(
+            timeout=float(web_cfg.get("timeout", 15.0)),
+            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
+            max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
+            max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
+            offload_dir=offload_dir,
+        )
+
     # 从 config/tools.json 读取 web 配置段，缺省时使用安全默认值
     @classmethod
-    def from_config(cls, config_path: Path | None = None) -> "WebPolicy":
+    def from_config(
+        cls,
+        config_path: Path | None = None,
+        *,
+        offload_dir: Path | None = None,
+    ) -> "WebPolicy":
         cfg_file = (
             config_path
             if config_path is not None
@@ -63,12 +84,7 @@ class WebPolicy:
             raw = json.loads(cfg_file.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("web"), dict):
                 web_cfg = raw["web"]
-        return cls(
-            timeout=float(web_cfg.get("timeout", 15.0)),
-            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
-            max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
-            max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
-        )
+        return cls.from_dict(web_cfg, offload_dir=offload_dir)
 
 
 # 严格校验目标 URL 仅限公开 http/https 地址，防止通过私网/回环/云元数据 IP 触发 SSRF
@@ -464,6 +480,7 @@ def execute_web_search(
     name="web_search",
     description="联网搜索实时信息、最新技术文档或公开网页，返回排名前几条的标题、链接与摘要。",
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
+    risk="network",
 )
 def web_search(query: str) -> str:
     return execute_web_search(query, WebPolicy.from_config())
@@ -477,6 +494,45 @@ def web_search(query: str) -> str:
         "超长正文会自动保存至 data/workspace/tool_outputs/ 供 read_markdown 分页续读。"
     ),
     parameters={"url": "完整的公开 http/https 网址"},
+    risk="network",
 )
 def fetch_webpage(url: str) -> str:
     return execute_fetch_webpage(url, WebPolicy.from_config())
+
+
+# 由 PluginManager 调用的上下文感知工具构建入口：一次性注入实例 offload_dir 与 web 配置
+def build_plugin_tools(context: Mapping[str, object]) -> list[Tool]:
+    raw_offload = context.get("offload_dir")
+    offload_dir = Path(str(raw_offload)).resolve() if isinstance(raw_offload, (str, Path)) else None
+    raw_web = context.get("web")
+    web_cfg = raw_web if isinstance(raw_web, Mapping) else {}
+    policy = WebPolicy.from_dict(web_cfg, offload_dir=offload_dir)
+    search_base: Tool = getattr(web_search, "__agent_tool__")
+    fetch_base: Tool = getattr(fetch_webpage, "__agent_tool__")
+
+    # 执行已绑定当前实例 WebPolicy 的联网搜索
+    def _bound_web_search(query: str) -> str:
+        return execute_web_search(query, policy)
+
+    # 执行已绑定当前实例 WebPolicy（含专属 offload_dir）的网页抓取
+    def _bound_fetch_webpage(url: str) -> str:
+        return execute_fetch_webpage(url, policy)
+
+    return [
+        build_dynamic_plugin_tool(
+            _bound_web_search,
+            name=search_base.name,
+            description=search_base.description,
+            parameters=search_base.parameters,
+            risk="network",
+            source_name="web_tools",
+        ),
+        build_dynamic_plugin_tool(
+            _bound_fetch_webpage,
+            name=fetch_base.name,
+            description=fetch_base.description,
+            parameters=fetch_base.parameters,
+            risk="network",
+            source_name="web_tools",
+        ),
+    ]

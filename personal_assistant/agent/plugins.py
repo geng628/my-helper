@@ -1,18 +1,26 @@
-"""Layer 2 通用插件发现器：扫描项目内插件文件，统一收集工具（TOOLS）、检索器（RETRIEVERS）与模型提供方（LLM_PROVIDERS）。"""
+"""Layer 2 通用插件管理器（PluginManager）：统一扫描插件文件，将 @tool 包装为动态 Tool 子类并收集 RETRIEVERS / LLM_PROVIDERS / CONFIG_COMPILERS。"""
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-from personal_assistant.agent.tools import Tool
+from personal_assistant.agent.tools import (
+    Tool,
+    ToolDocument,
+    ToolMetadata,
+    ToolRegistry,
+    build_dynamic_plugin_tool,
+)
 from personal_assistant.ai.client import ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
 ConfigCompiler = Callable[..., dict[str, object]]
+PluginToolFactory = Callable[[Mapping[str, object]], list[Tool]]
 
 
 # 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
@@ -65,10 +73,48 @@ def _import_plugin_module(file_path: Path) -> ModuleType:
     return module
 
 
-# 从已导入插件模块中收集 TOOLS 列表以及被 @tool 装饰的函数
-def _extract_module_tools(module: ModuleType, file_path: Path) -> list[Tool]:
+# 确保插件产出的 Tool 实例统一为动态 type() Tool 子类并附带标准 ToolMetadata 与 ToolDocument
+def _normalize_plugin_tool(item: Tool, source_name: str) -> Tool:
+    meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
+    doc = ToolDocument(source_type="plugin", source_name=source_name)
+    if type(item) is Tool:
+        wrapped = build_dynamic_plugin_tool(
+            item.run,
+            description=item.description,
+            parameters=item.parameters,
+            name=item.name,
+            param_enums=item.param_enums,
+            risk=meta.risk,
+            always_on=meta.always_on,
+            source_name=source_name,
+        )
+        return wrapped
+    object.__setattr__(item, "__tool_metadata__", meta)
+    object.__setattr__(item, "__tool_document__", doc)
+    return item
+
+
+# 从已导入插件模块中收集 TOOLS 列表、@tool 装饰函数（以及可选上下文绑定工厂 build_plugin_tools）
+def _extract_module_tools(
+    module: ModuleType,
+    file_path: Path,
+    context: Mapping[str, object] | None = None,
+) -> list[Tool]:
+    source_name = file_path.stem
     found: list[Tool] = []
     seen_in_file: set[str] = set()
+
+    context_builder = getattr(module, "build_plugin_tools", None)
+    if context is not None and callable(context_builder):
+        built = context_builder(context)
+        if not isinstance(built, (list, tuple)):
+            raise ValueError(f"插件 {file_path.name} 的 build_plugin_tools 必须返回列表或元组。")
+        for item in built:
+            if not isinstance(item, Tool):
+                raise ValueError(f"插件 {file_path.name} 的 build_plugin_tools 包含非 Tool 对象。")
+            if item.name not in seen_in_file:
+                seen_in_file.add(item.name)
+                found.append(_normalize_plugin_tool(item, source_name))
 
     exported = getattr(module, "TOOLS", None)
     if exported is not None:
@@ -79,13 +125,13 @@ def _extract_module_tools(module: ModuleType, file_path: Path) -> list[Tool]:
                 raise ValueError(f"插件 {file_path.name} 的 TOOLS 中包含非 Tool 对象。")
             if item.name not in seen_in_file:
                 seen_in_file.add(item.name)
-                found.append(item)
+                found.append(_normalize_plugin_tool(item, source_name))
 
     for value in vars(module).values():
         marked = getattr(value, "__agent_tool__", None)
         if isinstance(marked, Tool) and marked.name not in seen_in_file:
             seen_in_file.add(marked.name)
-            found.append(marked)
+            found.append(_normalize_plugin_tool(marked, source_name))
 
     return found
 
@@ -117,7 +163,111 @@ def _extract_named_factories(
     return found
 
 
-# 一次扫描同时加载插件工具、插件检索后端、插件 LLM Provider 与配置编译器插件，避免重复执行模块
+# 插件管理器：统一管理已加载插件模块，按运行时上下文生成动态 Tool 子类并注入同一个 ToolRegistry
+@dataclass(frozen=True)
+class PluginManager:
+    modules: tuple[tuple[Path, ModuleType], ...]
+    tools: tuple[Tool, ...]
+    retrievers: dict[str, RetrieverFactory]
+    providers: dict[str, ProviderFactory]
+    compilers: dict[str, ConfigCompiler]
+
+    # 扫描并导入配置的全部插件文件，一次性构建 PluginManager 实例
+    @classmethod
+    def from_entries(
+        cls,
+        entries: Iterable[str],
+        project_root: Path,
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> "PluginManager":
+        loaded_modules: list[tuple[Path, ModuleType]] = []
+        loaded_tools: list[Tool] = []
+        seen_tools: set[str] = set()
+        loaded_retrievers: dict[str, RetrieverFactory] = {}
+        loaded_providers: dict[str, ProviderFactory] = {}
+        loaded_compilers: dict[str, ConfigCompiler] = {}
+
+        for file_path in _resolve_plugin_targets(entries, project_root):
+            module = _import_plugin_module(file_path)
+            loaded_modules.append((file_path, module))
+            for item in _extract_module_tools(module, file_path, context=context):
+                if item.name in seen_tools:
+                    raise ValueError(f"插件工具名称重复：{item.name}（文件：{file_path.name}）")
+                seen_tools.add(item.name)
+                loaded_tools.append(item)
+
+            for name, factory in _extract_named_factories(
+                module,
+                file_path,
+                dict_attr="RETRIEVERS",
+                name_attr="RETRIEVER_NAME",
+                factory_attr="create_retriever",
+            ).items():
+                if name in loaded_retrievers:
+                    raise ValueError(f"检索插件名称重复：{name}（文件：{file_path.name}）")
+                loaded_retrievers[name] = factory
+
+            for name, factory in _extract_named_factories(
+                module,
+                file_path,
+                dict_attr="LLM_PROVIDERS",
+                name_attr="PROVIDER_NAME",
+                factory_attr="create_provider",
+            ).items():
+                if name in loaded_providers:
+                    raise ValueError(f"模型 Provider 插件名称重复：{name}（文件：{file_path.name}）")
+                loaded_providers[name] = factory
+
+            for name, compiler in _extract_named_factories(
+                module,
+                file_path,
+                dict_attr="CONFIG_COMPILERS",
+                name_attr="COMPILER_NAME",
+                factory_attr="compile_config",
+            ).items():
+                if name in loaded_compilers:
+                    raise ValueError(f"配置编译器插件名称重复：{name}（文件：{file_path.name}）")
+                loaded_compilers[name] = compiler
+
+        return cls(
+            modules=tuple(loaded_modules),
+            tools=tuple(loaded_tools),
+            retrievers=loaded_retrievers,
+            providers=loaded_providers,
+            compilers=loaded_compilers,
+        )
+
+    # 按给定运行时上下文（如实例专属 data_root / offload_dir / tools.json 配置）构建全部插件 Tool 子类列表
+    def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
+        if context is None:
+            return list(self.tools)
+        built: list[Tool] = []
+        seen: set[str] = set()
+        for file_path, module in self.modules:
+            for item in _extract_module_tools(module, file_path, context=context):
+                if item.name not in seen:
+                    seen.add(item.name)
+                    built.append(item)
+        return built
+
+    # 将全部插件工具连同 _metadata 与 _documents（source_type="plugin"）统一注册进目标 ToolRegistry
+    def register_tools_into(
+        self,
+        registry: ToolRegistry,
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        for item in self.build_tools(context=context):
+            meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
+            doc = getattr(item, "__tool_document__", None) or ToolDocument(
+                source_type="plugin",
+                source_name="plugin",
+            )
+            registry.register(item, metadata=meta, document=doc)
+
+
+# 一次扫描同时加载插件工具、插件检索后端、插件 LLM Provider 与配置编译器插件
 def load_plugins(
     entries: Iterable[str],
     project_root: Path,
@@ -127,54 +277,8 @@ def load_plugins(
     dict[str, ProviderFactory],
     dict[str, ConfigCompiler],
 ]:
-    loaded_tools: list[Tool] = []
-    seen_tools: set[str] = set()
-    loaded_retrievers: dict[str, RetrieverFactory] = {}
-    loaded_providers: dict[str, ProviderFactory] = {}
-    loaded_compilers: dict[str, ConfigCompiler] = {}
-
-    for file_path in _resolve_plugin_targets(entries, project_root):
-        module = _import_plugin_module(file_path)
-        for item in _extract_module_tools(module, file_path):
-            if item.name in seen_tools:
-                raise ValueError(f"插件工具名称重复：{item.name}（文件：{file_path.name}）")
-            seen_tools.add(item.name)
-            loaded_tools.append(item)
-
-        for name, factory in _extract_named_factories(
-            module,
-            file_path,
-            dict_attr="RETRIEVERS",
-            name_attr="RETRIEVER_NAME",
-            factory_attr="create_retriever",
-        ).items():
-            if name in loaded_retrievers:
-                raise ValueError(f"检索插件名称重复：{name}（文件：{file_path.name}）")
-            loaded_retrievers[name] = factory
-
-        for name, factory in _extract_named_factories(
-            module,
-            file_path,
-            dict_attr="LLM_PROVIDERS",
-            name_attr="PROVIDER_NAME",
-            factory_attr="create_provider",
-        ).items():
-            if name in loaded_providers:
-                raise ValueError(f"模型 Provider 插件名称重复：{name}（文件：{file_path.name}）")
-            loaded_providers[name] = factory
-
-        for name, compiler in _extract_named_factories(
-            module,
-            file_path,
-            dict_attr="CONFIG_COMPILERS",
-            name_attr="COMPILER_NAME",
-            factory_attr="compile_config",
-        ).items():
-            if name in loaded_compilers:
-                raise ValueError(f"配置编译器插件名称重复：{name}（文件：{file_path.name}）")
-            loaded_compilers[name] = compiler
-
-    return loaded_tools, loaded_retrievers, loaded_providers, loaded_compilers
+    manager = PluginManager.from_entries(entries, project_root)
+    return list(manager.tools), manager.retrievers, manager.providers, manager.compilers
 
 
 # 批量加载配置声明的全部插件工具，并禁止跨文件重名

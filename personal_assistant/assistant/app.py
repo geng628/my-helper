@@ -19,7 +19,11 @@ from personal_assistant.assistant.consolidator import (
     MemoryConsolidator,
 )
 from personal_assistant.assistant.db import StateStore
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.memory import (
+    FilesPolicy,
+    MemoryStore,
+    MemoryToolsetProvider,
+)
 from personal_assistant.assistant.prompts import format_system_prompt
 
 MAX_HISTORY_MESSAGES = 20
@@ -161,17 +165,19 @@ class AssistantApp:
             return self._today_fn()
         return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
-    # 为单轮对话构建受白名单管控的工具注册表，并将当前用户消息绑定到 remember_fact
+    # 为单轮对话构建受白名单管控的统一工具注册表（汇聚 MemoryToolsetProvider、PluginManager 与 CommandToolWrapper）
     def build_tools(
         self,
         user_text: str = "",
         message_id: int | None = None,
     ) -> ToolRegistry:
         getter = (lambda: (user_text, message_id)) if user_text else None
-        builtins = memory_tools(self.memory, get_user_message=getter, get_today=self._today)
+        provider = MemoryToolsetProvider(self.memory, get_user_message=getter, get_today=self._today)
         if self.tools_config is not None:
-            return self.tools_config.build_registry(*builtins, data_root=self.data_root)
-        return ToolRegistry(*builtins)
+            return self.tools_config.build_registry(providers=[provider], data_root=self.data_root)
+        registry = ToolRegistry()
+        registry.register_provider(provider)
+        return registry
 
     # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用
     def build_system_prompt(self, registry: ToolRegistry) -> str:
