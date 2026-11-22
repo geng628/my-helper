@@ -138,7 +138,7 @@ def multiply(x: str, y: str) -> str:
     assert messages[-2]["content"] == "42"
 
 
-# 测试外层统一主板基类 Plugin(ABC)（__init_subclass__ 自动发现、self.context、initialize/terminate）与内层 4 个强类型极简子协议
+# 测试外层统一主板基类 Plugin(ABC)（3 个同级插件：ToolsPlugin / FTS5RetrieverPlugin / ModelsDSLPlugin）与内层 4 个强类型极简子协议
 def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
         ConfigCompilerProtocol,
@@ -149,22 +149,27 @@ def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     from personal_assistant.agent.tools import Tool
     from personal_assistant.assistant.common import REPO_ROOT
     from plugins.models_dsl import ModelsDSLCompiler
+    from plugins.tools import ToolsPlugin
 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
 
-    # 1. 外层：plugins/ 下全部 5 个插件模块均继承同一个 Plugin(ABC) 主板基类并自动发现初始化
+    # 1. 外层：主板仅加载 3 个同级 Plugin(ABC) 实例（tools 文件夹插件 + fts5_bm25 / models_dsl 单文件插件）
+    assert len(manager.plugins) == 3
     assert all(isinstance(p, Plugin) for p in manager.plugins)
     plugin_ids = {p.plugin_id for p in manager.plugins}
     assert plugin_ids == {
-        "custom_tools",
-        "shell_tools",
-        "web_tools",
+        "tools",
         "fts5_bm25",
         "models_dsl",
     }
+    assert {type(p).__name__ for p in manager.plugins} == {
+        "ToolsPlugin",
+        "FTS5RetrieverPlugin",
+        "ModelsDSLPlugin",
+    }
     assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
 
-    # 2. 内层子协议 1：Tool 子类实例全部汇入 manager.default_tools
+    # 2. 内层子协议 1：plugins/tools/ 下的全部 @tool 模块由唯一的 ToolsPlugin 统一装配为 Tool 子类实例
     assert all(isinstance(t, Tool) for t in manager.default_tools)
     assert {"get_current_time", "run_command", "web_search", "fetch_webpage"}.issubset(
         {t.name for t in manager.default_tools}

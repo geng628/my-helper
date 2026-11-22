@@ -1,6 +1,7 @@
 """Layer 2 通用工具抽象、统一构建器（build_tool）与统一注册表（ToolRegistry）。"""
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -35,7 +36,7 @@ class Tool(ToolSchema):
         return str(self.handler(**values))
 
 
-# 统一工具构建器：将执行函数适配为指定 Tool 子类（或动态 type() 生成的 Tool 子类），并挂载 ToolMetadata 与 ToolDocument
+# 统一工具构建器：将执行函数适配为指定 Tool 子类（或动态 type() 生成的 Tool 子类），自动按函数签名绑定上下文参数并挂载 ToolMetadata 与 ToolDocument
 def build_tool(
     fn: Callable[..., str],
     *,
@@ -49,9 +50,25 @@ def build_tool(
     source_name: str = "core",
     base_cls: type[Tool] | None = None,
     extra_fields: Mapping[str, object] | None = None,
+    context: Mapping[str, object] | None = None,
 ) -> Tool:
     tool_name = name or fn.__name__
     schema_params = dict(parameters or {})
+
+    bound_context: dict[str, object] = {}
+    if context:
+        try:
+            sig = inspect.signature(fn)
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            for key, val in context.items():
+                if key in schema_params or val is None:
+                    continue
+                if accepts_var_kw or key in sig.parameters:
+                    bound_context[key] = val
+        except (TypeError, ValueError):
+            pass
 
     if base_cls is not None and base_cls is not Tool:
         target_cls = base_cls
@@ -59,9 +76,11 @@ def build_tool(
         safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", tool_name).title().replace("_", "") or "Dynamic"
         kind_label = source_type.title() or "Dynamic"
 
-        # 动态 Tool 子类的 run 实现：转发已校验参数给目标函数
+        # 动态 Tool 子类的 run 实现：合并预绑定运行时上下文与模型传入参数
         def _run(self: Tool, **values: str) -> str:
-            return str(fn(**values))
+            call_kwargs: dict[str, object] = dict(bound_context)
+            call_kwargs.update(values)
+            return str(fn(**call_kwargs))
 
         target_cls = type(
             f"{safe_suffix}{kind_label}Tool",
@@ -172,6 +191,21 @@ def tool(
         return fn
 
     return decorator
+
+
+# 判断对象是否为 Tool 实例或经过 @tool 装饰的函数
+def is_tool(item: object) -> bool:
+    return isinstance(item, Tool) or isinstance(getattr(item, "__agent_tool__", None), Tool)
+
+
+# 从 Tool 实例或 @tool 装饰的函数中提取底层 Tool 对象
+def extract_tool(item: object) -> Tool:
+    if isinstance(item, Tool):
+        return item
+    marked = getattr(item, "__agent_tool__", None)
+    if isinstance(marked, Tool):
+        return marked
+    raise TypeError(f"对象不是合法的 Tool 或 @tool 函数：{item!r}")
 
 
 # 统一工具注册表：汇聚所有 ToolsetProvider 与 Plugin 产出的 Tool 子类，维护 _tools / _metadata / _documents 并按需激活

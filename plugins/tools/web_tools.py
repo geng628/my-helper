@@ -16,15 +16,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from personal_assistant.agent.plugins import Plugin
-from personal_assistant.agent.tools import build_tool, tool
+from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import (
     DEFAULT_SOFT_WRAP_CHARS,
     truncate_or_offload,
     truncate_utf8,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -483,8 +482,17 @@ def execute_web_search(
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
     risk="network",
 )
-def web_search(query: str) -> str:
-    return execute_web_search(query, WebPolicy.from_config())
+def web_search(
+    query: str,
+    *,
+    config_path: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+) -> str:
+    if isinstance(web_config, Mapping):
+        policy = WebPolicy.from_dict(web_config)
+    else:
+        policy = WebPolicy.from_config(config_path)
+    return execute_web_search(query, policy)
 
 
 # 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文（超长自动落盘分页）
@@ -497,54 +505,15 @@ def web_search(query: str) -> str:
     parameters={"url": "完整的公开 http/https 网址"},
     risk="network",
 )
-def fetch_webpage(url: str) -> str:
-    return execute_fetch_webpage(url, WebPolicy.from_config())
-
-
-# 联网搜索与网页抓取主板插件（外层继承 Plugin ABC，通过 self.context 拿配置与 offload_dir，内层注册 Tool 子协议）
-class WebToolsPlugin(Plugin):
-    plugin_id = "web_tools"
-
-    # 统一初始化生命周期：从 self.context 构建 WebPolicy 并向 tool_registry 插槽注册 web_search 与 fetch_webpage
-    def initialize(self) -> None:
-        raw_web = self.context.raw_config.get("web")
-        if isinstance(raw_web, Mapping):
-            policy = WebPolicy.from_dict(raw_web, offload_dir=self.context.offload_dir)
-        else:
-            policy = WebPolicy.from_config(
-                self.context.config_path,
-                offload_dir=self.context.offload_dir,
-            )
-        search_spec = getattr(web_search, "__agent_tool__")
-        fetch_spec = getattr(fetch_webpage, "__agent_tool__")
-
-        # 执行已绑定当前 PluginContext WebPolicy 的联网搜索
-        def _bound_web_search(query: str) -> str:
-            return execute_web_search(query, policy)
-
-        # 执行已绑定当前 PluginContext WebPolicy（含专属 offload_dir）的网页抓取
-        def _bound_fetch_webpage(url: str) -> str:
-            return execute_fetch_webpage(url, policy)
-
-        self.context.register_tool(
-            build_tool(
-                _bound_web_search,
-                name=search_spec.name,
-                description=search_spec.description,
-                parameters=search_spec.parameters,
-                risk="network",
-                source_type="plugin",
-                source_name=self.plugin_id,
-            )
-        )
-        self.context.register_tool(
-            build_tool(
-                _bound_fetch_webpage,
-                name=fetch_spec.name,
-                description=fetch_spec.description,
-                parameters=fetch_spec.parameters,
-                risk="network",
-                source_type="plugin",
-                source_name=self.plugin_id,
-            )
-        )
+def fetch_webpage(
+    url: str,
+    *,
+    config_path: Path | None = None,
+    offload_dir: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+) -> str:
+    if isinstance(web_config, Mapping):
+        policy = WebPolicy.from_dict(web_config, offload_dir=offload_dir)
+    else:
+        policy = WebPolicy.from_config(config_path, offload_dir=offload_dir)
+    return execute_fetch_webpage(url, policy)

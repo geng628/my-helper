@@ -11,7 +11,7 @@ import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.memory import MemoryStore
-from plugins.shell_tools import ShellPolicy, execute_safe_command
+from plugins.tools.shell_tools import ShellPolicy, execute_safe_command
 
 
 # 测试插件能通过 config/tools.json 自动发现注册，并正常执行白名单内的只读命令

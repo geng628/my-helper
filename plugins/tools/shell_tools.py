@@ -12,11 +12,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from personal_assistant.agent.plugins import Plugin
-from personal_assistant.agent.tools import build_tool, tool
+from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import truncate_or_offload
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_ALLOWED_EXECUTABLES = (
     "ls",
@@ -291,7 +290,7 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     )
 
 
-# 插件工具入口：受 config/tools.json 的 shell 段白名单管控执行单条只读/受控命令（供直接函数调用兼容）
+# 插件工具入口：受 config/tools.json 的 shell 段白名单管控执行单条只读/受控命令（运行时上下文参数由 ToolsPlugin / build_tool 自动绑定）
 @tool(
     name="run_command",
     description=(
@@ -302,43 +301,20 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     parameters={"command": "要执行的单条命令字符串，例如 'ls -la' 或 'git log -n 5 --oneline'"},
     risk="exec",
 )
-def run_command(command: str) -> str:
-    policy = ShellPolicy.from_config()
-    return execute_safe_command(command, policy)
-
-
-# 受控 Shell 工具主板插件（外层继承 Plugin ABC，通过 self.context 拿配置与 offload_dir，内层注册 Tool 子协议）
-class ShellToolsPlugin(Plugin):
-    plugin_id = "shell_tools"
-
-    # 统一初始化生命周期：从 self.context 构建绑定实例目录的 ShellPolicy 并向 tool_registry 插槽注册 run_command
-    def initialize(self) -> None:
-        raw_shell = self.context.raw_config.get("shell")
-        if isinstance(raw_shell, Mapping):
-            policy = ShellPolicy.from_dict(
-                raw_shell,
-                project_root=self.context.project_root,
-                offload_dir=self.context.offload_dir,
-            )
-        else:
-            policy = ShellPolicy.from_config(
-                self.context.config_path,
-                offload_dir=self.context.offload_dir,
-            )
-        spec = getattr(run_command, "__agent_tool__")
-
-        # 执行已绑定当前 PluginContext 资源（project_root / offload_dir）的受控命令
-        def _bound_run_command(command: str) -> str:
-            return execute_safe_command(command, policy)
-
-        self.context.register_tool(
-            build_tool(
-                _bound_run_command,
-                name=spec.name,
-                description=spec.description,
-                parameters=spec.parameters,
-                risk="exec",
-                source_type="plugin",
-                source_name=self.plugin_id,
-            )
+def run_command(
+    command: str,
+    *,
+    project_root: Path | None = None,
+    config_path: Path | None = None,
+    offload_dir: Path | None = None,
+    shell_config: Mapping[str, object] | None = None,
+) -> str:
+    if isinstance(shell_config, Mapping):
+        policy = ShellPolicy.from_dict(
+            shell_config,
+            project_root=project_root or REPO_ROOT,
+            offload_dir=offload_dir,
         )
+    else:
+        policy = ShellPolicy.from_config(config_path, offload_dir=offload_dir)
+    return execute_safe_command(command, policy)

@@ -18,6 +18,8 @@ from personal_assistant.agent.tools import (
     ToolRegistry,
     ToolsetProvider,
     build_tool,
+    extract_tool,
+    is_tool,
 )
 from personal_assistant.ai.client import LLMClient, ProviderFactory
 
@@ -78,15 +80,40 @@ class PluginContext:
     compilers: dict[str, ConfigCompiler] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
 
-    # 插槽 1：向主板 ToolRegistry 注册一个 Tool 子类实例（或通过 build_tool 现场构建）
+    # 提取供 build_tool 自动按签名绑定到 @tool 函数上的系统资源上下文
+    def tool_bindings(self) -> dict[str, object]:
+        raw_shell = self.raw_config.get("shell")
+        raw_web = self.raw_config.get("web")
+        return {
+            "project_root": self.project_root,
+            "data_root": self.data_root,
+            "config_path": self.config_path,
+            "offload_dir": self.offload_dir,
+            "raw_config": dict(self.raw_config),
+            "shell_config": dict(raw_shell) if isinstance(raw_shell, Mapping) else None,
+            "web_config": dict(raw_web) if isinstance(raw_web, Mapping) else None,
+        }
+
+    # 插槽 1：向主板 ToolRegistry 注册一个 Tool 子类实例或 @tool 函数（自动通过 build_tool 绑定当前上下文）
     def register_tool(
         self,
-        item: Tool,
+        item: Tool | Callable[..., str],
         *,
+        source_name: str | None = None,
         metadata: ToolMetadata | None = None,
         document: ToolDocument | None = None,
     ) -> None:
-        self.tool_registry.register(item, metadata=metadata, document=document)
+        raw_tool = extract_tool(item)
+        if source_name is not None or not isinstance(item, Tool):
+            src = source_name or getattr(getattr(raw_tool, "__tool_document__", None), "source_name", "plugin")
+            normalized = _normalize_plugin_tool(
+                raw_tool,
+                source_name=src,
+                context=self.tool_bindings(),
+            )
+        else:
+            normalized = raw_tool
+        self.tool_registry.register(normalized, metadata=metadata, document=document)
 
     # 插槽 2：向主板注册检索引擎子协议实现（支持传入 RetrieverProtocol 实例或工厂函数）
     def register_retriever(
@@ -191,7 +218,7 @@ class Plugin(ABC):
         return None
 
 
-# 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
+# 解析配置中的插件文件或目录路径（同时支持 plugins/*.py 单文件插件与 plugins/*/plugin.py 文件夹插件）
 def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[Path]:
     root = project_root.resolve()
     files: list[Path] = []
@@ -206,14 +233,33 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
         target = (root / rel).resolve()
         if not target.is_relative_to(root):
             raise ValueError(f"插件路径超出项目范围：{entry}")
+        if not target.exists() and len(rel.parts) == 2 and rel.parts[0] == "plugins":
+            fallback = (root / "plugins" / "tools" / rel.parts[1]).resolve()
+            if fallback.is_relative_to(root) and fallback.exists():
+                target = fallback
         if not target.exists():
             continue
 
-        candidates = (
-            [p for p in sorted(target.glob("*.py")) if not p.name.startswith("_")]
-            if target.is_dir()
-            else [target]
-        )
+        candidates: list[Path] = []
+        if target.is_dir():
+            if (target / "plugin.py").is_file():
+                candidates.append(target / "plugin.py")
+            else:
+                for child in sorted(target.iterdir()):
+                    if child.name.startswith(("_", ".")):
+                        continue
+                    if child.is_dir():
+                        if (child / "plugin.py").is_file():
+                            candidates.append(child / "plugin.py")
+                        else:
+                            candidates.extend(
+                                p for p in sorted(child.glob("*.py")) if not p.name.startswith("_")
+                            )
+                    elif child.is_file() and child.suffix == ".py":
+                        candidates.append(child)
+        else:
+            candidates.append(target)
+
         for file_path in candidates:
             resolved = file_path.resolve()
             if not resolved.is_relative_to(root) or resolved.suffix != ".py" or not resolved.is_file():
@@ -241,8 +287,13 @@ def _import_plugin_module(file_path: Path) -> ModuleType:
     return module
 
 
-# 统一通过 build_tool 将 Tool 实例标准化为带 source_name 的动态 Tool 子类
-def _normalize_plugin_tool(item: Tool, source_name: str) -> Tool:
+# 统一通过 build_tool 将 Tool 实例标准化为带 source_name 与预绑定上下文的动态 Tool 子类
+def _normalize_plugin_tool(
+    item: Tool,
+    source_name: str,
+    *,
+    context: Mapping[str, object] | None = None,
+) -> Tool:
     meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
     raw_fn = getattr(item, "_raw_fn", None) or item.handler or item.run
     return build_tool(
@@ -255,6 +306,7 @@ def _normalize_plugin_tool(item: Tool, source_name: str) -> Tool:
         always_on=meta.always_on,
         source_type="plugin",
         source_name=source_name,
+        context=context,
     )
 
 
@@ -307,13 +359,13 @@ class _AutoScriptPlugin(Plugin):
                     raise ValueError(f"插件 {self.file_path.name} 的 TOOLS 中包含非 Tool 对象。")
                 if item.name not in seen_in_file:
                     seen_in_file.add(item.name)
-                    self.context.register_tool(_normalize_plugin_tool(item, source_name))
+                    self.context.register_tool(item, source_name=source_name)
 
         for value in vars(self.module).values():
             marked = getattr(value, "__agent_tool__", None)
             if isinstance(marked, Tool) and marked.name not in seen_in_file:
                 seen_in_file.add(marked.name)
-                self.context.register_tool(_normalize_plugin_tool(marked, source_name))
+                self.context.register_tool(marked, source_name=source_name)
 
         for name, factory in _extract_legacy_factories(
             self.module,
