@@ -7,7 +7,7 @@
 1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`sqlite3`、`urllib`、`threading`、`http.server` 等）；`pytest` 仅作为开发测试依赖。
 2. **插件优先与三层漏斗架构**：
    - 严格守住三层单向依赖：`personal_assistant/` 仅保留纯净三层产品代码——`ai`（纯 LLM 协议，零向上依赖） ← `agent`（通用 ReAct 与插件发现，只依赖 `ai`） ← `assistant`（个人助手业务）；顶层评测包 `evals/` 与 `tests/`、`plugins/` 平级（`personal_assistant/` 绝不反向依赖 `evals/`，且 `evals/` 绝不反向依赖 `assistant/cli.py`），每次改动必须通过 `tests/test_architecture.py` 架构守卫测试。
-   - 新增工具（`TOOLS` / `@tool`）、检索后端（`RETRIEVERS`）、模型厂商适配（`LLM_PROVIDERS`）或配置编译器（`CONFIG_COMPILERS`）优先写成 `plugins/*.py` 独立插件；非必要不动核心 `personal_assistant/agent/react.py`。
+   - 新增工具优先写入 [plugins/tools/](plugins/tools/) 下的 `@tool` 模块并由 [plugins/tools/plugin.py](plugins/tools/plugin.py)（`ToolsPlugin`）统一接入 `Tool` 协议；新增检索引擎、配置编译器或模型底座驱动则实现为继承外层统一主板基类 `Plugin(ABC)` 的独立插件 `plugins/*.py`，分别接入 `RetrieverProtocol`、`ConfigCompilerProtocol` 或 `LLMProviderProtocol`；非必要不动核心 `personal_assistant/agent/react.py`。
 3. **安全与隐私边界**：
    - 保持 `write_root = data/workspace`、只读 Shell 白名单、防 SSRF 校验；**禁止**开放让 LLM 无人工审批直接写入 `plugins/` 或 `personal_assistant/`。
    - 严禁提交 `.env`、`data/`、`evals/public/`；不得修改父目录中的旧版仓库。
@@ -37,6 +37,25 @@
 4. **提 PR + 等 CI + 确认合并**：
    - 推送分支至远端（`GIT_SSH_COMMAND="ssh -o BatchMode=yes" git push -u origin <branch>`）并创建 PR（正文按 `.github/PULL_REQUEST_TEMPLATE.md` 填写 `Closes #<编号>` 与改前/改后对比表）；
    - **只有当 GitHub Actions CI 全绿、评测结果达标且用户确认后**，才合并至 `main`（推荐 Squash Merge）并清理已合并分支。
+
+## 小 PR + 并行 Worktree 与三层接力 Review 规范
+
+为提升研发效率并同时守住架构质量与审阅清晰度，多任务协作默认遵循以下受控并行流程：
+
+1. **先拆方案、列文件清单、确认后再派活**：
+   - 收到多项需求时先读相关代码，列出**任务拆分方案、每个任务拟改文件列表、依赖关系及串/并行判定**，经用户确认后再启动编码；
+   - 一两行单文件的极小改动直接在单分支快做，不强行拆分。
+2. **串并行边界与并发限流（上限 2~3 路）**：
+   - **必须串行**：核心架构重构、公共抽象与协议定义、改动同一批文件（尤其注意避让 `memory.py`、`commands.py` 等高碰撞模块）或有先后依赖的任务，老实按顺序串行推进（后项可叠分支基于前项分支）。
+   - **允许并行**：边界清晰、文件零交集的独立小任务（如独立插件、独立 Bug、单测补全、`evals/` 改进），最多同时开 **2~3 个**子 Agent 在独立 git worktree（`workspace="share"`）与独立分支（`feat/issue-<N>-xxx`、`fix/issue-<N>-xxx`、`docs/issue-<N>-xxx`、`test/issue-<N>-xxx`）上开发，绝不直接污染主工作目录。
+3. **单 PR 单一职责与精简体积**：每个 Issue / PR 严守**只做一件事**，不顺手修改无关文件，保持 Diff 小而易审，提交前必须先 `rebase` 到最新 `main` 解决冲突。
+4. **并行防撞补丁（避开本仓库两类必撞点）**：
+   - **`docs/dev-log.md` 延后追加**：并行子 Agent 在开发阶段只改代码与测试，不在各自并行分支提前抢写 [docs/dev-log.md](docs/dev-log.md)；待各 PR 依次 `rebase origin/main` 准备合并前，再按合并顺序严格 `append-only` 追加，彻底消灭尾部冲突；
+   - **`.env` 与 `evals/public/` 只读复用**：独立 worktree 可零阻力跑 `uv run pytest` 与 40 题本地离线检索；跑实模 Benchmark 时只读复用主目录 `.env` 与 `evals/public/`（严禁复制提交）；若多条并行 PR 都会影响同一套实模评测指标，合入第 1 个后，后续 PR 必须先 `rebase` 最新 `main` 并补跑合流验收以排查跨 PR 语义交互。
+5. **三层接力 Review（严禁写代码子 Agent 自审）**：
+   - **第 1 层（机器硬守卫）**：`uv run pytest -v`（含 `tests/test_architecture.py`）、AST 中文 `#` 注释 0 缺失、GitHub Actions CI、同口径 Benchmark；
+   - **第 2 层（独立只读 Reviewer Agent）**：另开全新上下文的只读 Reviewer 子 Agent 对照 Issue 验收标准与 `git diff main...HEAD` 做对抗式审查（重点查：**范围漂移、跨 PR 语义冲突、重复造轮子、测试放水、安全/KV Cache 不变量破坏**），输出 `Blocker / Nit / Pass`；凡存在 `Blocker` 直接打回对应编码子 Agent 返工重测，修净后才端到用户面前；
+   - **第 3 层（项目 Owner 终审拍板）**：全部完成后集中汇总每个 PR 的分支/链接、测试与评测结果、Reviewer 结论及失败/遗留项（失败任务如实写明卡点，绝不假装完成），由用户终审架构边界、核心 Diff 与真实评测账本后拍板 Squash Merge。
 
 ## 跨模型交接日志协议（每次改动必做）
 

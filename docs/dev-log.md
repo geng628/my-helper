@@ -417,3 +417,14 @@
     - 改善（`Fail → Pass`，3 例）：① **`lme-031748ae`（Held-out 21 `knowledge-update` 目标修复题）**：助手经由 `MEMORY.md` 索引与 `search_markdown`/`list_files` 成功查回冷账本，精准答出“May 11, 2023 入职时带领 **4 名工程师**，Oct 24, 2023 更新后带领 **5 名工程师**”；② `lme-1d4da289`（Dev 14）；③ `lme-4adc0475`（Held-out 21）。
     - 退步与遗留（`Pass → Fail`，2 例，均未触发 `archive/`，属未改沉淀提示词前的沉淀提炼随机波动）：`lme-0e5e2d1a`（`single-session-assistant`，对话沉淀返回 `saved_files: []`，漏提助手答复的 38 名受试者）与 `lme-caf03d32`（`single-session-preference`，`preferences.md` 沉淀侧重植物饮食，漏提慢炖锅炖牛肉与酸奶需求）；另 `lme-a346bb18`、`lme-gpt4_2312f94c`、`lme-35a27287`、`lme-cc539528` 待下一独立 Issue 定向优化沉淀提示词与检索策略。
 - **下一步**：合并本 PR 后，单开下一个小 Issue 集中解决 `CONSOLIDATION_SYSTEM_PROMPT` 的“局部互补 `merge` vs 完全失效、显式事件发生日时间锚点与问答核心实体索引”。
+
+
+---
+
+### [2026-11-23] 新增《小 PR + 并行 Worktree 与三层接力 Review 规范》（Issue `#24`）
+- **目标与思路**：基于已成型的三层漏斗架构与 99 条 TDD 单测基线，在不牺牲代码品味、KV Cache 与架构不变量的前提下引入受控并行开发：将“先拆方案列文件清单确认再派活、2~3 路并发限流、核心架构与高碰撞文件串行、`docs/dev-log.md` 延后追加 + `.env`/`evals/public/` 只读复用防撞补丁、以及禁止作者自审的三层接力 Review（机器守卫 → 独立只读 Reviewer Agent → Owner 终审）”写入长期协作契约，并顺手对齐 `AGENTS.md` 中的外层 `Plugin(ABC)` 与内层 4 子协议描述。
+- **改动文件（Issue `#24`）**：
+  - `AGENTS.md`：同步最新插件主板/子协议描述，新增 `## 小 PR + 并行 Worktree 与三层接力 Review 规范` 一节。
+  - `docs/dev-log.md`：追加本次协作规范变更记录（严格 append-only）。
+- **验证**：纯文档改动，全量单测保持 **99/99 passed**；未改动任何 Python 源码，无需重跑实模 Benchmark。
+- **下一步**：合并本 PR 后，按新流程先提交首批 2 路低耦合 Eval 改进任务的拆分与拟改文件清单，经确认后再派独立 worktree 并行实施。
