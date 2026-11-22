@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from evals import evaluate_memory, load_scenarios, main, write_scenarios_jsonl
+from evals import evaluate_memory, judge_answer, load_scenarios, main, write_scenarios_jsonl
+from evals.memory_eval import JUDGE_SYSTEM_PROMPT
 from personal_assistant.ai import LLMClient, TokenUsage
 
 
@@ -528,3 +529,106 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
     )
     with pytest.raises(ValueError, match="missing-group"):
         load_scenarios(bad_path)
+
+
+# 测试 judge_answer 与 JUDGE_SYSTEM_PROMPT 在 is_abstention=True 下允许有效前提纠偏而不误判为编造
+def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    # 捕获传给 judge_llm 的完整消息列表并按序返回预设判决
+    class CapturingJudgeLLM(ScriptedMemoryEvalLLM):
+        # 校验未传工具并记录 system/user 请求消息
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            assert tools is None
+            captured_messages.append(list(messages))
+            return super().respond(messages, tools)
+
+    question = "When did Caroline go camping?"
+    expected_answer = "Not enough information / not mentioned in the conversation (do not answer 'last year')."
+    correction_reply = "Caroline has no camping record; it was Melanie's family who went camping last year."
+    fabricated_reply = "Caroline went camping with her family last year."
+
+    judge_llm = CapturingJudgeLLM(
+        [
+            (
+                {
+                    "role": "assistant",
+                    "content": '{"correct": true, "reason": "Valid premise correction: Caroline has no camping record and Melanie\'s family is noted from memory."}',
+                },
+                TokenUsage(260, 0, 24),
+            ),
+            (
+                {
+                    "role": "assistant",
+                    "content": '{"correct": false, "reason": "Adopted the false premise about Caroline."}',
+                },
+                TokenUsage(250, 0, 18),
+            ),
+        ]
+    )
+
+    ok_result = judge_answer(
+        judge_llm,
+        question,
+        expected_answer,
+        correction_reply,
+        is_abstention=True,
+    )
+    bad_result = judge_answer(
+        judge_llm,
+        question,
+        expected_answer,
+        fabricated_reply,
+        is_abstention=True,
+    )
+
+    assert ok_result == {
+        "mode": "llm_judge",
+        "correct": True,
+        "reason": "Valid premise correction: Caroline has no camping record and Melanie's family is noted from memory.",
+    }
+    assert bad_result == {
+        "mode": "llm_judge",
+        "correct": False,
+        "reason": "Adopted the false premise about Caroline.",
+    }
+
+    assert len(captured_messages) == 2
+    for call_msgs, expected_reply in zip(captured_messages, [correction_reply, fabricated_reply], strict=True):
+        assert len(call_msgs) == 2
+        assert call_msgs[0] == {"role": "system", "content": JUDGE_SYSTEM_PROMPT}
+        assert call_msgs[1]["role"] == "user"
+        user_payload = str(call_msgs[1]["content"])
+        assert f"Question: {question}" in user_payload
+        assert f"Reference Answer: {expected_answer}" in user_payload
+        assert "is_abstention: true" in user_payload
+        assert f"Assistant Reply: {expected_reply}" in user_payload
+
+    system_prompt = str(captured_messages[0][0]["content"])
+
+    # 规则 1 对正常问答（is_abstention=false）保持原有严格事实校验不变
+    assert (
+        "1. For normal questions (is_abstention=false): mark correct=true ONLY if the assistant's response "
+        "clearly states the essential factual content of the reference answer (equivalent wording, units, "
+        "or date formatting are acceptable; extra harmless context is fine; wrong numbers/entities or claiming "
+        "not to know is false)."
+    ) in system_prompt
+
+    # 规则 2 明确允许有效前提纠偏：否定错误前提/说明所问人或实体无记录，并指出记忆中另一人/实体属于有效纠偏而非编造
+    assert "2. For abstention questions (is_abstention=true):" in system_prompt
+    rule2_lower = system_prompt.split("2. For abstention questions (is_abstention=true):", maxsplit=1)[1].lower()
+    assert "correct=true" in rule2_lower
+    assert "premise correction" in rule2_lower
+    assert "false premise" in rule2_lower
+    assert "no such record" in rule2_lower
+    assert "different person/entity recorded in memory" in rule2_lower
+    assert "not fabrication" in rule2_lower
+
+    # 规则 2 仍严格把采纳错误前提或编造未记录细节判为 correct=false
+    assert "correct=false" in rule2_lower
+    assert "adopts the false premise" in rule2_lower
+    assert "fabricat" in rule2_lower and "unrecorded" in rule2_lower
