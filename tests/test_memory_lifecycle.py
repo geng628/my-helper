@@ -299,3 +299,98 @@ def test_consolidator_cleans_up_raw_remember_fact_ghost_without_losing_unrelated
         assert memory.search_hits("演练", root="data/memory", today=date(2026, 11, 25)) == []
     finally:
         state.close()
+
+
+# 测试 op=replace / op=remove 软退休至 archive/YYYY-MM.md 并记录 superseded_by 替代链（同时保持热记忆纯净与 MEMORY.md 幂等）
+def test_replace_and_remove_soft_retire_with_superseded_chain_and_fts5_traceability(
+    tmp_path: Path,
+) -> None:
+    from plugins.fts5_retriever import FTS5Retriever
+
+    retriever = FTS5Retriever()
+    memory = MemoryStore(tmp_path / "data", retriever=retriever)
+    day1 = date(2023, 5, 10)
+    day2 = date(2023, 10, 24)
+
+    # 1. replace 更新团队规模：活跃 work.md 只保留最新值（5 人），旧值（37 人）软退休进 archive 并记录替代链
+    memory.apply_memory_operations(
+        "work",
+        "工作备忘",
+        "团队规模与职责",
+        [
+            {"op": "add", "text": "刚升任架构师，初期带领 37 名工程师。"},
+            {"op": "add", "text": "临时兼任季度招聘接口人。"},
+        ],
+        today=day1,
+    )
+
+    memory.apply_memory_operations(
+        "work",
+        "工作备忘",
+        "团队规模与职责",
+        [
+            {
+                "op": "replace",
+                "old": "带领 37 名工程师",
+                "new": "担任架构师，目前带领 52 名工程师。",
+            }
+        ],
+        today=day2,
+    )
+
+    active_work = (memory.memory_dir / "work.md").read_text(encoding="utf-8")
+    assert "37 名工程师" not in active_work
+    assert "52 名工程师" in active_work
+
+    archive_file = memory.memory_dir / "archive" / "2023-10.md"
+    assert archive_file.is_file()
+    archive_text_1 = archive_file.read_text(encoding="utf-8")
+    assert "[superseded 2023-10-24 | from: work.md]" in archive_text_1
+    assert "带领 37 名工程师" in archive_text_1
+    assert "-> superseded_by:" in archive_text_1
+    assert "带领 52 名工程师" in archive_text_1
+
+    # MEMORY.md 登记一次 archive 入口指针，且再次软退休时字节级不变（不破坏 KV Cache）
+    index_after_replace = memory.memory_file.read_text(encoding="utf-8")
+    assert "data/memory/archive" in index_after_replace
+
+    # 2. remove 软退休作废条目并标记 -> superseded_by: (removed)
+    memory.apply_memory_operations(
+        "work",
+        "工作备忘",
+        "团队规模与职责",
+        [{"op": "remove", "old": "季度招聘接口人"}],
+        today=day2,
+    )
+    archive_text_2 = archive_file.read_text(encoding="utf-8")
+    assert "季度招聘接口人" in archive_text_2
+    assert "-> superseded_by: (removed)" in archive_text_2
+    assert memory.memory_file.read_text(encoding="utf-8") == index_after_replace
+
+    # 3. 默认热检索（FTS5 + 线性）不返回已退休旧值；显式检索 root="data/memory/archive" 可查到完整替代链
+    assert all("37" not in h.snippet for h in memory.search_hits("37", root="data/memory", today=day2))
+    assert all(
+        "季度招聘接口人" not in h.snippet
+        for h in memory.search_hits("季度招聘接口人", root="data/memory", today=day2)
+    )
+    fts_archive_hits = memory.search_hits("37", root="data/memory/archive", today=day2)
+    assert len(fts_archive_hits) == 1
+    assert "superseded_by:" in fts_archive_hits[0].snippet
+    assert "52 名工程师" in fts_archive_hits[0].snippet
+
+    linear_memory = MemoryStore(tmp_path / "data", create_dirs=False, retriever=None)
+    assert linear_memory.search_hits("37", root="data/memory", today=day2) == []
+    linear_archive_hits = linear_memory.search_hits("37", root="data/memory/archive", today=day2)
+    assert len(linear_archive_hits) == 1
+    assert "37 名工程师" in linear_archive_hits[0].snippet
+
+    # 4. facts.md 中的原始 (msg#...) 裸原话被规范化替换时，不往 archive/ 写入冗余副本
+    memory.remember_user_statement("我偏好深色主题。", message_id=42)
+    memory.apply_memory_operations(
+        "facts",
+        "事实备忘",
+        "通用事实",
+        [{"op": "remove", "old": "(msg#42)"}],
+        today=day2,
+    )
+    assert "(msg#42)" not in archive_file.read_text(encoding="utf-8")
