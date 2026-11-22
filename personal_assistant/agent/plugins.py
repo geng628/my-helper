@@ -1,4 +1,4 @@
-"""Layer 2 通用插件管理器（PluginManager）：统一扫描插件文件，将 @tool 包装为动态 Tool 子类并收集 RETRIEVERS / LLM_PROVIDERS / CONFIG_COMPILERS。"""
+"""Layer 2 通用插件管理器（PluginManager）：继承 ToolsetProvider，统一通过 build_tool 将 @tool 适配为动态 Tool 子类。"""
 from __future__ import annotations
 
 import hashlib
@@ -11,16 +11,14 @@ from types import ModuleType
 
 from personal_assistant.agent.tools import (
     Tool,
-    ToolDocument,
     ToolMetadata,
-    ToolRegistry,
-    build_dynamic_plugin_tool,
+    ToolsetProvider,
+    build_tool,
 )
 from personal_assistant.ai.client import ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
 ConfigCompiler = Callable[..., dict[str, object]]
-PluginToolFactory = Callable[[Mapping[str, object]], list[Tool]]
 
 
 # 解析配置中的插件文件或目录路径，拦截项目外越权路径并过滤掉下划线开头的辅助文件
@@ -73,28 +71,29 @@ def _import_plugin_module(file_path: Path) -> ModuleType:
     return module
 
 
-# 确保插件产出的 Tool 实例统一为动态 type() Tool 子类并附带标准 ToolMetadata 与 ToolDocument
-def _normalize_plugin_tool(item: Tool, source_name: str) -> Tool:
+# 统一通过 build_tool 构建插件 Tool 子类实例（自动按函数签名注入 context 中的 config_path / offload_dir 等参数）
+def _rebuild_plugin_tool(
+    item: Tool,
+    source_name: str,
+    context: Mapping[str, object] | None = None,
+) -> Tool:
     meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
-    doc = ToolDocument(source_type="plugin", source_name=source_name)
-    if type(item) is Tool:
-        wrapped = build_dynamic_plugin_tool(
-            item.run,
-            description=item.description,
-            parameters=item.parameters,
-            name=item.name,
-            param_enums=item.param_enums,
-            risk=meta.risk,
-            always_on=meta.always_on,
-            source_name=source_name,
-        )
-        return wrapped
-    object.__setattr__(item, "__tool_metadata__", meta)
-    object.__setattr__(item, "__tool_document__", doc)
-    return item
+    raw_fn = getattr(item, "_raw_fn", None) or item.handler or item.run
+    return build_tool(
+        raw_fn,
+        description=item.description,
+        parameters=item.parameters,
+        name=item.name,
+        param_enums=item.param_enums,
+        risk=meta.risk,
+        always_on=meta.always_on,
+        source_type="plugin",
+        source_name=source_name,
+        context=context,
+    )
 
 
-# 从已导入插件模块中收集 TOOLS 列表、@tool 装饰函数（以及可选上下文绑定工厂 build_plugin_tools）
+# 从已导入插件模块中统一收集 TOOLS 列表与被 @tool 装饰的函数，并通过 build_tool 实例化
 def _extract_module_tools(
     module: ModuleType,
     file_path: Path,
@@ -103,18 +102,6 @@ def _extract_module_tools(
     source_name = file_path.stem
     found: list[Tool] = []
     seen_in_file: set[str] = set()
-
-    context_builder = getattr(module, "build_plugin_tools", None)
-    if context is not None and callable(context_builder):
-        built = context_builder(context)
-        if not isinstance(built, (list, tuple)):
-            raise ValueError(f"插件 {file_path.name} 的 build_plugin_tools 必须返回列表或元组。")
-        for item in built:
-            if not isinstance(item, Tool):
-                raise ValueError(f"插件 {file_path.name} 的 build_plugin_tools 包含非 Tool 对象。")
-            if item.name not in seen_in_file:
-                seen_in_file.add(item.name)
-                found.append(_normalize_plugin_tool(item, source_name))
 
     exported = getattr(module, "TOOLS", None)
     if exported is not None:
@@ -125,13 +112,13 @@ def _extract_module_tools(
                 raise ValueError(f"插件 {file_path.name} 的 TOOLS 中包含非 Tool 对象。")
             if item.name not in seen_in_file:
                 seen_in_file.add(item.name)
-                found.append(_normalize_plugin_tool(item, source_name))
+                found.append(_rebuild_plugin_tool(item, source_name, context=context))
 
     for value in vars(module).values():
         marked = getattr(value, "__agent_tool__", None)
         if isinstance(marked, Tool) and marked.name not in seen_in_file:
             seen_in_file.add(marked.name)
-            found.append(_normalize_plugin_tool(marked, source_name))
+            found.append(_rebuild_plugin_tool(marked, source_name, context=context))
 
     return found
 
@@ -163,14 +150,16 @@ def _extract_named_factories(
     return found
 
 
-# 插件管理器：统一管理已加载插件模块，按运行时上下文生成动态 Tool 子类并注入同一个 ToolRegistry
+# 插件管理器（继承 ToolsetProvider）：所有插件文件只声明 @tool，由此类统一通过 build_tool 构建并注入 ToolRegistry
 @dataclass(frozen=True)
-class PluginManager:
+class PluginManager(ToolsetProvider):
     modules: tuple[tuple[Path, ModuleType], ...]
-    tools: tuple[Tool, ...]
+    default_tools: tuple[Tool, ...]
     retrievers: dict[str, RetrieverFactory]
     providers: dict[str, ProviderFactory]
     compilers: dict[str, ConfigCompiler]
+    source_type: str = "plugin"
+    source_name: str = "plugins"
 
     # 扫描并导入配置的全部插件文件，一次性构建 PluginManager 实例
     @classmethod
@@ -232,16 +221,20 @@ class PluginManager:
 
         return cls(
             modules=tuple(loaded_modules),
-            tools=tuple(loaded_tools),
+            default_tools=tuple(loaded_tools),
             retrievers=loaded_retrievers,
             providers=loaded_providers,
             compilers=loaded_compilers,
         )
 
-    # 按给定运行时上下文（如实例专属 data_root / offload_dir / tools.json 配置）构建全部插件 Tool 子类列表
+    # 返回默认无额外上下文时的插件工具列表（实现 ToolsetProvider.tools）
+    def tools(self) -> list[Tool]:
+        return list(self.default_tools)
+
+    # 按统一运行时上下文（如 config_path / offload_dir / data_root）通过 build_tool 构建全部插件 Tool 子类
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         if context is None:
-            return list(self.tools)
+            return list(self.default_tools)
         built: list[Tool] = []
         seen: set[str] = set()
         for file_path, module in self.modules:
@@ -250,21 +243,6 @@ class PluginManager:
                     seen.add(item.name)
                     built.append(item)
         return built
-
-    # 将全部插件工具连同 _metadata 与 _documents（source_type="plugin"）统一注册进目标 ToolRegistry
-    def register_tools_into(
-        self,
-        registry: ToolRegistry,
-        *,
-        context: Mapping[str, object] | None = None,
-    ) -> None:
-        for item in self.build_tools(context=context):
-            meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
-            doc = getattr(item, "__tool_document__", None) or ToolDocument(
-                source_type="plugin",
-                source_name="plugin",
-            )
-            registry.register(item, metadata=meta, document=doc)
 
 
 # 一次扫描同时加载插件工具、插件检索后端、插件 LLM Provider 与配置编译器插件
@@ -278,7 +256,7 @@ def load_plugins(
     dict[str, ConfigCompiler],
 ]:
     manager = PluginManager.from_entries(entries, project_root)
-    return list(manager.tools), manager.retrievers, manager.providers, manager.compilers
+    return list(manager.default_tools), manager.retrievers, manager.providers, manager.compilers
 
 
 # 批量加载配置声明的全部插件工具，并禁止跨文件重名

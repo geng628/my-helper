@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from personal_assistant.agent.tools import Tool, build_dynamic_plugin_tool, tool
+from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import (
     DEFAULT_SOFT_WRAP_CHARS,
     truncate_or_offload,
@@ -475,18 +475,22 @@ def execute_web_search(
         return f"错误：联网搜索失败（{error}）。"
 
 
-# 插件工具入口：联网搜索实时信息或最新资料，返回标题、链接与摘要
+# 插件工具入口：联网搜索实时信息或最新资料，返回标题、链接与摘要（支持由 build_tool 自动注入 config_path）
 @tool(
     name="web_search",
     description="联网搜索实时信息、最新技术文档或公开网页，返回排名前几条的标题、链接与摘要。",
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
     risk="network",
 )
-def web_search(query: str) -> str:
-    return execute_web_search(query, WebPolicy.from_config())
+def web_search(
+    query: str,
+    *,
+    config_path: Path | None = None,
+) -> str:
+    return execute_web_search(query, WebPolicy.from_config(config_path))
 
 
-# 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文（超长自动落盘分页）
+# 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文（支持由 build_tool 自动注入 config_path / offload_dir）
 @tool(
     name="fetch_webpage",
     description=(
@@ -496,43 +500,10 @@ def web_search(query: str) -> str:
     parameters={"url": "完整的公开 http/https 网址"},
     risk="network",
 )
-def fetch_webpage(url: str) -> str:
-    return execute_fetch_webpage(url, WebPolicy.from_config())
-
-
-# 由 PluginManager 调用的上下文感知工具构建入口：一次性注入实例 offload_dir 与 web 配置
-def build_plugin_tools(context: Mapping[str, object]) -> list[Tool]:
-    raw_offload = context.get("offload_dir")
-    offload_dir = Path(str(raw_offload)).resolve() if isinstance(raw_offload, (str, Path)) else None
-    raw_web = context.get("web")
-    web_cfg = raw_web if isinstance(raw_web, Mapping) else {}
-    policy = WebPolicy.from_dict(web_cfg, offload_dir=offload_dir)
-    search_base: Tool = getattr(web_search, "__agent_tool__")
-    fetch_base: Tool = getattr(fetch_webpage, "__agent_tool__")
-
-    # 执行已绑定当前实例 WebPolicy 的联网搜索
-    def _bound_web_search(query: str) -> str:
-        return execute_web_search(query, policy)
-
-    # 执行已绑定当前实例 WebPolicy（含专属 offload_dir）的网页抓取
-    def _bound_fetch_webpage(url: str) -> str:
-        return execute_fetch_webpage(url, policy)
-
-    return [
-        build_dynamic_plugin_tool(
-            _bound_web_search,
-            name=search_base.name,
-            description=search_base.description,
-            parameters=search_base.parameters,
-            risk="network",
-            source_name="web_tools",
-        ),
-        build_dynamic_plugin_tool(
-            _bound_fetch_webpage,
-            name=fetch_base.name,
-            description=fetch_base.description,
-            parameters=fetch_base.parameters,
-            risk="network",
-            source_name="web_tools",
-        ),
-    ]
+def fetch_webpage(
+    url: str,
+    *,
+    config_path: Path | None = None,
+    offload_dir: Path | None = None,
+) -> str:
+    return execute_fetch_webpage(url, WebPolicy.from_config(config_path, offload_dir=offload_dir))

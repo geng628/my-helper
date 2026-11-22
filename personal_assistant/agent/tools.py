@@ -1,9 +1,10 @@
-"""Layer 2 通用工具抽象与统一注册表：多源工具统一适配为 Tool 子类并汇入 ToolRegistry（_tools + _metadata + _documents）。"""
+"""Layer 2 通用工具抽象、统一构建器（build_tool）与统一注册表（ToolRegistry）。"""
 from __future__ import annotations
 
+import inspect
 import json
 import re
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
 from personal_assistant.ai.types import ToolSchema
@@ -35,27 +36,95 @@ class Tool(ToolSchema):
         return str(self.handler(**values))
 
 
-# 内核内置工具集提供方基类：批量产出 Tool 子类实例并统一注册进 ToolRegistry
-class ToolsetProvider:
-    source_type: str = "builtin"
-    source_name: str = "core"
+# 根据函数签名自动绑定运行时上下文参数（如 config_path / offload_dir / data_root），对大模型 Schema 保持透明
+def _bind_context_kwargs(
+    fn: Callable[..., str],
+    schema_params: Mapping[str, str],
+    context: Mapping[str, object] | None,
+) -> Callable[..., str]:
+    if not context:
+        return fn
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn
 
-    # 返回当前工具集提供的全部 Tool 子类实例（由具体业务子类实现）
-    def tools(self) -> list[Tool]:
-        raise NotImplementedError
+    bound_ctx: dict[str, object] = {}
+    for param_name, param in sig.parameters.items():
+        if param_name in schema_params:
+            continue
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            if param_name in context and context[param_name] is not None:
+                bound_ctx[param_name] = context[param_name]
 
-    # 将当前工具集的全部 Tool 实例连同元数据与来源文档统一写入目标 ToolRegistry
-    def register_into(self, registry: "ToolRegistry") -> None:
-        for item in self.tools():
-            meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
-            doc = getattr(item, "__tool_document__", None) or ToolDocument(
-                source_type=self.source_type,
-                source_name=self.source_name,
-            )
-            registry.register(item, metadata=meta, document=doc)
+    if not bound_ctx:
+        return fn
+
+    # 调用原函数时自动合并大模型参数与已绑定的运行时上下文参数
+    def _wrapped(**values: str) -> str:
+        return fn(**values, **bound_ctx)
+
+    return _wrapped
 
 
-# 用动态 type() 为插件函数生成专属 Tool 子类实例，并绑定 ToolMetadata 与 ToolDocument
+# 统一工具构建器：将任意函数适配为 Tool 子类实例（支持指定子类或动态 type() 生成），统一注入上下文、ToolMetadata 与 ToolDocument
+def build_tool(
+    fn: Callable[..., str],
+    *,
+    description: str,
+    parameters: dict[str, str] | None = None,
+    name: str | None = None,
+    param_enums: dict[str, tuple[str, ...]] | None = None,
+    risk: str = "read",
+    always_on: bool = False,
+    source_type: str = "builtin",
+    source_name: str = "core",
+    base_cls: type[Tool] | None = None,
+    context: Mapping[str, object] | None = None,
+    extra_fields: Mapping[str, object] | None = None,
+) -> Tool:
+    tool_name = name or fn.__name__
+    schema_params = dict(parameters or {})
+    bound_fn = _bind_context_kwargs(fn, schema_params, context)
+
+    if base_cls is not None and base_cls is not Tool:
+        target_cls = base_cls
+    else:
+        safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", tool_name).title().replace("_", "") or "Dynamic"
+        kind_label = source_type.title() or "Dynamic"
+
+        # 动态 Tool 子类的 run 实现：转发已校验参数给绑定好上下文的执行函数
+        def _run(self: Tool, **values: str) -> str:
+            return str(bound_fn(**values))
+
+        target_cls = type(
+            f"{safe_suffix}{kind_label}Tool",
+            (Tool,),
+            {"run": _run, "__doc__": f"动态生成的 {source_type} 工具子类：{tool_name}"},
+        )
+
+    init_kwargs: dict[str, object] = {
+        "name": tool_name,
+        "description": description,
+        "parameters": schema_params,
+        "handler": bound_fn,
+        "param_enums": param_enums,
+    }
+    if extra_fields:
+        init_kwargs.update(extra_fields)
+
+    instance: Tool = target_cls(**init_kwargs)
+    object.__setattr__(instance, "_raw_fn", fn)
+    object.__setattr__(instance, "__tool_metadata__", ToolMetadata(risk=risk, always_on=always_on))
+    object.__setattr__(
+        instance,
+        "__tool_document__",
+        ToolDocument(source_type=source_type, source_name=source_name),
+    )
+    return instance
+
+
+# 兼容别名：为插件函数动态生成 Tool 子类实例
 def build_dynamic_plugin_tool(
     fn: Callable[..., str],
     *,
@@ -66,36 +135,52 @@ def build_dynamic_plugin_tool(
     risk: str = "read",
     always_on: bool = False,
     source_name: str = "plugin",
+    context: Mapping[str, object] | None = None,
 ) -> Tool:
-    tool_name = name or fn.__name__
-    safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", tool_name).title().replace("_", "") or "Dynamic"
-
-    # 动态 Tool 子类的 run 实现：直接转发已校验的关键字参数给被装饰的插件函数
-    def _run(self: Tool, **values: str) -> str:
-        return str(fn(**values))
-
-    dynamic_cls = type(
-        f"{safe_suffix}PluginTool",
-        (Tool,),
-        {"run": _run, "__doc__": f"动态生成的插件工具子类：{tool_name}"},
-    )
-    instance: Tool = dynamic_cls(
-        name=tool_name,
+    return build_tool(
+        fn,
         description=description,
-        parameters=dict(parameters or {}),
-        handler=fn,
+        parameters=parameters,
+        name=name,
         param_enums=param_enums,
+        risk=risk,
+        always_on=always_on,
+        source_type="plugin",
+        source_name=source_name,
+        context=context,
     )
-    object.__setattr__(instance, "__tool_metadata__", ToolMetadata(risk=risk, always_on=always_on))
-    object.__setattr__(
-        instance,
-        "__tool_document__",
-        ToolDocument(source_type="plugin", source_name=source_name),
-    )
-    return instance
 
 
-# 装饰器：将普通 Python 函数包装为动态 type() Tool 子类，同时保持原函数可直接调用
+# 统一工具集提供方基类（内置 MemoryToolsetProvider / 插件 PluginManager / 命令 CommandToolsetProvider 均继承此类）
+class ToolsetProvider:
+    source_type: str = "builtin"
+    source_name: str = "core"
+
+    # 按可选运行时上下文产出当前提供方的全部 Tool 子类实例
+    def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
+        return self.tools()
+
+    # 无上下文时的默认工具列表接口（供子类重写或直接调用）
+    def tools(self) -> list[Tool]:
+        raise NotImplementedError
+
+    # 将当前提供方的全部 Tool 实例连同 _metadata 与 _documents 统一注册进目标 ToolRegistry
+    def register_into(
+        self,
+        registry: "ToolRegistry",
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        for item in self.build_tools(context=context):
+            meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
+            doc = getattr(item, "__tool_document__", None) or ToolDocument(
+                source_type=self.source_type,
+                source_name=self.source_name,
+            )
+            registry.register(item, metadata=meta, document=doc)
+
+
+# 装饰器：将普通 Python 函数统一通过 build_tool 包装为动态 type() Tool 子类，同时保持原函数可直接调用
 def tool(
     *,
     description: str,
@@ -108,7 +193,7 @@ def tool(
     # 为被装饰函数构造动态 Tool 子类实例并挂载到 __agent_tool__
     def decorator(fn: Callable[..., str]) -> Callable[..., str]:
         mod_name = (getattr(fn, "__module__", "") or "plugin").rsplit(".", 1)[-1]
-        spec = build_dynamic_plugin_tool(
+        spec = build_tool(
             fn,
             description=description,
             parameters=parameters,
@@ -116,6 +201,7 @@ def tool(
             param_enums=param_enums,
             risk=risk,
             always_on=always_on,
+            source_type="plugin",
             source_name=mod_name,
         )
         setattr(fn, "__agent_tool__", spec)
@@ -124,7 +210,7 @@ def tool(
     return decorator
 
 
-# 统一工具注册表：汇聚内置 ToolsetProvider、插件 @tool 与外部 Wrapper，统一维护 _tools / _metadata / _documents 并按需激活
+# 统一工具注册表：汇聚所有 ToolsetProvider 产出的 Tool 子类，维护 _tools / _metadata / _documents 并按需激活
 class ToolRegistry:
     # 初始化统一工具表、元数据表与来源文档表；若指定 allowed_names 则按白名单（含 always_on）按需激活
     def __init__(
@@ -172,9 +258,14 @@ class ToolRegistry:
         ):
             self._tools[item.name] = item
 
-    # 将一个 ToolsetProvider 的全部工具批量注册进当前注册表
-    def register_provider(self, provider: ToolsetProvider) -> None:
-        provider.register_into(self)
+    # 将任意 ToolsetProvider（内置 / 插件 / 命令）按统一上下文批量注册进当前注册表
+    def register_provider(
+        self,
+        provider: ToolsetProvider,
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        provider.register_into(self, context=context)
 
     # 按白名单列表动态更新当前激活的工具集 _tools（always_on 工具始终保持激活）
     def activate(self, allowed_names: Iterable[str] | None) -> None:

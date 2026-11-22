@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -19,9 +19,9 @@ from personal_assistant.agent.plugins import (
 from personal_assistant.agent.tools import (
     Tool,
     ToolDocument,
-    ToolMetadata,
     ToolRegistry,
     ToolsetProvider,
+    build_tool,
 )
 from personal_assistant.ai.client import (
     LLMClient,
@@ -136,7 +136,7 @@ class CommandSpec:
         )
         return f"退出码：{done.returncode}\n{body}"
 
-    # 将当前命令规格包装成 CommandToolWrapper(Tool) 子类实例（支持注入实例专属 offload_dir）
+    # 统一通过 build_tool 将当前命令规格包装成 CommandToolWrapper(Tool) 子类实例（支持注入实例专属 offload_dir）
     def to_tool(self, *, offload_dir: Path | None = None) -> "CommandToolWrapper":
         bound_spec = (
             replace(self, offload_dir=offload_dir)
@@ -146,21 +146,20 @@ class CommandSpec:
         param_desc = {name: spec.description for name, spec in bound_spec.params.items()}
         param_enums = {name: spec.enum for name, spec in bound_spec.params.items() if spec.enum}
         cmd_preview = " ".join(bound_spec.argv)
-        wrapper = CommandToolWrapper(
+        built = build_tool(
+            bound_spec.run,
             name=bound_spec.tool_name,
             description=f"执行固定白名单命令 `{cmd_preview}`。{bound_spec.description}",
             parameters=param_desc,
-            handler=bound_spec.run,
             param_enums=param_enums or None,
-            spec=bound_spec,
+            risk="exec",
+            source_type="command",
+            source_name="tools.json",
+            base_cls=CommandToolWrapper,
+            extra_fields={"spec": bound_spec},
         )
-        object.__setattr__(wrapper, "__tool_metadata__", ToolMetadata(risk="exec", always_on=False))
-        object.__setattr__(
-            wrapper,
-            "__tool_document__",
-            ToolDocument(source_type="command", source_name="tools.json"),
-        )
-        return wrapper
+        assert isinstance(built, CommandToolWrapper)
+        return built
 
 
 # 固定白名单命令的 Tool 子类包装器（对标 McpToolWrapper / CommandToolWrapper）
@@ -173,6 +172,24 @@ class CommandToolWrapper(Tool):
         if self.spec is not None:
             return self.spec.run(**values)
         return super().run(**values)
+
+
+# 固定命令工具集提供方（继承 ToolsetProvider）：按统一上下文将 commands 适配为 CommandToolWrapper(Tool) 子类列表
+@dataclass(frozen=True)
+class CommandToolsetProvider(ToolsetProvider):
+    commands: tuple[CommandSpec, ...]
+    source_type: str = "command"
+    source_name: str = "tools.json"
+
+    # 返回默认无上下文时的 CommandToolWrapper 列表
+    def tools(self) -> list[Tool]:
+        return [spec.to_tool() for spec in self.commands]
+
+    # 按运行时上下文（如 offload_dir）通过 build_tool 构建全部 CommandToolWrapper 实例
+    def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
+        raw_offload = context.get("offload_dir") if context is not None else None
+        offload_dir = Path(str(raw_offload)).resolve() if isinstance(raw_offload, (str, Path)) else None
+        return [spec.to_tool(offload_dir=offload_dir) for spec in self.commands]
 
 
 # 解析并严格校验 tools.json 中 commands 数组里的单条命令配置
@@ -284,8 +301,7 @@ class ToolsConfig:
     plugin_retrievers: tuple[tuple[str, RetrieverFactory], ...] = ()
     plugin_compilers: tuple[tuple[str, ConfigCompiler], ...] = ()
     project_root: Path = REPO_ROOT
-    shell: dict[str, object] = field(default_factory=dict)
-    web: dict[str, object] = field(default_factory=dict)
+    config_path: Path | None = None
     plugin_manager: PluginManager | None = None
 
     # 从 tools.json 读取并校验白名单配置，同时通过 PluginManager 扫描加载 plugins 目录中的全部插件
@@ -313,14 +329,6 @@ class ToolsConfig:
         if not isinstance(retrieval_raw, dict):
             raise ValueError("retrieval 必须是 JSON 对象。")
 
-        shell_raw = raw.get("shell", {})
-        if not isinstance(shell_raw, dict):
-            raise ValueError("shell 必须是 JSON 对象。")
-
-        web_raw = raw.get("web", {})
-        if not isinstance(web_raw, dict):
-            raise ValueError("web 必须是 JSON 对象。")
-
         commands_raw = raw.get("commands", [])
         if not isinstance(commands_raw, list):
             raise ValueError("commands 必须是数组。")
@@ -338,7 +346,7 @@ class ToolsConfig:
         manager = PluginManager.from_entries(
             plugins_raw,
             root,
-            context={"project_root": root, "shell": dict(shell_raw), "web": dict(web_raw)},
+            context={"project_root": root, "config_path": resolved_cfg},
         )
         for prov_name, prov_factory in manager.providers.items():
             register_provider(prov_name, prov_factory)
@@ -348,13 +356,12 @@ class ToolsConfig:
             files=dict(files_raw),
             commands=tuple(commands),
             plugins=tuple(plugins_raw),
-            plugin_tools=manager.tools,
+            plugin_tools=manager.default_tools,
             retrieval=dict(retrieval_raw),
             plugin_retrievers=tuple(sorted(manager.retrievers.items())),
             plugin_compilers=tuple(sorted(manager.compilers.items())),
             project_root=root,
-            shell=dict(shell_raw),
-            web=dict(web_raw),
+            config_path=resolved_cfg,
             plugin_manager=manager,
         )
 
@@ -449,9 +456,9 @@ class ToolsConfig:
 
     # 将全部已启用的固定命令转换为 CommandToolWrapper(Tool) 列表
     def command_tools(self, *, offload_dir: Path | None = None) -> list[Tool]:
-        return [spec.to_tool(offload_dir=offload_dir) for spec in self.commands]
+        return CommandToolsetProvider(self.commands).build_tools({"offload_dir": offload_dir})
 
-    # 统一汇聚内置 ToolsetProvider、PluginManager 动态 Tool 子类与 CommandToolWrapper(Tool) 进入同一个 ToolRegistry 并按需激活
+    # 统一将所有 ToolsetProvider（内置 / 插件 / 命令）按同一套 build_ctx 汇入单个 ToolRegistry 并按需激活
     def build_registry(
         self,
         *builtin_tools: Tool,
@@ -466,38 +473,28 @@ class ToolsConfig:
             *(item.name for item in extras),
         ]
         registry = ToolRegistry(allowed_names=allowed)
-        offload_dir = (
-            (data_root.resolve() / "workspace" / "tool_outputs")
-            if data_root is not None
-            else None
-        )
+        resolved_data = data_root.resolve() if data_root is not None else None
+        offload_dir = (resolved_data / "workspace" / "tool_outputs") if resolved_data is not None else None
+        build_ctx: dict[str, object] = {
+            "project_root": self.project_root,
+            "config_path": self.config_path,
+            "data_root": resolved_data,
+            "offload_dir": offload_dir,
+        }
 
-        # 1. 内核内置工具 (ToolsetProvider / BuiltinTool) ──▶ Tool 子类
         for provider in providers:
-            registry.register_provider(provider)
+            registry.register_provider(provider, context=build_ctx)
         for item in builtin_tools:
             registry.register(item)
-
-        # 2. 插件 @tool (PluginManager) ──▶ 动态 type() Tool 子类
-        plugin_ctx: dict[str, object] = {
-            "project_root": self.project_root,
-            "data_root": data_root.resolve() if data_root is not None else None,
-            "offload_dir": offload_dir,
-            "shell": self.shell,
-            "web": self.web,
-        }
         if self.plugin_manager is not None:
-            self.plugin_manager.register_tools_into(registry, context=plugin_ctx)
+            registry.register_provider(self.plugin_manager, context=build_ctx)
         else:
             for item in self.plugin_tools:
                 registry.register(
                     item,
                     document=ToolDocument(source_type="plugin", source_name="plugin"),
                 )
-
-        # 3. 固定命令 / 外部扩展 ──▶ CommandToolWrapper(Tool)
-        for cmd_tool in self.command_tools(offload_dir=offload_dir):
-            registry.register(cmd_tool)
+        registry.register_provider(CommandToolsetProvider(self.commands), context=build_ctx)
         for item in extras:
             registry.register(item)
 

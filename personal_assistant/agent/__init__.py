@@ -17,6 +17,7 @@ from personal_assistant.agent.tools import (
     ToolRegistry,
     ToolsetProvider,
     build_dynamic_plugin_tool,
+    build_tool,
     tool,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "ToolRegistry",
     "ToolsetProvider",
     "build_dynamic_plugin_tool",
+    "build_tool",
     "load_plugin_compilers",
     "load_plugin_providers",
     "load_plugin_retrievers",
