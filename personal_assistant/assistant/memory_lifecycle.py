@@ -66,6 +66,32 @@ def format_memory_bullet(text: str, stamp_day: date, until_day: date | None = No
     return f"- [{stamp_day.isoformat()}] {body}"
 
 
+# 按关键词定位主题文件中匹配的列表条目行号
+def _find_matching_indices(lines: list[str], old_key: str) -> list[int]:
+    if not old_key:
+        return []
+    lowered = old_key.lower()
+    return [
+        idx
+        for idx, line in enumerate(lines)
+        if line.lstrip().startswith("- ") and lowered in line.lower()
+    ]
+
+
+# 将补充维度无损拼接至已有记忆行尾部，保留原日期、原正文与既有 until 标记
+def _merge_memory_bullet(existing_line: str, addition: str, until_day: date | None = None) -> str:
+    clean_addition = clean_memory_body(addition)
+    base = existing_line.rstrip()
+    if until_day is not None and not UNTIL_PATTERN.search(base):
+        until_tag = f"(until: {until_day.isoformat()}) "
+        base = re.sub(r"^(-\s+\[\d{4}-\d{2}-\d{2}\]\s+)", rf"\1{until_tag}", base, count=1)
+        if until_tag not in base:
+            base = f"- [{until_day.isoformat()}] {until_tag}{base.lstrip('- ').strip()}"
+    sep = "；" if re.search(r"[\u4e00-\u9fff]", base + clean_addition) else "; "
+    base = base.rstrip("。；;.")
+    return f"{base}{sep}{clean_addition}"
+
+
 # 读取全部活跃主题记忆文件快照（排除 MEMORY.md 与 archive/），供沉淀器读旧改旧消冲突
 def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
     if not memory_dir.is_dir():
@@ -175,6 +201,27 @@ def apply_topic_operations(
             added_log.append(body)
             changed = True
 
+        elif op == "merge":
+            old_key = clean_memory_body(str(op_entry.get("old") or ""))
+            addition = clean_memory_body(str(op_entry.get("text") or op_entry.get("new") or ""))
+            if not addition:
+                continue
+            if until_day is not None and until_day < ref_day:
+                continue
+            matched_indices = _find_matching_indices(lines, old_key)
+            if matched_indices:
+                idx = matched_indices[0]
+                existing_line = lines[idx]
+                if addition.lower() in existing_line.lower():
+                    continue
+                lines[idx] = _merge_memory_bullet(existing_line, addition, until_day)
+                added_log.append(addition)
+                changed = True
+            elif not any(addition.lower() in existing_line.lower() for existing_line in lines):
+                lines.append(format_memory_bullet(addition, ref_day, until_day))
+                added_log.append(addition)
+                changed = True
+
         elif op == "replace":
             old_key = clean_memory_body(str(op_entry.get("old") or ""))
             new_body = clean_memory_body(str(op_entry.get("new") or op_entry.get("text") or ""))
@@ -183,15 +230,7 @@ def apply_topic_operations(
             if until_day is not None and until_day < ref_day:
                 continue
             formatted = format_memory_bullet(new_body, ref_day, until_day)
-            matched_indices = (
-                [
-                    idx
-                    for idx, line in enumerate(lines)
-                    if line.lstrip().startswith("- ") and old_key.lower() in line.lower()
-                ]
-                if old_key
-                else []
-            )
+            matched_indices = _find_matching_indices(lines, old_key)
             if matched_indices:
                 first_idx = matched_indices[0]
                 for idx in matched_indices:

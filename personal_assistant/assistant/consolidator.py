@@ -26,6 +26,7 @@ CONSOLIDATION_SYSTEM_PROMPT = (
     '      "index_summary": "一句简短索引说明（20字以内）",\n'
     '      "operations": [\n'
     '        {"op": "add", "text": "新增的明确事实/偏好/决定（可选填 until: YYYY-MM-DD）"},\n'
+    '        {"op": "merge", "old": "已有记忆中需补充维度的旧句关键词", "text": "追加合并的互补细节（程序保留旧正文，不覆盖）"},\n'
     '        {"op": "replace", "old": "已有记忆中被更新的旧句关键词", "new": "更新后的完整陈述"},\n'
     '        {"op": "remove", "old": "已作废或用户明确要求忘掉的旧句关键词"}\n'
     "      ]\n"
@@ -34,7 +35,7 @@ CONSOLIDATION_SYSTEM_PROMPT = (
     "}\n"
     "严格要求：\n"
     "1. 严禁编造对话中未明确出现的信息；纯寒暄不要写入 memories（返回空数组 []）；优先完整记录用户自身的事实、决策、偏好及具体专有名词（人名、书名、作品、地点、数值）；助手给出的具体推荐或结论仅用一句话提炼关键实体与结论，不抄录长段通用科普或教程。\n"
-    "2. 仅当同一属性/决策的旧值被新值推翻时（如修改端口、更换方案），用 op=replace 替换旧条目，且 new 只写当前最新有效状态，严禁括号附带或复述“从旧值改为/原方案已放弃”等废弃信息；新增的独立事件或累加记录一律用 op=add 保留；op=remove 直接删除作废条目，不另写“已取消”冗余句。\n"
+    "2. 仅当同一属性/决策的旧值被新值推翻时（如修改端口、更换方案），用 op=replace 替换旧条目，且 new 只写当前最新有效状态，严禁括号附带或复述“从旧值改为/原方案已放弃”等废弃信息；同一活动/主题补充互补细节（如目标值与实际值、进球与助攻）优先用 op=merge 追加保留旧维度；新增的独立事件或累加记录一律用 op=add 保留；op=remove 直接删除作废条目，不另写“已取消”冗余句。\n"
     "3. 若 data/memory/facts.md 中已有带 (msg#...) 标记的原始记录对应本次整理内容，必须用 op=replace 原地规范化（或迁至其他主题后对 facts.md 执行 op=remove），绝不同时保留原始裸句与规范化副本。\n"
     "4. 条目开头的 [YYYY-MM-DD] 仅为记录日期；凡对话提及相对时间（如昨天、上周六、明天、下周三），均须结合【当前日期】换算为精确绝对日期（YYYY-MM-DD）写入正文，不要模糊成“某月初/某月”；仅对有明确未来截止日的临时日程/待办填写 until（YYYY-MM-DD），过往事件与永久偏好不要填 until。\n"
     "5. session_summary 必须简洁客观，便于后续轮次无缝承接上下文。"
@@ -201,7 +202,7 @@ class MemoryConsolidator:
                 if not topic:
                     continue
 
-                # 同时支持新格式 operations（add/replace/remove）与旧格式 items（纯追加）
+                # 同时支持新格式 operations（add/merge/replace/remove）与旧格式 items（纯追加）
                 ops: list[dict[str, object]] = []
                 raw_ops = entry.get("operations")
                 if isinstance(raw_ops, list):
@@ -221,7 +222,7 @@ class MemoryConsolidator:
                     if saved not in saved_files:
                         saved_files.append(saved)
                     for op_item in ops:
-                        if str(op_item.get("op") or "add").lower() in {"add", "replace"}:
+                        if str(op_item.get("op") or "add").lower() in {"add", "merge", "replace"}:
                             val = str(op_item.get("new") or op_item.get("text") or "").strip()
                             if val:
                                 written_texts.append(val)

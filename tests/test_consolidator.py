@@ -295,3 +295,61 @@ def test_prompt_and_consolidation_hygiene_guardrails() -> None:
     assert "专有名词" in CONSOLIDATION_SYSTEM_PROMPT
     assert "优先完整记录用户自身的事实" in CONSOLIDATION_SYSTEM_PROMPT
     assert "不抄录长段通用科普或教程" in CONSOLIDATION_SYSTEM_PROMPT
+
+
+# 测试 CONSOLIDATION_SYSTEM_PROMPT 正式声明 op=merge 且沉淀器端到端无损合并互补维度，不覆盖也不触发 archive
+def test_consolidator_executes_op_merge_end_to_end_and_prompt_declares_merge(
+    tmp_path: Path,
+) -> None:
+    assert '"op": "merge"' in CONSOLIDATION_SYSTEM_PROMPT
+    assert "优先用 op=merge" in CONSOLIDATION_SYSTEM_PROMPT
+    assert len(CONSOLIDATION_SYSTEM_PROMPT) <= 1350
+
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        memory.apply_memory_operations(
+            "fitness",
+            "运动健康",
+            "马拉松成绩与目标",
+            [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+            today=date(2023, 5, 21),
+        )
+        state.append_message("m-merge", "user", "By the way, my marathon target time was 4:10:00.")
+        state.append_message("m-merge", "assistant", "Got it, thanks for sharing your target time.")
+
+        llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "User noted marathon target time was 4:10:00.",
+                        "memories": [
+                            {
+                                "topic": "fitness",
+                                "title": "运动健康",
+                                "index_summary": "马拉松成绩与目标",
+                                "operations": [
+                                    {
+                                        "op": "merge",
+                                        "old": "4:22:00",
+                                        "text": "Target time was 4:10:00.",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        result = runner.consolidate_once("m-merge", today=date(2023, 5, 24))
+        assert result is not None
+        assert result.saved_files == ("data/memory/fitness.md",)
+
+        content = (memory.memory_dir / "fitness.md").read_text(encoding="utf-8")
+        assert "4:22:00" in content
+        assert "4:10:00" in content
+        assert not (memory.memory_dir / "archive").exists()
+    finally:
+        state.close()

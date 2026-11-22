@@ -394,3 +394,77 @@ def test_replace_and_remove_soft_retire_with_superseded_chain_and_fts5_traceabil
         today=day2,
     )
     assert "(msg#42)" not in archive_file.read_text(encoding="utf-8")
+
+
+# 测试 op=merge 无损拼接互补维度：保留原时间与原事实正文，支持中英文标点与幂等去重，且不触发 superseded 软退休
+def test_merge_operation_enriches_existing_line_without_losing_old_facts_or_retiring(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryStore(tmp_path / "data")
+    day1 = date(2023, 5, 21)
+    day2 = date(2023, 5, 24)
+
+    # 1. 英文 merge：实际完赛成绩与目标时间属互补指标，保留 [2023-05-21] 与两个时间，不写 archive/
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+        today=day2,
+    )
+    fitness_lines = [
+        line
+        for line in (memory.memory_dir / "fitness.md").read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("- ")
+    ]
+    assert len(fitness_lines) == 1
+    assert "[2023-05-21]" in fitness_lines[0]
+    assert "4:22:00" in fitness_lines[0]
+    assert "; Target time was 4:10:00." in fitness_lines[0]
+    assert not (memory.memory_dir / "archive").exists()
+
+    # 2. 幂等重复 merge 不应重复追加相同补充内容
+    changed = memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+        today=day2,
+    )
+    assert changed is None
+
+    # 3. 中文 merge：按中文分号拼接，既有 until 标记保持完整且未传 until 时不丢失
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目配置",
+        [
+            {"op": "add", "text": "极光后端端口定为 9091。"},
+            {"op": "add", "text": "2023-05-28 举行架构评审。", "until": "2023-05-29"},
+        ],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目配置",
+        [
+            {"op": "merge", "old": "极光后端", "text": "日志采用标准库 logging。"},
+            {"op": "merge", "old": "架构评审", "text": "参会人员包括架构组。"},
+            {"op": "merge", "old": "极光后端", "text": "周六前提交压测报告。", "until": "2023-05-27"},
+            {"op": "merge", "old": "不存在的旧条目", "text": "极光数据库采用 SQLite。"},
+        ],
+        today=day2,
+    )
+    proj_text = (memory.memory_dir / "projects.md").read_text(encoding="utf-8")
+    assert "- [2023-05-21] (until: 2023-05-27) 极光后端端口定为 9091；日志采用标准库 logging；周六前提交压测报告。" in proj_text
+    assert "- [2023-05-21] (until: 2023-05-29) 2023-05-28 举行架构评审；参会人员包括架构组。" in proj_text
+    assert "- [2023-05-24] 极光数据库采用 SQLite。" in proj_text
+    assert not (memory.memory_dir / "archive").exists()
