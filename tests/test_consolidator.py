@@ -297,31 +297,27 @@ def test_prompt_and_consolidation_hygiene_guardrails() -> None:
     assert "不抄录长段通用科普或教程" in CONSOLIDATION_SYSTEM_PROMPT
 
 
-# 守卫记忆沉淀提示词的随口细节/问答索引、互补属性合并保留与事件实际发生时间规范
-def test_consolidation_prompt_covers_complementary_merge_event_dates_and_qa_entities() -> None:
-    # 规则 1：随口提及细节与聚焦问答的一句话核心实体/推荐/数值索引
-    assert "随口提及的具体细节、数值、物件" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "咨询特定主题" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "一句话" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "关键实体" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "推荐" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "数值" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "不抄录长段通用科普或教程" in CONSOLIDATION_SYSTEM_PROMPT
+# 守卫记忆沉淀提示词的紧凑字数上限、互补指标保留与显式日期/年份规范（防回归臃肿条款）
+def test_consolidation_prompt_surgical_complementary_metrics_and_explicit_dates() -> None:
+    assert len(CONSOLIDATION_SYSTEM_PROMPT) <= 1320, (
+        f"CONSOLIDATION_SYSTEM_PROMPT 超出 1320 字符精简预算：{len(CONSOLIDATION_SYSTEM_PROMPT)}"
+    )
 
-    # 规则 2：真失效 replace vs 互补属性合并保留，不确定时保守用 op=add
-    assert "互补属性" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "目标时间与实际成绩" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "进球数与助攻数" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "绝不丢弃仍有效的互补维度" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "拿不准是否冲突时保守使用 op=add" in CONSOLIDATION_SYSTEM_PROMPT
+    # 规则 2：保持锐利 replace 条件，仅在 op=add 中补充同一活动的互补指标保留
+    assert "同一活动的互补指标" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "目标值与实际值" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "不丢弃仍有效的旧维度" in CONSOLIDATION_SYSTEM_PROMPT
+    assert "一律用 op=add 保留" in CONSOLIDATION_SYSTEM_PROMPT
 
-    # 规则 4：[YYYY-MM-DD] 仅为记录日期，相对时间与早于今天的显式过往日期/年份须按实际发生时间写入正文
-    assert "仅为记录日期" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "实际发生时间" in CONSOLIDATION_SYSTEM_PROMPT
-    assert "显式过往日期" in CONSOLIDATION_SYSTEM_PROMPT
+    # 规则 4：覆盖相对时间与明确的具体日期/年份写入正文
+    assert "明确的具体日期/年份" in CONSOLIDATION_SYSTEM_PROMPT
     assert "2月20日" in CONSOLIDATION_SYSTEM_PROMPT
     assert "2022年" in CONSOLIDATION_SYSTEM_PROMPT
     assert "写入正文" in CONSOLIDATION_SYSTEM_PROMPT
+
+    # 防退步负向守卫：移除导致 LongMemEval 与累加题退步的臃肿/弱化条款
+    assert "当用户向助手咨询特定主题" not in CONSOLIDATION_SYSTEM_PROMPT
+    assert "拿不准是否冲突时保守使用 op=add" not in CONSOLIDATION_SYSTEM_PROMPT
 
     # 规则 3、5 与 JSON 输出契约保持完整
     assert '"session_summary"' in CONSOLIDATION_SYSTEM_PROMPT
