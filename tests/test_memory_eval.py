@@ -618,17 +618,20 @@ def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() ->
         "not to know is false)."
     ) in system_prompt
 
-    # 规则 2 明确允许有效前提纠偏：否定错误前提/说明所问人或实体无记录，并指出记忆中另一人/实体属于有效纠偏而非编造
+    # 规则 2 必须保留 ONLY if 合取约束，防止“先拒偏、后猜测/编造”的混合回答误判通过，同时允许基于记忆的前提纠偏
     assert "2. For abstention questions (is_abstention=true):" in system_prompt
-    rule2_lower = system_prompt.split("2. For abstention questions (is_abstention=true):", maxsplit=1)[1].lower()
-    assert "correct=true" in rule2_lower
-    assert "premise correction" in rule2_lower
-    assert "false premise" in rule2_lower
-    assert "no such record" in rule2_lower
-    assert "different person/entity recorded in memory" in rule2_lower
-    assert "not fabrication" in rule2_lower
+    rule2 = system_prompt.split("2. For abstention questions (is_abstention=true):", maxsplit=1)[1]
+    rule2_lower = rule2.lower()
+    assert "mark correct=true ONLY if" in rule2
+    assert "does not adopt the false premise" in rule2_lower
+    assert "does not fabricate unrecorded details" in rule2_lower
+    assert "and clearly rejects the false premise" in rule2_lower
+    assert "valid premise correction" in rule2_lower
+    assert "from memory" in rule2_lower
+    assert "different person/entity" in rule2_lower
+    assert "counts as valid premise rejection (correct=true), not fabrication" in rule2_lower
 
-    # 规则 2 仍严格把采纳错误前提或编造未记录细节判为 correct=false
+    # 规则 2 仍严格把顺从错误前提或猜测/编造未记录事实判为 correct=false
     assert "correct=false" in rule2_lower
-    assert "adopts the false premise" in rule2_lower
-    assert "fabricat" in rule2_lower and "unrecorded" in rule2_lower
+    assert "false premise were true" in rule2_lower
+    assert "speculating/fabricating unrecorded facts is correct=false" in rule2_lower
