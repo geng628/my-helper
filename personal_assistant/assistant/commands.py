@@ -302,6 +302,7 @@ class ToolsConfig:
     plugin_compilers: tuple[tuple[str, ConfigCompiler], ...] = ()
     project_root: Path = REPO_ROOT
     config_path: Path | None = None
+    raw_config: dict[str, object] = field(default_factory=dict)
     plugin_manager: PluginManager | None = None
 
     # 从 tools.json 读取并校验白名单配置，同时通过 PluginManager 扫描加载 plugins 目录中的全部插件
@@ -346,7 +347,7 @@ class ToolsConfig:
         manager = PluginManager.from_entries(
             plugins_raw,
             root,
-            context={"project_root": root, "config_path": resolved_cfg},
+            context={"project_root": root, "config_path": resolved_cfg, "raw_config": dict(raw)},
         )
         for prov_name, prov_factory in manager.providers.items():
             register_provider(prov_name, prov_factory)
@@ -362,6 +363,7 @@ class ToolsConfig:
             plugin_compilers=tuple(sorted(manager.compilers.items())),
             project_root=root,
             config_path=resolved_cfg,
+            raw_config=dict(raw),
             plugin_manager=manager,
         )
 
@@ -480,6 +482,7 @@ class ToolsConfig:
             "config_path": self.config_path,
             "data_root": resolved_data,
             "offload_dir": offload_dir,
+            "raw_config": self.raw_config,
         }
 
         for provider in providers:

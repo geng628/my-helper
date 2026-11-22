@@ -363,12 +363,17 @@
 
 ---
 
-### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与统一 `ToolRegistry` 多源工具架构重构（Issue `#20`）
-- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调；针对联调暴露的“内置工具与插件工具走两条不同配置/目录路径”以及 `ContextVar` / `os.getenv` 暗道问题，将工具体系重构为统一的多源汇聚架构：
-  1. **内核内置工具 (`MemoryToolsetProvider(ToolsetProvider)`)** ──▶ `BuiltinTool(Tool)` 子类
-  2. **插件 `@tool` (`PluginManager`)** ──▶ 动态 `type()` `Tool` 子类（在入表时一次性注入实例 `project_root`、`offload_dir` 与 `shell`/`web` 配置）
-  3. **配置命令包装 (`CommandSpec.to_tool`)** ──▶ `CommandToolWrapper(Tool)` 子类
-  三者统一汇入**同一个 `ToolRegistry._tools[name]` + `_metadata[name]` (`risk` / `always_on`) + `_documents[name]` (`source_type` / `source_name`)** 并按需激活，彻底废弃 `ContextVar` 暗道。
+### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与“外层 `Plugin(ABC)` 主板基类 + 内层 4 子协议 + 统一 `ToolRegistry`”架构重构（Issue `#20`）
+- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调；针对联调暴露的“各插件散乱无统一契约、内置工具与插件工具走两条不同配置/目录路径”以及 `ContextVar` / `os.getenv` 暗道问题，将插件与工具体系重构为**“外层 1 个统一主板基类 + 内层 4 个极简强类型子协议 + 统一 `ToolRegistry` 多源汇聚”**架构：
+  - **第一层：外层统一外壳 `Plugin(ABC)`**（`personal_assistant/agent/plugins.py`）：所有 `plugins/*.py` 均继承 `Plugin(ABC)`，只负责 3 件统一的事：① `__init_subclass__` 自动发现与注册；② 统一持有系统资源 `self.context: PluginContext`（`project_root` / `data_root` / `config_path` / `offload_dir` / `raw_config` / `tool_registry` 及 4 类标准插槽注册方法）；③ 统一生命周期 `initialize()` / `terminate()`。
+  - **第二层：内层 4 个极简强类型子协议**（核心运行时各子系统只认自己的小协议，不感知实现是否来自插件）：
+    1. **LLM 工具协议 `Tool(ToolSchema)`**（统一经 `build_tool()` 构建并汇聚至 `ToolRegistry._tools[name]` + `_metadata[name]` (`risk`, `always_on`) + `_documents[name]` (`source_type`, `source_name`)）：
+       - 内核内置工具：`MemoryToolsetProvider(ToolsetProvider)` ──▶ `BuiltinTool(Tool)` 子类
+       - 插件工具：`CustomToolsPlugin` / `ShellToolsPlugin` / `WebToolsPlugin` ──▶ 动态 `type()` `Tool` 子类
+       - 配置命令包装：`CommandToolsetProvider(ToolsetProvider)` / `CommandSpec.to_tool()` ──▶ `CommandToolWrapper(Tool)` 子类
+    2. **全文检索协议 `RetrieverProtocol`**（`name` + `search_hits(...)`，由 `FTS5RetrieverPlugin` 注册 `FTS5Retriever`）
+    3. **配置编译器协议 `ConfigCompilerProtocol`**（`name` + `compile(...)` / `presets()` / `render(...)`，由 `ModelsDSLPlugin` 注册 `ModelsDSLCompiler`）
+    4. **模型底座协议 `LLMProviderProtocol`**（`name` + `build(env)`）
 - **`main` (`4d18252`) 全量 5 套 141 题实模基线重测记录**：
   - 16 场景多轮记忆（`memory_scenarios.jsonl`）：**16/16 (100.0%)**（全类 100%，0 失败），KV 命中 `73.13%`、本地前缀复用 `87.44%`。
   - LongMemEval Dev 14：**10/14 (71.43%)**（`abstention` 2/2、`knowledge-update` 2/2、`single-session-user` 2/2），KV 命中 `54.52%`、本地前缀复用 `82.48%`。
@@ -376,14 +381,13 @@
   - LoCoMo 50 题 19 会话共享记忆：自动 Judge **38/50 (76.0%)**（`temporal` **9/10**、`open-domain` **7/10**、`completion_tokens` 20,075 较基线 `-2.1%`；`q176` 实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”属准确纠偏零幻觉，核查有效 **39/50**）。
   - 全量 40 题 `--mode agent`（`sample_cases.jsonl`）：**31/40 (77.5%)**，KV 命中 `77.85%`、本地前缀复用 `77.07%`（暴露 `agent_eval.py` 漏挂 `fts5_bm25` 检索插件）。
 - **改动文件（Issue `#20`）**：
-  - `personal_assistant/agent/tools.py` & `plugins.py` & `__init__.py`：新增唯一统一的 `build_tool()` 构建器（基于 `inspect.signature` 自动匹配并注入不在大模型 Schema 中的运行时上下文参数，如 `config_path` / `offload_dir` / `data_root`，并统一生成/实例化 `Tool` 子类及挂载 `ToolMetadata(risk, always_on)` 与 `ToolDocument(source_type, source_name)`）；`MemoryToolsetProvider`、`PluginManager`、`CommandToolsetProvider` 全部继承自统一基类 `ToolsetProvider`；`ToolRegistry` 统一维护 `_all_tools` / `_tools` / `_metadata` / `_documents` 并支持 `register_provider()` 与 `activate()` 按需加载。
-  - `personal_assistant/assistant/memory.py`：新增 `BuiltinTool(Tool)` 与 `MemoryToolsetProvider(ToolsetProvider)`（直接复用 `build_tool(..., base_cls=BuiltinTool)`）。
-  - `personal_assistant/assistant/commands.py`、`app.py`、`cli.py`：新增 `CommandToolWrapper(Tool)` 与 `CommandToolsetProvider(ToolsetProvider)`（直接复用 `build_tool(..., base_cls=CommandToolWrapper)`）；`ToolsConfig.build_registry(providers=..., data_root=...)` 通过统一的 `register_provider(provider, context=build_ctx)` 汇聚三路 `ToolsetProvider`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
-  - `plugins/shell_tools.py` & `plugins/web_tools.py`：与 `custom_tools.py` 完全一致，仅声明 `@tool` 函数（零 `build_plugin_tools` 胶水代码），通过关键字参数接收 `build_tool` 自动绑定的 `config_path` / `offload_dir`；`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `personal_assistant/agent/tools.py` & `plugins.py` & `__init__.py`：新增外层主板基类 `Plugin(ABC)` + `PluginContext` 与内层 4 子协议（`Tool`、`RetrieverProtocol`、`ConfigCompilerProtocol`、`LLMProviderProtocol`）；新增唯一统一的 `build_tool()` 构建器（将任意 callable 适配为指定 `Tool` 子类或动态 `type()` `Tool` 子类，并挂载 `ToolMetadata(risk, always_on)` 与 `ToolDocument(source_type, source_name)`）；`MemoryToolsetProvider`、`PluginManager`、`CommandToolsetProvider` 全部继承自统一基类 `ToolsetProvider`；`ToolRegistry` 统一维护 `_all_tools` / `_tools` / `_metadata` / `_documents` 并支持 `register_provider()` 与 `activate()` 按需加载。
+  - `plugins/custom_tools.py`、`shell_tools.py`、`web_tools.py`、`fts5_retriever.py`、`models_dsl.py`：全部 5 个插件统一改造为 `Plugin(ABC)` 子类（`CustomToolsPlugin`、`ShellToolsPlugin`、`WebToolsPlugin`、`FTS5RetrieverPlugin`、`ModelsDSLPlugin`），在 `initialize()` 中通过 `self.context` 读取配置/目录并向对应插槽注册 `Tool`、`FTS5Retriever(RetrieverProtocol)`、`ModelsDSLCompiler(ConfigCompilerProtocol)`，彻底消除魔术全局字典与函数属性动态猴子补丁；`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `personal_assistant/assistant/memory.py`、`commands.py`、`app.py`、`cli.py`：新增 `BuiltinTool(Tool)` / `MemoryToolsetProvider(ToolsetProvider)` 与 `CommandToolWrapper(Tool)` / `CommandToolsetProvider(ToolsetProvider)`；`ToolsConfig.build_registry(providers=..., data_root=...)` 通过统一的 `register_provider(provider, context=build_ctx)` 汇聚三路 `ToolsetProvider`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
   - `evals/agent_eval.py`：挂载 `retriever = cfg.build_retriever()` 并通过 `MemoryToolsetProvider` 统一构建工具表。
-  - `tests/test_step2_tools.py`、`tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 4 条 TDD 单测覆盖三源 `Tool` 子类统一构建汇聚与 `_metadata`/`_documents` 校验、无环境变量自定义 `data_root` 下 TOAST 落盘续读、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
+  - `tests/test_plugins.py`、`tests/test_step2_tools.py`、`tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 5 条 TDD 单测覆盖 `Plugin(ABC)` 外层主板基类 + 内层 4 子协议校验、三源 `Tool` 子类统一构建汇聚与 `_metadata`/`_documents` 校验、无环境变量自定义 `data_root` 下 TOAST 落盘续读、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
 - **同口径评测对比（改前 `4d18252` → 改后 `fix/issue-20-toast-data-root-tmpdir-agent-retriever`）**：
-  - 单元测试：**93/93 → 97/97 passed (5.40s)**（+4 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+  - 单元测试：**93/93 → 98/98 passed (5.21s)**（+5 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
   - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；29 道可答题目标源文档命中率从 **26/29 (89.7%) → 28/29 (96.6%)**），KV 命中 **77.85% → 80.69%**，本地前缀复用 **77.07% → 82.94%**，总 Prompt Tokens **-7.7%**。
   - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/...")` 精准读出被省略中间行测试名，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。

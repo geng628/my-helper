@@ -1,16 +1,11 @@
-"""可自由编辑的工具插件文件（无需修改 personal_assistant/ 任何核心代码）。
-
-如何新增自定义工具：
-1. 在本文件（或在 plugins/ 下新建任意 .py 文件）写一个普通函数并加上 @tool(...)；
-2. 把工具名加入 config/tools.json 的 enabled_tools 白名单即可立即生效；
-3. 想临时禁用某个工具，只需把它从 enabled_tools 里删掉即可。
-"""
+"""自定义工具插件（继承统一主板 Plugin 基类）：通过 self.context.register_tool 注册内层 Tool 子协议实例。"""
 from __future__ import annotations
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.tools import tool
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import build_tool, tool
 
 
 # 插件工具：返回当前北京时间字符串
@@ -28,3 +23,24 @@ def get_current_time() -> str:
 )
 def add_numbers(a: str, b: str) -> str:
     return str(int(a) + int(b))
+
+
+# 自定义工具主板插件（外层继承 Plugin ABC，内层向 tool_registry 插槽注册 Tool 子协议）
+class CustomToolsPlugin(Plugin):
+    plugin_id = "custom_tools"
+
+    # 统一初始化生命周期：将本插件内的工具通过 build_tool 注册进 self.context.tool_registry
+    def initialize(self) -> None:
+        for fn in (get_current_time, add_numbers):
+            spec = getattr(fn, "__agent_tool__")
+            self.context.register_tool(
+                build_tool(
+                    fn,
+                    name=spec.name,
+                    description=spec.description,
+                    parameters=spec.parameters,
+                    risk="read",
+                    source_type="plugin",
+                    source_name=self.plugin_id,
+                )
+            )

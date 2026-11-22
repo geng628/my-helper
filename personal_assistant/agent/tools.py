@@ -1,7 +1,6 @@
 """Layer 2 通用工具抽象、统一构建器（build_tool）与统一注册表（ToolRegistry）。"""
 from __future__ import annotations
 
-import inspect
 import json
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -24,7 +23,7 @@ class ToolDocument:
     source_name: str = "core"
 
 
-# 中层可执行工具基类：继承底层 ToolSchema，支持子类重写 run() 或委派给 handler 回调
+# 内层子协议 1：可执行工具基类（继承底层 ToolSchema，ToolRegistry 与 run_react 只认此基类的 run 契约）
 @dataclass(frozen=True)
 class Tool(ToolSchema):
     handler: Callable[..., str] | None = None
@@ -36,38 +35,7 @@ class Tool(ToolSchema):
         return str(self.handler(**values))
 
 
-# 根据函数签名自动绑定运行时上下文参数（如 config_path / offload_dir / data_root），对大模型 Schema 保持透明
-def _bind_context_kwargs(
-    fn: Callable[..., str],
-    schema_params: Mapping[str, str],
-    context: Mapping[str, object] | None,
-) -> Callable[..., str]:
-    if not context:
-        return fn
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return fn
-
-    bound_ctx: dict[str, object] = {}
-    for param_name, param in sig.parameters.items():
-        if param_name in schema_params:
-            continue
-        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-            if param_name in context and context[param_name] is not None:
-                bound_ctx[param_name] = context[param_name]
-
-    if not bound_ctx:
-        return fn
-
-    # 调用原函数时自动合并大模型参数与已绑定的运行时上下文参数
-    def _wrapped(**values: str) -> str:
-        return fn(**values, **bound_ctx)
-
-    return _wrapped
-
-
-# 统一工具构建器：将任意函数适配为 Tool 子类实例（支持指定子类或动态 type() 生成），统一注入上下文、ToolMetadata 与 ToolDocument
+# 统一工具构建器：将执行函数适配为指定 Tool 子类（或动态 type() 生成的 Tool 子类），并挂载 ToolMetadata 与 ToolDocument
 def build_tool(
     fn: Callable[..., str],
     *,
@@ -80,12 +48,10 @@ def build_tool(
     source_type: str = "builtin",
     source_name: str = "core",
     base_cls: type[Tool] | None = None,
-    context: Mapping[str, object] | None = None,
     extra_fields: Mapping[str, object] | None = None,
 ) -> Tool:
     tool_name = name or fn.__name__
     schema_params = dict(parameters or {})
-    bound_fn = _bind_context_kwargs(fn, schema_params, context)
 
     if base_cls is not None and base_cls is not Tool:
         target_cls = base_cls
@@ -93,9 +59,9 @@ def build_tool(
         safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", tool_name).title().replace("_", "") or "Dynamic"
         kind_label = source_type.title() or "Dynamic"
 
-        # 动态 Tool 子类的 run 实现：转发已校验参数给绑定好上下文的执行函数
+        # 动态 Tool 子类的 run 实现：转发已校验参数给目标函数
         def _run(self: Tool, **values: str) -> str:
-            return str(bound_fn(**values))
+            return str(fn(**values))
 
         target_cls = type(
             f"{safe_suffix}{kind_label}Tool",
@@ -107,7 +73,7 @@ def build_tool(
         "name": tool_name,
         "description": description,
         "parameters": schema_params,
-        "handler": bound_fn,
+        "handler": fn,
         "param_enums": param_enums,
     }
     if extra_fields:
@@ -135,7 +101,6 @@ def build_dynamic_plugin_tool(
     risk: str = "read",
     always_on: bool = False,
     source_name: str = "plugin",
-    context: Mapping[str, object] | None = None,
 ) -> Tool:
     return build_tool(
         fn,
@@ -147,7 +112,6 @@ def build_dynamic_plugin_tool(
         always_on=always_on,
         source_type="plugin",
         source_name=source_name,
-        context=context,
     )
 
 
@@ -210,7 +174,7 @@ def tool(
     return decorator
 
 
-# 统一工具注册表：汇聚所有 ToolsetProvider 产出的 Tool 子类，维护 _tools / _metadata / _documents 并按需激活
+# 统一工具注册表：汇聚所有 ToolsetProvider 与 Plugin 产出的 Tool 子类，维护 _tools / _metadata / _documents 并按需激活
 class ToolRegistry:
     # 初始化统一工具表、元数据表与来源文档表；若指定 allowed_names 则按白名单（含 always_on）按需激活
     def __init__(
