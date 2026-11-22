@@ -170,7 +170,7 @@ class AssistantApp:
         getter = (lambda: (user_text, message_id)) if user_text else None
         builtins = memory_tools(self.memory, get_user_message=getter, get_today=self._today)
         if self.tools_config is not None:
-            return self.tools_config.build_registry(*builtins)
+            return self.tools_config.build_registry(*builtins, data_root=self.data_root)
         return ToolRegistry(*builtins)
 
     # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用

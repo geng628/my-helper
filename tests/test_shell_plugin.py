@@ -254,3 +254,25 @@ def test_shell_plugin_finds_pytest_inside_symlinked_venv(
     out_real = execute_safe_command("pytest --version", policy)
     assert "退出码：0" in out_real
     assert "pytest" in out_real.lower()
+
+
+# 测试 run_command 执行使用 tmp_path 的 pytest 时，TMPDIR 不会指向工作区根目录、不遗留 pytest-of-* 脏目录
+def test_shell_plugin_pytest_tmpdir_does_not_pollute_cwd(tmp_path: Path) -> None:
+    sub_test = tmp_path / "test_mini_tmp.py"
+    sub_test.write_text(
+        "def test_uses_tmp_path(tmp_path):\n"
+        "    p = tmp_path / 'a.txt'\n"
+        "    p.write_text('ok')\n"
+        "    assert p.read_text() == 'ok'\n",
+        encoding="utf-8",
+    )
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("pytest",),
+        offload_dir=tmp_path / "workspace" / "tool_outputs",
+    )
+    out = execute_safe_command("pytest -q test_mini_tmp.py", policy)
+    assert "退出码：0" in out
+    leftover = [p.name for p in tmp_path.iterdir() if p.name.startswith("pytest-of-")]
+    assert leftover == [], f"pytest 临时目录污染了工作区 cwd：{leftover}"

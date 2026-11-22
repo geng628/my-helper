@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from personal_assistant.agent.plugins import ConfigCompiler, RetrieverFactory, load_plugins
@@ -20,7 +20,7 @@ from personal_assistant.ai.client import (
     register_provider,
 )
 from personal_assistant.ai.types import ModelsConfig
-from personal_assistant.assistant.common import truncate_or_offload
+from personal_assistant.assistant.common import bind_data_root, truncate_or_offload
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
@@ -90,7 +90,7 @@ class CommandSpec:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "HOME": str(self.cwd),
-            "TMPDIR": str(self.cwd),
+            "TMPDIR": tempfile.gettempdir(),
         }
         try:
             done = subprocess.run(
@@ -398,12 +398,29 @@ class ToolsConfig:
     def command_tools(self) -> list[Tool]:
         return [spec.to_tool() for spec in self.commands]
 
-    # 按 enabled_tools 白名单过滤内置工具与插件工具，再挂载启用的固定命令并生成注册表
+    # 按 enabled_tools 白名单过滤内置工具与插件工具，再挂载启用的固定命令并生成注册表（可选绑定实例 data_root）
     def build_registry(
         self,
         *builtin_tools: Tool,
         extra_tools: Iterable[Tool] = (),
+        data_root: Path | None = None,
     ) -> ToolRegistry:
         allowset = set(self.enabled_tools)
         selected = [tool for tool in (*builtin_tools, *self.plugin_tools) if tool.name in allowset]
-        return ToolRegistry(*selected, *self.command_tools(), *extra_tools)
+        all_tools = [*selected, *self.command_tools(), *extra_tools]
+        if data_root is not None:
+            resolved_root = data_root.resolve()
+            all_tools = [_bind_tool_data_root(t, resolved_root) for t in all_tools]
+        return ToolRegistry(*all_tools)
+
+
+# 为单个 Tool 绑定所属实例的 data_root 上下文，确保插件与固定命令的 TOAST 落盘目录与 MemoryStore 一致
+def _bind_tool_data_root(tool_item: Tool, data_root: Path) -> Tool:
+    raw_handler = tool_item.handler
+
+    # 在绑定的 data_root 上下文内执行原始工具处理函数
+    def _bound_handler(**kwargs: str) -> str:
+        with bind_data_root(data_root):
+            return raw_handler(**kwargs)
+
+    return replace(tool_item, handler=_bound_handler)

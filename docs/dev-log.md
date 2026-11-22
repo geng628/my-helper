@@ -359,3 +359,28 @@
     - **LoCoMo 50 共享长记忆（19 轮完整对话）**：自动 Judge `39/50 (78.0%) → 38/50 (76.0%)`（`temporal` **8/10 → 9/10**、`open-domain` **6/10 → 7/10**，仍严格拒绝猜测政治倾向 `q051` 与宗教程度 `q060`；本地前缀复用 `49.70% → 49.83%`）；逐例复核 4 例 `Pass → Fail`：`q182`（实答“是 Caroline 为教堂做彩绘玻璃窗，并非 Melanie”）与 `q163`（实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”）均准确纠偏、零幻觉，属 Judge 对纠偏表述误判，`q004` 同时答出心理咨询与收养机构仅主次排序差异，仅 `q129`（遗漏 rainbow sidewalk）为真实召回遗漏；实质有效准确率为 **40/50（80.0%）**，净增 `q016`、`q045`、`q015` 3 例修复。
   - **5 项防回退制衡指标核验**：① 拒答/对抗零真实退步（4 套拒答 100%，LoCoMo 有效对抗 9/9 零幻觉）；② 闲聊零多余工具调用（`kv-cache-efficiency` 第 1/3/4 轮 `tool_calls == []`）；③ KV/前缀复用健康（16 场景 90.43%、盲测 KV +3.81pp、LoCoMo 49.83%）；④ 记忆体积受控（16 场景 -1.5%、LME +8.3%–12.2%）；⑤ `SYSTEM_PROMPT` 仅 284 字符，零测试集特化词。
 - **遗留问题与下一步**：不放宽防幻觉红线去迎合主观猜测题；纯百科问答类 `single-session-assistant` 与记忆精简的天然权衡留作后续可选策略；LoCoMo 对抗题 LLM-as-a-Judge 误伤“明确否定并纠正主语”的现象可在后续评测工具改进中单独修正。合并 PR B 后继续推进 P2（如 `hybrid_rrf_retriever` 检索增强插件）。
+
+
+---
+
+### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与 3 处跨模块接缝缺陷修复（Issue `#20`）
+- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调，并针对联调揪出的 3 处确定性跨模块接缝缺陷做极简、零全局变量耦合修复。
+- **`main` (`4d18252`) 全量 5 套 141 题实模基线重测记录**：
+  - 16 场景多轮记忆（`memory_scenarios.jsonl`）：**16/16 (100.0%)**（全类 100%，0 失败），KV 命中 `73.13%`、本地前缀复用 `87.44%`。
+  - LongMemEval Dev 14：**10/14 (71.43%)**（`abstention` 2/2、`knowledge-update` 2/2、`single-session-user` 2/2），KV 命中 `54.52%`、本地前缀复用 `82.48%`。
+  - LongMemEval 盲测 Held-out 21：**18/21 (85.71%)**（较 `debeda2` 基线 `14/21` **+19.04pp**，`abstention` 3/3、`single-session-preference` 3/3、`single-session-assistant` 2/3），KV 命中 `57.77%`。
+  - LoCoMo 50 题 19 会话共享记忆：自动 Judge **38/50 (76.0%)**（`temporal` **9/10**、`open-domain` **7/10**、`completion_tokens` 20,075 较基线 `-2.1%`；`q176` 实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”属准确纠偏零幻觉，核查有效 **39/50**）。
+  - 全量 40 题 `--mode agent`（`sample_cases.jsonl`）：**31/40 (77.5%)**，KV 命中 `77.85%`、本地前缀复用 `77.07%`（暴露 `agent_eval.py` 漏挂 `fts5_bm25` 检索插件）。
+- **改动文件（Issue `#20`）**：
+  - `personal_assistant/assistant/common.py`：用标准库 `contextvars.ContextVar` 新增 `bind_data_root(data_root)`，`default_offload_dir()` 优先取当前上下文绑定的 `data_root`，再回退 `MY_HELPER_DATA` 与 `REPO_ROOT/data`，不改插件 `@tool` 签名且天然支持多实例/多线程隔离。
+  - `personal_assistant/assistant/commands.py`、`app.py`、`cli.py`：`ToolsConfig.build_registry(..., data_root=...)` 自动通过 `_bind_tool_data_root()` 绑定实例 `data_root`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `plugins/shell_tools.py`：`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`，彻底消除通过 `run_command` 跑 `pytest` 在 Git 仓库根目录遗留 `pytest-of-*` 脏目录的问题。
+  - `evals/agent_eval.py`：`_prepare_isolated_memory()` 挂载 `retriever = cfg.build_retriever()`，`evaluate_agent()` 调用 `cfg.build_registry(*builtins, data_root=memory.data_root)`。
+  - `tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 3 条 TDD 单测分别锁死自定义 `data_root` 无环境变量下的 TOAST 落盘续读闭环、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
+- **同口径评测对比（改前 `4d18252` → 改后 `fix/issue-20-toast-data-root-tmpdir-agent-retriever`）**：
+  - 单元测试：**93/93 → 96/96 passed (3.31s)**（+3 条跨模块 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
+  - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；29 道可答题目标源文档命中率从 **26/29 (89.7%) → 28/29 (96.6%)**），KV 命中 **77.85% → 80.69%**，本地前缀复用 **77.07% → 82.94%**，总 Prompt Tokens **-7.7%**。
+  - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/...")` 精准读出被省略中间行测试名，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。
+  - 退步与未验证项：无退步；`--mode agent` 剩余 5 例未命中 `expected_tools=["search_markdown"]` 中，1 例（`exact-pref-style`）为模型根据 `MEMORY.md` 索引直接一步调 `read_markdown` 读对文件，3 例为 `answerable=False` 的领域外负例直接拒答，仅 `para-tool-self-heal` 1 例未查记忆直接按通用知识作答。
+- **下一步**：合并本 PR 后，视需要评估 Issue `#13`（活跃上下文与工具轮次调优）或下一阶段检索/记忆优化。

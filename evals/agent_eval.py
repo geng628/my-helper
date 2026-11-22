@@ -34,7 +34,8 @@ def _prepare_isolated_memory(
         if cfg is not None
         else None
     )
-    return MemoryStore(isolated_data, policy=policy, create_dirs=True)
+    retriever = cfg.build_retriever() if cfg is not None else None
+    return MemoryStore(isolated_data, policy=policy, create_dirs=True, retriever=retriever)
 
 
 # 批量运行端到端 Agent 评测，保存每题的工具调用轨迹、最终回答与耗时
@@ -61,7 +62,11 @@ def evaluate_agent(
         memory = _prepare_isolated_memory(data_dir, Path(tmp), cfg, project_root)
         current_user: list[tuple[str, int | None]] = [("", None)]
         builtins = memory_tools(memory, get_user_message=lambda: current_user[0])
-        registry = cfg.build_registry(*builtins) if cfg is not None else ToolRegistry(*builtins)
+        registry = (
+            cfg.build_registry(*builtins, data_root=memory.data_root)
+            if cfg is not None
+            else ToolRegistry(*builtins)
+        )
         # 评测批次内冻结系统提示词，确保跨题前缀一致且与真实会话行为对齐
         frozen_system_prompt = format_system_prompt(memory)
 

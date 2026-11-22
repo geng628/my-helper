@@ -41,7 +41,10 @@ def build_repl_tools(
         cfg = ToolsConfig.load(cfg_path, project_root=project_root)
         policy = FilesPolicy.from_dict(cfg.files, project_root=project_root, data_root=data_dir)
         memory = MemoryStore(data_dir, policy=policy, retriever=cfg.build_retriever())
-        registry = cfg.build_registry(*memory_tools(memory, get_user_message=get_user_message))
+        registry = cfg.build_registry(
+            *memory_tools(memory, get_user_message=get_user_message),
+            data_root=data_dir,
+        )
         return registry, memory
 
     memory = MemoryStore(data_dir)

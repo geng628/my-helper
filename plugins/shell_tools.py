@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -244,7 +245,7 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "HOME": str(policy.cwd),
-        "TMPDIR": str(policy.cwd),
+        "TMPDIR": tempfile.gettempdir(),
     }
     try:
         done = subprocess.run(

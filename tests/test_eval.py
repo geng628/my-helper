@@ -225,3 +225,17 @@ def test_search_eval_supports_categories_and_temporal_today(tmp_path: Path) -> N
     assert by_cat["negative"]["total_cases"] == 1
     assert by_cat["negative"]["negative_clean_rate"] == 1.0
     assert report["cases"][0]["category"] == "temporal"
+
+
+# 测试 agent_eval 自动挂载 tools.json 配置的检索插件（fts5_bm25）并将 TOAST 落盘隔离在临时目录内
+def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from evals.agent_eval import _prepare_isolated_memory
+    from personal_assistant.assistant.commands import ToolsConfig
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    monkeypatch.delenv("MY_HELPER_DATA", raising=False)
+    cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
+    mem = _prepare_isolated_memory(REPO_ROOT / "evals" / "sample_data", tmp_path, cfg, REPO_ROOT)
+    assert getattr(mem.retriever, "name", None) == "fts5_bm25"
