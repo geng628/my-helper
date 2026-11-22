@@ -386,10 +386,10 @@
   - `personal_assistant/assistant/memory.py`、`commands.py`、`app.py`、`cli.py`：新增 `BuiltinTool(Tool)` / `MemoryToolsetProvider(ToolsetProvider)` 与 `CommandToolWrapper(Tool)` / `CommandToolsetProvider(ToolsetProvider)`；`ToolsConfig.build_registry(providers=..., data_root=...)` 通过统一的 `register_provider(provider, context=build_ctx)` 汇聚三路 `ToolsetProvider`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
   - `evals/agent_eval.py`：挂载 `retriever = cfg.build_retriever()` 并通过 `MemoryToolsetProvider` 统一构建工具表。
   - `tests/test_plugins.py`、`tests/test_step2_tools.py`、`tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 5 条 TDD 单测覆盖 `Plugin(ABC)` 外层主板基类 + 内层 4 子协议校验、三源 `Tool` 子类统一构建汇聚与 `_metadata`/`_documents` 校验、无环境变量自定义 `data_root` 下 TOAST 落盘续读、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
-- **同口径评测对比（改前 `4d18252` → 改后 `fix/issue-20-toast-data-root-tmpdir-agent-retriever`）**：
-  - 单元测试：**93/93 → 98/98 passed (5.21s)**（+5 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+- **同口径评测对比（改前 `4d18252` → 改后 `931514e`）**：
+  - 单元测试：**93/93 → 98/98 passed (3.54s)**（+5 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
-  - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；29 道可答题目标源文档命中率从 **26/29 (89.7%) → 28/29 (96.6%)**），KV 命中 **77.85% → 80.69%**，本地前缀复用 **77.07% → 82.94%**，总 Prompt Tokens **-7.7%**。
-  - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/...")` 精准读出被省略中间行测试名，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。
+  - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`，`git=931514e`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；新增命中 `para-crossling-injection`、`para-tdd-workflow`、`multi-benchmarks-and-rules`、`neg-ood-mars`；29 道可答题目标源文档命中率从 **25/29 (86.2%) → 27/29 (93.1%)**），KV 命中 **77.85% → 79.14%**，本地前缀复用 **77.07% → 78.58%**，`completion_tokens` **-1.8%**。
+  - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调（`git=931514e`）：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/20261122-130428-shell-pytest-b8524bb3.txt")` 精准读出被省略的第 30 行测试名 `test_fts5_retriever_bm25_ranking_hard_negatives_and_diversity`，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。
   - 退步与未验证项：无退步；`--mode agent` 剩余 5 例未命中 `expected_tools=["search_markdown"]` 中，1 例（`exact-pref-style`）为模型根据 `MEMORY.md` 索引直接一步调 `read_markdown` 读对文件，3 例为 `answerable=False` 的领域外负例直接拒答，仅 `para-tool-self-heal` 1 例未查记忆直接按通用知识作答。
 - **下一步**：合并本 PR 后，视需要评估 Issue `#13`（活跃上下文与工具轮次调优）或下一阶段检索/记忆优化。
