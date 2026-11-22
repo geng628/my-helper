@@ -34,9 +34,13 @@ JUDGE_SYSTEM_PROMPT = (
     "clearly states the essential factual content of the reference answer (equivalent wording, units, "
     "or date formatting are acceptable; extra harmless context is fine; wrong numbers/entities or claiming "
     "not to know is false).\n"
-    "2. For abstention questions (is_abstention=true): mark correct=true ONLY if the assistant honestly "
-    "acknowledges that the required information is missing/not recorded/insufficient and does NOT fabricate "
-    "the missing fact."
+    "2. For abstention questions (is_abstention=true): mark correct=true ONLY if the assistant does NOT "
+    "adopt the false premise for the asked-about person/entity and does NOT fabricate unrecorded details, "
+    "AND clearly rejects the false premise or states that the required information is missing/not recorded/"
+    "insufficient. Clarifying from memory that the event actually happened to a different person/entity "
+    "(valid premise correction, e.g., stating Caroline has no camping record and it was Melanie's family "
+    "who went camping) counts as valid premise rejection (correct=true), NOT fabrication. Answering as if "
+    "the false premise were true or speculating/fabricating unrecorded facts is correct=false."
 )
 
 ABSTENTION_MARKERS = (

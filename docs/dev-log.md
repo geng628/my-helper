@@ -428,3 +428,19 @@
   - `docs/dev-log.md`：追加本次协作规范变更记录（严格 append-only）。
 - **验证**：纯文档改动，全量单测保持 **99/99 passed**；未改动任何 Python 源码，无需重跑实模 Benchmark。
 - **下一步**：合并本 PR 后，按新流程先提交首批 2 路低耦合 Eval 改进任务的拆分与拟改文件清单，经确认后再派独立 worktree 并行实施。
+
+
+---
+
+### [2026-11-23] 修正对抗题 Judge 误伤“有效纠偏声明”问题与并行复盘（Issue `#27`）
+- **目标与思路**：按第 1 批并行任务试跑结果：
+  - **PR `#28`（Issue `#27`）通过验收并合并**：修正 `evals/memory_eval.py` 中 `JUDGE_SYSTEM_PROMPT` 规则 2（`is_abstention=true`），保留 `mark correct=true ONLY if` 严格合取防线（不顺从错误前提、不编造未记录细节、且明确拒绝前提或声明缺失），同时明确指出从记忆中澄清事件实际涉及另一人物/实体属于有效的纠偏声明（`correct=true`），而非编造；规则 1 逐字不变。
+  - **同期纯 Prompt 实验 PR `#29`（Issue `#26`）按纪律主动关闭**：逐例核对表明仅调 `CONSOLIDATION_SYSTEM_PROMPT` 在 Held-out 21 上 `18/21 → 18/21` 零真实提升（`lme-a346bb18` 实靠 PR `#23` 的 `archive/` 兜底、`lme-gpt4_2312f94c` 仍未稳定保留发生日），故改由独立小 Issue 以**代码级结构化机制（`op="merge"` 操作码 + `event_date` 结构化字段）**分别推进。
+- **改动文件（Issue `#27`，代码提交 `e2ccc25`）**：
+  - `evals/memory_eval.py`：收紧并明确 `JUDGE_SYSTEM_PROMPT` 规则 2 的纠偏与防混合猜测判定。
+  - `tests/test_memory_eval.py`：新增 `test_judge_answer_prompts_allow_valid_premise_correction_for_abstention()` 验证提示词契约、Rule 1 不变性与解析流程。
+- **三层审查与同口径验证**：
+  - 单元测试 & AST 中文注释：**100/100 passed**，0 缺失；离线检索 `38/40` 持平。
+  - 第 2 层独立只读 Reviewer：**`Pass`**（0 Blocker）。
+  - 实模 LLM-as-a-Judge 5 题专项验证（`deepseek-chat`，`e2ccc25`）：**5/5 全部符合预期**（`q176`/`q182` 纠偏均判 `true`；`q162` 幻觉、先拒答后猜测混合回复、普通数字错答均严格判 `false`）。
+- **下一步**：合并 PR `#28` 后，串行推进记忆闭环第 3 块拼图——代码级一等公民 `op="merge"` 操作码，并独立以实模 Benchmark 验收。
