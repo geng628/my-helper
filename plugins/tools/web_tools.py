@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
@@ -23,7 +23,7 @@ from personal_assistant.assistant.common import (
     truncate_utf8,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -50,9 +50,30 @@ class WebPolicy:
     max_results: int = 5
     offload_dir: Path | None = None
 
+    # 从已解析的 web 配置字典直接构建 WebPolicy（支持绑定实例专属 offload_dir）
+    @classmethod
+    def from_dict(
+        cls,
+        web_cfg: Mapping[str, object],
+        *,
+        offload_dir: Path | None = None,
+    ) -> "WebPolicy":
+        return cls(
+            timeout=float(web_cfg.get("timeout", 15.0)),
+            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
+            max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
+            max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
+            offload_dir=offload_dir,
+        )
+
     # 从 config/tools.json 读取 web 配置段，缺省时使用安全默认值
     @classmethod
-    def from_config(cls, config_path: Path | None = None) -> "WebPolicy":
+    def from_config(
+        cls,
+        config_path: Path | None = None,
+        *,
+        offload_dir: Path | None = None,
+    ) -> "WebPolicy":
         cfg_file = (
             config_path
             if config_path is not None
@@ -63,12 +84,7 @@ class WebPolicy:
             raw = json.loads(cfg_file.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("web"), dict):
                 web_cfg = raw["web"]
-        return cls(
-            timeout=float(web_cfg.get("timeout", 15.0)),
-            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
-            max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
-            max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
-        )
+        return cls.from_dict(web_cfg, offload_dir=offload_dir)
 
 
 # 严格校验目标 URL 仅限公开 http/https 地址，防止通过私网/回环/云元数据 IP 触发 SSRF
@@ -464,9 +480,19 @@ def execute_web_search(
     name="web_search",
     description="联网搜索实时信息、最新技术文档或公开网页，返回排名前几条的标题、链接与摘要。",
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
+    risk="network",
 )
-def web_search(query: str) -> str:
-    return execute_web_search(query, WebPolicy.from_config())
+def web_search(
+    query: str,
+    *,
+    config_path: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+) -> str:
+    if isinstance(web_config, Mapping):
+        policy = WebPolicy.from_dict(web_config)
+    else:
+        policy = WebPolicy.from_config(config_path)
+    return execute_web_search(query, policy)
 
 
 # 插件工具入口：抓取指定公开网页（http/https）并提取标题与纯文本正文（超长自动落盘分页）
@@ -477,6 +503,17 @@ def web_search(query: str) -> str:
         "超长正文会自动保存至 data/workspace/tool_outputs/ 供 read_markdown 分页续读。"
     ),
     parameters={"url": "完整的公开 http/https 网址"},
+    risk="network",
 )
-def fetch_webpage(url: str) -> str:
-    return execute_fetch_webpage(url, WebPolicy.from_config())
+def fetch_webpage(
+    url: str,
+    *,
+    config_path: Path | None = None,
+    offload_dir: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+) -> str:
+    if isinstance(web_config, Mapping):
+        policy = WebPolicy.from_dict(web_config, offload_dir=offload_dir)
+    else:
+        policy = WebPolicy.from_config(config_path, offload_dir=offload_dir)
+    return execute_fetch_webpage(url, policy)

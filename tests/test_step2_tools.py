@@ -285,3 +285,65 @@ def test_command_spec_offloads_long_stdout_and_stderr_with_head_tail(
     full_saved = offloaded[0].read_text(encoding="utf-8")
     assert "body line 20" in full_saved
     assert "FINAL_STDERR_LINE" in full_saved
+
+
+# 测试三类异构工具来源（BuiltinTool / 动态 type() PluginTool / CommandToolWrapper）统一汇聚进同一个 ToolRegistry（_tools + _metadata + _documents）并支持按需激活
+def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
+    tmp_path: Path,
+) -> None:
+    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, tool
+    from personal_assistant.assistant.app import AssistantApp
+    from personal_assistant.assistant.commands import CommandToolWrapper
+    from personal_assistant.assistant.common import REPO_ROOT
+    from personal_assistant.assistant.memory import BuiltinTool
+
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=REPO_ROOT / "config" / "tools.json",
+        project_root=REPO_ROOT,
+    )
+    try:
+        registry = app.build_tools()
+
+        # 1. 内核内置工具 (MemoryToolsetProvider) ──▶ BuiltinTool(Tool) 子类
+        read_tool = registry._tools["read_markdown"]
+        assert isinstance(read_tool, BuiltinTool)
+        assert isinstance(read_tool, Tool)
+        assert registry.metadata("read_markdown") == ToolMetadata(risk="read", always_on=False)
+        assert registry.document("read_markdown") == ToolDocument(
+            source_type="builtin",
+            source_name="memory",
+        )
+        assert registry.metadata("write_file") == ToolMetadata(risk="write", always_on=False)
+
+        # 2. 插件 @tool (PluginManager) ──▶ 动态 type() Tool 子类
+        run_cmd_tool = registry._tools["run_command"]
+        assert isinstance(run_cmd_tool, Tool)
+        assert type(run_cmd_tool) is not Tool
+        assert issubclass(type(run_cmd_tool), Tool)
+        assert registry.metadata("run_command") == ToolMetadata(risk="exec", always_on=False)
+        assert registry.document("run_command") == ToolDocument(
+            source_type="plugin",
+            source_name="shell_tools",
+        )
+
+        # 3. 固定命令包装器 ──▶ CommandToolWrapper(Tool) 子类
+        git_tool = registry._tools["cmd_git_status"]
+        assert isinstance(git_tool, CommandToolWrapper)
+        assert isinstance(git_tool, Tool)
+        assert registry.metadata("cmd_git_status") == ToolMetadata(risk="exec", always_on=False)
+        assert registry.document("cmd_git_status") == ToolDocument(
+            source_type="command",
+            source_name="tools.json",
+        )
+
+        # 4. 按需加载与 always_on 常驻激活
+        @tool(description="常驻心跳", always_on=True)
+        def always_ping() -> str:
+            return "pong"
+
+        registry.register(always_ping.__agent_tool__)
+        registry.activate(["read_markdown"])
+        assert set(registry.names) == {"read_markdown", "always_ping"}
+    finally:
+        app.close()

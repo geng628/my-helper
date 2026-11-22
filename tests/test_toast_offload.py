@@ -217,3 +217,46 @@ def test_truncate_or_offload_uses_my_helper_data_and_falls_back_on_oserror(
     fallback = truncate_or_offload(payload, max_bytes=120, tag="web", offload_dir=blocker)
     assert "输出已截断" in fallback
     assert "data/workspace/tool_outputs/" not in fallback
+
+
+# 测试 AssistantApp 使用自定义 data_root（未设 MY_HELPER_DATA）时，工具 TOAST 落盘自动对齐该实例并可由 read_markdown 续读
+def test_assistant_app_custom_data_root_binds_toast_offload_without_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from personal_assistant.assistant.app import AssistantApp
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    monkeypatch.delenv("MY_HELPER_DATA", raising=False)
+    custom_data = tmp_path / "isolated_instance_data"
+    app = AssistantApp(
+        data_root=custom_data,
+        config_path=REPO_ROOT / "config" / "tools.json",
+        project_root=REPO_ROOT,
+    )
+    try:
+        reg = app.build_tools()
+        obs = reg.execute("run_command", '{"command": "cat personal_assistant/assistant/memory.py"}')
+        match = re.search(r"(data/workspace/tool_outputs/[A-Za-z0-9_.-]+\.txt)", obs)
+        assert match is not None, f"未触发 TOAST 落盘：{obs[:200]}"
+        rel_path = match.group(1)
+        filename = Path(rel_path).name
+
+        # 落盘文件必须位于 custom_data 下，绝不污染仓库根目录 REPO_ROOT/data
+        assert (custom_data / "workspace" / "tool_outputs" / filename).is_file()
+        assert not (REPO_ROOT / "data" / "workspace" / "tool_outputs" / filename).exists()
+
+        # 同实例的 read_markdown 与 search_markdown 必须能直接读取与检索该落盘文件
+        read_obs = reg.execute(
+            "read_markdown",
+            f'{{"path": "{rel_path}", "start_line": 1, "end_line": 15}}',
+        )
+        assert "纯 Markdown 记忆" in read_obs
+        assert "文件不存在" not in read_obs
+
+        search_obs = reg.execute(
+            "search_markdown",
+            '{"query": "MemoryStore", "root": "data/workspace/tool_outputs"}',
+        )
+        assert filename in search_obs
+    finally:
+        app.close()

@@ -17,7 +17,11 @@ from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.memory import (
+    FilesPolicy,
+    MemoryStore,
+    MemoryToolsetProvider,
+)
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
@@ -41,11 +45,14 @@ def build_repl_tools(
         cfg = ToolsConfig.load(cfg_path, project_root=project_root)
         policy = FilesPolicy.from_dict(cfg.files, project_root=project_root, data_root=data_dir)
         memory = MemoryStore(data_dir, policy=policy, retriever=cfg.build_retriever())
-        registry = cfg.build_registry(*memory_tools(memory, get_user_message=get_user_message))
+        provider = MemoryToolsetProvider(memory, get_user_message=get_user_message)
+        registry = cfg.build_registry(providers=[provider], data_root=data_dir)
         return registry, memory
 
     memory = MemoryStore(data_dir)
-    return ToolRegistry(*memory_tools(memory, get_user_message=get_user_message)), memory
+    registry = ToolRegistry()
+    registry.register_provider(MemoryToolsetProvider(memory, get_user_message=get_user_message))
+    return registry, memory
 
 
 # 终端回调函数：实时打印每一步工具调用（Act）与观察结果（Observe）

@@ -359,3 +359,37 @@
     - **LoCoMo 50 共享长记忆（19 轮完整对话）**：自动 Judge `39/50 (78.0%) → 38/50 (76.0%)`（`temporal` **8/10 → 9/10**、`open-domain` **6/10 → 7/10**，仍严格拒绝猜测政治倾向 `q051` 与宗教程度 `q060`；本地前缀复用 `49.70% → 49.83%`）；逐例复核 4 例 `Pass → Fail`：`q182`（实答“是 Caroline 为教堂做彩绘玻璃窗，并非 Melanie”）与 `q163`（实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”）均准确纠偏、零幻觉，属 Judge 对纠偏表述误判，`q004` 同时答出心理咨询与收养机构仅主次排序差异，仅 `q129`（遗漏 rainbow sidewalk）为真实召回遗漏；实质有效准确率为 **40/50（80.0%）**，净增 `q016`、`q045`、`q015` 3 例修复。
   - **5 项防回退制衡指标核验**：① 拒答/对抗零真实退步（4 套拒答 100%，LoCoMo 有效对抗 9/9 零幻觉）；② 闲聊零多余工具调用（`kv-cache-efficiency` 第 1/3/4 轮 `tool_calls == []`）；③ KV/前缀复用健康（16 场景 90.43%、盲测 KV +3.81pp、LoCoMo 49.83%）；④ 记忆体积受控（16 场景 -1.5%、LME +8.3%–12.2%）；⑤ `SYSTEM_PROMPT` 仅 284 字符，零测试集特化词。
 - **遗留问题与下一步**：不放宽防幻觉红线去迎合主观猜测题；纯百科问答类 `single-session-assistant` 与记忆精简的天然权衡留作后续可选策略；LoCoMo 对抗题 LLM-as-a-Judge 误伤“明确否定并纠正主语”的现象可在后续评测工具改进中单独修正。合并 PR B 后继续推进 P2（如 `hybrid_rrf_retriever` 检索增强插件）。
+
+
+---
+
+### [2026-11-22] 合流后 `main` (`4d18252`) 全量实模重测与“外层 `Plugin(ABC)` 主板基类 + 内层 4 子协议 + 统一 `ToolRegistry`”架构重构（Issue `#20`）
+- **目标与思路**：在两条开发线（P1 记忆/提示词优化 + TOAST 输出卸载三部曲 `#10/#11/#12/#17`）合入 `main`（`4d18252`）后，首先对 `4d18252` 执行零复用的全量 5 套 141 题实模重测与跨模块联调；针对联调暴露的“各插件散乱无统一契约、内置工具与插件工具走两条不同配置/目录路径”以及 `ContextVar` / `os.getenv` 暗道问题，将插件与工具体系重构为**“外层 1 个统一主板基类 + 内层 4 个极简强类型子协议 + 统一 `ToolRegistry` 多源汇聚”**架构：
+  - **第一层：外层统一外壳 `Plugin(ABC)`**（`personal_assistant/agent/plugins.py`）：主板上仅挂载 **3 个同级 `Plugin(ABC)` 插件**（分别对应内层子协议：`plugins/tools/plugin.py` 的 `ToolsPlugin`、`plugins/fts5_retriever.py` 的 `FTS5RetrieverPlugin`、`plugins/models_dsl.py` 的 `ModelsDSLPlugin`），只负责 3 件统一的事：① `__init_subclass__` 自动发现与注册；② 统一持有系统资源 `self.context: PluginContext`（`project_root` / `data_root` / `config_path` / `offload_dir` / `raw_config` / `tool_registry` 及 4 类标准插槽注册方法）；③ 统一生命周期 `initialize()` / `terminate()`。
+  - **第二层：内层 4 个极简强类型子协议**（核心运行时各子系统只认自己的小协议，不感知实现是否来自插件）：
+    1. **LLM 工具协议 `Tool(ToolSchema)`**（统一经 `build_tool()` 构建并汇聚至 `ToolRegistry._tools[name]` + `_metadata[name]` (`risk`, `always_on`) + `_documents[name]` (`source_type`, `source_name`)）：
+       - 内核内置工具：`MemoryToolsetProvider(ToolsetProvider)` ──▶ `BuiltinTool(Tool)` 子类
+       - 插件工具包（`plugins/tools/` 下的 `custom_tools.py`、`shell_tools.py`、`web_tools.py` 只写纯 `@tool` 函数，由唯一的 `ToolsPlugin(Plugin)` 统一扫描装配）──▶ 动态 `type()` `Tool` 子类
+       - 配置命令包装：`CommandToolsetProvider(ToolsetProvider)` / `CommandSpec.to_tool()` ──▶ `CommandToolWrapper(Tool)` 子类
+    2. **全文检索协议 `RetrieverProtocol`**（`name` + `search_hits(...)`，由单文件插件 `FTS5RetrieverPlugin` 注册 `FTS5Retriever`）
+    3. **配置编译器协议 `ConfigCompilerProtocol`**（`name` + `compile(...)` / `presets()` / `render(...)`，由单文件插件 `ModelsDSLPlugin` 注册 `ModelsDSLCompiler`）
+    4. **模型底座协议 `LLMProviderProtocol`**（`name` + `build(env)`）
+- **`main` (`4d18252`) 全量 5 套 141 题实模基线重测记录**：
+  - 16 场景多轮记忆（`memory_scenarios.jsonl`）：**16/16 (100.0%)**（全类 100%，0 失败），KV 命中 `73.13%`、本地前缀复用 `87.44%`。
+  - LongMemEval Dev 14：**10/14 (71.43%)**（`abstention` 2/2、`knowledge-update` 2/2、`single-session-user` 2/2），KV 命中 `54.52%`、本地前缀复用 `82.48%`。
+  - LongMemEval 盲测 Held-out 21：**18/21 (85.71%)**（较 `debeda2` 基线 `14/21` **+19.04pp**，`abstention` 3/3、`single-session-preference` 3/3、`single-session-assistant` 2/3），KV 命中 `57.77%`。
+  - LoCoMo 50 题 19 会话共享记忆：自动 Judge **38/50 (76.0%)**（`temporal` **9/10**、`open-domain` **7/10**、`completion_tokens` 20,075 较基线 `-2.1%`；`q176` 实答“Caroline 本人没有露营记录，露营的是 Melanie 一家”属准确纠偏零幻觉，核查有效 **39/50**）。
+  - 全量 40 题 `--mode agent`（`sample_cases.jsonl`）：**31/40 (77.5%)**，KV 命中 `77.85%`、本地前缀复用 `77.07%`（暴露 `agent_eval.py` 漏挂 `fts5_bm25` 检索插件）。
+- **改动文件（Issue `#20`）**：
+  - `personal_assistant/agent/tools.py` & `plugins.py` & `__init__.py`：新增外层主板基类 `Plugin(ABC)` + `PluginContext`（同时支持 `plugins/*/plugin.py` 文件夹插件与 `plugins/*.py` 单文件插件发现）与内层 4 子协议（`Tool`、`RetrieverProtocol`、`ConfigCompilerProtocol`、`LLMProviderProtocol`）；新增唯一统一的 `build_tool()` 构建器（将任意 callable 适配为指定 `Tool` 子类或动态 `type()` `Tool` 子类，自动按签名绑定上下文参数并挂载 `ToolMetadata(risk, always_on)` 与 `ToolDocument(source_type, source_name)`）；`MemoryToolsetProvider`、`PluginManager`、`CommandToolsetProvider` 全部继承自统一基类 `ToolsetProvider`；`ToolRegistry` 统一维护 `_all_tools` / `_tools` / `_metadata` / `_documents` 并支持 `register_provider()` 与 `activate()` 按需加载。
+  - `plugins/tools/`（`plugin.py`、`__init__.py`、`custom_tools.py`、`shell_tools.py`、`web_tools.py`）与 `plugins/fts5_retriever.py`、`plugins/models_dsl.py`：把同类工具模块归拢至 `plugins/tools/` 目录，各工具文件只写纯 `@tool` 函数，由唯一的 `ToolsPlugin(Plugin)`（`plugin_id = "tools"`）统一扫描注册，与单文件检索插件 `FTS5RetrieverPlugin(Plugin)`（`plugin_id = "fts5_bm25"`）及单文件编译插件 `ModelsDSLPlugin(Plugin)`（`plugin_id = "models_dsl"`）严格同级；`execute_safe_command()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `personal_assistant/assistant/memory.py`、`commands.py`、`app.py`、`cli.py`：新增 `BuiltinTool(Tool)` / `MemoryToolsetProvider(ToolsetProvider)` 与 `CommandToolWrapper(Tool)` / `CommandToolsetProvider(ToolsetProvider)`；`ToolsConfig.build_registry(providers=..., data_root=...)` 通过统一的 `register_provider(provider, context=build_ctx)` 汇聚三路 `ToolsetProvider`；`CommandSpec.run()` 子进程 `TMPDIR` 改为 `tempfile.gettempdir()`。
+  - `evals/agent_eval.py`：挂载 `retriever = cfg.build_retriever()` 并通过 `MemoryToolsetProvider` 统一构建工具表。
+  - `tests/test_plugins.py`、`tests/test_step2_tools.py`、`tests/test_toast_offload.py`、`tests/test_shell_plugin.py`、`tests/test_eval.py`：新增 5 条 TDD 单测覆盖 `Plugin(ABC)` 外层主板基类 + 内层 4 子协议校验、三源 `Tool` 子类统一构建汇聚与 `_metadata`/`_documents` 校验、无环境变量自定义 `data_root` 下 TOAST 落盘续读、`pytest` 子进程 `TMPDIR` 零工作区污染与 `agent_eval` 检索插件挂载。
+- **同口径评测对比（改前 `4d18252` → 改后 `931514e`）**：
+  - 单元测试：**93/93 → 98/98 passed (3.54s)**（+5 条 TDD 单测，三层架构守卫全绿）；AST 中文注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**、MRR **0.9483**；LoCoMo 200 题保持 **105/200 (52.5%)**、Recall **0.6851**（零退步）。
+  - 全量 40 题 `--mode agent` 实模端到端（`deepseek-chat`，`git=931514e`）：工具命中 **31/40 (77.5%) → 35/40 (87.5%)**（**+10.0pp / +4 题**，`0` 例 `Pass → Fail` 退步；新增命中 `para-crossling-injection`、`para-tdd-workflow`、`multi-benchmarks-and-rules`、`neg-ood-mars`；29 道可答题目标源文档命中率从 **25/29 (86.2%) → 27/29 (93.1%)**），KV 命中 **77.85% → 79.14%**，本地前缀复用 **77.07% → 78.58%**，`completion_tokens` **-1.8%**。
+  - 无 `MY_HELPER_DATA` 环境变量下的 TOAST + ReAct 实模联调（`git=931514e`）：模型 2 轮调用 `run_command("pytest -v")` → `read_markdown("data/workspace/tool_outputs/20261122-130428-shell-pytest-b8524bb3.txt")` 精准读出被省略的第 30 行测试名 `test_fts5_retriever_bm25_ranking_hard_negatives_and_diversity`，落盘完全隔离于 `custom_data` 且仓库根目录 `pytest-of-*` 残留为 `[]`。
+  - 退步与未验证项：无退步；`--mode agent` 剩余 5 例未命中 `expected_tools=["search_markdown"]` 中，1 例（`exact-pref-style`）为模型根据 `MEMORY.md` 索引直接一步调 `read_markdown` 读对文件，3 例为 `answerable=False` 的领域外负例直接拒答，仅 `para-tool-self-heal` 1 例未查记忆直接按通用知识作答。
+- **下一步**：合并本 PR 后，视需要评估 Issue `#13`（活跃上下文与工具轮次调优）或下一阶段检索/记忆优化。

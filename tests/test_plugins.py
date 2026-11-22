@@ -136,3 +136,55 @@ def multiply(x: str, y: str) -> str:
     reply = run_react(llm, messages, registry)
     assert reply == "6 乘以 7 等于 42。"
     assert messages[-2]["content"] == "42"
+
+
+# 测试外层统一主板基类 Plugin(ABC)（3 个同级插件：ToolsPlugin / FTS5RetrieverPlugin / ModelsDSLPlugin）与内层 4 个强类型极简子协议
+def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
+    from personal_assistant.agent.plugins import (
+        ConfigCompilerProtocol,
+        Plugin,
+        PluginManager,
+        RetrieverProtocol,
+    )
+    from personal_assistant.agent.tools import Tool
+    from personal_assistant.assistant.common import REPO_ROOT
+    from plugins.models_dsl import ModelsDSLCompiler
+    from plugins.tools import ToolsPlugin
+
+    manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
+
+    # 1. 外层：主板仅加载 3 个同级 Plugin(ABC) 实例（tools 文件夹插件 + fts5_bm25 / models_dsl 单文件插件）
+    assert len(manager.plugins) == 3
+    assert all(isinstance(p, Plugin) for p in manager.plugins)
+    plugin_ids = {p.plugin_id for p in manager.plugins}
+    assert plugin_ids == {
+        "tools",
+        "fts5_bm25",
+        "models_dsl",
+    }
+    assert {type(p).__name__ for p in manager.plugins} == {
+        "ToolsPlugin",
+        "FTS5RetrieverPlugin",
+        "ModelsDSLPlugin",
+    }
+    assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
+
+    # 2. 内层子协议 1：plugins/tools/ 下的全部 @tool 模块由唯一的 ToolsPlugin 统一装配为 Tool 子类实例
+    assert all(isinstance(t, Tool) for t in manager.default_tools)
+    assert {"get_current_time", "run_command", "web_search", "fetch_webpage"}.issubset(
+        {t.name for t in manager.default_tools}
+    )
+
+    # 3. 内层子协议 2：RetrieverProtocol（MemoryStore 只认 search_hits）
+    fts_instance = manager.retrievers["fts5_bm25"]({})
+    assert isinstance(fts_instance, RetrieverProtocol)
+    assert fts_instance.name == "fts5_bm25"
+
+    # 4. 内层子协议 3：ConfigCompilerProtocol（ToolsConfig 只认 compile / presets / render）
+    dsl_compiler = ModelsDSLCompiler()
+    assert isinstance(dsl_compiler, ConfigCompilerProtocol)
+    compiled = manager.compilers["models_dsl"]("use ollama", "models.dsl")
+    assert compiled["default"] == "ollama"
+
+    # 5. 统一生命周期清理钩子可正常调用
+    manager.terminate_all()

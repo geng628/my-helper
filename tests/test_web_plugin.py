@@ -10,7 +10,7 @@ import pytest
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.memory import MemoryStore
 from plugins.fts5_retriever import FTS5Retriever
-from plugins.web_tools import (
+from plugins.tools.web_tools import (
     WebPolicy,
     execute_fetch_webpage,
     execute_web_search,

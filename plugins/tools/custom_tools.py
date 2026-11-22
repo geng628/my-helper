@@ -1,10 +1,4 @@
-"""可自由编辑的工具插件文件（无需修改 personal_assistant/ 任何核心代码）。
-
-如何新增自定义工具：
-1. 在本文件（或在 plugins/ 下新建任意 .py 文件）写一个普通函数并加上 @tool(...)；
-2. 把工具名加入 config/tools.json 的 enabled_tools 白名单即可立即生效；
-3. 想临时禁用某个工具，只需把它从 enabled_tools 里删掉即可。
-"""
+"""用户可自由编辑的通用工具实现（plugins/tools/custom_tools.py）：仅声明 @tool 函数，统一由 ToolsPlugin 装配。"""
 from __future__ import annotations
 
 from datetime import datetime

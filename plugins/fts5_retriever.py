@@ -9,6 +9,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from personal_assistant.agent.plugins import Plugin
 from personal_assistant.assistant.memory import SearchHit
 from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN, today_shanghai
 
@@ -499,11 +500,15 @@ class FTS5Retriever:
             return hits
 
 
-# 检索插件工厂函数：由 personal_assistant.plugins 自动发现并按 config/tools.json 的 retrieval 段装配
+# 检索插件工厂函数：按 config/tools.json 的 retrieval 段装配实现 RetrieverProtocol 的 FTS5Retriever
 def create_retriever(config: dict[str, object]) -> FTS5Retriever:
     return FTS5Retriever(FTS5Config.from_dict(config))
 
 
-RETRIEVERS = {
-    RETRIEVER_NAME: create_retriever,
-}
+# FTS5 全文检索主板插件（外层继承 Plugin ABC，内层向 retrievers 插槽注册 RetrieverProtocol 实现）
+class FTS5RetrieverPlugin(Plugin):
+    plugin_id = RETRIEVER_NAME
+
+    # 统一初始化生命周期：向 self.context.register_retriever 插槽登记 fts5_bm25 检索器
+    def initialize(self) -> None:
+        self.context.register_retriever(self.plugin_id, create_retriever)

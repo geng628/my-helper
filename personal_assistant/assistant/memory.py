@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.tools import Tool
+from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
 from personal_assistant.assistant.common import truncate_utf8
 from personal_assistant.assistant.memory_lifecycle import (
     apply_topic_operations,
@@ -802,79 +802,139 @@ class MemoryStore:
         return [json.loads(line) for line in lines[-limit:]]
 
 
-# 将 MemoryStore 的核心能力打包成 6 个基础内置 Tool（受 config/tools.json 白名单开关控制）
+# 内核内置工具子类：承载记忆与文件操作，由统一 build_tool 构建并注入 ToolRegistry
+@dataclass(frozen=True)
+class BuiltinTool(Tool):
+    pass
+
+
+# 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 向 ToolRegistry 提供 6 个 BuiltinTool 子类实例
+class MemoryToolsetProvider(ToolsetProvider):
+    source_type = "builtin"
+    source_name = "memory"
+
+    # 绑定当前实例的 MemoryStore、用户消息回调与逻辑时钟回调
+    def __init__(
+        self,
+        memory: MemoryStore,
+        get_user_message: Callable[[], tuple[str, int | None]] | None = None,
+        get_today: Callable[[], date] | None = None,
+    ) -> None:
+        self.memory = memory
+        self.get_user_message = get_user_message
+        self.get_today = get_today
+
+    # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
+    def tools(self) -> list[Tool]:
+        memory = self.memory
+        get_user_message = self.get_user_message
+        get_today = self.get_today
+
+        # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
+        def search_markdown(query: str, root: str = "data/memory") -> str:
+            ref_day = get_today() if get_today is not None else None
+            return memory.search_markdown(query, root=root, today=ref_day)
+
+        # 适配 read_markdown 工具参数（将模型传入的字符串行号转为整数）
+        def read_markdown(path: str, start_line: str, end_line: str) -> str:
+            try:
+                start, end = int(start_line), int(end_line)
+            except ValueError as error:
+                raise ValueError("start_line 和 end_line 必须是整数。") from error
+            return memory.read_markdown(path, start, end)
+
+        # 适配 write_file 工具：写入工作区并返回相对路径提示
+        def write_file(path: str, content: str, mode: str) -> str:
+            saved = memory.write_workspace_file(path, content, mode=mode)
+            return f"已写入：{saved}"
+
+        # 适配 remember_fact 工具：直接保存当前轮用户原话，防止模型篡改事实
+        def remember_fact() -> str:
+            if get_user_message is None:
+                raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
+            user_text, message_id = get_user_message()
+            target = memory.remember_user_statement(user_text, message_id=message_id)
+            return f"已记录用户原话到 {target}"
+
+        # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
+        def save_rule(statement: str) -> str:
+            path = memory.save_rule(statement, source="agent")
+            return f"已保存行为规则：data/memory/rules/{path.name}"
+
+        specs: list[tuple[str, str, dict[str, str], Callable[..., str], str, dict[str, tuple[str, ...]] | None]] = [
+            (
+                "list_files",
+                "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
+                {"root": "目录起点，如 data/memory、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
+                memory.list_files,
+                "read",
+                None,
+            ),
+            (
+                "search_markdown",
+                "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
+                {"query": "搜索关键词", "root": "搜索目录，如 data/memory、data/workspace、docs"},
+                search_markdown,
+                "read",
+                None,
+            ),
+            (
+                "read_markdown",
+                "按路径和行号读取允许目录内的 Markdown/文本文件。",
+                {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
+                read_markdown,
+                "read",
+                None,
+            ),
+            (
+                "write_file",
+                "在 data/workspace 目录内创建或覆盖文本文件（覆盖前自动备份）。",
+                {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
+                write_file,
+                "write",
+                {"mode": ("create", "overwrite")},
+            ),
+            (
+                "remember_fact",
+                "仅在用户明确要求记住信息时调用，将当前用户原话追加到 data/memory/facts.md（按需检索，不膨胀索引）。",
+                {},
+                remember_fact,
+                "write",
+                None,
+            ),
+            (
+                "save_rule",
+                "将用户要求遵守的行为规则保存到 data/memory/rules/。",
+                {"statement": "规则内容"},
+                save_rule,
+                "write",
+                None,
+            ),
+        ]
+        return [
+            build_tool(
+                fn,
+                name=name,
+                description=desc,
+                parameters=params,
+                param_enums=enums,
+                risk=risk,
+                source_type=self.source_type,
+                source_name=self.source_name,
+                base_cls=BuiltinTool,
+            )
+            for name, desc, params, fn, risk, enums in specs
+        ]
+
+
+# 将 MemoryStore 的核心能力打包成 6 个基础内置 Tool（委派给 MemoryToolsetProvider）
 def memory_tools(
     memory: MemoryStore,
     get_user_message: Callable[[], tuple[str, int | None]] | None = None,
     get_today: Callable[[], date] | None = None,
 ) -> list[Tool]:
-    # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
-    def search_markdown(query: str, root: str = "data/memory") -> str:
-        ref_day = get_today() if get_today is not None else None
-        return memory.search_markdown(query, root=root, today=ref_day)
-
-    # 适配 read_markdown 工具参数（将模型传入的字符串行号转为整数）
-    def read_markdown(path: str, start_line: str, end_line: str) -> str:
-        try:
-            start, end = int(start_line), int(end_line)
-        except ValueError as error:
-            raise ValueError("start_line 和 end_line 必须是整数。") from error
-        return memory.read_markdown(path, start, end)
-
-    # 适配 write_file 工具：写入工作区并返回相对路径提示
-    def write_file(path: str, content: str, mode: str) -> str:
-        saved = memory.write_workspace_file(path, content, mode=mode)
-        return f"已写入：{saved}"
-
-    # 适配 remember_fact 工具：直接保存当前轮用户原话，防止模型篡改事实
-    def remember_fact() -> str:
-        if get_user_message is None:
-            raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
-        user_text, message_id = get_user_message()
-        target = memory.remember_user_statement(user_text, message_id=message_id)
-        return f"已记录用户原话到 {target}"
-
-    # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
-    def save_rule(statement: str) -> str:
-        path = memory.save_rule(statement, source="agent")
-        return f"已保存行为规则：data/memory/rules/{path.name}"
-
-    return [
-        Tool(
-            "list_files",
-            "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
-            {"root": "目录起点，如 data/memory、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
-            memory.list_files,
-        ),
-        Tool(
-            "search_markdown",
-            "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
-            {"query": "搜索关键词", "root": "搜索目录，如 data/memory、data/workspace、docs"},
-            search_markdown,
-        ),
-        Tool(
-            "read_markdown",
-            "按路径和行号读取允许目录内的 Markdown/文本文件。",
-            {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
-            read_markdown,
-        ),
-        Tool(
-            "write_file",
-            "在 data/workspace 目录内创建或覆盖文本文件（覆盖前自动备份）。",
-            {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
-            write_file,
-            param_enums={"mode": ("create", "overwrite")},
-        ),
-        Tool(
-            "remember_fact",
-            "仅在用户明确要求记住信息时调用，将当前用户原话追加到 data/memory/facts.md（按需检索，不膨胀索引）。",
-            {},
-            remember_fact,
-        ),
-        Tool(
-            "save_rule",
-            "将用户要求遵守的行为规则保存到 data/memory/rules/。",
-            {"statement": "规则内容"},
-            save_rule,
-        ),
-    ]
+    return MemoryToolsetProvider(
+        memory,
+        get_user_message=get_user_message,
+        get_today=get_today,
+    ).tools()

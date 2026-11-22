@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from personal_assistant.agent.plugins import Plugin
+
 COMPILER_NAME = "models_dsl"
 
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
@@ -552,10 +554,38 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
     }
 
 
-# 在编译器函数上挂载预设目录与自动生成函数，核心层无需直接 import 插件文件
-compile_models_dsl.presets = list_presets  # type: ignore[attr-defined]
-compile_models_dsl.render = render_models_dsl  # type: ignore[attr-defined]
+# 实现内层 ConfigCompilerProtocol 协议的强类型配置编译器（支持 compile / presets / render 与直接调用）
+class ModelsDSLCompiler:
+    name = COMPILER_NAME
 
-CONFIG_COMPILERS = {
-    COMPILER_NAME: compile_models_dsl,
-}
+    # 编译 DSL 文本为标准 models.json 字典
+    def compile(self, text: str, source: str = "models.dsl") -> dict[str, object]:
+        return compile_models_dsl(text, source=source)
+
+    # 支持作为可调用函数 compiler(text, source) 直接调用
+    def __call__(self, text: str, source: str = "models.dsl") -> dict[str, object]:
+        return compile_models_dsl(text, source=source)
+
+    # 返回内置模型厂商预设列表
+    def presets(self) -> list[dict[str, object]]:
+        return list_presets()
+
+    # 按表单参数自动生成极简一行或块状 DSL 文本
+    def render(self, **kwargs: object) -> str:
+        return render_models_dsl(
+            preset=str(kwargs.get("preset") or ""),
+            api_key=str(kwargs.get("api_key") or ""),
+            model=str(kwargs.get("model") or ""),
+            base_url=str(kwargs.get("base_url") or ""),
+            name=str(kwargs.get("name") or ""),
+            temperature=float(kwargs.get("temperature", 0.2)),  # type: ignore[arg-type]
+        )
+
+
+# 极简模型配置 DSL 主板插件（外层继承 Plugin ABC，内层向 compilers 插槽注册 ConfigCompilerProtocol 实现）
+class ModelsDSLPlugin(Plugin):
+    plugin_id = COMPILER_NAME
+
+    # 统一初始化生命周期：向 self.context.register_compiler 插槽登记 ModelsDSLCompiler
+    def initialize(self) -> None:
+        self.context.register_compiler(ModelsDSLCompiler())
