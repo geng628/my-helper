@@ -65,6 +65,7 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
     )
     tool_obj = next(t for t in registry if t.name == "search_chat_history")
     assert set(tool_obj.parameters) == {"query"}
+    assert "原对话语言" in tool_obj.parameters["query"]
 
     # 调用工具只读检索历史原文，且绝不改动 chat_history.sqlite3 磁盘表结构
     with sqlite3.connect(db_path) as before_conn:
@@ -504,3 +505,115 @@ def test_history_single_topic_session_idf_zero_still_recalls(tmp_path: Path) -> 
         execute_search_chat_history(db_path, "development Kubernetes etcd certificate rotation secret")
         == "未找到匹配的历史对话记录。"
     )
+
+
+# 测试单主题 IDF<=0 时 2/3 查询召回、排序分数不坍缩为 0.0 与负例门控
+def test_history_single_topic_two_thirds_recall_score_nonzero_and_negative_gates(
+    tmp_path: Path,
+) -> None:
+    from plugins.tools.history_tools import _HistoryFTSIndex, execute_search_chat_history
+
+    db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
+    state = StateStore(db_path)
+    try:
+        # 12 条消息均含 back-end（使 back / end 在 FTS5 内 IDF<=0 钳位为 1e-6）
+        for idx in range(1, 7):
+            if idx == 5:
+                state.append_message(
+                    "be-topic",
+                    "user",
+                    "Do you recommend online resources for learning back-end development?",
+                )
+                state.append_message(
+                    "be-topic",
+                    "assistant",
+                    "I recommend NodeSchool, Udacity, and Coursera for back-end learning.",
+                )
+                continue
+            state.append_message(
+                "be-topic",
+                "user",
+                f"Turn {idx}: tell me about back-end architecture and services.",
+            )
+            extra = (
+                " Tip 2: learn a back-end programming language such as Ruby, Python, or PHP."
+                if idx == 4
+                else ""
+            )
+            state.append_message(
+                "be-topic",
+                "assistant",
+                f"Answer {idx}: back-end services manage data and APIs.{extra}",
+            )
+    finally:
+        state.close()
+
+    # msg #8（Ruby, Python, PHP）仅命中 back + end（2/3 = 0.67 覆盖率且 IDF<=0），与 msg #10 均须召回
+    both_recalled = execute_search_chat_history(db_path, "recommend back-end", limit=5)
+    assert "NodeSchool" in both_recalled
+    assert "Ruby, Python, or PHP" in both_recalled
+
+    # 验证直接调用 _HistoryFTSIndex.search() 在 IDF<=0 时分数 > 0.0 且高覆盖命中严格排在低覆盖前
+    index = _HistoryFTSIndex()
+    try:
+        # services(10/12) 与 back/end(12/12) 全部在 FTS5 内触发 IDF<=0，验证 3 词全覆盖(msg #12)严格高于 2/3 覆盖(msg #10)
+        ranked = index.search(db_path, "services back-end", limit=12, context_window=0)
+        assert ranked
+        assert all(hit.score > 0.0 for hit in ranked)
+        scores_by_id = {hit.msg_id: hit.score for hit in ranked}
+        assert scores_by_id[12] > scores_by_id[10]
+    finally:
+        index.close()
+
+    # 验证单主题 IDF<=0 场景下低覆盖负例（1/2、2/4、1/6）仍严格返回空
+    assert execute_search_chat_history(db_path, "services nonexistent") == "未找到匹配的历史对话记录。"
+    assert (
+        execute_search_chat_history(db_path, "back-end nonexistent alpha beta")
+        == "未找到匹配的历史对话记录。"
+    )
+    assert (
+        execute_search_chat_history(db_path, "services Kubernetes etcd vault rotation secret")
+        == "未找到匹配的历史对话记录。"
+    )
+
+
+# 测试由 prev_tokens 跨轮命中触发的前一条助手消息保留 1800 字符完整证据，不被 600 字符腰斩
+def test_history_prev_tokens_evidence_not_clipped_at_600(tmp_path: Path) -> None:
+    from plugins.tools.history_tools import _HistoryFTSIndex, execute_search_chat_history
+
+    db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
+    state = StateStore(db_path)
+    try:
+        filler = "Recommendation item details and craft notes for India textiles. " * 12
+        assert len(filler) > 650
+        state.append_message(
+            "s-prev",
+            "assistant",
+            f"1. Fabriclore.\n{filler}\n4. NostalgiaStoreMarker is an online store based in India.",
+        )
+        state.append_message(
+            "s-prev",
+            "user",
+            "Thanks! Do you have online communities forum discussion suggestions?",
+        )
+        state.append_message(
+            "s-prev",
+            "assistant",
+            "Sure, you can explore craft groups.",
+        )
+    finally:
+        state.close()
+
+    # user #2 本体命中 4 个词且 prev_tokens 命中 NostalgiaStoreMarker（cov=1.0）；assistant #1 本体仅 1/5=0.20 < 0.22
+    query = "NostalgiaStoreMarker online communities forum discussion"
+    index = _HistoryFTSIndex()
+    try:
+        hits = index.search(db_path, query, limit=5)
+        assert len(hits) == 1
+        assert hits[0].msg_id == 2
+        assert hits[0].prev_matched is True
+    finally:
+        index.close()
+
+    rendered = execute_search_chat_history(db_path, query, limit=5)
+    assert "NostalgiaStoreMarker is an online store based in India." in rendered

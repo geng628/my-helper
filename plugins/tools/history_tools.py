@@ -29,6 +29,7 @@ class HistoryHit:
     created_at: str
     score: float
     context_messages: tuple[tuple[int, str, str, str], ...]
+    prev_matched: bool = False
 
 
 # 单个 chat_history.sqlite3 对应的内存增量 FTS5 索引容器（只读同步，零表结构侵入）
@@ -231,36 +232,41 @@ class _HistoryFTSIndex:
                 ).fetchone()[0]
             )
 
-            scored: list[tuple[float, int, str, str, str]] = []
+            scored: list[tuple[float, int, str, str, str, bool]] = []
             for msg_id, m_chat_id, role, created_at, bm25_score, b_tok, p_tok in rows:
                 body_terms = set(str(b_tok).split())
-                all_terms = body_terms | set(str(p_tok).split())
+                prev_terms = set(str(p_tok).split())
+                all_terms = body_terms | prev_terms
                 matched_body = query_set & body_terms
                 matched_all = query_set & all_terms
+                prev_matched = bool(query_set & prev_terms)
                 if not matched_body:
                     continue
                 if len(matched_all) < min_matched:
                     continue
                 bm25_val = max(0.0, float(bm25_score))
                 coverage = len(matched_all) / len(query_set)
-                # 单主题会话中多数消息都含主题词时，FTS5 的 BM25 IDF 可能 <= 0；高覆盖命中（>= 0.75）不被误杀
-                high_coverage = coverage >= 0.75
+                # 单主题会话多数消息含共同主题词时，SQLite FTS5 的 IDF<=0 会钳位到 1e-6，放宽 >=0.6 覆盖（如 2/3 查询）避免误杀
+                high_coverage = coverage >= 0.6
                 if total_msgs >= 10 and bm25_val < cfg.min_bm25_score and not high_coverage:
                     continue
                 high_conf_bm25 = len(matched_all) >= 3 and bm25_val >= 10.0
                 if coverage < cfg.min_term_coverage and not high_conf_bm25:
                     continue
                 body_ratio = len(matched_body) / len(query_set)
-                base_score = bm25_val if bm25_val > 0.0 else 0.1
+                # 对 IDF 钳位导致的极小正 bm25 值（~1e-6）同步托底，防止 round 后全坍缩成 0.0 而丢失覆盖率排序
+                base_score = max(bm25_val, cfg.min_bm25_score, 0.1)
                 final_score = round(base_score * (1.0 + 0.6 * coverage + 0.4 * body_ratio), 4)
-                scored.append((final_score, int(msg_id), str(m_chat_id), str(role), str(created_at)))
+                scored.append(
+                    (final_score, int(msg_id), str(m_chat_id), str(role), str(created_at), prev_matched)
+                )
 
             scored.sort(key=lambda item: (-item[0], -item[1]))
 
-            chosen: list[tuple[float, int, str, str, str]] = []
+            chosen: list[tuple[float, int, str, str, str, bool]] = []
             chosen_by_chat: dict[str, list[int]] = {}
             for item in scored:
-                _, hit_id, m_chat_id, _, _ = item
+                _, hit_id, m_chat_id, _, _, _ = item
                 prev_ids = chosen_by_chat.setdefault(m_chat_id, [])
                 if any(abs(hit_id - prev_id) <= window_val for prev_id in prev_ids):
                     continue
@@ -270,7 +276,7 @@ class _HistoryFTSIndex:
                     break
 
             hits: list[HistoryHit] = []
-            for score, hit_id, m_chat_id, role, created_at in chosen:
+            for score, hit_id, m_chat_id, role, created_at, prev_matched in chosen:
                 prev_rows = self.conn.execute(
                     """
                     SELECT id, role, content, created_at
@@ -308,6 +314,7 @@ class _HistoryFTSIndex:
                         created_at=created_at,
                         score=score,
                         context_messages=tuple(ctx_rows),
+                        prev_matched=prev_matched,
                     )
                 )
             return hits
@@ -369,14 +376,19 @@ def format_history_hits(hits: list[HistoryHit]) -> str:
         )
         for pos, (cid, role, content, created_at) in enumerate(hit.context_messages):
             is_matched = cid == hit.msg_id
-            # 当命中用户提问时，紧随其后的助手答复也保留完整长度，避免长推荐列表被腰斩
+            # 当命中用户提问时保留紧随其后的助手答复完整长度；当命中依赖 prev_tokens 跨轮证据时亦保留前一条消息完整长度
             is_paired_reply = (
                 matched_pos != -1
                 and pos == matched_pos + 1
                 and hit.context_messages[matched_pos][1] == "user"
                 and role == "assistant"
             )
-            cap = MAX_MATCHED_MSG_CHARS if (is_matched or is_paired_reply) else MAX_NEIGHBOR_MSG_CHARS
+            is_prev_evidence = matched_pos != -1 and pos == matched_pos - 1 and hit.prev_matched
+            cap = (
+                MAX_MATCHED_MSG_CHARS
+                if (is_matched or is_paired_reply or is_prev_evidence)
+                else MAX_NEIGHBOR_MSG_CHARS
+            )
             marker = ">>> " if is_matched else "    "
             day_part = created_at[:10] if created_at else ""
             lines.append(f"{marker}[{role} #{cid} | {day_part}] {_clip_message(content, cap)}")
@@ -421,7 +433,7 @@ def execute_search_chat_history(
         "当先查 data/memory/ 后仍缺少过往具体细节（如助手曾给出的推荐选项、研究数据、原话）时调用；"
         "当前有效状态、更新后决策与偏好仍以 data/memory/ 为准。"
     ),
-    parameters={"query": "搜索关键词（中英文皆可），用于匹配历史对话原文"},
+    parameters={"query": "搜索关键词（请使用原对话语言的核心词，如英文对话用英文词、中文对话用中文词）"},
     risk="read",
 )
 def search_chat_history(
