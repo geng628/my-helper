@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from evals import evaluate_memory, judge_answer, load_scenarios, main, write_scenarios_jsonl
 from evals.memory_eval import JUDGE_SYSTEM_PROMPT
-from personal_assistant.ai import LLMClient, TokenUsage
+from personal_assistant.ai import LLMClient, OpenAICompatibleLLM, TokenUsage
 
 
 # 可按序返回预设消息与 usage 的脚本化假模型，用于确定性测试 memory_eval
@@ -635,3 +637,122 @@ def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() ->
     assert "correct=false" in rule2_lower
     assert "false premise were true" in rule2_lower
     assert "speculating/fabricating unrecorded facts is correct=false" in rule2_lower
+
+
+# 构造测试用 OpenAI /choices 模拟响应字典
+def _mock_choice_resp(content: str | None, prompt: int, cached: int, completion: int, tool_calls: list[dict[str, object]] | None = None) -> dict[str, object]:
+    msg: dict[str, object] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        msg["tool_calls"] = tool_calls
+    return {
+        "choices": [
+            {"message": msg}
+        ],
+        "usage": {"prompt_tokens": prompt, "prompt_cache_hit_tokens": cached, "completion_tokens": completion},
+    }
+
+
+# 测试 evaluate_memory(workers>1) 参数校验、真并发执行、乱序完成保序汇总、shared_group 隔离与 CLI --workers 透传
+def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_arg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for bad in (0, -1, True):
+        with pytest.raises(ValueError, match="workers"):
+            evaluate_memory(ScriptedMemoryEvalLLM([]), [], workers=bad)  # type: ignore[arg-type]
+
+    # 1. 4 场景共享单个 OpenAICompatibleLLM 真并发（Barrier(4) 强证）且逆序完成仍严格按原序输出
+    scenarios = [
+        {"id": f"sc-{i}", "category": "extraction", "steps": [{"action": "ask", "chat_id": f"c-{i}", "message": f"q #{i}", "must_include": ["nonexistent"] if i == 1 else [f"ok-{i}"]}]}
+        for i in range(4)
+    ]
+    barrier = threading.Barrier(4, timeout=5.0)
+
+    # 通过 Barrier(4) 与逆序休眠迫使 sc-3 先完、sc-0 后完
+    def concurrent_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        idx = int(str(msgs[-1]["content"]).split("#")[-1])
+        barrier.wait()
+        time.sleep((3 - idx) * 0.03)
+        return _mock_choice_resp(f"ok-{idx}", 200 + idx, 50 + idx, 10 + idx)
+
+    shared_llm = OpenAICompatibleLLM(api_key="sk-test", base_url="https://example.com/v1", model="demo-model", post_json=concurrent_post)
+    main_thread = threading.current_thread()
+    progress_events: list[tuple[int, int, str, threading.Thread]] = []
+    report = evaluate_memory(
+        shared_llm,
+        scenarios,
+        workers=4,
+        on_progress=lambda d, t, r: progress_events.append((d, t, str(r["id"]), threading.current_thread())),
+        git_commit="conc-sha",
+    )
+    assert [item["id"] for item in report["scenarios"]] == ["sc-0", "sc-1", "sc-2", "sc-3"]
+    assert report["summary"]["passed_scenarios"] == 3 and report["summary"]["failed_scenarios"] == 1
+    assert [item["id"] for item in report["failures"]] == ["sc-1"]
+    assert report["summary"]["cache"]["llm_calls"] == 4
+    assert report["summary"]["cache"]["prompt_tokens"] == 806
+    assert report["summary"]["cache"]["cached_tokens"] == 206
+    assert report["summary"]["cache"]["completion_tokens"] == 46
+    assert [ev[:2] for ev in progress_events] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+    assert all(ev[3] is main_thread for ev in progress_events)
+
+    # 2. shared_group + workers=3：前置沉淀只执行 1 次且先于 QA 完成，3 路 QA 并发且文件写入互不污染
+    setup_ready, setup_lock, consolidate_calls = threading.Event(), threading.Lock(), 0
+    qa_barrier = threading.Barrier(3, timeout=5.0)
+    setup_steps = [
+        {"action": "seed_history", "chat_id": "conv-s1", "messages": [{"role": "user", "content": "Alice adopted Max."}, {"role": "assistant", "content": "Nice."}]},
+        {"action": "consolidate", "chat_id": "conv-s1", "today": "2023-05-01"},
+    ]
+    shared_scenarios = [
+        {
+            "id": f"shared-qa-{i}",
+            "category": "single-hop",
+            "shared_group": "conv-shared-conc",
+            "setup_step_count": len(setup_steps),
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [*setup_steps, {
+                "action": "ask", "chat_id": "eval-query", "today": "2023-05-10", "message": f"QA{i}_TAG: dog name?", "must_include": ["Max"],
+                "file_checks": [{"path": "data/memory/pets.md", "must_include": ["Max"]}, {"path": "data/memory/facts.md", "must_include": ["QA0_TAG"] if i == 0 else [], "must_not_include": [] if i == 0 else ["QA0_TAG"]}],
+            }],
+        }
+        for i in range(3)
+    ]
+
+    # 处理共享前置沉淀与 3 路并发 QA 请求的模拟 POST
+    def shared_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+        nonlocal consolidate_calls
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        if payload.get("tools") is None and "后台记忆整理器" in str(msgs[0].get("content") or ""):
+            with setup_lock:
+                consolidate_calls += 1
+            setup_ready.set()
+            body = json.dumps({"session_summary": "Max.", "memories": [{"topic": "pets", "title": "宠物", "index_summary": "宠物", "operations": [{"op": "add", "text": "Alice adopted Max."}]}]}, ensure_ascii=False)
+            return _mock_choice_resp(body, 400, 0, 40)
+        last_user = next(str(m.get("content") or "") for m in reversed(msgs) if m.get("role") == "user")
+        if not any(m.get("role") == "tool" for m in msgs):
+            assert setup_ready.is_set()
+            qa_barrier.wait()
+            if "QA0_TAG" in last_user:
+                return _mock_choice_resp(None, 300, 0, 15, tool_calls=[{"id": "call-qa0", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}])
+        return _mock_choice_resp("Alice's dog is named Max.", 310, 120, 12)
+
+    shared_report = evaluate_memory(
+        OpenAICompatibleLLM(api_key="sk-test", base_url="https://example.com/v1", model="demo-model", post_json=shared_post),
+        shared_scenarios,
+        workers=3,
+        git_commit="shared-conc-sha",
+    )
+    assert consolidate_calls == 1 and shared_report["summary"]["passed_scenarios"] == 3
+    assert [item["id"] for item in shared_report["scenarios"]] == ["shared-qa-0", "shared-qa-1", "shared-qa-2"]
+
+    # 3. 验证 CLI --workers 校验及透传
+    with pytest.raises(ValueError, match="workers"):
+        main(["--mode", "memory", "--workers", "0"])
+    cli_cases = tmp_path / "cli_cases.jsonl"
+    cli_cases.write_text(json.dumps(scenarios[0], ensure_ascii=False) + "\n", encoding="utf-8")
+    captured: list[int] = []
+    monkeypatch.setattr(
+        "evals.cli.evaluate_memory",
+        lambda llm, sc, **kw: captured.append(int(kw["workers"])) or {"mode": "memory", "git_commit": "cli", "summary": {}, "failures": [], "scenarios": []},
+    )
+    assert main(["--mode", "memory", "--cases", str(cli_cases), "--workers", "4", "--no-judge"]) == 0
+    assert captured == [4]
