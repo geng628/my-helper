@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from personal_assistant.agent.plugins import Plugin, PluginManager
 from personal_assistant.agent.tools import ToolDocument, ToolMetadata
@@ -272,3 +276,190 @@ def test_assistant_app_react_uses_search_chat_history_with_turn_isolation(tmp_pa
         assert current_question not in obs
     finally:
         app.close()
+
+
+# 测试有界 LRU 淘汰下的租约钉住机制与多线程并发检索（淘汰后不崩且不静默漏查，释放后延迟关闭）
+def test_history_lru_eviction_lease_pinning_and_concurrency(tmp_path: Path) -> None:
+    from plugins.tools.history_tools import (
+        MAX_CACHED_DBS,
+        _checkout_history_index,
+        _release_history_index,
+        execute_search_chat_history,
+    )
+
+    total_dbs = MAX_CACHED_DBS + 4
+    db_paths: list[Path] = []
+    for i in range(total_dbs):
+        db_p = tmp_path / f"db_{i:02d}" / "chat_history.sqlite3"
+        st = StateStore(db_p)
+        try:
+            st.append_message("s1", "assistant", f"唯一项目代号 NebulaToken{i:02d} 部署完毕。")
+        finally:
+            st.close()
+        db_paths.append(db_p)
+
+    # 1. 确定性租约钉住测试：借出 db_0 后触发多次淘汰，pin 期间仍可正常检索，释放后才关闭连接
+    pinned = _checkout_history_index(db_paths[0])
+    try:
+        for i in range(1, total_dbs):
+            out = execute_search_chat_history(db_paths[i], f"NebulaToken{i:02d}")
+            assert f"NebulaToken{i:02d}" in out
+        assert pinned._retired is True
+        hits = pinned.search(db_paths[0], "NebulaToken00")
+        assert hits and "NebulaToken00" in hits[0].context_messages[0][2]
+    finally:
+        _release_history_index(pinned)
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        pinned.conn.execute("SELECT 1")
+
+    # 2. 多线程并发跨 > MAX_CACHED_DBS 库检索无竞态异常且 100% 准确命中
+    def _worker(idx: int) -> str:
+        target_idx = idx % total_dbs
+        return execute_search_chat_history(db_paths[target_idx], f"NebulaToken{target_idx:02d}")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_worker, range(total_dbs * 3)))
+    for idx, res in enumerate(results):
+        assert f"NebulaToken{idx % total_dbs:02d}" in res
+
+
+# 测试 AssistantApp 多轮 chat() 复用同一缓存插件模块并保持增量游标跨轮递增（不重复全表重扫）
+def test_assistant_app_multi_turn_reuses_incremental_history_index(tmp_path: Path) -> None:
+    llm = ScriptedHistoryLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "t1_call",
+                        "type": "function",
+                        "function": {
+                            "name": "search_chat_history",
+                            "arguments": '{"query": "HeliosFirstMilestone"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "第1轮已查到 HeliosFirstMilestone。"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "t2_call",
+                        "type": "function",
+                        "function": {
+                            "name": "search_chat_history",
+                            "arguments": '{"query": "HeliosSecondMilestone"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "第2轮已查到 HeliosSecondMilestone。"},
+        ]
+    )
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=REPO_ROOT / "config" / "tools.json",
+        project_root=REPO_ROOT,
+        llm=llm,
+    )
+    try:
+        app.state.append_message("s-multi", "assistant", "早期记录 HeliosFirstMilestone 完成。")
+        r1 = app.chat("查一下 HeliosFirstMilestone", chat_id="s-multi")
+        assert "HeliosFirstMilestone" in str(r1["tool_calls"][0]["observation"])
+
+        hist_mods = [m for name, m in sys.modules.items() if name.startswith("my_helper_plugin_history_tools_")]
+        assert len(hist_mods) == 1
+        mod_turn1 = hist_mods[0]
+        cache_dict_id_turn1 = id(mod_turn1._HISTORY_INDICES)
+        idx_turn1 = mod_turn1._HISTORY_INDICES[app.state.db_path.resolve()]
+        last_id_turn1 = idx_turn1.last_indexed_id
+        assert last_id_turn1 > 0
+
+        # 轮间追加新记录后执行第2轮对话，模块与索引实例均应复用且游标向前增量推进
+        new_msg_id = app.state.append_message("s-multi", "assistant", "新增记录 HeliosSecondMilestone 上线。")
+        r2 = app.chat("查一下 HeliosSecondMilestone", chat_id="s-multi")
+        assert "HeliosSecondMilestone" in str(r2["tool_calls"][0]["observation"])
+
+        mod_turn2 = next(m for name, m in sys.modules.items() if name.startswith("my_helper_plugin_history_tools_"))
+        assert mod_turn2 is mod_turn1
+        assert id(mod_turn2._HISTORY_INDICES) == cache_dict_id_turn1
+        idx_turn2 = mod_turn2._HISTORY_INDICES[app.state.db_path.resolve()]
+        assert idx_turn2 is idx_turn1
+        assert idx_turn2.last_indexed_id >= new_msg_id
+        assert idx_turn2.last_indexed_id > last_id_turn1
+    finally:
+        app.close()
+
+
+# 测试长消息裁剪（配对助手长推荐保留至 1800 字符 vs 普通邻居 600 字符）、总字节上限与 retrieval_config 透传
+def test_history_truncation_and_retrieval_config_forwarding(tmp_path: Path) -> None:
+    from plugins.tools.history_tools import (
+        MAX_MATCHED_MSG_CHARS,
+        MAX_NEIGHBOR_MSG_CHARS,
+        MAX_OUTPUT_BYTES,
+        execute_search_chat_history,
+    )
+
+    db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
+    state = StateStore(db_path)
+    try:
+        state.append_message("s-trunc", "assistant", "PRE_NEIGHBOR " + ("A" * 900) + " PRE_TAIL_SHOULD_CLIP")
+        state.append_message("s-trunc", "user", "请推荐学习书单 UniqueTriggerQuery")
+        state.append_message(
+            "s-trunc",
+            "assistant",
+            "PAIRED_REPLY " + ("B" * 1500) + " PAIRED_TAIL_KEPT " + ("C" * 500) + " OVER_1800_CLIPPED",
+        )
+    finally:
+        state.close()
+
+    formatted = execute_search_chat_history(db_path, "UniqueTriggerQuery")
+    assert "PAIRED_TAIL_KEPT" in formatted
+    assert "OVER_1800_CLIPPED" not in formatted
+    assert "PRE_NEIGHBOR" in formatted
+    assert "PRE_TAIL_SHOULD_CLIP" not in formatted
+    assert MAX_MATCHED_MSG_CHARS == 1800 and MAX_NEIGHBOR_MSG_CHARS == 600
+
+    # 验证多条长命中叠加时总输出字节严格受 MAX_OUTPUT_BYTES 限制
+    big_db = tmp_path / "big" / "chat_history.sqlite3"
+    big_state = StateStore(big_db)
+    try:
+        for i in range(6):
+            big_state.append_message(
+                f"c{i}",
+                "assistant",
+                f"BatchMarkerHit {i} " + ("内容块" * 800),
+            )
+    finally:
+        big_state.close()
+    big_out = execute_search_chat_history(big_db, "BatchMarkerHit", limit=6)
+    notice = "\n…（输出已截断）"
+    assert big_out.endswith(notice)
+    assert len(big_out.encode("utf-8")) <= MAX_OUTPUT_BYTES + len(notice.encode("utf-8"))
+
+    # 验证 config/tools.json 的 retrieval 段透传到 search_chat_history 的 retrieval_config 门控
+    strict_cfg_path = tmp_path / "strict_tools.json"
+    strict_cfg_path.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["search_chat_history"],
+                "plugins": ["plugins"],
+                "retrieval": {"plugin": "fts5_bm25", "min_term_coverage": 0.99},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    strict_reg = ToolsConfig.load(strict_cfg_path, project_root=REPO_ROOT).build_registry(
+        data_root=tmp_path / "data",
+        tool_context={"history_db_path": db_path},
+    )
+    # 2 个查询词只命中 1 个词（覆盖率 0.5 < 0.99），严格透传配置下应拦截并返回空
+    assert (
+        strict_reg.execute("search_chat_history", '{"query": "UniqueTriggerQuery NonExistentWord"}')
+        == "未找到匹配的历史对话记录。"
+    )

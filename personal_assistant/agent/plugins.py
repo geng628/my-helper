@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -244,21 +245,42 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
-# 动态导入单个插件 .py 文件并注册到 sys.modules，触发 Plugin.__init_subclass__ 自动登记
+_IMPORT_LOCK = threading.RLock()
+_MODULE_FINGERPRINTS: dict[str, tuple[int, int, int]] = {}
+
+
+# 动态导入单个插件 .py 文件并注册到 sys.modules（按文件指纹缓存未改动模块，支持热重载并保留模块级状态）
 def _import_plugin_module(file_path: Path) -> ModuleType:
-    digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
-    module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"无法加载插件文件：{file_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    resolved = file_path.resolve()
     try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+        st = resolved.stat()
+        fingerprint: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        fingerprint = None
+    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:10]
+    module_name = f"my_helper_plugin_{resolved.stem}_{digest}"
+    with _IMPORT_LOCK:
+        cached = sys.modules.get(module_name)
+        if (
+            cached is not None
+            and fingerprint is not None
+            and _MODULE_FINGERPRINTS.get(module_name) == fingerprint
+        ):
+            return cached
+        spec = importlib.util.spec_from_file_location(module_name, resolved)
+        if spec is None or spec.loader is None:
+            raise ValueError(f"无法加载插件文件：{file_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            _MODULE_FINGERPRINTS.pop(module_name, None)
+            raise
+        if fingerprint is not None:
+            _MODULE_FINGERPRINTS[module_name] = fingerprint
+        return module
 
 
 # 统一通过 build_tool 将 Tool 实例标准化为带 source_name 与预绑定上下文的动态 Tool 子类

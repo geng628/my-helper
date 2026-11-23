@@ -62,6 +62,8 @@ class _HistoryFTSIndex:
         self.last_indexed_id = 0
         self.indexed_count = 0
         self.last_tokens_by_chat: dict[str, str] = {}
+        self._active_users = 0
+        self._retired = False
 
     # 线程安全地关闭内存 FTS5 连接
     def close(self) -> None:
@@ -96,6 +98,8 @@ class _HistoryFTSIndex:
                     "SELECT COALESCE(MAX(id), 0), COUNT(*) FROM messages"
                 ).fetchone()
             except sqlite3.OperationalError:
+                self._reset()
+                self.db_ino = -1
                 return False
             max_id = int(stat_row[0]) if stat_row else 0
             total_count = int(stat_row[1]) if stat_row else 0
@@ -121,6 +125,8 @@ class _HistoryFTSIndex:
                 (self.last_indexed_id,),
             ).fetchall()
         except sqlite3.Error:
+            self._reset()
+            self.db_ino = -1
             return False
         finally:
             if ro_conn is not None:
@@ -129,6 +135,9 @@ class _HistoryFTSIndex:
         if not rows:
             return True
 
+        pending_tokens = dict(self.last_tokens_by_chat)
+        pending_last_id = self.last_indexed_id
+        pending_count = self.indexed_count
         with self.conn:
             for msg_id, chat_id, role, content, created_at in rows:
                 mid = int(msg_id)
@@ -136,7 +145,7 @@ class _HistoryFTSIndex:
                 text = str(content)
                 body_tok = " ".join(tokenize_text(text, for_query=False))
                 # prev_tokens 仅引用同一会话前一条消息，严格保证单向追加与 before_msg_id 隔离
-                prev_tok = self.last_tokens_by_chat.get(cid, "")
+                prev_tok = pending_tokens.get(cid, "")
                 self.conn.execute(
                     """
                     INSERT INTO msg_meta (id, chat_id, role, content, created_at)
@@ -151,9 +160,13 @@ class _HistoryFTSIndex:
                     """,
                     (mid, body_tok, prev_tok),
                 )
-                self.last_tokens_by_chat[cid] = body_tok
-                self.last_indexed_id = mid
-                self.indexed_count += 1
+                pending_tokens[cid] = body_tok
+                pending_last_id = mid
+                pending_count += 1
+        # 仅在 SQLite 事务成功提交后再推进内存游标，避免异常回滚后游标漂移
+        self.last_tokens_by_chat = pending_tokens
+        self.last_indexed_id = pending_last_id
+        self.indexed_count = pending_count
         return True
 
     # 同步只读快照后执行 BM25 + 词覆盖率双门控检索，并拼装同会话相邻上下文窗口
@@ -302,20 +315,35 @@ _CACHE_LOCK = threading.RLock()
 _HISTORY_INDICES: OrderedDict[Path, _HistoryFTSIndex] = OrderedDict()
 
 
-# 获取或创建指定数据库路径对应的有界 LRU 增量索引实例
-def _get_history_index(db_path: Path) -> _HistoryFTSIndex:
+# 借出并钉住指定数据库路径对应的有界 LRU 增量索引（在 _CACHE_LOCK 外关闭无人使用的淘汰项）
+def _checkout_history_index(db_path: Path) -> _HistoryFTSIndex:
     key = db_path.resolve()
+    to_close: list[_HistoryFTSIndex] = []
     with _CACHE_LOCK:
         index = _HISTORY_INDICES.get(key)
         if index is not None:
             _HISTORY_INDICES.move_to_end(key)
-            return index
-        index = _HistoryFTSIndex()
-        _HISTORY_INDICES[key] = index
+        else:
+            index = _HistoryFTSIndex()
+            _HISTORY_INDICES[key] = index
+        index._active_users += 1
         while len(_HISTORY_INDICES) > MAX_CACHED_DBS:
             _, oldest = _HISTORY_INDICES.popitem(last=False)
-            oldest.close()
-        return index
+            oldest._retired = True
+            if oldest._active_users == 0:
+                to_close.append(oldest)
+    for old_idx in to_close:
+        old_idx.close()
+    return index
+
+
+# 释放索引租约并在该索引已被 LRU 淘汰且无其他并发使用时关闭底层连接
+def _release_history_index(index: _HistoryFTSIndex) -> None:
+    with _CACHE_LOCK:
+        index._active_users = max(0, index._active_users - 1)
+        should_close = index._retired and index._active_users == 0
+    if should_close:
+        index.close()
 
 
 # 按字符上限裁剪单条消息正文，保留换行结构便于阅读列表
@@ -367,16 +395,19 @@ def execute_search_chat_history(
 ) -> str:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("搜索关键词不能为空。")
-    index = _get_history_index(db_path)
-    hits = index.search(
-        db_path,
-        query,
-        chat_id=chat_id,
-        before_msg_id=before_msg_id,
-        limit=limit,
-        context_window=context_window,
-        config=config,
-    )
+    index = _checkout_history_index(db_path)
+    try:
+        hits = index.search(
+            db_path,
+            query,
+            chat_id=chat_id,
+            before_msg_id=before_msg_id,
+            limit=limit,
+            context_window=context_window,
+            config=config,
+        )
+    finally:
+        _release_history_index(index)
     return format_history_hits(hits)
 
 
