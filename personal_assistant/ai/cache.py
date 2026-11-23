@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from statistics import mean
 
@@ -88,16 +89,18 @@ def format_cache_summary(summary: dict[str, object]) -> str:
     return f"{server_part} | {prefix_part} | 模型调用 {calls} 次"
 
 
-# 缓存监控器：按会话隔离记录上一次请求前缀，并累积全部调用统计
+# 缓存监控器：按会话隔离记录上一次请求前缀，并线程安全地累积全部调用统计
 class CacheMonitor:
-    # 初始化会话前缀缓存与调用明细列表
+    # 初始化线程互斥锁、会话前缀缓存与调用明细列表
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._last_serialized: dict[str, str] = {}
         self.records: list[CallCacheRecord] = []
 
     # 返回当前已记录条数，用于截取单轮或单题区间的增量统计
     def snapshot_index(self) -> int:
-        return len(self.records)
+        with self._lock:
+            return len(self.records)
 
     # 记录一次成功完成的 LLM 调用并计算其与同会话上一次请求的前缀复用率
     def record(
@@ -106,28 +109,31 @@ class CacheMonitor:
         serialized: str,
         usage: TokenUsage | None = None,
     ) -> CallCacheRecord:
-        prev = self._last_serialized.get(session_key)
-        total = len(serialized)
-        if prev is None or total == 0:
-            prefix_len = 0
-            reuse_rate = None
-        else:
-            prefix_len = common_prefix_len(prev, serialized)
-            reuse_rate = round(prefix_len / total, 4)
-        self._last_serialized[session_key] = serialized
-        entry = CallCacheRecord(
-            session_key=session_key,
-            prefix_chars=prefix_len,
-            total_chars=total,
-            prefix_reuse_rate=reuse_rate,
-            usage=usage,
-        )
-        self.records.append(entry)
-        return entry
+        with self._lock:
+            prev = self._last_serialized.get(session_key)
+            total = len(serialized)
+            if prev is None or total == 0:
+                prefix_len = 0
+                reuse_rate = None
+            else:
+                prefix_len = common_prefix_len(prev, serialized)
+                reuse_rate = round(prefix_len / total, 4)
+            self._last_serialized[session_key] = serialized
+            entry = CallCacheRecord(
+                session_key=session_key,
+                prefix_chars=prefix_len,
+                total_chars=total,
+                prefix_reuse_rate=reuse_rate,
+                usage=usage,
+            )
+            self.records.append(entry)
+            return entry
 
     # 汇总从 since 位置起的调用统计（默认汇总全部历史调用）
     def summary(self, since: int = 0) -> dict[str, object]:
-        return summarize_records(self.records[since:])
+        with self._lock:
+            snapshot = list(self.records[since:])
+        return summarize_records(snapshot)
 
     # 包装任意 LLMClient，在不侵入上层循环的前提下自动采集缓存统计
     def wrap(self, llm: LLMClient, session_key: str = "default") -> "TrackingLLMClient":
@@ -147,7 +153,17 @@ class TrackingLLMClient(LLMClient):
         self.inner = inner
         self.monitor = monitor
         self.session_key = session_key
-        self.last_usage: TokenUsage | None = None
+        self._usage_local = threading.local()
+
+    # 读取当前线程最近一次被监控调用的 Token 统计
+    @property
+    def last_usage(self) -> TokenUsage | None:
+        return getattr(self._usage_local, "value", None)
+
+    # 设置当前线程最近一次被监控调用的 Token 统计
+    @last_usage.setter
+    def last_usage(self, value: TokenUsage | None) -> None:
+        self._usage_local.value = value
 
     # 转发请求给底层客户端，并在成功返回后记录本地前缀复用率与服务端 usage
     def respond(
@@ -156,8 +172,10 @@ class TrackingLLMClient(LLMClient):
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
         serialized = serialize_request(messages, tools)
+        self.last_usage = None
         reply = self.inner.respond(messages, tools)
-        usage = getattr(self.inner, "last_usage", None)
-        self.last_usage = usage if isinstance(usage, TokenUsage) else None
-        self.monitor.record(self.session_key, serialized, self.last_usage)
+        raw_usage = getattr(self.inner, "last_usage", None)
+        usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
+        self.last_usage = usage
+        self.monitor.record(self.session_key, serialized, usage)
         return reply

@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from evals import evaluate_memory, judge_answer, load_scenarios, main, write_scenarios_jsonl
 from evals.memory_eval import JUDGE_SYSTEM_PROMPT
-from personal_assistant.ai import LLMClient, TokenUsage
+from personal_assistant.ai import LLMClient, OpenAICompatibleLLM, TokenUsage
 
 
 # 可按序返回预设消息与 usage 的脚本化假模型，用于确定性测试 memory_eval
@@ -635,3 +637,245 @@ def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() ->
     assert "correct=false" in rule2_lower
     assert "false premise were true" in rule2_lower
     assert "speculating/fabricating unrecorded facts is correct=false" in rule2_lower
+
+
+# 测试 evaluate_memory(workers>1) 参数校验、真并发执行、乱序完成下的输入保序汇总、shared_group 隔离与 CLI --workers 透传
+def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_arg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="workers"):
+        evaluate_memory(ScriptedMemoryEvalLLM([]), [], workers=0)
+    with pytest.raises(ValueError, match="workers"):
+        evaluate_memory(ScriptedMemoryEvalLLM([]), [], workers=-1)
+    with pytest.raises(ValueError, match="workers"):
+        evaluate_memory(ScriptedMemoryEvalLLM([]), [], workers=True)  # type: ignore[arg-type]
+
+    # 1. 验证 4 个独立场景共享同一个 OpenAICompatibleLLM 实例真正 4 路并发，且乱序完成仍严格按原顺序输出
+    scenarios = [
+        {
+            "id": f"sc-{idx}",
+            "category": "extraction",
+            "steps": [
+                {
+                    "action": "ask",
+                    "chat_id": f"c-{idx}",
+                    "message": f"question #{idx}",
+                    "must_include": ["nonexistent-token"] if idx == 1 else [f"ok-{idx}"],
+                }
+            ],
+        }
+        for idx in range(4)
+    ]
+    barrier = threading.Barrier(4, timeout=5.0)
+
+    # 通过 Barrier(4) 强证 4 场景真实并发（串行会超时），并按逆序休眠迫使 sc-3 先完、sc-0 后完
+    def concurrent_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> dict[str, object]:
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        user_msg = str(msgs[-1]["content"])
+        idx = int(user_msg.split("#")[-1])
+        barrier.wait()
+        time.sleep((3 - idx) * 0.03)
+        return {
+            "choices": [{"message": {"role": "assistant", "content": f"ok-{idx}"}}],
+            "usage": {
+                "prompt_tokens": 200 + idx,
+                "prompt_cache_hit_tokens": 50 + idx,
+                "completion_tokens": 10 + idx,
+            },
+        }
+
+    shared_llm = OpenAICompatibleLLM(
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        model="demo-model",
+        post_json=concurrent_post,
+    )
+    main_thread = threading.current_thread()
+    progress_events: list[tuple[int, int, str, threading.Thread]] = []
+
+    # 收集主线程收到的进度事件以核验线程安全与递增序号
+    def on_progress(done: int, total: int, record: dict[str, object]) -> None:
+        progress_events.append((done, total, str(record["id"]), threading.current_thread()))
+
+    report = evaluate_memory(
+        shared_llm,
+        scenarios,
+        workers=4,
+        on_progress=on_progress,
+        git_commit="conc-sha",
+    )
+    assert [item["id"] for item in report["scenarios"]] == ["sc-0", "sc-1", "sc-2", "sc-3"]
+    assert report["summary"]["passed_scenarios"] == 3
+    assert report["summary"]["failed_scenarios"] == 1
+    assert [item["id"] for item in report["failures"]] == ["sc-1"]
+    assert report["summary"]["cache"]["llm_calls"] == 4
+    assert report["summary"]["cache"]["prompt_tokens"] == 806
+    assert report["summary"]["cache"]["cached_tokens"] == 206
+    assert report["summary"]["cache"]["completion_tokens"] == 46
+    assert [ev[:2] for ev in progress_events] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+    assert all(ev[3] is main_thread for ev in progress_events)
+
+    # 2. 验证 shared_group + workers=3：共享前置沉淀只执行一次且先于全部 QA 完成，3 条 QA 并发且目录互不污染
+    setup_ready = threading.Event()
+    setup_lock = threading.Lock()
+    consolidate_calls = 0
+    qa_barrier = threading.Barrier(3, timeout=5.0)
+    setup_steps = [
+        {
+            "action": "seed_history",
+            "chat_id": "conv-s1",
+            "messages": [
+                {"role": "user", "content": "Alice adopted a dog named Max."},
+                {"role": "assistant", "content": "Nice, Max is a lovely name."},
+            ],
+        },
+        {"action": "consolidate", "chat_id": "conv-s1", "today": "2023-05-01"},
+    ]
+    shared_scenarios = [
+        {
+            "id": f"shared-qa-{idx}",
+            "category": "single-hop",
+            "shared_group": "conv-shared-conc",
+            "setup_step_count": len(setup_steps),
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [
+                *setup_steps,
+                {
+                    "action": "ask",
+                    "chat_id": "eval-query",
+                    "today": "2023-05-10",
+                    "message": f"QA{idx}_TAG: What is Alice's dog's name?",
+                    "must_include": ["Max"],
+                    "file_checks": [
+                        {"path": "data/memory/pets.md", "must_include": ["Max"]},
+                        {
+                            "path": "data/memory/facts.md",
+                            "must_include": ["QA0_TAG"] if idx == 0 else [],
+                            "must_not_include": [] if idx == 0 else ["QA0_TAG"],
+                        },
+                    ],
+                },
+            ],
+        }
+        for idx in range(3)
+    ]
+
+    # 处理共享前置沉淀与 3 路并发 QA 请求的模拟 POST
+    def shared_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> dict[str, object]:
+        nonlocal consolidate_calls
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        sys_text = str(msgs[0].get("content") or "")
+        tools = payload.get("tools")
+        if tools is None and "后台记忆整理器" in sys_text:
+            with setup_lock:
+                consolidate_calls += 1
+            setup_ready.set()
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "session_summary": "Alice has a dog named Max.",
+                                    "memories": [
+                                        {
+                                            "topic": "pets",
+                                            "title": "宠物记录",
+                                            "index_summary": "宠物名字",
+                                            "operations": [
+                                                {"op": "add", "text": "Alice adopted a dog named Max."}
+                                            ],
+                                        }
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 400, "prompt_cache_hit_tokens": 0, "completion_tokens": 40},
+            }
+
+        has_tool_obs = any(m.get("role") == "tool" for m in msgs)
+        last_user = next(str(m.get("content") or "") for m in reversed(msgs) if m.get("role") == "user")
+        if not has_tool_obs:
+            assert setup_ready.is_set()
+            qa_barrier.wait()
+            if "QA0_TAG" in last_user:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-qa0",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "remember_fact",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 300, "prompt_cache_hit_tokens": 0, "completion_tokens": 15},
+                }
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "Alice's dog is named Max."}}],
+            "usage": {"prompt_tokens": 310, "prompt_cache_hit_tokens": 120, "completion_tokens": 12},
+        }
+
+    shared_group_llm = OpenAICompatibleLLM(
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        model="demo-model",
+        post_json=shared_post,
+    )
+    shared_report = evaluate_memory(
+        shared_group_llm,
+        shared_scenarios,
+        workers=3,
+        git_commit="shared-conc-sha",
+    )
+    assert consolidate_calls == 1
+    assert shared_report["summary"]["passed_scenarios"] == 3
+    assert [item["id"] for item in shared_report["scenarios"]] == ["shared-qa-0", "shared-qa-1", "shared-qa-2"]
+
+    # 3. 验证 CLI --workers 校验及参数透传到 evaluate_memory
+    with pytest.raises(ValueError, match="workers"):
+        main(["--mode", "memory", "--workers", "0"])
+
+    cli_cases = tmp_path / "cli_cases.jsonl"
+    cli_cases.write_text(json.dumps(scenarios[0], ensure_ascii=False) + "\n", encoding="utf-8")
+    captured_workers: list[int] = []
+
+    # 拦截 evaluate_memory 调用并记录传入的 workers 参数
+    def fake_evaluate_memory(llm, scenarios_arg, **kwargs):
+        captured_workers.append(int(kwargs["workers"]))
+        return {
+            "mode": "memory",
+            "git_commit": "cli-sha",
+            "summary": {"total_scenarios": 1, "passed_scenarios": 1, "failed_scenarios": 0},
+            "failures": [],
+            "scenarios": [],
+        }
+
+    monkeypatch.setattr("evals.cli.evaluate_memory", fake_evaluate_memory)
+    rc = main(["--mode", "memory", "--cases", str(cli_cases), "--workers", "4", "--no-judge"])
+    assert rc == 0
+    assert captured_workers == [4]

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
@@ -122,7 +123,17 @@ class OpenAICompatibleLLM(LLMClient):
     model: str
     temperature: float = 0.2
     post_json: PostJson = default_post_json
-    last_usage: TokenUsage | None = field(default=None, init=False, repr=False)
+    _usage_local: threading.local = field(default_factory=threading.local, init=False, repr=False)
+
+    # 读取当前线程最近一次调用记录的 Token 统计（避免多线程共享客户端串台）
+    @property
+    def last_usage(self) -> TokenUsage | None:
+        return getattr(self._usage_local, "value", None)
+
+    # 设置当前线程最近一次调用的 Token 统计
+    @last_usage.setter
+    def last_usage(self, value: TokenUsage | None) -> None:
+        self._usage_local.value = value
 
     # 组装 OpenAI 格式请求体调用 /chat/completions，记录 usage 并返回首条 assistant 消息
     def respond(
@@ -140,6 +151,7 @@ class OpenAICompatibleLLM(LLMClient):
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
+        self.last_usage = None
         response = self.post_json(
             f"{self.base_url.rstrip('/')}/chat/completions",
             payload,

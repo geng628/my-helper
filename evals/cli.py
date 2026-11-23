@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
+    parser.add_argument("--workers", type=int, default=1, help="memory 模式并发场景数（默认 1 串行；>1 并发执行各独立场景）")
     parser.add_argument("--config", default=None, help="tools.json 路径（agent/memory 模式使用）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
     # 以下参数专用于 --mode download 下载并转换公开学术基准（默认落盘到 evals/public）
@@ -73,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42, help="download 模式分层抽样随机种子")
     parser.add_argument("--force", action="store_true", help="download 模式强制重新下载原始 JSON")
     args = parser.parse_args(argv)
+    if args.workers < 1:
+        raise ValueError("--workers 必须 >= 1。")
 
     if args.mode == "download":
         summary = prepare_public_datasets(
@@ -134,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             scenarios,
             config_path=cfg_path,
             judge_llm=judge,
+            workers=args.workers,
             on_progress=_report_progress,
             on_setup_done=_report_setup_done,
         )

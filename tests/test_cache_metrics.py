@@ -1,6 +1,9 @@
 """KV 缓存观测单元测试：验证各厂商 usage 解析、本地前缀复用率与回归检测。"""
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from personal_assistant.ai.cache import (
@@ -156,3 +159,98 @@ def test_cache_monitor_prefix_reuse_regression_and_session_isolation() -> None:
     cold_text = format_cache_summary({"llm_calls": 1, "prompt_tokens": 0, "cached_tokens": 0, "server_cache_hit_rate": None, "mean_prefix_reuse_rate": None})
     assert "服务端未返回 usage" in cold_text
     assert "首次冷启动" in cold_text
+
+
+# 测试多线程共享 OpenAICompatibleLLM 与 CacheMonitor 时 last_usage 线程隔离、统计无丢数且异常自动清零
+def test_openai_compatible_llm_last_usage_and_cache_monitor_thread_safe() -> None:
+    n_threads = 8
+    enter_barrier = threading.Barrier(n_threads, timeout=5.0)
+    read_barrier = threading.Barrier(n_threads, timeout=5.0)
+    should_fail = threading.local()
+
+    # 强制 8 个并发请求交叠返回各线程专属 usage，验证不互相覆盖
+    def concurrent_post(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> dict[str, object]:
+        if getattr(should_fail, "flag", False):
+            raise RuntimeError("boom")
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        tid = int(str(msgs[-1]["content"]).split("-")[-1])
+        enter_barrier.wait()
+        return {
+            "choices": [{"message": {"role": "assistant", "content": f"reply-{tid}"}}],
+            "usage": {
+                "prompt_tokens": 1000 + tid,
+                "prompt_cache_hit_tokens": 100 + tid,
+                "completion_tokens": 10 + tid,
+            },
+        }
+
+    client = OpenAICompatibleLLM(
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        model="demo-model",
+        post_json=concurrent_post,
+    )
+
+    # 先测裸 OpenAICompatibleLLM：全部 8 线程均写完后再同时读 last_usage，绝不串台
+    def worker_direct(tid: int) -> TokenUsage | None:
+        reply = client.respond([{"role": "user", "content": f"thread-{tid}"}])
+        assert reply["content"] == f"reply-{tid}"
+        read_barrier.wait()
+        return client.last_usage
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        observed = list(pool.map(worker_direct, range(n_threads)))
+
+    for tid, usage in enumerate(observed):
+        assert usage == TokenUsage(
+            prompt_tokens=1000 + tid,
+            cached_tokens=100 + tid,
+            completion_tokens=10 + tid,
+        )
+
+    # 再测共享 CacheMonitor + TrackingLLMClient 并发记录，全量统计零丢失、会话键不混用
+    monitor = CacheMonitor()
+
+    # 单线程并发触发 TrackingLLMClient.respond 与 monitor.record
+    def worker_tracked(tid: int) -> TokenUsage | None:
+        tracked = monitor.wrap(client, session_key=f"chat-{tid}")
+        tracked.respond([{"role": "user", "content": f"thread-{tid}"}])
+        return tracked.last_usage
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        tracked_usages = list(pool.map(worker_tracked, range(n_threads)))
+
+    for tid, usage in enumerate(tracked_usages):
+        assert usage == TokenUsage(
+            prompt_tokens=1000 + tid,
+            cached_tokens=100 + tid,
+            completion_tokens=10 + tid,
+        )
+
+    summary = monitor.summary()
+    assert summary["llm_calls"] == n_threads
+    assert summary["prompt_tokens"] == sum(1000 + i for i in range(n_threads))
+    assert summary["cached_tokens"] == sum(100 + i for i in range(n_threads))
+    assert summary["completion_tokens"] == sum(10 + i for i in range(n_threads))
+    by_session = {rec.session_key: rec.usage for rec in monitor.records}
+    assert len(by_session) == n_threads
+    for tid in range(n_threads):
+        assert by_session[f"chat-{tid}"] == TokenUsage(
+            prompt_tokens=1000 + tid,
+            cached_tokens=100 + tid,
+            completion_tokens=10 + tid,
+        )
+
+    # 同一线程随后一次 respond() 失败抛异常时，last_usage 必须清零而非残留旧值
+    enter_barrier = threading.Barrier(1, timeout=5.0)
+    client.respond([{"role": "user", "content": "thread-0"}])
+    assert client.last_usage == TokenUsage(prompt_tokens=1000, cached_tokens=100, completion_tokens=10)
+    should_fail.flag = True
+    with pytest.raises(RuntimeError, match="boom"):
+        client.respond([{"role": "user", "content": "thread-0"}])
+    assert client.last_usage is None
