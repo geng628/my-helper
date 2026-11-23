@@ -233,9 +233,6 @@ class _HistoryFTSIndex:
 
             scored: list[tuple[float, int, str, str, str]] = []
             for msg_id, m_chat_id, role, created_at, bm25_score, b_tok, p_tok in rows:
-                bm25_val = max(0.0, float(bm25_score))
-                if total_msgs >= 10 and bm25_val < cfg.min_bm25_score:
-                    continue
                 body_terms = set(str(b_tok).split())
                 all_terms = body_terms | set(str(p_tok).split())
                 matched_body = query_set & body_terms
@@ -244,7 +241,12 @@ class _HistoryFTSIndex:
                     continue
                 if len(matched_all) < min_matched:
                     continue
+                bm25_val = max(0.0, float(bm25_score))
                 coverage = len(matched_all) / len(query_set)
+                # 单主题会话中多数消息都含主题词时，FTS5 的 BM25 IDF 可能 <= 0；高覆盖命中（>= 0.75）不被误杀
+                high_coverage = coverage >= 0.75
+                if total_msgs >= 10 and bm25_val < cfg.min_bm25_score and not high_coverage:
+                    continue
                 high_conf_bm25 = len(matched_all) >= 3 and bm25_val >= 10.0
                 if coverage < cfg.min_term_coverage and not high_conf_bm25:
                     continue
@@ -415,9 +417,9 @@ def execute_search_chat_history(
 @tool(
     name="search_chat_history",
     description=(
-        "按关键词检索当前轮之前的历史对话原文（含同会话相邻一问一答），"
-        "用于找回未整理进 data/memory/ 的过往推荐、数字或原话细节；"
-        "当前有效状态与偏好以 data/memory/ 为准。"
+        "按关键词只读检索当前轮之前的历史对话原文（含同会话相邻一问一答）。"
+        "当先查 data/memory/ 后仍缺少过往具体细节（如助手曾给出的推荐选项、研究数据、原话）时调用；"
+        "当前有效状态、更新后决策与偏好仍以 data/memory/ 为准。"
     ),
     parameters={"query": "搜索关键词（中英文皆可），用于匹配历史对话原文"},
     risk="read",

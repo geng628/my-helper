@@ -252,14 +252,14 @@ _MODULE_FINGERPRINTS: dict[str, tuple[int, int, int]] = {}
 # 动态导入单个插件 .py 文件并注册到 sys.modules（按文件指纹缓存未改动模块，支持热重载并保留模块级状态）
 def _import_plugin_module(file_path: Path) -> ModuleType:
     resolved = file_path.resolve()
-    try:
-        st = resolved.stat()
-        fingerprint: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
-    except OSError:
-        fingerprint = None
     digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:10]
     module_name = f"my_helper_plugin_{resolved.stem}_{digest}"
     with _IMPORT_LOCK:
+        try:
+            st = resolved.stat()
+            fingerprint: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            fingerprint = None
         cached = sys.modules.get(module_name)
         if (
             cached is not None

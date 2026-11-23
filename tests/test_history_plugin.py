@@ -223,7 +223,6 @@ def test_history_fts5_incremental_sync_db_reset_missing_and_abstention(tmp_path:
 # 测试 AssistantApp 端到端 ReAct 调用 search_chat_history 找回已压缩历史推荐并隔离当前提问
 def test_assistant_app_react_uses_search_chat_history_with_turn_isolation(tmp_path: Path) -> None:
     assert len(SYSTEM_PROMPT) <= 300
-    assert "search_chat_history" in SYSTEM_PROMPT
     assert "不要编造未观测到的结果" in SYSTEM_PROMPT
     assert "建议/推荐/规划" in SYSTEM_PROMPT
 
@@ -274,6 +273,8 @@ def test_assistant_app_react_uses_search_chat_history_with_turn_isolation(tmp_pa
         obs = str(calls[0]["observation"])
         assert "The Anarchist's Tool Chest" in obs
         assert current_question not in obs
+        hist_tool = next(t for t in app.build_tools() if t.name == "search_chat_history")
+        assert "data/memory/" in hist_tool.description
     finally:
         app.close()
 
@@ -382,7 +383,9 @@ def test_assistant_app_multi_turn_reuses_incremental_history_index(tmp_path: Pat
         # 轮间追加新记录后执行第2轮对话，模块与索引实例均应复用且游标向前增量推进
         new_msg_id = app.state.append_message("s-multi", "assistant", "新增记录 HeliosSecondMilestone 上线。")
         r2 = app.chat("查一下 HeliosSecondMilestone", chat_id="s-multi")
-        assert "HeliosSecondMilestone" in str(r2["tool_calls"][0]["observation"])
+        obs_turn2 = str(r2["tool_calls"][0]["observation"])
+        assert "新增记录 HeliosSecondMilestone 上线。" in obs_turn2
+        assert "查一下 HeliosSecondMilestone" not in obs_turn2
 
         mod_turn2 = next(m for name, m in sys.modules.items() if name.startswith("my_helper_plugin_history_tools_"))
         assert mod_turn2 is mod_turn1
@@ -461,5 +464,43 @@ def test_history_truncation_and_retrieval_config_forwarding(tmp_path: Path) -> N
     # 2 个查询词只命中 1 个词（覆盖率 0.5 < 0.99），严格透传配置下应拦截并返回空
     assert (
         strict_reg.execute("search_chat_history", '{"query": "UniqueTriggerQuery NonExistentWord"}')
+        == "未找到匹配的历史对话记录。"
+    )
+
+
+# 测试单主题会话下 FTS5 BM25 IDF <= 0 时，高覆盖命中不被误杀且无关干扰词仍严格拦截
+def test_history_single_topic_session_idf_zero_still_recalls(tmp_path: Path) -> None:
+    from plugins.tools.history_tools import execute_search_chat_history
+
+    db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
+    state = StateStore(db_path)
+    try:
+        # 构造 12 条均包含 front-end back-end development 的单主题对话，使该词组 IDF <= 0
+        for idx in range(6):
+            state.append_message(
+                "single-topic",
+                "user",
+                f"Question {idx}: explain front-end and back-end development responsibilities.",
+            )
+            extra = (
+                " I recommended Ruby, Python, and PHP for back-end web services."
+                if idx == 3
+                else ""
+            )
+            state.append_message(
+                "single-topic",
+                "assistant",
+                f"Answer {idx}: front-end and back-end development handle UI and server logic.{extra}",
+            )
+    finally:
+        state.close()
+
+    recalled = execute_search_chat_history(db_path, "front-end back-end development")
+    assert recalled != "未找到匹配的历史对话记录。"
+    assert "front-end and back-end development" in recalled
+
+    # 高相似低覆盖负例仍必须严格返回空
+    assert (
+        execute_search_chat_history(db_path, "development Kubernetes etcd certificate rotation secret")
         == "未找到匹配的历史对话记录。"
     )
