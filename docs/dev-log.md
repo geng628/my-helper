@@ -468,3 +468,27 @@
     - **遗留失败（4 例）**：`lme-gpt4_2312f94c`（`temporal-reasoning`，S22 与 XPS 13 先后顺序仍待结构化 `event_date` 解决）、`lme-1d4da289`、`lme-cc539528`（科普推荐未沉淀进长期记忆）、`lme-5a7937c8`（同上波动）。
     - **未验证项**：LoCoMo 50 题未在本小 PR 重跑。
 - **下一步**：待 PR 合入 `main` 后，串行推进第 4 块拼图——在 `operations` 与 `format_memory_bullet()` 引入代码级一等公民 **`event_date`** 结构化字段（独立渲染 `(event: YYYY-MM-DD)` 与写入日期 `[YYYY-MM-DD]` 隔离，直击 `lme-gpt4_2312f94c`）。
+
+
+---
+
+### [2026-11-23] 清理过渡期历史兼容胶水，统一现代插件主板与记忆变更协议（Issue `#34`）
+- **目标与思路**：基于 `main` (`9b4b7f3`) 做架构去债，砍掉演进过程中遗留的 5 类过渡期兼容胶水，彻底收敛到“只有一套现代写法（Single Way）”：
+  1. 清理 `plugins/<x>.py → plugins/tools/<x>.py` 隐式路径兜底，显式统一为 `plugins/tools`。
+  2. 清理旧式魔法全局变量插件加载（`_extract_legacy_factories`、`TOOLS = [...]` 列表扫描）、`register_compiler` / `register_provider` 两参数旧分支与 `_callable_compiler`+`setattr` 包装、`ConfigCompiler` 类型别名及 `ModelsDSLCompiler.__call__`，统一收敛为外层 `Plugin(ABC)` + 内层强类型子协议（`Tool` / `RetrieverProtocol` / `ConfigCompilerProtocol` / `LLMProviderProtocol`）；无 `Plugin` 子类的单文件工具脚本仅支持 `@tool` 装饰器一种写法。
+  3. 清理 `load_plugins` / `load_plugin_tools` / `load_plugin_retrievers` / `load_plugin_providers` / `load_plugin_compilers` 5 个批量加载薄壳，统一使用唯一加载入口 `PluginManager.from_entries()`。
+  4. 清理 `build_dynamic_plugin_tool`、`memory_tools()`、`command_tools()` 及 `ToolsConfig` 上冗余的 `plugin_tools` / `plugin_retrievers` / `plugin_compilers` 快照字段和 `plugin_manager is None` 死分支，统一使用 `build_tool()`、`MemoryToolsetProvider`、`CommandToolsetProvider` 与 `ToolsConfig.plugin_manager` 单一真相源。
+  5. 清理 `consolidator.py` 旧格式 `items` 兼容分支与 `MemoryStore.save_memory_entries()` 死接口，唯一保留结构化 `operations`（`add / merge / replace / remove`）与 `apply_memory_operations()`。
+- **改动文件（Issue `#34`，代码提交 `9ce3cc0`）**：
+  - 核心代码：`personal_assistant/agent/plugins.py`、`personal_assistant/agent/tools.py`、`personal_assistant/agent/__init__.py`、`personal_assistant/assistant/commands.py`、`personal_assistant/assistant/memory.py`、`personal_assistant/assistant/consolidator.py`、`personal_assistant/assistant/cli.py`、`personal_assistant/assistant/__init__.py`。
+  - 插件与脚本：`plugins/models_dsl.py`、`scripts/demo.py`。
+  - 单测升级与负向守卫：`tests/test_plugins.py`、`tests/test_architecture.py`、`tests/test_fts5_plugin.py`、`tests/test_models_dsl.py`、`tests/test_step3_memory.py`、`tests/test_consolidator.py`、`tests/test_shell_plugin.py`、`tests/test_web_plugin.py`（新增 `test_legacy_compat_shims_removed_and_rejected` 与 `test_consolidator_ignores_legacy_items_format`）。
+- **Layer 2 独立只读审查 trace（`9ce3cc0`）**：Verdict **`Pass`**（0 Blocker，3 条非阻塞 Nits：`tests/test_plugins.py` 未使用导入 `LLMProviderProtocol`、可补测 2 参数调用拒收及本条 `dev-log.md` 延后追加提醒）。
+- **同口径验证对比（改前 `main` `9b4b7f3` → 改后 `9ce3cc0`）**：
+  - 单元测试 (`uv run pytest -v`)：**104 passed → 106 passed**（4.72s，含三层架构守卫及 2 条新增负向守卫单测）。
+  - AST 中文 `#` 注释校验：全部 18 个改动 `.py` 文件 **0 缺失**。
+  - 离线演示 (`uv run python scripts/demo.py`)：两段离线 ReAct 演示正常跑通。
+  - 40 题自建检索 (`fts5_bm25`)：**38/40 (95.0%)** 持平（`mean_source_recall=0.9483`、`mean_mrr=0.9483`、`negative_clean_rate=1.0`），零退步。
+  - LoCoMo 200 题离线检索 (`fts5_bm25`)：**105/200 (52.5%)** 持平（`mean_source_recall=0.6851`、`mean_mrr=0.6221`），零退步。
+  - **未验证项**：本次未重跑实模多轮/端到端评测（Memory 16 / LongMemEval 35 / LoCoMo 50 / Agent 40），因 `SYSTEM_PROMPT`、`CONSOLIDATION_SYSTEM_PROMPT`、检索算法及模型调用逻辑均零改动。
+- **下一步**：待本 PR 合入 `main` 后，基于干净底座按「干净版路线 A」推进主线——为历史对话 `chat_history.sqlite3` 增加零 Schema 侵入、复用同一 FTS5 分词底座的只读按需原文检索工具 `search_chat_history`。
