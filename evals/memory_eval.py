@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
+from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from personal_assistant.ai.cache import CallCacheRecord, summarize_records
@@ -593,6 +594,51 @@ def _aggregate_scenario_records(records: list[dict[str, object]]) -> dict[str, o
     }
 
 
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+# 按输入顺序或线程池并发执行独立作业：workers>1 时主线程依次回调 on_done，并严格按原序返回
+def _run_ordered_jobs(
+    items: list[_T],
+    worker_fn: Callable[[_T], _R],
+    *,
+    workers: int,
+    on_done: Callable[[int, int, _R], None] | None = None,
+) -> list[_R]:
+    total = len(items)
+    if total == 0:
+        return []
+    if workers == 1 or total == 1:
+        seq_results: list[_R] = []
+        for idx, item in enumerate(items, start=1):
+            res = worker_fn(item)
+            seq_results.append(res)
+            if on_done is not None:
+                on_done(idx, total, res)
+        return seq_results
+
+    results: list[_R | None] = [None] * total
+    with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
+        future_to_idx: dict[Future[_R], int] = {
+            pool.submit(worker_fn, item): idx for idx, item in enumerate(items)
+        }
+        try:
+            done = 0
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                res = fut.result()
+                results[idx] = res
+                done += 1
+                if on_done is not None:
+                    on_done(done, total, res)
+        except Exception:
+            for pending in future_to_idx:
+                pending.cancel()
+            raise
+    return cast(list[_R], results)
+
+
 # 批量运行端到端记忆与生命周期评测（默认 workers=1 串行；workers>1 使用线程池并发独立场景并按输入序汇总）
 def evaluate_memory(
     llm: LLMClient,
@@ -627,7 +673,6 @@ def evaluate_memory(
     grouped: dict[str, list[dict[str, object]]] = {}
     all_cache_records: list[CallCacheRecord] = []
     latencies: list[float] = []
-    total = len(prepared_items)
 
     with tempfile.TemporaryDirectory(prefix="my-helper-shared-eval-") as shared_tmp:
         shared_dirs: dict[str, Path] = {}
@@ -636,111 +681,55 @@ def evaluate_memory(
             safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
             shared_dirs[gid] = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
 
-        # Phase 1：先构建全部共享长记忆只读快照（workers>1 且存在多组共享前置时并发执行）
-        if workers == 1 or len(setup_items) <= 1:
-            for gid, spec in setup_items:
-                s_rep, s_recs = _build_shared_setup(
-                    llm, gid, spec, shared_dirs[gid], cfg_path, project_root
-                )
-                if on_setup_done is not None:
-                    on_setup_done(s_rep)
-                shared_setups_report[gid] = s_rep
-                setup_cache_records.extend(s_recs)
-        else:
-            setup_results: dict[str, tuple[dict[str, object], list[CallCacheRecord]]] = {}
-            with ThreadPoolExecutor(max_workers=min(workers, len(setup_items))) as pool:
-                future_to_gid: dict[Future[tuple[dict[str, object], list[CallCacheRecord]]], str] = {
-                    pool.submit(
-                        _build_shared_setup,
-                        llm,
-                        gid,
-                        spec,
-                        shared_dirs[gid],
-                        cfg_path,
-                        project_root,
-                    ): gid
-                    for gid, spec in setup_items
-                }
-                try:
-                    for fut in as_completed(future_to_gid):
-                        gid = future_to_gid[fut]
-                        s_rep, s_recs = fut.result()
-                        setup_results[gid] = (s_rep, s_recs)
-                        if on_setup_done is not None:
-                            on_setup_done(s_rep)
-                except Exception:
-                    for pending in future_to_gid:
-                        pending.cancel()
-                    raise
-            for gid, _ in setup_items:
-                s_rep, s_recs = setup_results[gid]
-                shared_setups_report[gid] = s_rep
-                setup_cache_records.extend(s_recs)
-
+        # Phase 1：先构建全部共享长记忆只读快照（workers>1 且存在多组时并发）
+        setup_results = _run_ordered_jobs(
+            setup_items,
+            lambda item: _build_shared_setup(
+                llm, item[0], item[1], shared_dirs[item[0]], cfg_path, project_root
+            ),
+            workers=workers,
+            on_done=(lambda _i, _n, item: on_setup_done(item[0])) if on_setup_done is not None else None,
+        )
+        for (gid, _), (s_rep, s_recs) in zip(setup_items, setup_results, strict=True):
+            shared_setups_report[gid] = s_rep
+            setup_cache_records.extend(s_recs)
         all_cache_records.extend(setup_cache_records)
 
-        # Phase 2：统一构造独立隔离的 QA / 场景作业列表，供串行与并发模式共享
-        run_jobs: list[tuple[dict[str, object], list[dict[str, object]], Path | None, bool]] = []
-        for scenario, gid, qa_steps in prepared_items:
-            base_dir = shared_dirs.get(gid) if gid else None
-            setup_has_consolidate = bool(
-                gid
-                and any(
-                    isinstance(s, dict) and s.get("action") == "consolidate"
-                    for s in (shared_specs.get(gid, {}).get("steps") or [])
-                )
+        # Phase 2：并发或串行执行各隔离场景并按输入原序汇总
+        run_jobs = [
+            (
+                scenario,
+                qa_steps,
+                shared_dirs.get(gid) if gid else None,
+                bool(
+                    gid
+                    and any(
+                        isinstance(s, dict) and s.get("action") == "consolidate"
+                        for s in (shared_specs.get(gid, {}).get("steps") or [])
+                    )
+                ),
             )
-            run_jobs.append((scenario, qa_steps, base_dir, setup_has_consolidate))
+            for scenario, gid, qa_steps in prepared_items
+        ]
+        scenario_results = _run_ordered_jobs(
+            run_jobs,
+            lambda job: _run_single_scenario(
+                llm,
+                job[0],
+                cfg_path,
+                project_root,
+                judge_llm=judge_llm,
+                base_data_dir=job[2],
+                steps_override=job[1],
+                disable_auto_consolidation=job[3],
+            ),
+            workers=workers,
+            on_done=(lambda done, total_n, item: on_progress(done, total_n, item[0]))
+            if on_progress is not None
+            else None,
+        )
 
-        scenario_results: list[tuple[dict[str, object], list[CallCacheRecord]] | None] = [None] * total
-        if workers == 1 or total <= 1:
-            for idx, (scenario, qa_steps, base_dir, setup_has_consolidate) in enumerate(run_jobs):
-                rec, recs = _run_single_scenario(
-                    llm,
-                    scenario,
-                    cfg_path,
-                    project_root,
-                    judge_llm=judge_llm,
-                    base_data_dir=base_dir,
-                    steps_override=qa_steps,
-                    disable_auto_consolidation=setup_has_consolidate,
-                )
-                scenario_results[idx] = (rec, recs)
-                if on_progress is not None:
-                    on_progress(idx + 1, total, rec)
-        else:
-            with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
-                future_to_idx: dict[Future[tuple[dict[str, object], list[CallCacheRecord]]], int] = {
-                    pool.submit(
-                        _run_single_scenario,
-                        llm,
-                        scenario,
-                        cfg_path,
-                        project_root,
-                        judge_llm=judge_llm,
-                        base_data_dir=base_dir,
-                        steps_override=qa_steps,
-                        disable_auto_consolidation=setup_has_consolidate,
-                    ): idx
-                    for idx, (scenario, qa_steps, base_dir, setup_has_consolidate) in enumerate(run_jobs)
-                }
-                try:
-                    completed = 0
-                    for fut in as_completed(future_to_idx):
-                        idx = future_to_idx[fut]
-                        rec, recs = fut.result()
-                        scenario_results[idx] = (rec, recs)
-                        completed += 1
-                        if on_progress is not None:
-                            on_progress(completed, total, rec)
-                except Exception:
-                    for pending in future_to_idx:
-                        pending.cancel()
-                    raise
-
-        for result in scenario_results:
-            assert result is not None
-            record, cache_records = result
+        for record, cache_records in scenario_results:
             per_scenario.append(record)
             grouped.setdefault(str(record["category"]), []).append(record)
             all_cache_records.extend(cache_records)

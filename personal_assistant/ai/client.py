@@ -157,8 +157,9 @@ class OpenAICompatibleLLM(LLMClient):
             payload,
             {"Authorization": f"Bearer {self.api_key}"},
         )
+        msg = dict(response["choices"][0]["message"])
         self.last_usage = extract_usage(response)
-        return dict(response["choices"][0]["message"])
+        return msg
 
 
 # 默认内建 OpenAI 兼容 Provider 构造器
