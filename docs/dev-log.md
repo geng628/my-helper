@@ -524,3 +524,23 @@
     - 如实汇报 5 例失败（均 **0 次**调用 `search_chat_history`，无冷库污染或防回退退步）：① `lme-9ea5eabc`（`knowledge-update`，仅调 `read_markdown`，因 5 月 Hawaii 与上月 4 月 Paris 沉淀未分离 `event_date` 错判更近行程）；② `lme-gpt4_194be4b3`（`multi-session`，仅调 `read_markdown`，将待售的 Pearl Export 架子鼓排除在现有乐器数外答成 3 件）；③ `lme-5a7937c8`（`multi-session`，`read_markdown`/`search_markdown` 后仍漏算 Dec 10 共 2 天 vs 3 天）；④ `lme-gpt4_2312f94c`（`temporal-reasoning`，仅调 `read_markdown`，双时间轴有序待 PR #33 修复）；⑤ `lme-35a27287`（`single-session-preference`，`tools=[]` 直接反问城市）。
   - **未验证项**：LoCoMo 50 题多轮记忆与 `--mode agent` 40 题未在本 PR 重跑。
 - **下一步**：合入 PR `#37` 后，将 PR `#33`（`event_date` 结构化时间轴）rebase 到最新 `main` 验收合并（可同时覆盖 `lme-gpt4_2312f94c` 与 `lme-9ea5eabc` 类发生日乱序），随后按需另开极小 PR 隔离 `memory16` 中 `get_current_time()` 宿主机墙钟泄露。
+
+
+---
+
+### [2026-11-23] 线程安全化 `last_usage` / `CacheMonitor` 与评测 `--workers` 并发开关（Issue `#38`）
+- **目标与思路**：解决多轮实模评测串行耗时（LME 35 + Memory 16 合计 ~16 分钟）及多线程并发共享单个 `OpenAICompatibleLLM` 实例时的状态竞态缺陷：
+  1. **线程隔离与互斥锁（`personal_assistant/ai/client.py`、`cache.py`）**：`OpenAICompatibleLLM.last_usage` 与 `TrackingLLMClient.last_usage` 改为 `threading.local()` 存取，并在每次 `respond()` 发起前清零（避免异常路径残留旧统计）；`CacheMonitor` 使用 `threading.Lock` 保护 `snapshot_index()`、`record()` 与 `summary()` 切片快照，仅在内存字典/列表读写期间持锁，不阻塞外部 HTTP 请求与汇总计算（同时根治主对话线程与后台沉淀线程并发写监控的潜在竞态）。
+  2. **纯场景级 `--workers` 并发（`evals/memory_eval.py`、`evals/cli.py`）**：新增可选 `workers: int = 1` / `--workers` 参数（严格校验非 `bool` 且 `>= 1`）；Phase 1 先完成所有 `shared_group` 只读沉淀快照后再启动 Phase 2 各独立场景并发（单场景内部仍保持串行以维护 KV Cache），`on_setup_done` / `on_progress` 在主线程顺序回调，最终严格按输入原始索引恢复 `scenarios`、`failures`、`cache` 与 `latencies` 确定性顺序，异常时取消尚未启动的队列任务。
+- **改动文件（Issue `#38`，代码提交 `e7ab0a9`）**：
+  - `personal_assistant/ai/client.py`：`OpenAICompatibleLLM._usage_local`、`@property`/`@last_usage.setter` 与 `respond()` 前清零。
+  - `personal_assistant/ai/cache.py`：`CacheMonitor._lock` 互斥保护与 `TrackingLLMClient._usage_local` 线程局部统计。
+  - `evals/memory_eval.py` & `evals/cli.py`：`evaluate_memory(..., workers=1)` 两阶段 `ThreadPoolExecutor` 调度、统一 `run_jobs` 构造与 `--workers` 参数接入。
+  - `tests/test_cache_metrics.py` & `tests/test_memory_eval.py`：新增 8 线程双 Barrier 共享客户端/监控压测单测与 4 场景/3 共享 QA Barrier 真并发保序及 CLI `--workers` 单测。
+- **Layer 2 独立只读审查 trace（`e7ab0a9`）**：Verdict **`Pass`**（0 Blocker，3 条非阻塞 Nits：Phase 1 多组共享并发未单设多组 Barrier 单测、`OpenAICompatibleLLM.respond` 解析 `choices` 异常顺序及 `--workers < 1` 全模式校验）。
+- **同口径验证对比（改前 `main` `52867b0` → 改后 `e7ab0a9`）**：
+  - 单元测试 (`uv run pytest -v`)：**116 passed → 118 passed**（含 `tests/test_architecture.py` 及 2 条并发 Barrier 单测；AST 中文 `#` 注释 **0 缺失**）。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`），LoCoMo 200 题保持 **105/200 (52.5%)**（`Recall=0.6851`），零退步。
+  - **真实 API 5 题并发冒烟（`--mode memory --category single-session-assistant --max-cases 5 --workers 5`，`/tmp/issue_eval_workers_smoke5.json`）**：**5/5 (100.0%)**、服务端 KV 命中 **71.81%**、本地前缀复用 **65.62%**（`llm_calls=17`, `prompt_tokens=37,251`），总墙钟耗时 **`17.90s`**（5 题单题延迟之和 `68.2s`，逆序完成但输出列表严格保持原 JSONL 题序）。
+  - **未验证项**：本次小 PR 未重跑完整 35 题 LME 与 16 场景全集（留作下一步 `rebase` PR `#33` 时直接使用 `--workers` 实测验收）。
+- **下一步**：合入本 PR 后，将 PR `#33`（`event_date` 结构化时间轴）rebase 到最新 `main`，用 `--workers 5` 快速完成全量 LME 35 + Memory 16 验收。
