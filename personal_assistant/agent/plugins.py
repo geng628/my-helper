@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ class PluginContext:
     config_path: Path | None = None
     offload_dir: Path | None = None
     raw_config: Mapping[str, object] = field(default_factory=dict)
+    extra_bindings: Mapping[str, object] = field(default_factory=dict)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
@@ -82,15 +84,21 @@ class PluginContext:
     def tool_bindings(self) -> dict[str, object]:
         raw_shell = self.raw_config.get("shell")
         raw_web = self.raw_config.get("web")
-        return {
-            "project_root": self.project_root,
-            "data_root": self.data_root,
-            "config_path": self.config_path,
-            "offload_dir": self.offload_dir,
-            "raw_config": dict(self.raw_config),
-            "shell_config": dict(raw_shell) if isinstance(raw_shell, Mapping) else None,
-            "web_config": dict(raw_web) if isinstance(raw_web, Mapping) else None,
-        }
+        raw_retrieval = self.raw_config.get("retrieval")
+        bindings: dict[str, object] = dict(self.extra_bindings)
+        bindings.update(
+            {
+                "project_root": self.project_root,
+                "data_root": self.data_root,
+                "config_path": self.config_path,
+                "offload_dir": self.offload_dir,
+                "raw_config": dict(self.raw_config),
+                "shell_config": dict(raw_shell) if isinstance(raw_shell, Mapping) else None,
+                "web_config": dict(raw_web) if isinstance(raw_web, Mapping) else None,
+                "retrieval_config": dict(raw_retrieval) if isinstance(raw_retrieval, Mapping) else None,
+            }
+        )
+        return bindings
 
     # 插槽 1：向主板 ToolRegistry 注册一个 Tool 子类实例或 @tool 函数（自动通过 build_tool 绑定当前上下文）
     def register_tool(
@@ -237,21 +245,42 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
     return files
 
 
-# 动态导入单个插件 .py 文件并注册到 sys.modules，触发 Plugin.__init_subclass__ 自动登记
+_IMPORT_LOCK = threading.RLock()
+_MODULE_FINGERPRINTS: dict[str, tuple[int, int, int]] = {}
+
+
+# 动态导入单个插件 .py 文件并注册到 sys.modules（按文件指纹缓存未改动模块，支持热重载并保留模块级状态）
 def _import_plugin_module(file_path: Path) -> ModuleType:
-    digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:10]
-    module_name = f"my_helper_plugin_{file_path.stem}_{digest}"
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"无法加载插件文件：{file_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+    resolved = file_path.resolve()
+    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:10]
+    module_name = f"my_helper_plugin_{resolved.stem}_{digest}"
+    with _IMPORT_LOCK:
+        try:
+            st = resolved.stat()
+            fingerprint: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            fingerprint = None
+        cached = sys.modules.get(module_name)
+        if (
+            cached is not None
+            and fingerprint is not None
+            and _MODULE_FINGERPRINTS.get(module_name) == fingerprint
+        ):
+            return cached
+        spec = importlib.util.spec_from_file_location(module_name, resolved)
+        if spec is None or spec.loader is None:
+            raise ValueError(f"无法加载插件文件：{file_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            _MODULE_FINGERPRINTS.pop(module_name, None)
+            raise
+        if fingerprint is not None:
+            _MODULE_FINGERPRINTS[module_name] = fingerprint
+        return module
 
 
 # 统一通过 build_tool 将 Tool 实例标准化为带 source_name 与预绑定上下文的动态 Tool 子类
@@ -374,12 +403,15 @@ class PluginManager(ToolsetProvider):
         )
         raw_cfg = context.get("raw_config")
         cfg_map = raw_cfg if isinstance(raw_cfg, Mapping) else {}
+        raw_extra = context.get("extra_bindings")
+        extra_map = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
         return PluginContext(
             project_root=project_root,
             data_root=data_root,
             config_path=config_path,
             offload_dir=offload_dir,
             raw_config=cfg_map,
+            extra_bindings=extra_map,
         )
 
     # 返回默认无额外上下文时的插件工具列表（实现 ToolsetProvider.tools）

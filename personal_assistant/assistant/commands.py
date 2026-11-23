@@ -447,6 +447,7 @@ class ToolsConfig:
         extra_tools: Iterable[Tool] = (),
         providers: Iterable[ToolsetProvider] = (),
         data_root: Path | None = None,
+        tool_context: Mapping[str, object] | None = None,
     ) -> ToolRegistry:
         extras = list(extra_tools)
         allowed = [
@@ -464,6 +465,8 @@ class ToolsConfig:
             "offload_dir": offload_dir,
             "raw_config": self.raw_config,
         }
+        if tool_context:
+            build_ctx["extra_bindings"] = dict(tool_context)
 
         for provider in providers:
             registry.register_provider(provider, context=build_ctx)

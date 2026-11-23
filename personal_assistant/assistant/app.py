@@ -174,7 +174,14 @@ class AssistantApp:
         getter = (lambda: (user_text, message_id)) if user_text else None
         provider = MemoryToolsetProvider(self.memory, get_user_message=getter, get_today=self._today)
         if self.tools_config is not None:
-            return self.tools_config.build_registry(providers=[provider], data_root=self.data_root)
+            tool_ctx: dict[str, object] = {"history_db_path": self.state.db_path}
+            if message_id is not None:
+                tool_ctx["before_msg_id"] = message_id
+            return self.tools_config.build_registry(
+                providers=[provider],
+                data_root=self.data_root,
+                tool_context=tool_ctx,
+            )
         registry = ToolRegistry()
         registry.register_provider(provider)
         return registry

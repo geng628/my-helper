@@ -492,3 +492,35 @@
   - LoCoMo 200 题离线检索 (`fts5_bm25`)：**105/200 (52.5%)** 持平（`mean_source_recall=0.6851`、`mean_mrr=0.6221`），零退步。
   - **未验证项**：本次未重跑实模多轮/端到端评测（Memory 16 / LongMemEval 35 / LoCoMo 50 / Agent 40），因 `SYSTEM_PROMPT`、`CONSOLIDATION_SYSTEM_PROMPT`、检索算法及模型调用逻辑均零改动。
 - **下一步**：待本 PR 合入 `main` 后，基于干净底座按「干净版路线 A」推进主线——为历史对话 `chat_history.sqlite3` 增加零 Schema 侵入、复用同一 FTS5 分词底座的只读按需原文检索工具 `search_chat_history`。
+
+
+---
+
+### [2026-11-23] 新增只读增量 FTS5 历史对话检索插件工具 `search_chat_history`（Issue `#36`）
+- **目标与思路**：按干净版路线 A 为“热记忆只提炼用户事实/偏好、不抄录长段助手科普/推荐”的天然权衡补齐 Tier-3 冷原话按需回溯能力，同时严格保持 `db.py`、`prompts.py`（采纳 Option 1 与 `main` `a46878c` 逐字一致）与 `evals/` 零改动、零 Schema 侵入与零旧库兼容包袱：
+  1. **纯 `@tool` 插件落地（`plugins/tools/history_tools.py`）**：通过只读 SQLite URI（`?mode=ro`）读取 `chat_history.sqlite3`，按自增 `id > last_indexed_id` 维护内存增量 FTS5 索引（与 `plugins/fts5_retriever.py` 同构），直接复用 `tokenize_text()` 与 `FTS5Config`（BM25 + 词覆盖率双门控）。
+  2. **通用上下文注入与快照隔离**：在 Layer 2 `PluginContext` 新增业务无关的 `extra_bindings` 与 `retrieval_config` 透传；`AssistantApp.build_tools()` 注入 `{"history_db_path": self.state.db_path, "before_msg_id": message_id}`，检索端以 `id < before_msg_id` 严格隔离当前轮消息（`prev_tokens` 仅单向向后引用同会话前一条、`next_rows` 同受 `id < before_msg_id` 约束），同时保持 `data/state` 仍在 `files`/`shell` 拒绝名单内。
+  3. **参数引导与三大实测缺陷根治（`c7e2ea2` → `0a6cf70`）**：`@tool search_chat_history` 仅暴露单参数 `query`（契合 `ToolRegistry._validate_values` 非空校验），并在参数描述中明确提示使用“原对话语言”（避免中文系统提示词下对英文原文发中文词搜空）；在工具描述内引导先查 `data/memory/`、记忆未记细节时再调 `search_chat_history`；针对单主题 `IDF <= 0`（SQLite 钳位到 `1e-6`）导致 `round(..., 4)` 坍缩 `0.0` 与 `2/3` 查询误杀，放宽 `high_coverage = coverage >= 0.6` 并以 `base_score = max(bm25_val, cfg.min_bm25_score, 0.1)` 保序；传播 `HistoryHit.prev_matched` 让因 `prev_tokens` 跨轮命中的前一条助手答复同样保留 `MAX_MATCHED_MSG_CHARS`（1800 字符），避免长推荐列表被 `MAX_NEIGHBOR_MSG_CHARS`（600 字符）腰斩（直击 `lme-c7cf7dfd` 店铺列表第 4 项 `Nostalgia` 被截断问题）。
+- **改动文件（Issue `#36`，代码提交 `af4d334` → `671ff3b` → `c7e2ea2` → `0a6cf70`）**：
+  - `plugins/tools/history_tools.py`（新增）：`HistoryHit`（含 `prev_matched`）、`_HistoryFTSIndex`（只读增量同步、事务提交后推进游标、异常重置、单主题 `IDF` 托底与 `>= 0.6` 覆盖门控）、有界 LRU 租约钉住（`_checkout_history_index` / `_release_history_index`）、`format_history_hits`（配对回复与 `prev_matched` 证据 1800 字符保留）、`execute_search_chat_history` 与 `@tool search_chat_history`。
+  - `personal_assistant/agent/plugins.py`：新增 `PluginContext.extra_bindings` 与 `retrieval_config` 透传（核心绑定优先覆盖），以及 `_import_plugin_module()` 在 `_IMPORT_LOCK` 内基于文件指纹 `(st_mtime_ns, st_size, st_ino)` 的线程安全模块缓存（支持热重载同时确保跨轮保留 `_HISTORY_INDICES` 状态）。
+  - `personal_assistant/assistant/commands.py`、`app.py`、`config/tools.json`：透传 `tool_context` 并在 `enabled_tools` 启用 `search_chat_history`（`prompts.py`、`db.py` 与 `evals/` 均与 `main` `a46878c` 零 diff）。
+  - `tests/test_history_plugin.py`（新增 10 条单测）与 `tests/test_step2_tools.py`：覆盖只读零改表边界、原对话语言提示契约、中英双语/跨轮 `prev_tokens`/上下文窗口/`before_msg_id` 隔离、增量同步/删库重建/负例空返回、`AssistantApp.chat()` 端到端与多轮复用、多线程 LRU 租约淘汰、截断上限与 `retrieval_config` 透传、单主题 `IDF<=0` 2/3 覆盖召回与非零排序/负例门控、以及 `prev_matched` 证据免于 600 字符截断。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`af4d334`）→ `Blocker`（2 Blocker + 4 Nits）**：① `_get_history_index` 释放 `_CACHE_LOCK` 后并发 LRU 淘汰关闭竞态与锁内阻塞；② `ToolsPlugin.initialize()` 每轮重执行模块清空 `_HISTORY_INDICES` 并泄漏内存连接；另指出 `sync()` 游标更新时机与测试缺口。
+  - **Round 2（`671ff3b`）→ `Pass`（0 Blocker）**：核验 `_active_users`/`_retired` 锁外延迟关闭、文件指纹缓存模块、事务后推进游标与 113/113 全绿。
+  - **Round 3（`c7e2ea2`）→ `Pass`（0 Blocker）**：核验 `prompts.py` 回退 `main`、`_IMPORT_LOCK` 覆盖 `stat()` 与 `high_coverage` 放行，114/114 全绿。
+  - **Round 4（`0a6cf70`）→ `Pass`（0 Blocker，3 条非阻塞 Nits）**：核验 `base_score`、`high_coverage >= 0.6`、低覆盖负例门控、`prev_matched` 传播与 116/116 全绿。
+- **同口径验证对比（改前 `main` `a46878c` → 改后 `0a6cf70`）**：
+  - 单元测试 (`uv run pytest -v`)：**106 passed → 116 passed**（4.70s，含 `test_architecture.py` 及 10 条新增单测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`、`negative_clean_rate=1.0`）；LoCoMo 200 题保持 **105/200 (52.5%)**（`Recall=0.6851`、`MRR=0.6221`），零退步。
+  - **当日同配置对照组 A/B（关闭 vs 开启 `search_chat_history`，同一天 `deepseek-chat`）**：
+    - `single-session-assistant`（5 题）：`main` 等价关闭组 **`1/5 (20.0%)`**（仅过 `lme-561fabcd`） → `0a6cf70` 冒烟实测 **`5/5 (100.0%)`**、全量 35 题复测 **`5/5 (100.0%)`**（连续两次全对；4 道在 `main` 上失败的题目 `lme-1d4da289`、`lme-c7cf7dfd`、`lme-cc539528`、`lme-0e5e2d1a` 均先检索 `data/memory/` 再转调 `search_chat_history` 精准作答）。
+    - `single-session-preference`（5 题）：`main` 等价关闭组 `3/5 (60.0%)` → `0a6cf70` 全量实测 **`4/5 (80.0%)`**，零回退。
+  - **16 场景多轮记忆 Dev（`/tmp/issue_36_v4_memory16.json`，`git=0a6cf70`）**：**16/16 (100.0%)**，服务端 KV 命中 **66.15%**、本地前缀复用 **84.38%**（`completion_tokens=13,228`）；`knowledge-update 4/4`、`abstention 2/2`、`extraction 3/3`、`multi-session 2/2`、`temporal 3/3`、`compaction-cache 2/2` 全类通过；`kv-cache-efficiency` 闲聊全为 `tools=[]`；`temp-fact-expiry` 即使调用过 `search_chat_history` 仍未复活已过期事件，`explicit-forget-remove` 亦通过。
+  - **LongMemEval 35 题全量（`/tmp/issue_36_v4_lme35.json`，`git=0a6cf70`）**：
+    - 总计：**30/35 (85.71%)**，服务端 KV 命中 **55.14%**、本地前缀复用 **76.35%**（`completion_tokens=36,730`）。
+    - 分类：**`single-session-assistant` 5/5 (100%)**、**`abstention` 5/5 (100%)**、**`single-session-user` 5/5 (100%)**、**`single-session-preference` 4/5 (80%)**、`temporal-reasoning` 4/5 (80%)、`knowledge-update` 4/5 (80%)、`multi-session` 3/5 (60%)。
+    - 如实汇报 5 例失败（均 **0 次**调用 `search_chat_history`，无冷库污染或防回退退步）：① `lme-9ea5eabc`（`knowledge-update`，仅调 `read_markdown`，因 5 月 Hawaii 与上月 4 月 Paris 沉淀未分离 `event_date` 错判更近行程）；② `lme-gpt4_194be4b3`（`multi-session`，仅调 `read_markdown`，将待售的 Pearl Export 架子鼓排除在现有乐器数外答成 3 件）；③ `lme-5a7937c8`（`multi-session`，`read_markdown`/`search_markdown` 后仍漏算 Dec 10 共 2 天 vs 3 天）；④ `lme-gpt4_2312f94c`（`temporal-reasoning`，仅调 `read_markdown`，双时间轴有序待 PR #33 修复）；⑤ `lme-35a27287`（`single-session-preference`，`tools=[]` 直接反问城市）。
+  - **未验证项**：LoCoMo 50 题多轮记忆与 `--mode agent` 40 题未在本 PR 重跑。
+- **下一步**：合入 PR `#37` 后，将 PR `#33`（`event_date` 结构化时间轴）rebase 到最新 `main` 验收合并（可同时覆盖 `lme-gpt4_2312f94c` 与 `lme-9ea5eabc` 类发生日乱序），随后按需另开极小 PR 隔离 `memory16` 中 `get_current_time()` 宿主机墙钟泄露。
