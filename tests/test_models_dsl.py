@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.agent.plugins import load_plugin_compilers
+from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.ai import (
     LLMClient,
     ModelProfile,
@@ -24,9 +24,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # 测试插件发现器自动加载 plugins/models_dsl.py 中的 models_dsl 编译器并编译多模型配置
 def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
-    compilers = load_plugin_compilers(["plugins"], REPO_ROOT)
+    compilers = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers
     assert "models_dsl" in compilers
-    compile_fn = compilers["models_dsl"]
+    compiler = compilers["models_dsl"]
 
     dsl = """
     # 极简模型配置：直接填 api_key 即可用，无需用户折腾环境变量
@@ -47,7 +47,7 @@ def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
       temp     0.1
     }
     """
-    compiled = compile_fn(dsl, "models.dsl")
+    compiled = compiler.compile(dsl, "models.dsl")
     assert compiled["default"] == "deepseek"
     assert set(compiled["models"].keys()) == {"deepseek", "local_qwen"}
     assert compiled["models"]["deepseek"]["api_key"] == "sk-live-secret-9876543210"
@@ -56,7 +56,7 @@ def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
     assert compiled["models"]["local_qwen"]["key_env"] == "OLLAMA_API_KEY"
 
     # 单模型省略 default 时自动设为默认模型
-    single = compile_fn(
+    single = compiler.compile(
         "model solo {\n  base_url https://api.example.com/v1\n  model demo-1\n  api_key sk-demo\n}\n",
         "single.dsl",
     )
@@ -72,25 +72,25 @@ def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
 
 # 测试 DSL 编译器对语法错误、未知字段、重复定义、无效 URL/温度与悬空 default 给出精确行列报错
 def test_models_dsl_reports_precise_syntax_and_semantic_errors() -> None:
-    compile_fn = load_plugin_compilers(["plugins"], REPO_ROOT)["models_dsl"]
+    compiler = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers["models_dsl"]
 
     # 未知字段
     with pytest.raises(ValueError, match="第 3 行"):
-        compile_fn(
+        compiler.compile(
             "model a {\n  base_url https://x.com/v1\n  bogus 123\n  model m\n}\n",
             "bad.dsl",
         )
 
     # default 指向不存在的模型
     with pytest.raises(ValueError, match="ghost"):
-        compile_fn(
+        compiler.compile(
             "default ghost\nmodel a {\n  base_url https://x.com/v1\n  model m\n}\n",
             "bad.dsl",
         )
 
     # 重复模型名
     with pytest.raises(ValueError, match="重复"):
-        compile_fn(
+        compiler.compile(
             "model a {\n  base_url https://x.com/v1\n  model m1\n}\n"
             "model a {\n  base_url https://x.com/v1\n  model m2\n}\n",
             "bad.dsl",
@@ -98,13 +98,13 @@ def test_models_dsl_reports_precise_syntax_and_semantic_errors() -> None:
 
     # 非法 base_url 与越界 temperature
     with pytest.raises(ValueError, match="http"):
-        compile_fn("model a {\n  base_url ftp://x.com\n  model m\n}\n", "bad.dsl")
+        compiler.compile("model a {\n  base_url ftp://x.com\n  model m\n}\n", "bad.dsl")
     with pytest.raises(ValueError, match="0"):
-        compile_fn("model a {\n  base_url https://x.com/v1\n  model m\n  temp 3.5\n}\n", "bad.dsl")
+        compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n  temp 3.5\n}\n", "bad.dsl")
 
     # 缺少右花括号
     with pytest.raises(ValueError, match="}"):
-        compile_fn("model a {\n  base_url https://x.com/v1\n  model m\n", "bad.dsl")
+        compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n", "bad.dsl")
 
 
 # 测试直写明文密钥端到端零环境变量运行、落盘 JSON 自动 chmod 600 与回退 models.json
@@ -222,7 +222,7 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
-    compile_fn = load_plugin_compilers(["plugins"], REPO_ROOT)["models_dsl"]
+    compiler = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers["models_dsl"]
     dsl = """
     # 非程序员极简写法：一行自动补全网址、默认模型、provider 与 temperature
     use deepseek sk-ds-one-line
@@ -230,7 +230,7 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
     add ollama
     add openai gpt-4o sk-oa-override
     """
-    compiled = compile_fn(dsl, "simple.dsl")
+    compiled = compiler.compile(dsl, "simple.dsl")
     assert compiled["default"] == "deepseek"
     assert compiled["models"]["deepseek"]["base_url"] == "https://api.deepseek.com/v1"
     assert compiled["models"]["deepseek"]["model"] == "deepseek-chat"

@@ -9,7 +9,7 @@ from personal_assistant.assistant.consolidator import (
     MemoryConsolidator,
 )
 from personal_assistant.assistant.db import StateStore
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, SearchHit, memory_tools
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, MemoryToolsetProvider, SearchHit
 from personal_assistant.assistant.memory_lifecycle import is_line_expired
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT, format_system_prompt
 
@@ -22,6 +22,7 @@ __all__ = [
     "FilesPolicy",
     "MemoryConsolidator",
     "MemoryStore",
+    "MemoryToolsetProvider",
     "ParamSpec",
     "REPO_ROOT",
     "SYSTEM_PROMPT",
@@ -32,6 +33,5 @@ __all__ = [
     "format_system_prompt",
     "is_line_expired",
     "load_dotenv",
-    "memory_tools",
     "truncate_utf8",
 ]

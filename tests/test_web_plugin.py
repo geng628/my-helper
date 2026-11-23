@@ -1,4 +1,4 @@
-"""联网搜索与网页正文提取插件（plugins/web_tools.py）单元测试（TDD）。"""
+"""联网搜索与网页正文提取插件（plugins/tools/web_tools.py）单元测试（TDD）。"""
 from __future__ import annotations
 
 import json

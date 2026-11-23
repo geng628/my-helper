@@ -8,14 +8,23 @@ import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.ai import LLMClient
-from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.plugins import (
+    ConfigCompilerProtocol,
+    LLMProviderProtocol,
+    Plugin,
+    PluginContext,
+    PluginManager,
+)
 from personal_assistant.agent.react import run_react
 
 
+# 测试用脚本化模拟模型
 class ScriptedLLM(LLMClient):
+    # 初始化预设回复序列
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = list(responses)
 
+    # 弹出并返回下一条预设回复
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -24,13 +33,14 @@ class ScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
-def test_load_plugins_supports_decorator_and_tools_list_and_allowlist(tmp_path: Path) -> None:
+# 测试 @tool 装饰器插件、显式 Plugin 子类与白名单拦截机制
+def test_load_plugins_supports_decorator_and_plugin_class_and_allowlist(tmp_path: Path) -> None:
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "_helper.py").write_text("raise RuntimeError('should be ignored')\n", encoding="utf-8")
     (plugins_dir / "my_tools.py").write_text(
         """
-from personal_assistant.agent.tools import Tool, tool
+from personal_assistant.agent.tools import tool
 
 @tool(description="反转字符串", parameters={"text": "输入文本"})
 def reverse_text(text: str) -> str:
@@ -39,15 +49,29 @@ def reverse_text(text: str) -> str:
 @tool(description="未加入白名单的工具")
 def disabled_plugin() -> str:
     return "should not run"
-
-TOOLS = [
-    Tool(
-        name="shout",
-        description="转成大写",
-        parameters={"text": "文本"},
-        handler=lambda text: text.upper(),
+""",
+        encoding="utf-8",
     )
-]
+    (plugins_dir / "a_shout_plugin.py").write_text(
+        """
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool
+
+# 测试用显式工具插件子类
+class ShoutPlugin(Plugin):
+    plugin_id = "shout_plugin"
+
+    # 通过主板插槽注册大写转换工具
+    def initialize(self) -> None:
+        self.context.register_tool(
+            Tool(
+                name="shout",
+                description="转成大写",
+                parameters={"text": "文本"},
+                handler=lambda text: text.upper(),
+            ),
+            source_name="a_shout_plugin",
+        )
 """,
         encoding="utf-8",
     )
@@ -74,11 +98,12 @@ TOOLS = [
     assert "不在白名单中" in registry.execute("disabled_plugin", "{}")
 
 
+# 测试 PluginManager.from_entries 拒绝越界路径并拦截跨文件重名工具
 def test_plugin_security_rejects_outside_paths_and_duplicates(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="项目内相对路径"):
-        load_plugin_tools(["../outside.py"], tmp_path)
+        PluginManager.from_entries(["../outside.py"], tmp_path)
     with pytest.raises(ValueError, match="项目内相对路径"):
-        load_plugin_tools(["/etc/passwd"], tmp_path)
+        PluginManager.from_entries(["/etc/passwd"], tmp_path)
 
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
@@ -92,9 +117,10 @@ def dup_tool() -> str:
     (plugins_dir / "a.py").write_text(code, encoding="utf-8")
     (plugins_dir / "b.py").write_text(code, encoding="utf-8")
     with pytest.raises(ValueError, match="重复"):
-        load_plugin_tools(["plugins"], tmp_path)
+        PluginManager.from_entries(["plugins"], tmp_path)
 
 
+# 测试插件工具在完整 ReAct 循环中的执行与观察回传
 def test_plugin_tool_runs_inside_react_loop(tmp_path: Path) -> None:
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
@@ -183,8 +209,79 @@ def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     # 4. 内层子协议 3：ConfigCompilerProtocol（ToolsConfig 只认 compile / presets / render）
     dsl_compiler = ModelsDSLCompiler()
     assert isinstance(dsl_compiler, ConfigCompilerProtocol)
-    compiled = manager.compilers["models_dsl"]("use ollama", "models.dsl")
+    assert not callable(dsl_compiler)
+    assert isinstance(manager.compilers["models_dsl"], ConfigCompilerProtocol)
+    compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
     # 5. 统一生命周期清理钩子可正常调用
     manager.terminate_all()
+
+
+# 测试所有已移除的历史兼容胶水与旧版全局变量写法均彻底失效
+def test_legacy_compat_shims_removed_and_rejected(tmp_path: Path) -> None:
+    import personal_assistant.agent as agent_pkg
+    import personal_assistant.agent.plugins as plugins_mod
+    import personal_assistant.agent.tools as tools_mod
+    import personal_assistant.assistant as assistant_pkg
+    import personal_assistant.assistant.memory as memory_mod
+    from personal_assistant.assistant.memory import MemoryStore
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    # 1. 不再把 plugins/<x>.py 静默兜底解析为 plugins/tools/<x>.py
+    assert PluginManager.from_entries(["plugins/custom_tools.py"], repo_root).tools() == []
+
+    # 2. 旧式魔法全局变量与 TOOLS = [...] 列表不再被静默扫描加载
+    legacy_plugin = tmp_path / "legacy_plugin.py"
+    legacy_plugin.write_text(
+        """
+from personal_assistant.agent.tools import Tool
+
+TOOLS = [Tool(name="legacy_tool", description="旧列表工具", parameters={}, handler=lambda: "ok")]
+RETRIEVERS = {"legacy_ret": lambda cfg: None}
+RETRIEVER_NAME = "legacy_single_ret"
+create_retriever = lambda cfg: None
+LLM_PROVIDERS = {"legacy_prov": lambda env: None}
+PROVIDER_NAME = "legacy_single_prov"
+create_provider = lambda env: None
+CONFIG_COMPILERS = {"legacy_comp": lambda text, source="": {}}
+COMPILER_NAME = "legacy_single_comp"
+compile_config = lambda text, source="": {}
+""",
+        encoding="utf-8",
+    )
+    legacy_mgr = PluginManager.from_entries([legacy_plugin.name], tmp_path)
+    assert legacy_mgr.tools() == []
+    assert legacy_mgr.retrievers == {}
+    assert legacy_mgr.providers == {}
+    assert legacy_mgr.compilers == {}
+
+    # 3. 已清理的历史别名、薄壳与死接口不再存在于公开包与底层模块
+    for sym in (
+        "load_plugins",
+        "load_plugin_tools",
+        "load_plugin_retrievers",
+        "load_plugin_providers",
+        "load_plugin_compilers",
+        "ConfigCompiler",
+    ):
+        assert not hasattr(agent_pkg, sym), f"agent_pkg 仍残留 {sym}"
+        assert not hasattr(plugins_mod, sym), f"plugins_mod 仍残留 {sym}"
+
+    assert not hasattr(agent_pkg, "build_dynamic_plugin_tool")
+    assert not hasattr(tools_mod, "build_dynamic_plugin_tool")
+
+    assert not hasattr(assistant_pkg, "memory_tools")
+    assert not hasattr(memory_mod, "memory_tools")
+    assert not hasattr(MemoryStore, "save_memory_entries")
+
+    for attr in ("command_tools", "plugin_tools", "plugin_retrievers", "plugin_compilers"):
+        assert not hasattr(ToolsConfig, attr), f"ToolsConfig 仍残留 {attr}"
+
+    # 4. PluginContext 仅接受强类型 ConfigCompilerProtocol / LLMProviderProtocol，拒绝裸函数
+    ctx = PluginContext(project_root=tmp_path)
+    with pytest.raises((TypeError, ValueError)):
+        ctx.register_compiler(lambda text, source="": {})  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        ctx.register_provider(lambda env: None)  # type: ignore[arg-type]

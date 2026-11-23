@@ -312,24 +312,30 @@ print(json.dumps({"has_main": callable(evals.main), "leaked": leaked}))
 
 # 测试 Provider 插件化注册与按 LLM_PROVIDER 环境变量分发（换厂商不改 react.py）
 def test_llm_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from personal_assistant.agent.plugins import load_plugin_providers
+    from personal_assistant.agent.plugins import PluginManager
     from personal_assistant.ai.client import LLMClient, from_env, register_provider
 
     plugin_file = tmp_path / "custom_provider.py"
     plugin_file.write_text(
+        "from personal_assistant.agent.plugins import Plugin\n"
         "from personal_assistant.ai.client import LLMClient\n"
         "class DummyProviderLLM(LLMClient):\n"
         "    def __init__(self, model):\n"
         "        self.model = model\n"
         "    def respond(self, messages, tools=None):\n"
         "        return {'role': 'assistant', 'content': f'dummy:{self.model}'}\n"
-        "def build_dummy(env):\n"
-        "    return DummyProviderLLM(env.get('LLM_MODEL', 'demo'))\n"
-        "LLM_PROVIDERS = {'dummy_test_provider': build_dummy}\n",
+        "class DummyProvider:\n"
+        "    name = 'dummy_test_provider'\n"
+        "    def build(self, env):\n"
+        "        return DummyProviderLLM(env.get('LLM_MODEL', 'demo'))\n"
+        "class DummyProviderPlugin(Plugin):\n"
+        "    plugin_id = 'dummy_test_provider'\n"
+        "    def initialize(self):\n"
+        "        self.context.register_provider(DummyProvider())\n",
         encoding="utf-8",
     )
 
-    providers = load_plugin_providers([plugin_file.name], tmp_path)
+    providers = PluginManager.from_entries([plugin_file.name], tmp_path).providers
     assert "dummy_test_provider" in providers
     register_provider("dummy_test_provider", providers["dummy_test_provider"])
 

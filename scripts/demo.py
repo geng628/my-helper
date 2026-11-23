@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.react import run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
@@ -45,7 +45,7 @@ def _print_step(name: str, args: str, observation: str) -> None:
 # 运行两个离线演示场景：多轮链式工具调用 + 工具参数出错自愈
 def run_offline_demo(show_messages: bool = False) -> None:
     tools = ToolRegistry(
-        *load_plugin_tools(["plugins/custom_tools.py"], ROOT),
+        *PluginManager.from_entries(["plugins/tools"], ROOT).tools(),
         allowed_names=["get_current_time", "add_numbers"],
     )
 

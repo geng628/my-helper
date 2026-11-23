@@ -11,14 +11,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from personal_assistant.agent.plugins import (
-    ConfigCompiler,
-    PluginManager,
-    RetrieverFactory,
-)
+from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.tools import (
     Tool,
-    ToolDocument,
     ToolRegistry,
     ToolsetProvider,
     build_tool,
@@ -295,15 +290,12 @@ class ToolsConfig:
     enabled_tools: tuple[str, ...]
     files: dict[str, object]
     commands: tuple[CommandSpec, ...]
+    plugin_manager: PluginManager
     plugins: tuple[str, ...] = ()
-    plugin_tools: tuple[Tool, ...] = ()
     retrieval: dict[str, object] = field(default_factory=dict)
-    plugin_retrievers: tuple[tuple[str, RetrieverFactory], ...] = ()
-    plugin_compilers: tuple[tuple[str, ConfigCompiler], ...] = ()
     project_root: Path = REPO_ROOT
     config_path: Path | None = None
     raw_config: dict[str, object] = field(default_factory=dict)
-    plugin_manager: PluginManager | None = None
 
     # 从 tools.json 读取并校验白名单配置，同时通过 PluginManager 扫描加载 plugins 目录中的全部插件
     @classmethod
@@ -356,15 +348,12 @@ class ToolsConfig:
             enabled_tools=tuple(enabled_raw),
             files=dict(files_raw),
             commands=tuple(commands),
+            plugin_manager=manager,
             plugins=tuple(plugins_raw),
-            plugin_tools=manager.default_tools,
             retrieval=dict(retrieval_raw),
-            plugin_retrievers=tuple(sorted(manager.retrievers.items())),
-            plugin_compilers=tuple(sorted(manager.compilers.items())),
             project_root=root,
             config_path=resolved_cfg,
             raw_config=dict(raw),
-            plugin_manager=manager,
         )
 
     # 加载模型配置：优先通过 models_dsl 插件编译 models.dsl（可选原子落盘为 0600 权限的 models.json），否则直接读 models.json
@@ -378,11 +367,10 @@ class ToolsConfig:
         dsl_path = cfg_dir / "models.dsl"
         json_path = cfg_dir / "models.json"
         if dsl_path.is_file():
-            compilers = dict(self.plugin_compilers)
-            compiler = compilers.get("models_dsl")
+            compiler = self.plugin_manager.compilers.get("models_dsl")
             if compiler is None:
                 raise ValueError("发现 config/models.dsl，但未加载 models_dsl 编译插件。")
-            compiled = compiler(dsl_path.read_text(encoding="utf-8"), dsl_path.name)
+            compiled = compiler.compile(dsl_path.read_text(encoding="utf-8"), dsl_path.name)
             models_cfg = ModelsConfig.from_dict(compiled)
             if write_json:
                 _atomic_write_private_json(json_path, compiled)
@@ -394,11 +382,8 @@ class ToolsConfig:
 
     # 获取 models_dsl 插件暴露的内置厂商预设目录，供终端向导与网页设置表单展示
     def model_presets(self) -> list[dict[str, object]]:
-        compiler = dict(self.plugin_compilers).get("models_dsl")
-        presets_fn = getattr(compiler, "presets", None)
-        if callable(presets_fn):
-            return list(presets_fn())
-        return []
+        compiler = self.plugin_manager.compilers.get("models_dsl")
+        return list(compiler.presets()) if compiler is not None else []
 
     # 自动生成极简 config/models.dsl 并编译落盘为 0600 权限的 config/models.json（零手写代码）
     def save_model_setup(
@@ -412,11 +397,10 @@ class ToolsConfig:
         name: str = "",
         temperature: float = 0.2,
     ) -> ModelsConfig:
-        compiler = dict(self.plugin_compilers).get("models_dsl")
-        render_fn = getattr(compiler, "render", None)
-        if compiler is None or not callable(render_fn):
+        compiler = self.plugin_manager.compilers.get("models_dsl")
+        if compiler is None:
             raise ValueError("未加载 models_dsl 配置插件，无法自动生成模型配置。")
-        dsl_text = render_fn(
+        dsl_text = compiler.render(
             preset=preset,
             api_key=api_key,
             model=model,
@@ -425,7 +409,7 @@ class ToolsConfig:
             temperature=temperature,
         )
         # 先在内存中编译校验，确认无任何语法或语义错误后再原子落盘
-        compiled = compiler(dsl_text, "models.dsl")
+        compiled = compiler.compile(dsl_text, "models.dsl")
         models_cfg = ModelsConfig.from_dict(compiled)
         cfg_dir = config_dir.resolve()
         _atomic_write_private_text(cfg_dir / "models.dsl", dsl_text)
@@ -450,15 +434,11 @@ class ToolsConfig:
         plugin_name = str(raw_name or "").strip()
         if not plugin_name or plugin_name == "linear":
             return None
-        registry = dict(self.plugin_retrievers)
+        registry = self.plugin_manager.retrievers
         if plugin_name not in registry:
             available = "、".join(sorted(registry)) or "（无）"
             raise ValueError(f"未找到检索插件 {plugin_name!r}，当前已加载：{available}")
         return registry[plugin_name](dict(self.retrieval))
-
-    # 将全部已启用的固定命令转换为 CommandToolWrapper(Tool) 列表
-    def command_tools(self, *, offload_dir: Path | None = None) -> list[Tool]:
-        return CommandToolsetProvider(self.commands).build_tools({"offload_dir": offload_dir})
 
     # 统一将所有 ToolsetProvider（内置 / 插件 / 命令）按同一套 build_ctx 汇入单个 ToolRegistry 并按需激活
     def build_registry(
@@ -489,14 +469,7 @@ class ToolsConfig:
             registry.register_provider(provider, context=build_ctx)
         for item in builtin_tools:
             registry.register(item)
-        if self.plugin_manager is not None:
-            registry.register_provider(self.plugin_manager, context=build_ctx)
-        else:
-            for item in self.plugin_tools:
-                registry.register(
-                    item,
-                    document=ToolDocument(source_type="plugin", source_name="plugin"),
-                )
+        registry.register_provider(self.plugin_manager, context=build_ctx)
         registry.register_provider(CommandToolsetProvider(self.commands), context=build_ctx)
         for item in extras:
             registry.register(item)
