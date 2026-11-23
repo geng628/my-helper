@@ -444,3 +444,27 @@
   - 第 2 层独立只读 Reviewer：**`Pass`**（0 Blocker）。
   - 实模 LLM-as-a-Judge 5 题专项验证（`deepseek-chat`，`e2ccc25`）：**5/5 全部符合预期**（`q176`/`q182` 纠偏均判 `true`；`q162` 幻觉、先拒答后猜测混合回复、普通数字错答均严格判 `false`）。
 - **下一步**：合并 PR `#28` 后，串行推进记忆闭环第 3 块拼图——代码级一等公民 `op="merge"` 操作码，并独立以实模 Benchmark 验收。
+
+
+---
+
+### [2026-11-23] 新增一等公民 `op="merge"` 无损合并互补记忆维度（Issue `#30`）
+- **目标与思路**：延续第 3 块拼图与“结构化代码机制优先于纯 Prompt 微调”的路线，在 `memory_lifecycle.py` 与 `consolidator.py` 引入代码级一等公民 **`op="merge"`**：当同一主题/活动补充互补属性（如马拉松完赛成绩与目标成绩、足球进球与助攻）时，原地无损拼接保留原时间戳、原正文与既有 `(until: ...)` 标记，不破坏原文且不误触发 `replace`/`remove` 的 `superseded` 软退休。
+- **改动文件（Issue `#30`，代码提交 `c39268b` → 审阅修复 `238c6f4`）**：
+  - `personal_assistant/assistant/memory_lifecycle.py`：新增 `_find_matching_indices()`、`_bullet_contains_clause()`（子句边界幂等去重，兼容多次 merge 剥离尾部标点，同时防 `"12."` 误命中 `"12.5"`）、`_merge_memory_bullet()`（中英文分号拼接，支持 `HH:MM` 时间戳与无日期行回退使用 `ref_day` 盖戳），以及 `apply_topic_operations()` 的 `op="merge"` 分支（未命中旧句时安全回退为 `add` 形态）。
+  - `personal_assistant/assistant/consolidator.py`：`CONSOLIDATION_SYSTEM_PROMPT` 声明 `"op": "merge"` 与规则 2（保持 `1343 <= 1350` 字符、完整保留全部既有守卫词）；`consolidate_once()` 对 `written_texts` 纳入 `merge`（与 `memory_lifecycle.py` 一致优先取 `text` 再回退 `new`）以触发 `prune_consolidated_raw_facts()`。
+  - `tests/test_memory_lifecycle.py` & `tests/test_consolidator.py`：新增 4 条 TDD 单测覆盖中英文多次 merge 幂等去重、边界防误判、`HH:MM` 与无日期 `until` 盖戳、`matched_indices[0]`、过期跳过、端到端合并与 `facts.md` `(msg#...)` 幽灵清理。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`c39268b`）→ `Blocker`（1 Blocker + 4 Nits）**：捕获“3 次及以上连续 `merge` 时中间子句末尾句号被 `rstrip` 剥离导致原句幂等去重失效 (`target time was 4:10:00.` 重复拼接)”，以及 `HH:MM` 正则漏匹配、`written_texts` `new`/`text` 优先级与边界单测缺失。
+  - **Round 2（`238c6f4`）→ `Pass`（0 Blocker）**：逐项核验 `_bullet_contains_clause` 边界、无日期行 `ref_day` 盖戳、`written_texts` 优先级一致与 104/104 全量单测通过。
+- **同口径评测对比（改前 `main` `24a2156` → 改后 `238c6f4`，同一套 PR `#28` Judge）**：
+  - 单元测试：**100/100 → 104/104 passed**；AST 中文注释：业务/评测核心 0 缺失（既有 `plugins/tools/` 闭包除外）。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**；LoCoMo 200 题保持 **105/200 (52.5%)**，零退步。
+  - 16 场景多轮记忆 Dev（`issue30_v2_memory16.json`）：**15/16 (93.75%)**（`knowledge-update 4/4`、`temporal 3/3`、`abstention 2/2`、`extraction 3/3`、`multi-session 2/2`；服务端 KV 命中 **80.97%**、本地前缀复用 **90.15%**；唯一字面失败 `rolling-multi-compaction` 实答“企业微信机器人”缺缩写 `'企微'`，无记忆丢失）。
+  - LongMemEval 35 题（`deepseek-chat`，`main_24a2156_lme35.json` vs `issue30_v2_lme35.json`）：
+    - 总计：**28/35 (80.00%) → 31/35 (88.57%)**（Dev 14: `11/14 → 12/14`；Held-out 21: `17/21 → 19/21`）；本地前缀复用 **80.29% → 81.52%**；服务端 KV 命中 `61.74% → 37.91%`（注：`completion_tokens` 36,385 → 36,870 +1.3%，属单次评测前缀冷热批间波动）。
+    - **`op="merge"` 目标验证**：`lme-a346bb18` 单次 `read_markdown` 即精准答出 `4:22` 与 `4:10` 差值 12 分钟（无需回查 `archive/`）；`lme-4adc0475`（`3 goals + 2 assists = 5`）与 `lme-gpt4_194be4b3`（全部 4 件乐器，含 Pearl Export 鼓组）均稳定通过。
+    - **非 `merge` 题改善与退步（如实区分波动）**：改善 4 例（`lme-35a27287`、`lme-c7cf7dfd`、`lme-0e5e2d1a`、`lme-gpt4_9a159967`）均属非 `merge` 题的模型检索/沉淀提炼命中；退步 1 例（`lme-5a7937c8`，实答 2 天漏算 Dec 10 教会募捐食盒活动）为模型归类到 `volunteering.md` 后检索遗漏波动，非 `op="merge"` 代码缺陷。
+    - **遗留失败（4 例）**：`lme-gpt4_2312f94c`（`temporal-reasoning`，S22 与 XPS 13 先后顺序仍待结构化 `event_date` 解决）、`lme-1d4da289`、`lme-cc539528`（科普推荐未沉淀进长期记忆）、`lme-5a7937c8`（同上波动）。
+    - **未验证项**：LoCoMo 50 题未在本小 PR 重跑。
+- **下一步**：待 PR 合入 `main` 后，串行推进第 4 块拼图——在 `operations` 与 `format_memory_bullet()` 引入代码级一等公民 **`event_date`** 结构化字段（独立渲染 `(event: YYYY-MM-DD)` 与写入日期 `[YYYY-MM-DD]` 隔离，直击 `lme-gpt4_2312f94c`）。

@@ -394,3 +394,260 @@ def test_replace_and_remove_soft_retire_with_superseded_chain_and_fts5_traceabil
         today=day2,
     )
     assert "(msg#42)" not in archive_file.read_text(encoding="utf-8")
+
+
+# 测试 op=merge 无损拼接互补维度：保留原时间与原事实正文，支持中英文标点与幂等去重，且不触发 superseded 软退休
+def test_merge_operation_enriches_existing_line_without_losing_old_facts_or_retiring(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryStore(tmp_path / "data")
+    day1 = date(2023, 5, 21)
+    day2 = date(2023, 5, 24)
+
+    # 1. 英文 merge：实际完赛成绩与目标时间属互补指标，保留 [2023-05-21] 与两个时间，不写 archive/
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+        today=day2,
+    )
+    fitness_lines = [
+        line
+        for line in (memory.memory_dir / "fitness.md").read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("- ")
+    ]
+    assert len(fitness_lines) == 1
+    assert "[2023-05-21]" in fitness_lines[0]
+    assert "4:22:00" in fitness_lines[0]
+    assert "; Target time was 4:10:00." in fitness_lines[0]
+    assert not (memory.memory_dir / "archive").exists()
+
+    # 2. 幂等重复 merge 不应重复追加相同补充内容
+    changed = memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松与训练目标",
+        [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+        today=day2,
+    )
+    assert changed is None
+
+    # 3. 中文 merge：按中文分号拼接，既有 until 标记保持完整且未传 until 时不丢失
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目配置",
+        [
+            {"op": "add", "text": "极光后端端口定为 9091。"},
+            {"op": "add", "text": "2023-05-28 举行架构评审。", "until": "2023-05-29"},
+        ],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目配置",
+        [
+            {"op": "merge", "old": "极光后端", "text": "日志采用标准库 logging。"},
+            {"op": "merge", "old": "架构评审", "text": "参会人员包括架构组。"},
+            {"op": "merge", "old": "极光后端", "text": "周六前提交压测报告。", "until": "2023-05-27"},
+            {"op": "merge", "old": "不存在的旧条目", "text": "极光数据库采用 SQLite。"},
+        ],
+        today=day2,
+    )
+    proj_text = (memory.memory_dir / "projects.md").read_text(encoding="utf-8")
+    assert "- [2023-05-21] (until: 2023-05-27) 极光后端端口定为 9091；日志采用标准库 logging；周六前提交压测报告。" in proj_text
+    assert "- [2023-05-21] (until: 2023-05-29) 2023-05-28 举行架构评审；参会人员包括架构组。" in proj_text
+    assert "- [2023-05-24] 极光数据库采用 SQLite。" in proj_text
+    assert not (memory.memory_dir / "archive").exists()
+
+
+# 测试多次 merge 剥离尾部标点后的幂等去重、子句边界保护、HH:MM 与无日期行回退，以及多命中首条与过期跳过
+def test_merge_multi_merge_idempotency_and_edge_cases(tmp_path: Path) -> None:
+    memory = MemoryStore(tmp_path / "data")
+    day1 = date(2023, 5, 21)
+    day2 = date(2023, 5, 24)
+    day3 = date(2023, 5, 25)
+
+    # 1. 英文 3 段多次 merge：中间子句被剥离句号后，再次 merge 原句与中间子句必须严格幂等返回 None
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松训练",
+        [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松训练",
+        [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+        today=day2,
+    )
+    memory.apply_memory_operations(
+        "fitness",
+        "运动健康",
+        "马拉松训练",
+        [{"op": "merge", "old": "marathon", "text": "Average pace was 6:12/km."}],
+        today=day3,
+    )
+    fitness_lines = [
+        line
+        for line in (memory.memory_dir / "fitness.md").read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("- ")
+    ]
+    assert len(fitness_lines) == 1
+    assert "4:22:00" in fitness_lines[0]
+    assert "Target time was 4:10:00" in fitness_lines[0]
+    assert "Average pace was 6:12/km." in fitness_lines[0]
+
+    assert (
+        memory.apply_memory_operations(
+            "fitness",
+            "运动健康",
+            "马拉松训练",
+            [{"op": "merge", "old": "marathon", "text": "Target time was 4:10:00."}],
+            today=day3,
+        )
+        is None
+    )
+    assert (
+        memory.apply_memory_operations(
+            "fitness",
+            "运动健康",
+            "马拉松训练",
+            [{"op": "merge", "old": "marathon", "text": "Completed first full marathon in 4:22:00."}],
+            today=day3,
+        )
+        is None
+    )
+
+    # 中文 3 段多次 merge 幂等性
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目",
+        [{"op": "add", "text": "极光后端端口定为 9091。"}],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目",
+        [{"op": "merge", "old": "极光后端", "text": "日志采用标准库 logging。"}],
+        today=day2,
+    )
+    memory.apply_memory_operations(
+        "projects",
+        "项目备忘",
+        "极光项目",
+        [{"op": "merge", "old": "极光后端", "text": "周六前提交压测报告。"}],
+        today=day3,
+    )
+    assert (
+        memory.apply_memory_operations(
+            "projects",
+            "项目备忘",
+            "极光项目",
+            [{"op": "merge", "old": "极光后端", "text": "日志采用标准库 logging。"}],
+            today=day3,
+        )
+        is None
+    )
+
+    # 2. 非子串误判边界保护："12." 不得误命中 "12.5 km."，"Port 9091." 不得误命中 "Port 90910."
+    memory.apply_memory_operations(
+        "runs",
+        "跑步记录",
+        "距离与端口测试",
+        [
+            {"op": "add", "text": "Distance was 12.5 km."},
+            {"op": "add", "text": "Port 90910."},
+        ],
+        today=day1,
+    )
+    assert (
+        memory.apply_memory_operations(
+            "runs",
+            "跑步记录",
+            "距离与端口测试",
+            [{"op": "merge", "old": "Distance", "text": "12."}],
+            today=day2,
+        )
+        == "data/memory/runs.md"
+    )
+    assert (
+        memory.apply_memory_operations(
+            "runs",
+            "跑步记录",
+            "距离与端口测试",
+            [{"op": "merge", "old": "Port", "text": "Port 9091."}],
+            today=day2,
+        )
+        == "data/memory/runs.md"
+    )
+    runs_text = (memory.memory_dir / "runs.md").read_text(encoding="utf-8")
+    assert "Distance was 12.5 km; 12." in runs_text
+    assert "Port 90910; Port 9091." in runs_text
+
+    # 3. 带 HH:MM 时间戳与无日期条目附加 until 时不双括号，且无日期行使用 ref_day 盖戳
+    events_path = memory.memory_dir / "events.md"
+    events_path.write_text(
+        "# 活动 (events.md)\n\n- [2023-05-21 14:30] 参加技术分享。\n- 临时备忘。\n",
+        encoding="utf-8",
+    )
+    memory.apply_memory_operations(
+        "events",
+        "活动",
+        "活动日程",
+        [
+            {"op": "merge", "old": "技术分享", "text": "地点在 3 楼。", "until": "2023-05-27"},
+            {"op": "merge", "old": "临时备忘", "text": "补充细节。", "until": "2023-05-27"},
+        ],
+        today=day2,
+    )
+    events_lines = events_path.read_text(encoding="utf-8").splitlines()
+    assert "- [2023-05-21 14:30] (until: 2023-05-27) 参加技术分享；地点在 3 楼。" in events_lines
+    assert "- [2023-05-24] (until: 2023-05-27) 临时备忘；补充细节。" in events_lines
+
+    # 4. 多条命中时只丰富首条 matched_indices[0]，以及已过期 until < ref_day 时跳过 merge
+    memory.apply_memory_operations(
+        "training",
+        "训练记录",
+        "日常训练",
+        [
+            {"op": "add", "text": "晨跑训练 5 公里。"},
+            {"op": "add", "text": "力量训练 30 分钟。"},
+        ],
+        today=day1,
+    )
+    memory.apply_memory_operations(
+        "training",
+        "训练记录",
+        "日常训练",
+        [{"op": "merge", "old": "训练", "text": "配速 5 分 30 秒。"}],
+        today=day2,
+    )
+    training_text = (memory.memory_dir / "training.md").read_text(encoding="utf-8")
+    assert "- [2023-05-21] 晨跑训练 5 公里；配速 5 分 30 秒。" in training_text
+    assert "- [2023-05-21] 力量训练 30 分钟。" in training_text
+
+    assert (
+        memory.apply_memory_operations(
+            "training",
+            "训练记录",
+            "日常训练",
+            [{"op": "merge", "old": "训练", "text": "过期补充。", "until": "2023-05-20"}],
+            today=day2,
+        )
+        is None
+    )
+    assert "过期补充" not in (memory.memory_dir / "training.md").read_text(encoding="utf-8")

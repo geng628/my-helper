@@ -295,3 +295,119 @@ def test_prompt_and_consolidation_hygiene_guardrails() -> None:
     assert "专有名词" in CONSOLIDATION_SYSTEM_PROMPT
     assert "优先完整记录用户自身的事实" in CONSOLIDATION_SYSTEM_PROMPT
     assert "不抄录长段通用科普或教程" in CONSOLIDATION_SYSTEM_PROMPT
+
+
+# 测试 CONSOLIDATION_SYSTEM_PROMPT 正式声明 op=merge 且沉淀器端到端无损合并互补维度，不覆盖也不触发 archive
+def test_consolidator_executes_op_merge_end_to_end_and_prompt_declares_merge(
+    tmp_path: Path,
+) -> None:
+    assert '"op": "merge"' in CONSOLIDATION_SYSTEM_PROMPT
+    assert "优先用 op=merge" in CONSOLIDATION_SYSTEM_PROMPT
+    assert len(CONSOLIDATION_SYSTEM_PROMPT) <= 1350
+
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        memory.apply_memory_operations(
+            "fitness",
+            "运动健康",
+            "马拉松成绩与目标",
+            [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+            today=date(2023, 5, 21),
+        )
+        state.append_message("m-merge", "user", "By the way, my marathon target time was 4:10:00.")
+        state.append_message("m-merge", "assistant", "Got it, thanks for sharing your target time.")
+
+        llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "User noted marathon target time was 4:10:00.",
+                        "memories": [
+                            {
+                                "topic": "fitness",
+                                "title": "运动健康",
+                                "index_summary": "马拉松成绩与目标",
+                                "operations": [
+                                    {
+                                        "op": "merge",
+                                        "old": "4:22:00",
+                                        "text": "Target time was 4:10:00.",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        result = runner.consolidate_once("m-merge", today=date(2023, 5, 24))
+        assert result is not None
+        assert result.saved_files == ("data/memory/fitness.md",)
+
+        content = (memory.memory_dir / "fitness.md").read_text(encoding="utf-8")
+        assert "4:22:00" in content
+        assert "4:10:00" in content
+        assert not (memory.memory_dir / "archive").exists()
+    finally:
+        state.close()
+
+
+# 测试 op=merge 沉淀后同样触发 prune_consolidated_raw_facts 清理裸原话幽灵，且 written_texts 与 text/new 优先级一致
+def test_consolidator_op_merge_prunes_consolidated_raw_facts_ghost(tmp_path: Path) -> None:
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        memory.apply_memory_operations(
+            "fitness",
+            "运动健康",
+            "马拉松成绩与目标",
+            [{"op": "add", "text": "Completed first full marathon in 4:22:00."}],
+            today=date(2023, 5, 21),
+        )
+        m1 = state.append_message("merge-prune", "user", "记住，我养了一只橘猫。")
+        memory.remember_user_statement("记住，我养了一只橘猫。", message_id=m1)
+        state.append_message("merge-prune", "assistant", "好的，记下了。")
+        m3 = state.append_message("merge-prune", "user", "记住，我的马拉松目标成绩是 4:10:00。")
+        memory.remember_user_statement("记住，我的马拉松目标成绩是 4:10:00。", message_id=m3)
+        state.append_message("merge-prune", "assistant", "记下了。")
+
+        llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "用户补充马拉松目标成绩为 4:10:00。",
+                        "memories": [
+                            {
+                                "topic": "fitness",
+                                "title": "运动健康",
+                                "index_summary": "马拉松成绩与目标",
+                                "operations": [
+                                    {
+                                        "op": "merge",
+                                        "old": "marathon",
+                                        "text": "马拉松目标成绩是 4:10:00。",
+                                        "new": "不应优先使用的备用字段。",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=4, keep_recent_messages=0, min_batch_messages=4)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        runner.consolidate_once("merge-prune", today=date(2023, 5, 24))
+
+        fitness_text = (memory.memory_dir / "fitness.md").read_text(encoding="utf-8")
+        assert "Completed first full marathon in 4:22:00；马拉松目标成绩是 4:10:00。" in fitness_text
+        facts_text = (memory.memory_dir / "facts.md").read_text(encoding="utf-8")
+        assert f"(msg#{m3})" not in facts_text
+        assert "橘猫" in facts_text
+        assert f"(msg#{m1})" in facts_text
+    finally:
+        state.close()
