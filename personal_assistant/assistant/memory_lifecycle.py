@@ -8,9 +8,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 UNTIL_PATTERN = re.compile(r"\(until:\s*(\d{4}-\d{2}-\d{2})\)")
+EVENT_DATE_PATTERN = re.compile(r"\(event:\s*(\d{4}-\d{2}-\d{2})\)")
 MSG_TAG_PATTERN = re.compile(r"\(msg#(\d+)\)")
 ECHOED_PREFIX_PATTERN = re.compile(
-    r"^(?:-\s+)?(?:\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*)*(?:\(until:\s*\d{4}-\d{2}-\d{2}\)\s*)?"
+    r"^(?:-\s+)?(?:\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s*)*"
+    r"(?:\((?:event|until):\s*\d{4}-\d{2}-\d{2}\)\s*)*"
 )
 RESERVED_MEMORY_TOPICS = frozenset({"memory", "audit", "rules", "archive"})
 ARCHIVE_INDEX_PATH = "data/memory/archive"
@@ -58,11 +60,22 @@ def clean_memory_body(text: str) -> str:
     return ECHOED_PREFIX_PATTERN.sub("", collapsed).strip()
 
 
-# 格式化单条主题记忆行（可选附加 (until: YYYY-MM-DD) 有效期标记）
-def format_memory_bullet(text: str, stamp_day: date, until_day: date | None = None) -> str:
+# 格式化单条主题记忆行（可选附加 (event: YYYY-MM-DD) 事件发生日与 (until: YYYY-MM-DD) 有效期标记）
+def format_memory_bullet(
+    text: str,
+    stamp_day: date,
+    until_day: date | None = None,
+    *,
+    event_day: date | None = None,
+) -> str:
     body = clean_memory_body(text)
+    tags: list[str] = []
+    if event_day is not None:
+        tags.append(f"(event: {event_day.isoformat()})")
     if until_day is not None:
-        return f"- [{stamp_day.isoformat()}] (until: {until_day.isoformat()}) {body}"
+        tags.append(f"(until: {until_day.isoformat()})")
+    if tags:
+        return f"- [{stamp_day.isoformat()}] {' '.join(tags)} {body}"
     return f"- [{stamp_day.isoformat()}] {body}"
 
 
@@ -88,28 +101,41 @@ def _bullet_contains_clause(line: str, clause: str) -> bool:
     return re.search(pattern, body) is not None
 
 
-# 将补充维度无损拼接至已有记忆行尾部，保留原日期、原正文与既有 until 标记
+# 将补充维度无损拼接至已有记忆行尾部，保留原日期、原正文与既有 event/until 标记
 def _merge_memory_bullet(
     existing_line: str,
     addition: str,
     *,
     stamp_day: date,
     until_day: date | None = None,
+    event_day: date | None = None,
 ) -> str:
     clean_addition = clean_memory_body(addition)
     base = existing_line.rstrip()
-    if until_day is not None and not UNTIL_PATTERN.search(base):
-        until_tag = f"(until: {until_day.isoformat()}) "
-        base = re.sub(
-            r"^(\s*-\s+\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s+)",
-            rf"\1{until_tag}",
-            base,
-            count=1,
-        )
-        if until_tag not in base:
+    need_event = event_day is not None and not EVENT_DATE_PATTERN.search(base)
+    need_until = until_day is not None and not UNTIL_PATTERN.search(base)
+    if need_event or need_until:
+        date_prefix = re.match(r"^(\s*-\s+\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s+)", base)
+        if not date_prefix:
             indent = base[: len(base) - len(base.lstrip())]
             stripped_body = re.sub(r"^\s*-\s+", "", base).strip()
-            base = f"{indent}- [{stamp_day.isoformat()}] {until_tag}{stripped_body}"
+            base = f"{indent}- [{stamp_day.isoformat()}] {stripped_body}"
+        if need_event and event_day is not None:
+            event_tag = f"(event: {event_day.isoformat()}) "
+            base = re.sub(
+                r"^(\s*-\s+\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s+)",
+                rf"\1{event_tag}",
+                base,
+                count=1,
+            )
+        if need_until and until_day is not None:
+            until_tag = f"(until: {until_day.isoformat()}) "
+            base = re.sub(
+                r"^(\s*-\s+\[\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?\]\s+(?:\(event:\s*\d{4}-\d{2}-\d{2}\)\s+)?)",
+                rf"\1{until_tag}",
+                base,
+                count=1,
+            )
     sep = "；" if re.search(r"[\u4e00-\u9fff]", base + clean_addition) else "; "
     base = base.rstrip("。；;.")
     return f"{base}{sep}{clean_addition}"
@@ -211,6 +237,7 @@ def apply_topic_operations(
             continue
         op = str(op_entry.get("op") or "add").strip().lower()
         until_day = parse_iso_date(op_entry.get("until"))
+        event_day = parse_iso_date(op_entry.get("event_date"))
 
         if op == "add":
             body = clean_memory_body(str(op_entry.get("text") or op_entry.get("new") or ""))
@@ -220,7 +247,7 @@ def apply_topic_operations(
                 continue
             if any(body in existing_line for existing_line in lines):
                 continue
-            lines.append(format_memory_bullet(body, ref_day, until_day))
+            lines.append(format_memory_bullet(body, ref_day, until_day, event_day=event_day))
             added_log.append(body)
             changed = True
 
@@ -238,7 +265,11 @@ def apply_topic_operations(
                 if _bullet_contains_clause(existing_line, addition):
                     continue
                 lines[idx] = _merge_memory_bullet(
-                    existing_line, addition, stamp_day=ref_day, until_day=until_day
+                    existing_line,
+                    addition,
+                    stamp_day=ref_day,
+                    until_day=until_day,
+                    event_day=event_day,
                 )
                 added_log.append(addition)
                 changed = True
@@ -247,7 +278,7 @@ def apply_topic_operations(
                 and _bullet_contains_clause(existing_line, addition)
                 for existing_line in lines
             ):
-                lines.append(format_memory_bullet(addition, ref_day, until_day))
+                lines.append(format_memory_bullet(addition, ref_day, until_day, event_day=event_day))
                 added_log.append(addition)
                 changed = True
 
@@ -258,7 +289,7 @@ def apply_topic_operations(
                 continue
             if until_day is not None and until_day < ref_day:
                 continue
-            formatted = format_memory_bullet(new_body, ref_day, until_day)
+            formatted = format_memory_bullet(new_body, ref_day, until_day, event_day=event_day)
             matched_indices = _find_matching_indices(lines, old_key)
             if matched_indices:
                 first_idx = matched_indices[0]

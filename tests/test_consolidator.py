@@ -452,3 +452,50 @@ def test_consolidator_ignores_legacy_items_format(tmp_path: Path) -> None:
         assert not (memory.memory_dir / "preferences.md").exists()
     finally:
         state.close()
+
+
+# 测试 CONSOLIDATION_SYSTEM_PROMPT 正式声明 event_date 字段并满足预算，且沉淀器端到端保留事件真实发生日 (event: YYYY-MM-DD)
+def test_consolidator_executes_event_date_end_to_end_and_prompt_declares_event_date(
+    tmp_path: Path,
+) -> None:
+    assert "event_date" in CONSOLIDATION_SYSTEM_PROMPT
+    assert len(CONSOLIDATION_SYSTEM_PROMPT) <= 1350
+
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        state.append_message("ev-1", "user", "I got my Samsung Galaxy S22 on February 20th at Best Buy.")
+        state.append_message("ev-1", "assistant", "Congrats on your new phone!")
+        llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "User bought a Samsung Galaxy S22 on 2023-02-20.",
+                        "memories": [
+                            {
+                                "topic": "devices",
+                                "title": "设备记录",
+                                "index_summary": "购机与设备购买记录",
+                                "operations": [
+                                    {
+                                        "op": "add",
+                                        "text": "Bought Samsung Galaxy S22 at Best Buy on 2023-02-20.",
+                                        "event_date": "2023-02-20",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        result = runner.consolidate_once("ev-1", today=date(2023, 3, 15))
+        assert result is not None
+        assert result.saved_files == ("data/memory/devices.md",)
+
+        devices_lines = (memory.memory_dir / "devices.md").read_text(encoding="utf-8").splitlines()
+        assert "- [2023-03-15] (event: 2023-02-20) Bought Samsung Galaxy S22 at Best Buy on 2023-02-20." in devices_lines
+    finally:
+        state.close()

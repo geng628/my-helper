@@ -651,3 +651,165 @@ def test_merge_multi_merge_idempotency_and_edge_cases(tmp_path: Path) -> None:
         is None
     )
     assert "过期补充" not in (memory.memory_dir / "training.md").read_text(encoding="utf-8")
+
+
+# 测试 event_date 一等公民：独立渲染 (event: YYYY-MM-DD)、过去事件绝不过期、前缀复读清洗、非法值容错、merge/replace 兼容与 FTS5 检索可见性
+def test_event_date_structured_rendering_echo_cleanup_merge_and_non_expiry(tmp_path: Path) -> None:
+    from plugins.fts5_retriever import FTS5Retriever
+
+    retriever = FTS5Retriever()
+    memory = MemoryStore(tmp_path / "data", retriever=retriever)
+    day_write = date(2023, 3, 15)
+
+    # 1. 过去 event_date（2023-02-20 < 2023-03-15）绝不跳过，绝不算过期，也绝不被归档
+    memory.apply_memory_operations(
+        "devices",
+        "设备记录",
+        "购机与数码设备",
+        [
+            {
+                "op": "add",
+                "text": "在 Best Buy 购买 Samsung Galaxy S22。",
+                "event_date": "2023-02-20",
+            },
+            # 复读 (event: ...) 前缀清洗，不产生重复标记
+            {
+                "op": "add",
+                "text": "(event: 2023-02-20) 购买 Sony 耳机。",
+                "event_date": "2023-02-20",
+            },
+        ],
+        today=day_write,
+    )
+    devices_lines = (memory.memory_dir / "devices.md").read_text(encoding="utf-8").splitlines()
+    s22_line = "- [2023-03-15] (event: 2023-02-20) 在 Best Buy 购买 Samsung Galaxy S22。"
+    assert s22_line in devices_lines
+    assert "- [2023-03-15] (event: 2023-02-20) 购买 Sony 耳机。" in devices_lines
+    assert is_line_expired(s22_line, today=date(2099, 1, 1)) is False
+
+    # 2. event_date + until 组合按规范顺序 (event: ...) (until: ...) 渲染，且复读不同顺序的前缀也会去重
+    memory.apply_memory_operations(
+        "schedule",
+        "日程备忘",
+        "重要日程",
+        [
+            {
+                "op": "add",
+                "text": "项目答辩。",
+                "event_date": "2023-03-20",
+                "until": "2023-03-21",
+            },
+            {
+                "op": "add",
+                "text": "- [2023-03-15] (until: 2023-03-21) (event: 2023-03-20) 架构评审。",
+                "event_date": "2023-03-20",
+                "until": "2023-03-21",
+            },
+        ],
+        today=day_write,
+    )
+    schedule_lines = (memory.memory_dir / "schedule.md").read_text(encoding="utf-8").splitlines()
+    defense_line = "- [2023-03-15] (event: 2023-03-20) (until: 2023-03-21) 项目答辩。"
+    review_line = "- [2023-03-15] (event: 2023-03-20) (until: 2023-03-21) 架构评审。"
+    assert defense_line in schedule_lines
+    assert review_line in schedule_lines
+    assert is_line_expired(defense_line, today=date(2023, 3, 21)) is False
+    assert is_line_expired(defense_line, today=date(2023, 3, 22)) is True
+
+    # 3. 非法 event_date 安全忽略 (event: ...)，仍保留正文
+    memory.apply_memory_operations(
+        "prefs",
+        "个人偏好",
+        "使用习惯",
+        [
+            {"op": "add", "text": "偏好深色主题。", "event_date": "2023-02"},
+            {"op": "add", "text": "偏好使用终端工具。", "event_date": "unknown"},
+        ],
+        today=day_write,
+    )
+    prefs_lines = (memory.memory_dir / "prefs.md").read_text(encoding="utf-8").splitlines()
+    assert "- [2023-03-15] 偏好深色主题。" in prefs_lines
+    assert "- [2023-03-15] 偏好使用终端工具。" in prefs_lines
+
+    # 4. 过期归档只归档带 until 的日程，绝不误归档带过去 event_date 的事实；FTS5 在遥远未来仍能搜到
+    archived = memory.archive_expired_memories(today=date(2023, 4, 1))
+    assert archived == {"data/memory/schedule.md": 2}
+    assert s22_line in (memory.memory_dir / "devices.md").read_text(encoding="utf-8").splitlines()
+    hits_date = memory.search_hits("2023-02-20", root="data/memory", today=date(2099, 1, 1))
+    assert any("Samsung Galaxy S22" in h.snippet and "(event: 2023-02-20)" in h.snippet for h in hits_date)
+    hits_device = memory.search_hits("Samsung Galaxy S22", root="data/memory", today=date(2099, 1, 1))
+    assert any("(event: 2023-02-20)" in h.snippet for h in hits_device)
+
+    # 5. replace 配合 event_date：新行带 (event: ...)，旧行进入 archive/
+    memory.apply_memory_operations(
+        "orders",
+        "订单状态",
+        "设备物流进展",
+        [{"op": "add", "text": "Dell XPS 13 延迟发货中。"}],
+        today=day_write,
+    )
+    memory.apply_memory_operations(
+        "orders",
+        "订单状态",
+        "设备物流进展",
+        [{"op": "replace", "old": "延迟发货", "new": "Dell XPS 13 已签收。", "event_date": "2023-02-25"}],
+        today=date(2023, 3, 16),
+    )
+    orders_lines = (memory.memory_dir / "orders.md").read_text(encoding="utf-8").splitlines()
+    assert "- [2023-03-16] (event: 2023-02-25) Dell XPS 13 已签收。" in orders_lines
+    assert "Dell XPS 13 延迟发货中" in (memory.memory_dir / "archive" / "2023-03.md").read_text(encoding="utf-8")
+
+    # 6. merge 配合 event_date / 既有 event & until / 幂等 / 无日期行回退
+    memory.apply_memory_operations(
+        "merge-cases",
+        "合并场景",
+        "事件日期合并",
+        [
+            {"op": "add", "text": "购买了旗舰手机。"},
+            {"op": "add", "text": "准备演讲稿。", "until": "2023-04-01"},
+            {"op": "add", "text": "参加技术大会。", "event_date": "2023-03-20"},
+        ],
+        today=day_write,
+    )
+    memory.apply_memory_operations(
+        "merge-cases",
+        "合并场景",
+        "事件日期合并",
+        [
+            {"op": "merge", "old": "旗舰手机", "text": "学生折扣省了 100 美元。", "event_date": "2023-02-20"},
+            {"op": "merge", "old": "演讲稿", "text": "加入性能对比图。", "event_date": "2023-03-28"},
+            {"op": "merge", "old": "技术大会", "text": "提交会前签到。", "until": "2023-03-21"},
+            {"op": "merge", "old": "技术大会", "text": "领取参会胸牌。", "event_date": "2023-03-25"},
+        ],
+        today=day_write,
+    )
+    mc_lines = (memory.memory_dir / "merge-cases.md").read_text(encoding="utf-8").splitlines()
+    assert "- [2023-03-15] (event: 2023-02-20) 购买了旗舰手机；学生折扣省了 100 美元。" in mc_lines
+    assert "- [2023-03-15] (event: 2023-03-28) (until: 2023-04-01) 准备演讲稿；加入性能对比图。" in mc_lines
+    conf_line = next(line for line in mc_lines if "参加技术大会" in line)
+    assert conf_line == "- [2023-03-15] (event: 2023-03-20) (until: 2023-03-21) 参加技术大会；提交会前签到；领取参会胸牌。"
+    assert conf_line.count("(event:") == 1
+
+    # 对已带 (event: ...) 的行再次 merge 相同子句必须幂等返回 None
+    assert (
+        memory.apply_memory_operations(
+            "merge-cases",
+            "合并场景",
+            "事件日期合并",
+            [{"op": "merge", "old": "旗舰手机", "text": "学生折扣省了 100 美元。", "event_date": "2023-02-20"}],
+            today=day_write,
+        )
+        is None
+    )
+
+    # 无日期行使用 ref_day 盖 [YYYY-MM-DD] 并正确插入 (event: YYYY-MM-DD)
+    undated_path = memory.memory_dir / "undated.md"
+    undated_path.write_text("# 杂记 (undated.md)\n\n- 临时备忘。\n", encoding="utf-8")
+    memory.apply_memory_operations(
+        "undated",
+        "杂记",
+        "无日期条目",
+        [{"op": "merge", "old": "临时备忘", "text": "补充。", "event_date": "2023-05-20"}],
+        today=date(2023, 5, 24),
+    )
+    assert "- [2023-05-24] (event: 2023-05-20) 临时备忘；补充。" in undated_path.read_text(encoding="utf-8").splitlines()
