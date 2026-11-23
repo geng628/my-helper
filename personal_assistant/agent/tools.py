@@ -109,31 +109,6 @@ def build_tool(
     return instance
 
 
-# 兼容别名：为插件函数动态生成 Tool 子类实例
-def build_dynamic_plugin_tool(
-    fn: Callable[..., str],
-    *,
-    description: str,
-    parameters: dict[str, str] | None = None,
-    name: str | None = None,
-    param_enums: dict[str, tuple[str, ...]] | None = None,
-    risk: str = "read",
-    always_on: bool = False,
-    source_name: str = "plugin",
-) -> Tool:
-    return build_tool(
-        fn,
-        description=description,
-        parameters=parameters,
-        name=name,
-        param_enums=param_enums,
-        risk=risk,
-        always_on=always_on,
-        source_type="plugin",
-        source_name=source_name,
-    )
-
-
 # 统一工具集提供方基类（内置 MemoryToolsetProvider / 插件 PluginManager / 命令 CommandToolsetProvider 均继承此类）
 class ToolsetProvider:
     source_type: str = "builtin"

@@ -202,14 +202,9 @@ class MemoryConsolidator:
                 if not topic:
                     continue
 
-                # 同时支持新格式 operations（add/merge/replace/remove）与旧格式 items（纯追加）
-                ops: list[dict[str, object]] = []
+                # 仅解析结构化 operations（add/merge/replace/remove）
                 raw_ops = entry.get("operations")
-                if isinstance(raw_ops, list):
-                    ops.extend(op for op in raw_ops if isinstance(op, dict))
-                raw_items = entry.get("items")
-                if isinstance(raw_items, list):
-                    ops.extend({"op": "add", "text": str(item)} for item in raw_items if str(item).strip())
+                ops = [op for op in raw_ops if isinstance(op, dict)] if isinstance(raw_ops, list) else []
                 if not ops:
                     continue
                 try:

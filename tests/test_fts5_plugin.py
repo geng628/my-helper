@@ -12,13 +12,13 @@ from personal_assistant.assistant.commands import ToolsConfig
 from evals import main as eval_main
 from personal_assistant.ai import NoopLLMClient
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.agent.plugins import load_plugin_retrievers
+from personal_assistant.agent.plugins import PluginManager
 
 
 # 测试插件加载器能从 plugins/ 自动发现 fts5_bm25 检索插件，并受 tools.json 的 retrieval 段开关控制
 def test_fts5_plugin_discovery_and_tools_config_toggle(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    retrievers = load_plugin_retrievers(["plugins"], repo_root)
+    retrievers = PluginManager.from_entries(["plugins"], repo_root).retrievers
     assert "fts5_bm25" in retrievers
 
     cfg_path = tmp_path / "tools.json"
@@ -59,7 +59,7 @@ def test_fts5_plugin_discovery_and_tools_config_toggle(tmp_path: Path) -> None:
 # 测试 FTS5 BM25 插件的英文停用词/词干召回、中文双字索引、高相似干扰负例拦截与多文件多样性
 def test_fts5_retriever_bm25_ranking_hard_negatives_and_diversity(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    factory = load_plugin_retrievers(["plugins"], repo_root)["fts5_bm25"]
+    factory = PluginManager.from_entries(["plugins"], repo_root).retrievers["fts5_bm25"]
     retriever = factory({"min_term_coverage": 0.25, "max_hits_per_file": 2})
 
     data_dir = tmp_path / "data"
@@ -111,7 +111,7 @@ def test_fts5_retriever_bm25_ranking_hard_negatives_and_diversity(tmp_path: Path
 # 测试 FTS5 检索插件的 SQL 级过期过滤（today 边界）、归档屏蔽以及文件修改后的增量同步
 def test_fts5_retriever_temporal_expiry_archive_and_incremental_sync(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    factory = load_plugin_retrievers(["plugins"], repo_root)["fts5_bm25"]
+    factory = PluginManager.from_entries(["plugins"], repo_root).retrievers["fts5_bm25"]
     retriever = factory({})
 
     data_dir = tmp_path / "data"

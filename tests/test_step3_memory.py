@@ -8,7 +8,7 @@ import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.ai import LLMClient
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, memory_tools
+from personal_assistant.assistant.memory import FilesPolicy, MemoryStore, MemoryToolsetProvider
 from personal_assistant.agent.react import run_react
 
 
@@ -125,7 +125,7 @@ def test_memory_tools_and_react_integration(tmp_path: Path) -> None:
     )
 
     current_msg = ("记住，回复优先给 Python 标准库示例", 99)
-    registry = cfg.build_registry(*memory_tools(memory, get_user_message=lambda: current_msg))
+    registry = cfg.build_registry(providers=[MemoryToolsetProvider(memory, get_user_message=lambda: current_msg)])
     assert set(cfg.enabled_tools).issubset(set(registry.names))
 
     llm = ScriptedLLM(

@@ -1,4 +1,4 @@
-"""受控白名单 Shell 插件（plugins/shell_tools.py）单元测试（TDD）。"""
+"""受控白名单 Shell 插件（plugins/tools/shell_tools.py）单元测试（TDD）。"""
 from __future__ import annotations
 
 import json

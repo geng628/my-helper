@@ -19,12 +19,10 @@ from personal_assistant.agent.tools import (
     ToolsetProvider,
     build_tool,
     extract_tool,
-    is_tool,
 )
 from personal_assistant.ai.client import LLMClient, ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
-ConfigCompiler = Callable[..., dict[str, object]]
 
 
 # 内层子协议 2：检索引擎极简协议（MemoryStore 只认此协议的 search_hits 契约，不关心实现是否来自插件）
@@ -77,7 +75,7 @@ class PluginContext:
     raw_config: Mapping[str, object] = field(default_factory=dict)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
-    compilers: dict[str, ConfigCompiler] = field(default_factory=dict)
+    compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
 
     # 提取供 build_tool 自动按签名绑定到 @tool 函数上的系统资源上下文
@@ -139,54 +137,27 @@ class PluginContext:
         else:
             raise ValueError(f"检索插件必须实现 RetrieverProtocol 或可调用工厂：{clean_name}")
 
-    # 插槽 3：向主板注册配置编译器子协议实现（支持传入 ConfigCompilerProtocol 对象或编译函数）
-    def register_compiler(
-        self,
-        compiler_or_name: ConfigCompilerProtocol | str,
-        compiler_fn: ConfigCompiler | None = None,
-    ) -> None:
-        if isinstance(compiler_or_name, ConfigCompilerProtocol):
-            clean_name = compiler_or_name.name.strip()
-            target: Any = compiler_or_name
-        else:
-            clean_name = str(compiler_or_name).strip()
-            target = compiler_fn
-        if not clean_name or target is None:
-            raise ValueError(f"配置编译器插件注册参数非法：{compiler_or_name!r}")
+    # 插槽 3：向主板注册配置编译器子协议实现（仅接受 ConfigCompilerProtocol 实例）
+    def register_compiler(self, compiler: ConfigCompilerProtocol) -> None:
+        if not isinstance(compiler, ConfigCompilerProtocol):
+            raise TypeError(f"配置编译器插件必须实现 ConfigCompilerProtocol：{compiler!r}")
+        clean_name = compiler.name.strip()
+        if not clean_name:
+            raise ValueError("配置编译器插件名称不能为空。")
         if clean_name in self.compilers:
             raise ValueError(f"配置编译器插件名称重复：{clean_name}")
-        if isinstance(target, ConfigCompilerProtocol) and not callable(target):
-            # 包装 ConfigCompilerProtocol.compile 为可调用对象并透传 presets / render 方法
-            def _callable_compiler(text: str, source: str = "models.dsl") -> dict[str, object]:
-                return target.compile(text, source)
+        self.compilers[clean_name] = compiler
 
-            setattr(_callable_compiler, "presets", target.presets)
-            setattr(_callable_compiler, "render", target.render)
-            self.compilers[clean_name] = _callable_compiler
-        elif callable(target):
-            self.compilers[clean_name] = target
-        else:
-            raise ValueError(f"配置编译器插件必须实现 ConfigCompilerProtocol 或可调用：{clean_name}")
-
-    # 插槽 4：向主板注册大模型客户端驱动子协议实现（支持传入 LLMProviderProtocol 对象或工厂函数）
-    def register_provider(
-        self,
-        provider_or_name: LLMProviderProtocol | str,
-        factory_fn: ProviderFactory | None = None,
-    ) -> None:
-        if isinstance(provider_or_name, LLMProviderProtocol):
-            clean_name = provider_or_name.name.strip()
-            factory: ProviderFactory = provider_or_name.build
-        else:
-            clean_name = str(provider_or_name).strip()
-            if factory_fn is None or not callable(factory_fn):
-                raise ValueError(f"模型 Provider 插件缺少可调用工厂：{clean_name}")
-            factory = factory_fn
+    # 插槽 4：向主板注册大模型客户端驱动子协议实现（仅接受 LLMProviderProtocol 实例）
+    def register_provider(self, provider: LLMProviderProtocol) -> None:
+        if not isinstance(provider, LLMProviderProtocol):
+            raise TypeError(f"模型 Provider 插件必须实现 LLMProviderProtocol：{provider!r}")
+        clean_name = provider.name.strip()
         if not clean_name:
             raise ValueError("模型 Provider 插件名称不能为空。")
         if clean_name in self.providers:
             raise ValueError(f"模型 Provider 插件名称重复：{clean_name}")
-        self.providers[clean_name] = factory
+        self.providers[clean_name] = provider.build
 
 
 # 外层统一主板基类：所有 plugins/*.py 插件均继承此类，通过 __init_subclass__ 自动发现、共享 self.context 与统一生命周期
@@ -233,10 +204,6 @@ def _resolve_plugin_targets(entries: Iterable[str], project_root: Path) -> list[
         target = (root / rel).resolve()
         if not target.is_relative_to(root):
             raise ValueError(f"插件路径超出项目范围：{entry}")
-        if not target.exists() and len(rel.parts) == 2 and rel.parts[0] == "plugins":
-            fallback = (root / "plugins" / "tools" / rel.parts[1]).resolve()
-            if fallback.is_relative_to(root) and fallback.exists():
-                target = fallback
         if not target.exists():
             continue
 
@@ -310,33 +277,6 @@ def _normalize_plugin_tool(
     )
 
 
-# 从模块中提取旧式字典声明（兼容单测中的临时脚本插件）
-def _extract_legacy_factories(
-    module: ModuleType,
-    file_path: Path,
-    *,
-    dict_attr: str,
-    name_attr: str,
-    factory_attr: str,
-) -> dict[str, Callable]:
-    found: dict[str, Callable] = {}
-    exported = getattr(module, dict_attr, None)
-    if exported is not None:
-        if not isinstance(exported, dict):
-            raise ValueError(f"插件 {file_path.name} 的 {dict_attr} 必须是字典。")
-        for name, factory in exported.items():
-            if not isinstance(name, str) or not name.strip() or not callable(factory):
-                raise ValueError(f"插件 {file_path.name} 的 {dict_attr} 项格式非法：{name!r}")
-            found[name.strip()] = factory
-
-    single_name = getattr(module, name_attr, None)
-    single_factory = getattr(module, factory_attr, None)
-    if isinstance(single_name, str) and single_name.strip() and callable(single_factory):
-        found.setdefault(single_name.strip(), single_factory)
-
-    return found
-
-
 # 为仅写了 @tool 函数而未显式声明 Plugin 子类的简单脚本模块自动生成统一 Plugin 外壳
 class _AutoScriptPlugin(Plugin):
     # 绑定待包装的脚本模块与文件名
@@ -345,54 +285,15 @@ class _AutoScriptPlugin(Plugin):
         self.module = module
         self.file_path = file_path
 
-    # 扫描脚本中的 @tool / TOOLS / 旧式字典并统一注册进 self.context 插槽
+    # 扫描脚本中的 @tool 装饰函数并统一注册进 self.context 插槽
     def initialize(self) -> None:
         source_name = self.file_path.stem
         seen_in_file: set[str] = set()
-
-        exported = getattr(self.module, "TOOLS", None)
-        if exported is not None:
-            if not isinstance(exported, (list, tuple)):
-                raise ValueError(f"插件 {self.file_path.name} 的 TOOLS 必须是列表或元组。")
-            for item in exported:
-                if not isinstance(item, Tool):
-                    raise ValueError(f"插件 {self.file_path.name} 的 TOOLS 中包含非 Tool 对象。")
-                if item.name not in seen_in_file:
-                    seen_in_file.add(item.name)
-                    self.context.register_tool(item, source_name=source_name)
-
         for value in vars(self.module).values():
             marked = getattr(value, "__agent_tool__", None)
             if isinstance(marked, Tool) and marked.name not in seen_in_file:
                 seen_in_file.add(marked.name)
                 self.context.register_tool(marked, source_name=source_name)
-
-        for name, factory in _extract_legacy_factories(
-            self.module,
-            self.file_path,
-            dict_attr="RETRIEVERS",
-            name_attr="RETRIEVER_NAME",
-            factory_attr="create_retriever",
-        ).items():
-            self.context.register_retriever(name, factory)
-
-        for name, factory in _extract_legacy_factories(
-            self.module,
-            self.file_path,
-            dict_attr="LLM_PROVIDERS",
-            name_attr="PROVIDER_NAME",
-            factory_attr="create_provider",
-        ).items():
-            self.context.register_provider(name, factory)
-
-        for name, compiler in _extract_legacy_factories(
-            self.module,
-            self.file_path,
-            dict_attr="CONFIG_COMPILERS",
-            name_attr="COMPILER_NAME",
-            factory_attr="compile_config",
-        ).items():
-            self.context.register_compiler(name, compiler)
 
 
 # 在给定 PluginContext 上实例化并执行全部插件模块的 Plugin.initialize() 生命周期
@@ -422,7 +323,7 @@ class PluginManager(ToolsetProvider):
     default_tools: tuple[Tool, ...]
     retrievers: dict[str, RetrieverFactory]
     providers: dict[str, ProviderFactory]
-    compilers: dict[str, ConfigCompiler]
+    compilers: dict[str, ConfigCompilerProtocol]
     plugins: tuple[Plugin, ...] = ()
     source_type: str = "plugin"
     source_name: str = "plugins"
@@ -499,50 +400,3 @@ class PluginManager(ToolsetProvider):
     def terminate_all(self) -> None:
         for plugin in self.plugins:
             plugin.terminate()
-
-
-# 一次扫描同时加载插件工具、插件检索后端、插件 LLM Provider 与配置编译器插件
-def load_plugins(
-    entries: Iterable[str],
-    project_root: Path,
-) -> tuple[
-    list[Tool],
-    dict[str, RetrieverFactory],
-    dict[str, ProviderFactory],
-    dict[str, ConfigCompiler],
-]:
-    manager = PluginManager.from_entries(entries, project_root)
-    return list(manager.default_tools), manager.retrievers, manager.providers, manager.compilers
-
-
-# 批量加载配置声明的全部插件工具，并禁止跨文件重名
-def load_plugin_tools(entries: Iterable[str], project_root: Path) -> list[Tool]:
-    tools, _, _, _ = load_plugins(entries, project_root)
-    return tools
-
-
-# 批量加载配置声明的全部插件检索后端工厂（如 fts5_bm25），并禁止跨文件重名
-def load_plugin_retrievers(
-    entries: Iterable[str],
-    project_root: Path,
-) -> dict[str, RetrieverFactory]:
-    _, retrievers, _, _ = load_plugins(entries, project_root)
-    return retrievers
-
-
-# 批量加载配置声明的全部插件大模型 Provider 工厂（如自定义非 OpenAI 厂商适配器）
-def load_plugin_providers(
-    entries: Iterable[str],
-    project_root: Path,
-) -> dict[str, ProviderFactory]:
-    _, _, providers, _ = load_plugins(entries, project_root)
-    return providers
-
-
-# 批量加载配置声明的全部外部配置编译器插件（如 models_dsl -> models.json）
-def load_plugin_compilers(
-    entries: Iterable[str],
-    project_root: Path,
-) -> dict[str, ConfigCompiler]:
-    _, _, _, compilers = load_plugins(entries, project_root)
-    return compilers

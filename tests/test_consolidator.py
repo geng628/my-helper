@@ -79,13 +79,16 @@ def test_consolidator_distills_memories_deduplicates_and_compacts_context(tmp_pa
                                 "topic": "projects",
                                 "title": "项目决策",
                                 "index_summary": "架构选择与关键决策",
-                                "items": ["使用纯 Python 标准库搭建个人 Agent", "采用索引式 Markdown 记忆"],
+                                "operations": [
+                                    {"op": "add", "text": "使用纯 Python 标准库搭建个人 Agent"},
+                                    {"op": "add", "text": "采用索引式 Markdown 记忆"},
+                                ],
                             },
                             {
                                 "topic": "memory",  # 保留字主题名应被安全跳过，绝不覆盖 MEMORY.md
                                 "title": "非法主题",
                                 "index_summary": "应被拦截",
-                                "items": ["不应写入"],
+                                "operations": [{"op": "add", "text": "不应写入"}],
                             },
                         ],
                     },
@@ -101,7 +104,10 @@ def test_consolidator_distills_memories_deduplicates_and_compacts_context(tmp_pa
                                 "topic": "projects",
                                 "title": "项目决策",
                                 "index_summary": "架构选择与关键决策",
-                                "items": ["使用纯 Python 标准库搭建个人 Agent", "启用阈值触发的后台自动沉淀"],
+                                "operations": [
+                                    {"op": "add", "text": "使用纯 Python 标准库搭建个人 Agent"},
+                                    {"op": "add", "text": "启用阈值触发的后台自动沉淀"},
+                                ],
                             }
                         ],
                     },
@@ -183,7 +189,7 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
                             "topic": "preferences",
                             "title": "个人偏好",
                             "index_summary": "沟通与代码风格偏好",
-                            "items": ["偏好简洁中文回答"],
+                            "operations": [{"op": "add", "text": "偏好简洁中文回答"}],
                         }
                     ],
                 },
@@ -409,5 +415,40 @@ def test_consolidator_op_merge_prunes_consolidated_raw_facts_ghost(tmp_path: Pat
         assert f"(msg#{m3})" not in facts_text
         assert "橘猫" in facts_text
         assert f"(msg#{m1})" in facts_text
+    finally:
+        state.close()
+
+
+# 测试记忆沉淀仅接受结构化 operations 协议，忽略旧版 items 兼容格式
+def test_consolidator_ignores_legacy_items_format(tmp_path: Path) -> None:
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        state.append_message("legacy-items", "user", "我喜欢乌龙茶。")
+        state.append_message("legacy-items", "assistant", "记下了。")
+        llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "用户喜欢乌龙茶。",
+                        "memories": [
+                            {
+                                "topic": "preferences",
+                                "title": "个人偏好",
+                                "index_summary": "饮品偏好",
+                                "items": ["喜欢乌龙茶"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
+        runner = MemoryConsolidator(state, memory, llm, policy=policy)
+        result = runner.consolidate_once("legacy-items", today=date(2026, 11, 20))
+        assert result is not None
+        assert result.saved_files == ()
+        assert not (memory.memory_dir / "preferences.md").exists()
     finally:
         state.close()

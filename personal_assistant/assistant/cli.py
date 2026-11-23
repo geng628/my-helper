@@ -8,7 +8,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from personal_assistant.agent.plugins import load_plugin_tools
+from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.react import run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import format_cache_summary
@@ -25,9 +25,9 @@ from personal_assistant.assistant.memory import (
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
-# 从可编辑插件文件加载演示用时间工具（不硬编码工具实现）
+# 从可编辑插件目录加载演示用时间工具（不硬编码工具实现）
 def build_demo_tools() -> ToolRegistry:
-    plugin_tools = load_plugin_tools(["plugins/custom_tools.py"], REPO_ROOT)
+    plugin_tools = PluginManager.from_entries(["plugins/tools"], REPO_ROOT).tools()
     return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 

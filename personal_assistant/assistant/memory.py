@@ -724,19 +724,6 @@ class MemoryStore:
             today=today,
         )
 
-    # 将沉淀提炼的长期记忆按主题去重追加到 data/memory/<topic>.md（兼容旧接口）
-    def save_memory_entries(
-        self,
-        topic: str,
-        title: str,
-        index_summary: str,
-        items: list[str],
-        *,
-        today: date | None = None,
-    ) -> str | None:
-        ops = [{"op": "add", "text": str(item)} for item in items if str(item).strip()]
-        return self.apply_memory_operations(topic, title, index_summary, ops, today=today)
-
     # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md
     def archive_expired_memories(self, today: date | None = None) -> dict[str, int]:
         return archive_expired_topics(
@@ -927,16 +914,3 @@ class MemoryToolsetProvider(ToolsetProvider):
             )
             for name, desc, params, fn, risk, enums in specs
         ]
-
-
-# 将 MemoryStore 的核心能力打包成 6 个基础内置 Tool（委派给 MemoryToolsetProvider）
-def memory_tools(
-    memory: MemoryStore,
-    get_user_message: Callable[[], tuple[str, int | None]] | None = None,
-    get_today: Callable[[], date] | None = None,
-) -> list[Tool]:
-    return MemoryToolsetProvider(
-        memory,
-        get_user_message=get_user_message,
-        get_today=get_today,
-    ).tools()

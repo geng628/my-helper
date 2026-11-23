@@ -554,16 +554,12 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
     }
 
 
-# 实现内层 ConfigCompilerProtocol 协议的强类型配置编译器（支持 compile / presets / render 与直接调用）
+# 实现内层 ConfigCompilerProtocol 协议的强类型配置编译器（支持 compile / presets / render）
 class ModelsDSLCompiler:
     name = COMPILER_NAME
 
     # 编译 DSL 文本为标准 models.json 字典
     def compile(self, text: str, source: str = "models.dsl") -> dict[str, object]:
-        return compile_models_dsl(text, source=source)
-
-    # 支持作为可调用函数 compiler(text, source) 直接调用
-    def __call__(self, text: str, source: str = "models.dsl") -> dict[str, object]:
         return compile_models_dsl(text, source=source)
 
     # 返回内置模型厂商预设列表
