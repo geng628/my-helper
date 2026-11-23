@@ -546,3 +546,37 @@
   - **真实 API 5 题并发冒烟（`--mode memory --category single-session-assistant --max-cases 5 --workers 5`，跑于等价并发调度提交 `e7ab0a9`，`/tmp/issue_eval_workers_smoke5.json`）**：**5/5 (100.0%)**、服务端 KV 命中 **71.81%**、本地前缀复用 **65.62%**（`llm_calls=17`, `prompt_tokens=37,251`），总墙钟耗时 **`17.90s`**（5 题单题延迟之和 `68.2s`，逆序完成但输出列表严格保持原 JSONL 题序）。
   - **未验证项**：本次小 PR 未重跑完整 35 题 LME 与 16 场景全集（留作下一步 `rebase` PR `#33` 时直接使用 `--workers` 实测验收）。
 - **下一步**：合入本 PR 后，将 PR `#33`（`event_date` 结构化时间轴）rebase 到最新 `main`，用 `--workers 5` 快速完成全量 LME 35 + Memory 16 验收。
+
+
+---
+
+### [2026-11-23] 新增一等公民 `event_date` 结构化字段（双时间轴分离记录日与事件发生日，Issue `#32`）
+- **目标与思路**：解决过往记忆仅有 `[YYYY-MM-DD]`（记录日）与 `(until: YYYY-MM-DD)`（过期截止日）两类标记、导致问答阶段将记录日期误认作事件发生日期的“双时间轴混淆”顽疾（典型如近 3 轮同口径实测 3/3 均错的 `lme-gpt4_2312f94c`：用户在 `2023-03-15` 提到 `2023-02-20` 购买 Galaxy S22 与 `2023-02-25` 收到 Dell XPS 13）。通过代码级一等公民字段 `event_date` 显式渲染 `(event: YYYY-MM-DD)`，并与 `until` 彻底隔离：**`event_date < ref_day` 绝不跳过、绝不过期、绝不误归档**。
+- **改动文件（Issue `#32`，原提交 `25e2422` → rebase 至 `main` `dba72a3` 后代码提交 `0290a97`）**：
+  - `personal_assistant/assistant/memory_lifecycle.py`：新增 `EVENT_DATE_PATTERN`；更新 `ECHOED_PREFIX_PATTERN` 支持剥离任意顺序复读的 `(event|until): YYYY-MM-DD`；`format_memory_bullet()` 与 `_merge_memory_bullet()` 支持可选 `event_day: date | None`（统一规范序 `- [YYYY-MM-DD] (event: YYYY-MM-DD) (until: YYYY-MM-DD) 正文`，兼容 `until` 先存在时补插 `event_date`、`HH:MM` 时间戳及无日期行回退用 `ref_day` 盖戳）；`apply_topic_operations()` 对 `add` / `merge` / `replace` 解析 `event_date`，且严格仅按 `until_day` 判过期。
+  - `personal_assistant/assistant/consolidator.py`：`CONSOLIDATION_SYSTEM_PROMPT` 在 `add` / `replace` Schema 与规则 4 声明可选 `event_date`（总长度 **`1345 <= 1350`** 字符，完整保留全部既有守卫词与已统一的 `operations`-only 解析；`SYSTEM_PROMPT` 零改动）。
+  - `tests/test_memory_lifecycle.py` & `tests/test_consolidator.py`：新增 2 条 TDD 单测，覆盖过去 `event_date` 永不过期/不归档、`event_date + until` 规范序、复读前缀去重、非法日期忽略、`replace`/`merge`/无日期行兼容、FTS5 检索可见性及端到端沉淀输出。
+- **Layer 2 独立只读审查 trace**：
+  - **初版（`25e2422`）→ `Pass`**（0 Blocker，4 条非阻塞 Nits）；
+  - **Rebase 后复用验收（`0290a97` on `main` `dba72a3`）→ `Pass`**（0 Blocker；核验与 PR `#35` / `#37` / `#39` 零语义冲突、`CONSOLIDATION_SYSTEM_PROMPT=1345`、全量 `120 passed`、AST `0` 缺失、3 条信息性 Nits）。
+- **同口径合流验证对比（基于最新 `main` `dba72a3` → `0290a97`，使用 `--workers 5` 实跑）**：
+  - 单元测试 (`uv run pytest -v`)：**118 passed → 120 passed**（`4.75s~4.80s`，含 `tests/test_architecture.py` 及 2 条 `event_date` 单测）；AST 中文 `#` 注释：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**；LoCoMo 200 题保持 **105/200 (52.5%)**，零退步。
+  - **LongMemEval 35 题（`--workers 5`，`/tmp/pr33_rebased_lme35.json`，总墙钟耗时 `135.16s` / 2m15s）**：
+    - 总计：**30/35 (`main` `0a6cf70`) → `32/35 (91.43%)`**（历史新高；服务端 KV 命中 **57.06%**、本地前缀复用 **76.61%**、`completion_tokens=36,819`）。
+    - 分类：**`abstention` 5/5 (100%)**、**`knowledge-update` 5/5 (100%)**（`lme-9ea5eabc` 通过）、**`single-session-assistant` 5/5 (100%)**（完整守住 PR `#37` 成果）、**`single-session-user` 5/5 (100%)**、**`multi-session` 4/5 (80%)**（`lme-gpt4_194be4b3` 通过）、**`single-session-preference` 4/5 (80%)**、`temporal-reasoning` 4/5 (80%)（`lme-gpt4_4cd9eba1` 通过）。
+    - **失败项如实汇报（3 例）**：① `lme-35a27287`（既有 `tools=[]` 未查记忆反问城市）；② `lme-5a7937c8`（`multi-session` 漏算 Dec 10 答 2 天 vs 3 天）；③ `lme-gpt4_2312f94c`（全量这轮记忆层已精准写出并读取 **`Feb 20, 2023` S22** 与 **`Feb 25, 2023` XPS 13**，彻底消除 `main` 上的 `2023-03-15` 记录日幻觉，仅模型在末尾句比较时口误称 `Dell XPS 13 came first`；同代码独立 2 题冒烟 `/tmp/pr33_smoke2.json` 与初版 `25e2422` 均已验证 `facts.md` `(event: 2023-02-20)` / `(event: 2023-02-25)` 落盘并 `2/2 PASS`）。
+  - **16 场景多轮记忆 Dev（`--workers 5`，`/tmp/pr33_rebased_memory16.json`，总墙钟耗时 `91.95s` / 1m32s）**：
+    - 总计：**`15/16 (93.75%)`**，服务端 KV 命中 **79.10%**、本地前缀复用 **87.34%**（`completion_tokens=12,698`）。
+    - **`knowledge-update 4/4`、`abstention 2/2`、`extraction 3/3`、`multi-session 2/2`、`temporal 3/3`**（`relative-date-resolution`、`temp-fact-expiry`、`expiry-boundary-same-day` 全过）、`explicit-forget-remove` 与 `kv-cache-efficiency`（闲聊 `tools=[]`）全部通过。
+    - **失败项如实汇报（1 例）**：`rolling-multi-compaction`（实答 `"企业微信机器人"`，未中缩写字面 `'企微'`，零记忆丢失）。
+  - **真模型多轮评测 3（LoCoMo 50 题，`--workers 5`，合并后当前树）**：`40/50 (80.00%)`（基线 `4d18252` 为 `38/50` / `76.0%`，提升 `+2` 题 / `+4.0pp`；`WALL_TIME_SEC=218.84s`，`mean_latency_ms=11533.003`，`llm_calls=146`，`server_cache_hit_rate=0.4919`，`mean_prefix_reuse_rate=0.5211`）。
+    - **分维度通过率**：`temporal` **`9/10`**、`single-hop` **`9/10`**、`open-domain` **`8/10`**、`adversarial` **`8/10`**、`multi-hop` **`6/10`**；`search_chat_history` 触发 `9/50` 次（`4/9` 通过）。
+    - **全部 10 例失败如实汇报**：
+      - `adversarial` 2 例（经核对 `evals/public/locomo_memory_scenarios.jsonl` 原文，均**零幻觉**）：`locomo-conv-26-q162` 询问手绘碗联想内容（对话 `setup step#7 msg#5` 原句明确写明 *"reminds me of art and self-expression"*，属上游 LoCoMo 数据集误标为不可回答题，助手据此实答 `"艺术与自我表达"`）；`locomo-conv-26-q174` 诱导询问 *"Caroline's sculpture for the art show"*（助手核对检索与对话历史后显式纠偏 *"it's a painting, not a sculpture; I don't have any record of her making sculpture"*，准确拒绝错误前提后仍被自动裁判判负）。
+      - `multi-hop` 4 例：`locomo-conv-26-q004`（引述咨询研究，未将领养机构并列为“研究”）、`locomo-conv-26-q024`（漏答书名 `"Nothing is Impossible"`）、`locomo-conv-26-q077`（将 10 月 19 日答为露营而非徒步）、`locomo-conv-26-q041`（去海滩次数计为 1 次而非 2 次）。
+      - `open-domain` 2 例：`locomo-conv-26-q060`（推断 Caroline 非宗教人士，裁判期待 `"Somewhat, but not extremely religious"`）、`locomo-conv-26-q015`（对反事实推理答 `"can't answer definitively"` 而非 `"Likely no"`）。
+      - `temporal` 1 例：`locomo-conv-26-q059`（答了 `2023-07-02` 的黑白碗而非 `24 August 2023` 的盘子）。
+      - `single-hop` 1 例：`locomo-conv-26-q111`（提到杯子但漏掉 `"with a dog face on it"`）。
+  - **未验证项**：无（40 题 / LoCoMo 200 题离线检索、`16` 场景、LongMemEval `35` 题、LoCoMo `50` 题均已基于当前合并树实测）。
+- **下一步**：合入 PR `#33` 后，可按需推进下一步检索增强（如 `plugins/hybrid_rrf_retriever.py`）或另开极小 PR 隔离评测中 `get_current_time()` 宿主机墙钟泄露。
