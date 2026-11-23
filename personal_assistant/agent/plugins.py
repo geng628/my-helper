@@ -73,6 +73,7 @@ class PluginContext:
     config_path: Path | None = None
     offload_dir: Path | None = None
     raw_config: Mapping[str, object] = field(default_factory=dict)
+    extra_bindings: Mapping[str, object] = field(default_factory=dict)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
@@ -82,15 +83,21 @@ class PluginContext:
     def tool_bindings(self) -> dict[str, object]:
         raw_shell = self.raw_config.get("shell")
         raw_web = self.raw_config.get("web")
-        return {
-            "project_root": self.project_root,
-            "data_root": self.data_root,
-            "config_path": self.config_path,
-            "offload_dir": self.offload_dir,
-            "raw_config": dict(self.raw_config),
-            "shell_config": dict(raw_shell) if isinstance(raw_shell, Mapping) else None,
-            "web_config": dict(raw_web) if isinstance(raw_web, Mapping) else None,
-        }
+        raw_retrieval = self.raw_config.get("retrieval")
+        bindings: dict[str, object] = dict(self.extra_bindings)
+        bindings.update(
+            {
+                "project_root": self.project_root,
+                "data_root": self.data_root,
+                "config_path": self.config_path,
+                "offload_dir": self.offload_dir,
+                "raw_config": dict(self.raw_config),
+                "shell_config": dict(raw_shell) if isinstance(raw_shell, Mapping) else None,
+                "web_config": dict(raw_web) if isinstance(raw_web, Mapping) else None,
+                "retrieval_config": dict(raw_retrieval) if isinstance(raw_retrieval, Mapping) else None,
+            }
+        )
+        return bindings
 
     # 插槽 1：向主板 ToolRegistry 注册一个 Tool 子类实例或 @tool 函数（自动通过 build_tool 绑定当前上下文）
     def register_tool(
@@ -374,12 +381,15 @@ class PluginManager(ToolsetProvider):
         )
         raw_cfg = context.get("raw_config")
         cfg_map = raw_cfg if isinstance(raw_cfg, Mapping) else {}
+        raw_extra = context.get("extra_bindings")
+        extra_map = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
         return PluginContext(
             project_root=project_root,
             data_root=data_root,
             config_path=config_path,
             offload_dir=offload_dir,
             raw_config=cfg_map,
+            extra_bindings=extra_map,
         )
 
     # 返回默认无额外上下文时的插件工具列表（实现 ToolsetProvider.tools）

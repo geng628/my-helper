@@ -3,6 +3,7 @@
     "list_files",
     "search_markdown",
     "read_markdown",
+    "search_chat_history",
     "write_file",
     "remember_fact",
     "save_rule",

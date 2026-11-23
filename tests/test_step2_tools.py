@@ -53,6 +53,7 @@ def test_load_real_project_tools_config() -> None:
     assert registry.names == [
         "search_markdown",
         "get_current_time",
+        "search_chat_history",
         "run_command",
         "web_search",
         "fetch_webpage",
