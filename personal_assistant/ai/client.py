@@ -250,28 +250,40 @@ class OpenAICompatibleLLM(LLMClient):
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
+    # 组装 /chat/completions 的请求地址、请求体与鉴权头（同步与流式调用共用）
+    def _build_request(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None,
+        *,
+        stream: bool,
+    ) -> tuple[str, dict[str, object], dict[str, str]]:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        return (
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            payload,
+            {"Authorization": f"Bearer {self.api_key}"},
+        )
+
     # 组装 OpenAI 格式请求体调用 /chat/completions，记录 usage 并返回首条 assistant 消息
     def respond(
         self,
         messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-
+        url, payload, headers = self._build_request(messages, tools, stream=False)
         self.last_usage = None
-        response = self.post_json(
-            f"{self.base_url.rstrip('/')}/chat/completions",
-            payload,
-            {"Authorization": f"Bearer {self.api_key}"},
-        )
+        response = self.post_json(url, payload, headers)
         msg = dict(response["choices"][0]["message"])
         self.last_usage = extract_usage(response)
         return msg
@@ -286,19 +298,7 @@ class OpenAICompatibleLLM(LLMClient):
             yield from super().stream(messages, tools)
             return
 
-        payload: dict[str, object] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        url, payload, headers = self._build_request(messages, tools, stream=True)
         self.last_usage = None
         t0 = time.perf_counter()
 
