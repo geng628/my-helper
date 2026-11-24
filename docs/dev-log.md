@@ -569,4 +569,30 @@
   - 离线演示与检索：[scripts/demo.py](scripts/demo.py) 离线演示通过；`fts5_bm25` 40 题保持 **38/40 (95.0%)**（`MRR=0.9483`），LoCoMo 200 题保持 **105/200 (52.5%)**，零退步。
   - **真实模型（`deepseek-chat`）SSE 流式冒烟（测于底层流式一致的提交 `fa4f698`）**：Turn 1 直答实时收到 **6** 个 `text_delta` 分片（`ttft_ms=3129.6ms < turn_total_ms=3357.9ms`，`prompt_tokens=1773`, `completion_tokens=6`）；Turn 2 触发增量工具调用 `get_current_time`（`0.141ms`）并流式收到 **16** 个 `text_delta` 分片，服务端 KV 命中 **`91.2%` (`3328/3649`)**、前缀复用 **`96.1%`**（`stream_options.include_usage` 正常生效）。
   - **退步与未验证项**：无退步；因本 PR 不改 `SYSTEM_PROMPT`、`CONSOLIDATION_SYSTEM_PROMPT`、检索算法及记忆写入逻辑，多轮记忆全集（Memory 16 / LongMemEval 35 / LoCoMo 100）未在本 PR 重跑，`bb7c650` 精简后端到端行为由覆盖完整 HTTP SSE 路径的 `test_streaming.py` 与 `124 passed` 守卫验证。
-- **下一步**：合入 PR `#41`（关联 Issue `#40`）后，开启 **PR 2（纯插件 `plugins/telemetry.py`）** 实现 `ObserverProtocol`，在不改动微内核机制代码的前提下落地有界窗口、分阶段耗时拆解与后台沉淀开销观测。
+- **下一步**：PR `#41` 已以 Squash Merge 合入 `main`（`5b79f6c`，含后续 `c02d9cd` CLI/请求去重收口），接着开启 **PR 2（纯插件 `plugins/telemetry.py`）** 实现 `ObserverProtocol`，在不改动微内核机制代码的前提下落地有界窗口、分阶段耗时拆解与后台沉淀开销观测。
+
+
+---
+
+### [2026-11-24] 零微内核改动运行期观测插件 `plugins/telemetry.py`（Issue `#42`）
+- **目标与设计落点**：基于合入 `main` (`5b79f6c`) 的第 5 主板插槽 `ObserverProtocol`，以**零 `personal_assistant/` 微内核改动**的独立插件完成运行期分阶段耗时拆解、有界窗口与后台记忆沉淀观测账本：
+  1. **`plugins/telemetry.py`（`311` 行，仅依赖 `personal_assistant.ai` / `agent` 公开类型）**：
+     - 外层继承 `Plugin(ABC)`（`TelemetryPlugin`），在 `initialize()` 向插槽 5 注册工厂 `create_observer(cfg)`（确保每个 `AssistantApp` 实例拥有独立观测状态）；
+     - 内层 `TelemetryObserver` 用 `threading.Lock` 保护全路径，使用 `deque(maxlen=window_size)` 存最近回合（`TurnRecord`）与后台任务（`TaskRecord`）并配合单调递增游标 `_turn_seq` / `_task_seq`；通过 `_touch_bounded(..., max_sessions)` 为 `_in_flight` 与 `_sessions` 提供有界 MRU 淘汰；全局 `totals` 与单会话 `session` 复用共享累计器 `_CumulativeStats`，前后对话与后台 `TaskEvent` 严格隔离；`TelemetryConfig` 对 `bool` / 非正数回退默认值并在 `__post_init__` 拦截非法 `<= 0` 配置，各事件耗时字段统一非负钳位。
+  2. **配置、Web UI 与文档**：`config/tools.json` 增加 `"telemetry": {"enabled": true, "window_size": 200}`；[scripts/web_ui.html](scripts/web_ui.html) 在回复气泡下方渲染分阶段耗时（总计 / 首字 / 模型 / 工具）并在 `cachePill.title` 悬停提示后台沉淀次数与最近耗时（经 `!Number.isFinite` 与 `escapeHtml` 安全防护）；[README.md](README.md) 同步补全插件结构说明。
+- **改动文件（Commit `f21df2a`）**：
+  - `plugins/telemetry.py`、`config/tools.json`、`scripts/web_ui.html`、`README.md`
+  - `tests/test_telemetry_plugin.py`（复用 `tests.test_streaming.ScriptedStreamLLM`，覆盖插件发现与开关隔离、分阶段拆解与有界 MRU/负耗时/非法配置校验、真实 `AssistantApp` + `BackgroundConsolidator` 端到端链路、8 线程并发压测）及更新 `tests/test_plugins.py`、`tests/test_history_plugin.py` 插件数量清点断言。
+  - 微内核核查：`git diff --exit-code main -- personal_assistant/` 确认 **`0` 行改动**。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`44be770`）→ `Pass`**（0 Blocker，提出 5 条关于全路径非负钳位、`_pos_int`/`TelemetryConfig` 正数校验、避免 `asdict` 冗余展开、补充 `_in_flight` 淘汰测试与 `Number.isFinite` 校验的 Nits）；
+  - **Round 2（`f21df2a`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径验证对比（改前 `main` `5b79f6c` → 改后 `f21df2a`）**：
+  - 单元测试 (`uv run pytest -v`)：**124 passed → 128 passed**（`6.57s`，含 `tests/test_architecture.py` 三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`，跑于等价逻辑提交）：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`），LoCoMo 200 题保持 **105/200 (52.5%)**（`Recall=0.6851, MRR=0.6221`），零退步。
+  - **真实模型（`deepseek-chat`）2 轮端到端冒烟（`/tmp/telemetry_real_smoke`，跑于等价逻辑提交，已清理）**：
+    - Turn 1（直答）：`total_ms=2245.795`, `ttft_ms=2044.105`, `llm_ms=2245.314`, `tool_ms=0.0`, `cached_tokens=1536/1760 (87.27%)`；
+    - Turn 2（触发 `get_current_time`）：`total_ms=4904.028`, `ttft_ms=2539.205`, `llm_ms=4902.172`, `tool_ms=0.089`, `cached_tokens=3200/3589 (89.16%)`；
+    - `app.status()`：`observers=["telemetry"]`，累计 2 轮总命中率 `88.54% (4736/5349)`。
+- **未验证项**：因本 PR 零微内核改动、未修改任何 Prompt、检索算法与记忆写入逻辑，未重跑真实模型多轮记忆全集（`memory_scenarios` 16 / LongMemEval 35 / LoCoMo 100）。
+- **下一步**：合入 Issue `#42` 对应 PR 后，再评估基于实测遥测结果与未解决的检索/长记忆优化项（Issue `#32` / `#13`）。
