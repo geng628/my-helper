@@ -285,3 +285,77 @@ compile_config = lambda text, source="": {}
         ctx.register_compiler(lambda text, source="": {})  # type: ignore[arg-type]
     with pytest.raises((TypeError, ValueError)):
         ctx.register_provider(lambda env: None)  # type: ignore[arg-type]
+
+
+# 测试第 5 插槽 ObserverProtocol 的实例/工厂注册、重名校验与 ToolsConfig.build_observers 装配
+def test_observer_protocol_slot_registration_and_app_isolation(tmp_path: Path) -> None:
+    from personal_assistant.agent.plugins import ObserverProtocol
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "mem_observer.py").write_text(
+        """
+from personal_assistant.agent.plugins import Plugin
+
+# 测试用内存观测器实现（符合 ObserverProtocol）
+class InMemoryObserver:
+    name = "mem_obs"
+
+    # 初始化事件收集列表与配置副本
+    def __init__(self, cfg: dict[str, object]) -> None:
+        self.cfg = dict(cfg)
+        self.events: list[object] = []
+
+    # 收集微内核广播的事件
+    def on_event(self, session_key: str, event: object) -> None:
+        self.events.append((session_key, event))
+
+    # 返回当前已收集事件数量与配置快照
+    def snapshot(self, *, session_key: str | None = None) -> dict[str, object]:
+        return {"count": len(self.events), "session_key": session_key, "tag": self.cfg.get("tag", "default")}
+
+
+# 测试用观测插件（通过工厂函数注册，确保每个应用实例独享状态）
+class MemObserverPlugin(Plugin):
+    plugin_id = "mem_obs"
+
+    # 向主板插槽 5 注册观测器工厂
+    def initialize(self) -> None:
+        self.context.register_observer("mem_obs", lambda cfg: InMemoryObserver(cfg))
+""",
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "tools.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "enabled_tools": [],
+                "plugins": ["plugins"],
+                "telemetry": {"tag": "isolated"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = ToolsConfig.load(cfg_path, project_root=tmp_path)
+    obs_list_a = cfg.build_observers()
+    obs_list_b = cfg.build_observers()
+    assert len(obs_list_a) == 1 and len(obs_list_b) == 1
+    assert isinstance(obs_list_a[0], ObserverProtocol)
+    assert obs_list_a[0] is not obs_list_b[0]
+    obs_list_a[0].on_event("c1", "ping")  # type: ignore[arg-type]
+    assert obs_list_a[0].snapshot(session_key="c1") == {
+        "count": 1,
+        "session_key": "c1",
+        "tag": "isolated",
+    }
+    assert obs_list_b[0].snapshot()["count"] == 0
+
+    ctx = PluginContext(project_root=tmp_path)
+    with pytest.raises(ValueError, match="不能为空"):
+        ctx.register_observer("  ", obs_list_a[0])
+    ctx.register_observer("obs1", obs_list_a[0])
+    with pytest.raises(ValueError, match="重复"):
+        ctx.register_observer("obs1", obs_list_b[0])
+    with pytest.raises((TypeError, ValueError)):
+        ctx.register_observer("bad", 123)  # type: ignore[arg-type]

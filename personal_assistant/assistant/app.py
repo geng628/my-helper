@@ -3,15 +3,24 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.react import MAX_TOOL_ROUNDS, run_react
+from personal_assistant.agent.plugins import ObserverProtocol
+from personal_assistant.agent.react import (
+    MAX_TOOL_ROUNDS,
+    AgentEvent,
+    RuntimeEvent,
+    ToolStep,
+    TurnEnd,
+    iter_react,
+)
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
+from personal_assistant.ai.types import TextDelta
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
@@ -46,6 +55,7 @@ class AssistantApp:
         consolidator_llm: LLMClient | None = None,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
+        observers: Iterable[ObserverProtocol] | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -87,6 +97,12 @@ class AssistantApp:
         self._session_prompts: dict[str, str] = {}
         self._last_archive_day = ""
         self.cache_monitor = CacheMonitor()
+        if observers is not None:
+            self.observers: tuple[ObserverProtocol, ...] = tuple(observers)
+        elif self.tools_config is not None:
+            self.observers = tuple(self.tools_config.build_observers())
+        else:
+            self.observers = ()
         self._custom_consolidator_llm = consolidator_llm is not None
         self.consolidator = MemoryConsolidator(
             self.state,
@@ -94,7 +110,28 @@ class AssistantApp:
             consolidator_llm or self.llm,
             policy=consolidation_policy,
         )
-        self.background_consolidator = BackgroundConsolidator(self.consolidator)
+        self.background_consolidator = BackgroundConsolidator(
+            self.consolidator,
+            on_event=self._emit_event,
+        )
+
+    # 安全向所有已装配观测插件广播运行期事件，确保任何插件异常不拖垮微内核
+    def _emit_event(self, session_key: str, event: RuntimeEvent) -> None:
+        for observer in self.observers:
+            try:
+                observer.on_event(session_key, event)
+            except Exception:  # noqa: BLE001
+                continue
+
+    # 安全读取各观测插件的只读快照，故障插件记录 error 字段而不阻断 /status
+    def _collect_telemetry(self, *, session_key: str | None = None) -> dict[str, object]:
+        snapshots: dict[str, object] = {}
+        for observer in self.observers:
+            try:
+                snapshots[observer.name] = observer.snapshot(session_key=session_key)
+            except Exception as error:  # noqa: BLE001
+                snapshots[observer.name] = {"error": f"{type(error).__name__}: {error}"}
+        return snapshots
 
     # 返回内置模型厂商预设目录，供零代码向导与网页设置表单展示
     def model_presets(self) -> list[dict[str, object]]:
@@ -231,19 +268,36 @@ class AssistantApp:
             self._last_archive_day = today_str
         self.memory.archive_expired_memories(today=today)
 
-    # 处理一轮完整对话：加载摘要与活跃历史、执行 ReAct 循环、持久化回答并在达阈值时后台自动沉淀
-    def chat(
+    # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
+    def stream_chat(
         self,
         text: str,
         chat_id: str = "default",
         *,
         max_rounds: int = MAX_TOOL_ROUNDS,
-        on_step: Callable[[str, str, str], None] | None = None,
-    ) -> dict[str, object]:
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> Iterator[dict[str, object]]:
         clean_text = text.strip()
         if not clean_text:
             raise ValueError("消息内容不能为空。")
+        if isinstance(self.llm, NoopLLMClient):
+            self.llm.respond([{"role": "user", "content": clean_text}])
+        return self._run_stream_turn(
+            clean_text,
+            chat_id,
+            max_rounds=max_rounds,
+            on_event=on_event,
+        )
 
+    # 内部生成器：装配冻结上下文与会话历史、执行流式 ReAct 并将事件转发给全部观测插件，结束后持久化并触发沉淀
+    def _run_stream_turn(
+        self,
+        clean_text: str,
+        chat_id: str,
+        *,
+        max_rounds: int,
+        on_event: Callable[[AgentEvent], None] | None,
+    ) -> Iterator[dict[str, object]]:
         self._maybe_archive_expired()
         compaction = self.state.get_compaction(chat_id)
         history = self.state.active_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
@@ -264,29 +318,40 @@ class AssistantApp:
         messages.extend(self._build_history_messages(history))
         messages.append({"role": "user", "content": clean_text})
 
-        traces: list[dict[str, str]] = []
-
-        # 记录本轮工具轨迹并在需要时转发给终端等外部回调
-        def record_step(name: str, args: str, obs: str) -> None:
-            traces.append({"tool": name, "arguments": args, "observation": obs})
-            if on_step is not None:
-                on_step(name, args, obs)
-
+        traces: list[dict[str, object]] = []
+        reply = ""
         start_idx = self.cache_monitor.snapshot_index()
         tracked_llm = self.cache_monitor.wrap(self.llm, session_key=chat_id)
-        reply = run_react(
+        for event in iter_react(
             tracked_llm,
             messages,
             registry,
             max_rounds=max_rounds,
-            on_step=record_step,
-        )
+        ):
+            self._emit_event(chat_id, event)
+            if on_event is not None:
+                on_event(event)
+            if isinstance(event, TextDelta):
+                yield {"type": "text_delta", "text": event.text}
+            elif isinstance(event, ToolStep):
+                step_dict: dict[str, object] = {
+                    "tool": event.tool,
+                    "arguments": event.arguments,
+                    "observation": event.observation,
+                    "duration_ms": event.duration_ms,
+                }
+                traces.append(step_dict)
+                yield {"type": "tool_step", **step_dict}
+            elif isinstance(event, TurnEnd):
+                reply = event.reply
+
         assistant_msg_id = self.state.append_message(chat_id, "assistant", reply)
         scheduled = self.background_consolidator.maybe_schedule(
             chat_id,
             on_complete=lambda res: self.reset_session_prompt(res.chat_id),
         )
-        return {
+        done_payload: dict[str, object] = {
+            "type": "done",
             "reply": reply,
             "chat_id": chat_id,
             "message_id": assistant_msg_id,
@@ -294,6 +359,30 @@ class AssistantApp:
             "cache": self.cache_monitor.summary(since=start_idx),
             "consolidation_scheduled": scheduled,
         }
+        telemetry = self._collect_telemetry(session_key=chat_id)
+        if telemetry:
+            done_payload["telemetry"] = telemetry
+        yield done_payload
+
+    # 处理一轮完整同步对话：直接消费 stream_chat 单一实现并提取最终 done 结果字典
+    def chat(
+        self,
+        text: str,
+        chat_id: str = "default",
+        *,
+        max_rounds: int = MAX_TOOL_ROUNDS,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for frame in self.stream_chat(
+            text,
+            chat_id=chat_id,
+            max_rounds=max_rounds,
+            on_event=on_event,
+        ):
+            if frame.get("type") == "done":
+                result = {k: v for k, v in frame.items() if k != "type"}
+        return result
 
     # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
     def search(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
@@ -310,7 +399,7 @@ class AssistantApp:
             f"【事实备忘 (facts.md，按需检索不注入 Prompt)】\n{facts}"
         )
 
-    # 返回系统运行状态摘要（LLM 配置状态、记忆文件数、消息数、白名单工具及已加载插件）
+    # 返回系统运行状态摘要（LLM 配置状态、记忆文件数、消息数、工具、插件与观测快照）
     def status(self) -> dict[str, object]:
         memory_count = (
             sum(
@@ -330,6 +419,8 @@ class AssistantApp:
             "tools": registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],
             "retriever": str(getattr(self.memory.retriever, "name", "linear")),
+            "observers": [obs.name for obs in self.observers],
+            "telemetry": self._collect_telemetry(),
             "cache": self.cache_monitor.summary(),
             "consolidation": self.background_consolidator.status(),
         }

@@ -9,8 +9,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.react import run_react
+from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai import TextDelta
 from personal_assistant.ai.cache import format_cache_summary
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient, from_env
 from personal_assistant.ai.types import ModelsConfig
@@ -55,9 +56,9 @@ def build_repl_tools(
     return registry, memory
 
 
-# 终端回调函数：实时打印每一步工具调用（Act）与观察结果（Observe）
-def _print_step(name: str, args: str, observation: str) -> None:
-    print(f"  [Act] {name}({args})")
+# 打印单步工具执行日志与耗时（若先前正在逐字输出文本，先补一次换行）
+def _print_tool_step(tool: object, args: object, observation: object, duration_ms: float) -> None:
+    print(f"  [Act] {tool}({args}) ({duration_ms:.1f}ms)")
     print(f"  [Observe] {observation}")
 
 
@@ -76,7 +77,7 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     return None
 
 
-# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与加载白名单工具
+# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与实时流式输出
 def run_repl(
     app: AssistantApp | None = None,
     *,
@@ -99,13 +100,29 @@ def run_repl(
             if user_text.lower() in {"exit", "quit", "/quit"}:
                 break
             messages.append({"role": "user", "content": user_text})
+            streamed = False
+
+            # 处理直接工具模式下的单个 Agent 事件并实时打印
+            def on_direct_event(ev: AgentEvent) -> None:
+                nonlocal streamed
+                if isinstance(ev, ToolStep):
+                    if streamed:
+                        print()
+                        streamed = False
+                    _print_tool_step(ev.tool, ev.arguments, ev.observation, ev.duration_ms)
+                elif isinstance(ev, TextDelta) and ev.text:
+                    if not streamed:
+                        print("助手> ", end="", flush=True)
+                        streamed = True
+                    print(ev.text, end="", flush=True)
+
             try:
-                reply = run_react(client, messages, tools, on_step=_print_step)
+                reply = run_react(client, messages, tools, on_event=on_direct_event)
             except LLMNotConfigured as error:
                 messages.pop()
                 print(f"助手> {error}")
                 continue
-            print(f"助手> {reply}")
+            print() if streamed else print(f"助手> {reply}")
         return
 
     owned = app is None
@@ -127,12 +144,32 @@ def run_repl(
             if cmd_reply is not None:
                 print(f"助手>\n{cmd_reply}")
                 continue
+            streamed = False
+            result: dict[str, object] = {}
             try:
-                result = active_app.chat(user_text, chat_id=chat_id, on_step=_print_step)
+                for frame in active_app.stream_chat(user_text, chat_id=chat_id):
+                    ev_type = frame.get("type")
+                    if ev_type == "tool_step":
+                        if streamed:
+                            print()
+                            streamed = False
+                        _print_tool_step(
+                            frame.get("tool"),
+                            frame.get("arguments"),
+                            frame.get("observation"),
+                            float(frame.get("duration_ms") or 0.0),
+                        )
+                    elif ev_type == "text_delta" and frame.get("text"):
+                        if not streamed:
+                            print("助手> ", end="", flush=True)
+                            streamed = True
+                        print(frame["text"], end="", flush=True)
+                    elif ev_type == "done":
+                        result = frame
+                        print() if streamed else print(f"助手> {frame.get('reply', '')}")
             except LLMNotConfigured as error:
                 print(f"助手> {error}")
                 continue
-            print(f"助手> {result['reply']}")
             cache_info = result.get("cache")
             if isinstance(cache_info, dict) and cache_info.get("llm_calls"):
                 print(f"  [Cache] {format_cache_summary(cache_info)}")

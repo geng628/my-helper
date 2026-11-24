@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.react import run_react
+from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
 from personal_assistant.assistant.cli import build_demo_tools
@@ -36,10 +36,11 @@ class DemoScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
-# 打印每一步工具调用（Act）与工具返回观察（Observe）
-def _print_step(name: str, args: str, observation: str) -> None:
-    print(f"  [Act]     {name}({args})")
-    print(f"  [Observe] {observation}")
+# 打印每一步工具调用事件（Act 与耗时）与工具返回观察（Observe）
+def _print_event(event: AgentEvent) -> None:
+    if isinstance(event, ToolStep):
+        print(f"  [Act]     {event.tool}({event.arguments}) ({event.duration_ms:.1f}ms)")
+        print(f"  [Observe] {event.observation}")
 
 
 # 运行两个离线演示场景：多轮链式工具调用 + 工具参数出错自愈
@@ -85,7 +86,7 @@ def run_offline_demo(show_messages: bool = False) -> None:
         {"role": "user", "content": "现在几点了？顺便帮我算一下 19 加 23。"},
     ]
     print(f"你> {msgs1[-1]['content']}")
-    reply1 = run_react(llm1, msgs1, tools, on_step=_print_step)
+    reply1 = run_react(llm1, msgs1, tools, on_event=_print_event)
     print(f"助手> {reply1}")
     if show_messages:
         print("\n--- 完整 messages 轨迹 ---")
@@ -124,7 +125,7 @@ def run_offline_demo(show_messages: bool = False) -> None:
         {"role": "user", "content": "帮我算 10 加 32。"},
     ]
     print(f"你> {msgs2[-1]['content']}")
-    reply2 = run_react(llm2, msgs2, tools, on_step=_print_step)
+    reply2 = run_react(llm2, msgs2, tools, on_event=_print_event)
     print(f"助手> {reply2}")
     if show_messages:
         print("\n--- 完整 messages 轨迹 ---")
@@ -142,7 +143,7 @@ def run_live_ask(question: str, show_messages: bool = False) -> int:
     ]
     print(f"你> {question}")
     try:
-        reply = run_react(client, messages, tools, on_step=_print_step)
+        reply = run_react(client, messages, tools, on_event=_print_event)
     except LLMNotConfigured as error:
         print(f"助手> {error}")
         print("提示：不配置 API Key 也可直接运行 `uv run python scripts/demo.py` 查看离线演示。")

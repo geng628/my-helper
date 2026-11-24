@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+from personal_assistant.agent.react import RuntimeEvent
 from personal_assistant.agent.tools import (
     Tool,
     ToolDocument,
@@ -24,6 +25,7 @@ from personal_assistant.agent.tools import (
 from personal_assistant.ai.client import LLMClient, ProviderFactory
 
 RetrieverFactory = Callable[[dict[str, object]], object]
+ObserverFactory = Callable[[dict[str, object]], "ObserverProtocol"]
 
 
 # 内层子协议 2：检索引擎极简协议（MemoryStore 只认此协议的 search_hits 契约，不关心实现是否来自插件）
@@ -66,7 +68,48 @@ class LLMProviderProtocol(Protocol):
     def build(self, env: Mapping[str, str]) -> LLMClient: ...
 
 
-# 插件主板上下文（PluginContext）：统一向所有 Plugin 子类提供系统资源与 4 个标准子协议插槽
+# 校验并向主板插槽注册子协议实例或工厂函数，复用检索与观测插件的统一装配逻辑
+def _register_slot_factory(
+    slot: dict[str, Callable[[dict[str, object]], Any]],
+    name: str,
+    item: Any,
+    protocol_cls: type[object],
+    label: str,
+    *,
+    invalid_exc: type[Exception] = ValueError,
+) -> None:
+    clean_name = name.strip()
+    if not clean_name:
+        raise ValueError(f"{label}名称不能为空。")
+    if clean_name in slot:
+        raise ValueError(f"{label}名称重复：{clean_name}")
+    if isinstance(item, protocol_cls) and not callable(item):
+        instance = item
+
+        # 返回已实例化的子协议对象
+        def _factory(_cfg: dict[str, object]) -> Any:
+            return instance
+
+        slot[clean_name] = _factory
+    elif callable(item):
+        slot[clean_name] = item
+    else:
+        raise invalid_exc(f"{label}必须实现 {protocol_cls.__name__} 或可调用工厂：{clean_name}")
+
+
+# 内层子协议 5：运行期可观测器极简协议（微内核仅按 session_key 广播事件与导出快照，不感知具体统计策略）
+@runtime_checkable
+class ObserverProtocol(Protocol):
+    name: str
+
+    # 接收微内核广播的运行期事件（回合起止、流式文本增量、模型调用、工具执行与后台任务）
+    def on_event(self, session_key: str, event: RuntimeEvent) -> None: ...
+
+    # 按可选会话键导出只读观测快照，供 /status 与界面展示
+    def snapshot(self, *, session_key: str | None = None) -> dict[str, object]: ...
+
+
+# 插件主板上下文（PluginContext）：统一向所有 Plugin 子类提供系统资源与 5 个标准子协议插槽
 @dataclass
 class PluginContext:
     project_root: Path
@@ -79,6 +122,7 @@ class PluginContext:
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
+    observers: dict[str, ObserverFactory] = field(default_factory=dict)
 
     # 提取供 build_tool 自动按签名绑定到 @tool 函数上的系统资源上下文
     def tool_bindings(self) -> dict[str, object]:
@@ -127,23 +171,9 @@ class PluginContext:
         name: str,
         retriever_or_factory: RetrieverProtocol | RetrieverFactory,
     ) -> None:
-        clean_name = name.strip()
-        if not clean_name:
-            raise ValueError("检索插件名称不能为空。")
-        if clean_name in self.retrievers:
-            raise ValueError(f"检索插件名称重复：{clean_name}")
-        if isinstance(retriever_or_factory, RetrieverProtocol) and not callable(retriever_or_factory):
-            instance = retriever_or_factory
-
-            # 返回已实例化的 RetrieverProtocol 对象
-            def _factory(_cfg: dict[str, object]) -> object:
-                return instance
-
-            self.retrievers[clean_name] = _factory
-        elif callable(retriever_or_factory):
-            self.retrievers[clean_name] = retriever_or_factory
-        else:
-            raise ValueError(f"检索插件必须实现 RetrieverProtocol 或可调用工厂：{clean_name}")
+        _register_slot_factory(
+            self.retrievers, name, retriever_or_factory, RetrieverProtocol, "检索插件"
+        )
 
     # 插槽 3：向主板注册配置编译器子协议实现（仅接受 ConfigCompilerProtocol 实例）
     def register_compiler(self, compiler: ConfigCompilerProtocol) -> None:
@@ -166,6 +196,21 @@ class PluginContext:
         if clean_name in self.providers:
             raise ValueError(f"模型 Provider 插件名称重复：{clean_name}")
         self.providers[clean_name] = provider.build
+
+    # 插槽 5：向主板注册运行观测器子协议实现（支持传入 ObserverProtocol 实例或工厂函数）
+    def register_observer(
+        self,
+        name: str,
+        observer_or_factory: ObserverProtocol | ObserverFactory,
+    ) -> None:
+        _register_slot_factory(
+            self.observers,
+            name,
+            observer_or_factory,
+            ObserverProtocol,
+            "观测插件",
+            invalid_exc=TypeError,
+        )
 
 
 # 外层统一主板基类：所有 plugins/*.py 插件均继承此类，通过 __init_subclass__ 自动发现、共享 self.context 与统一生命周期
@@ -353,6 +398,7 @@ class PluginManager(ToolsetProvider):
     retrievers: dict[str, RetrieverFactory]
     providers: dict[str, ProviderFactory]
     compilers: dict[str, ConfigCompilerProtocol]
+    observers: dict[str, ObserverFactory] = field(default_factory=dict)
     plugins: tuple[Plugin, ...] = ()
     source_type: str = "plugin"
     source_name: str = "plugins"
@@ -380,6 +426,7 @@ class PluginManager(ToolsetProvider):
             retrievers=dict(ctx.retrievers),
             providers=dict(ctx.providers),
             compilers=dict(ctx.compilers),
+            observers=dict(ctx.observers),
             plugins=tuple(active_plugins),
         )
 

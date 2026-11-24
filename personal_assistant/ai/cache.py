@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from statistics import mean
 
 from personal_assistant.ai.client import LLMClient
-from personal_assistant.ai.types import TokenUsage
+from personal_assistant.ai.types import LLMStreamEvent, StreamDone, TokenUsage
 
 
 # 将单次请求的 tools 与 messages 序列化为逐行稳定文本，便于精确计算最长公共前缀
@@ -179,3 +180,25 @@ class TrackingLLMClient(LLMClient):
         self.last_usage = usage
         self.monitor.record(self.session_key, serialized, usage)
         return reply
+
+    # 流式转发请求给底层客户端，并在流结束时同步记录本地前缀复用率与服务端 usage
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        serialized = serialize_request(messages, tools)
+        self.last_usage = None
+        recorded = False
+        for event in self.inner.stream(messages, tools):
+            if isinstance(event, StreamDone) and not recorded:
+                raw_usage = (
+                    event.usage
+                    if isinstance(event.usage, TokenUsage)
+                    else getattr(self.inner, "last_usage", None)
+                )
+                usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
+                self.last_usage = usage
+                self.monitor.record(self.session_key, serialized, usage)
+                recorded = True
+            yield event

@@ -2,13 +2,24 @@
 from personal_assistant.agent.plugins import (
     ConfigCompilerProtocol,
     LLMProviderProtocol,
+    ObserverFactory,
+    ObserverProtocol,
     Plugin,
     PluginContext,
     PluginManager,
     RetrieverFactory,
     RetrieverProtocol,
 )
-from personal_assistant.agent.react import MAX_TOOL_ROUNDS, run_react
+from personal_assistant.agent.react import (
+    MAX_TOOL_ROUNDS,
+    AgentEvent,
+    RuntimeEvent,
+    TaskEvent,
+    ToolStep,
+    TurnEnd,
+    iter_react,
+    run_react,
+)
 from personal_assistant.agent.tools import (
     Tool,
     ToolDocument,
@@ -20,20 +31,28 @@ from personal_assistant.agent.tools import (
 )
 
 __all__ = [
+    "AgentEvent",
     "ConfigCompilerProtocol",
     "LLMProviderProtocol",
     "MAX_TOOL_ROUNDS",
+    "ObserverFactory",
+    "ObserverProtocol",
     "Plugin",
     "PluginContext",
     "PluginManager",
     "RetrieverFactory",
     "RetrieverProtocol",
+    "RuntimeEvent",
+    "TaskEvent",
     "Tool",
     "ToolDocument",
     "ToolMetadata",
     "ToolRegistry",
+    "ToolStep",
     "ToolsetProvider",
+    "TurnEnd",
     "build_tool",
+    "iter_react",
     "run_react",
     "tool",
 ]

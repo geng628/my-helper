@@ -7,9 +7,12 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
+from personal_assistant.agent.react import TaskEvent
 from personal_assistant.ai.client import LLMClient, NoopLLMClient
+from personal_assistant.ai.types import TokenUsage
 from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
@@ -246,14 +249,29 @@ class MemoryConsolidator:
 
 # 进程内后台调度器：用标准库线程异步执行沉淀，不阻塞对话回复并确保同会话互斥
 class BackgroundConsolidator:
-    # 初始化后台调度锁、在途会话集合与最近执行状态记录
-    def __init__(self, consolidator: MemoryConsolidator) -> None:
+    # 初始化后台调度锁、在途会话集合、最近执行状态记录与可选事件回调
+    def __init__(
+        self,
+        consolidator: MemoryConsolidator,
+        *,
+        on_event: Callable[[str, TaskEvent], None] | None = None,
+    ) -> None:
         self.consolidator = consolidator
+        self.on_event = on_event
         self._lock = threading.Lock()
         self._in_flight: set[str] = set()
         self._threads: dict[str, threading.Thread] = {}
         self.last_result: dict[str, object] | None = None
         self.last_error: str | None = None
+
+    # 安全发送后台任务事件，确保外部观测器异常不影响调度主流程
+    def _emit_event(self, chat_id: str, event: TaskEvent) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(chat_id, event)
+        except Exception:  # noqa: BLE001
+            return
 
     # 检查阈值并按需拉起后台线程执行沉淀；若已触发返回 True，未达阈值或正在执行返回 False
     def maybe_schedule(
@@ -281,12 +299,15 @@ class BackgroundConsolidator:
             worker.start()
         return True
 
-    # 后台工作线程主体：捕获异常不崩溃主进程，完成后记录状态并触发回调
+    # 后台工作线程主体：捕获异常不崩溃主进程，完成后记录状态、单点广播事件并触发回调
     def _run_worker(
         self,
         chat_id: str,
         on_complete: Callable[[ConsolidationResult], None] | None,
     ) -> None:
+        t0 = perf_counter()
+        result: ConsolidationResult | None = None
+        err_text: str | None = None
         try:
             result = self.consolidator.consolidate_once(chat_id)
             if result is not None:
@@ -296,9 +317,31 @@ class BackgroundConsolidator:
                 if on_complete is not None:
                     on_complete(result)
         except Exception as error:  # noqa: BLE001
+            err_text = f"{type(error).__name__}: {error}"
             with self._lock:
-                self.last_error = f"{type(error).__name__}: {error}"
+                self.last_error = err_text
         finally:
+            if result is not None or err_text is not None:
+                raw_usage = getattr(self.consolidator.llm, "last_usage", None)
+                details = (
+                    {
+                        "compacted_messages": result.compacted_messages,
+                        "compacted_until_id": result.compacted_until_id,
+                        "saved_files": list(result.saved_files),
+                    }
+                    if result is not None
+                    else {}
+                )
+                self._emit_event(
+                    chat_id,
+                    TaskEvent(
+                        kind="consolidation",
+                        duration_ms=round((perf_counter() - t0) * 1000, 3),
+                        usage=raw_usage if isinstance(raw_usage, TokenUsage) else None,
+                        details=details,
+                        error=err_text,
+                    ),
+                )
             with self._lock:
                 self._in_flight.discard(chat_id)
                 self._threads.pop(chat_id, None)
