@@ -366,8 +366,25 @@
       return parts.join(" · ");
     }
 
-    function renderMetaRow(wrap, cache, consolidationScheduled) {
+    function formatMs(ms) {
+      if (typeof ms !== "number" || !Number.isFinite(ms)) return "";
+      return ms < 1000 ? `${ms.toFixed(0)}ms` : `${(ms / 1000).toFixed(2)}s`;
+    }
+
+    function formatTelemetryLine(telemetry) {
+      const t = telemetry && telemetry.telemetry && telemetry.telemetry.last_turn;
+      if (!t || typeof t.total_ms !== "number") return "";
+      const parts = [`总计 ${formatMs(t.total_ms)}`];
+      if (typeof t.ttft_ms === "number") parts.push(`首字 ${formatMs(t.ttft_ms)}`);
+      if (typeof t.llm_ms === "number") parts.push(`模型 ${formatMs(t.llm_ms)}`);
+      if (t.tool_calls > 0 && typeof t.tool_ms === "number") parts.push(`工具 ${formatMs(t.tool_ms)}`);
+      return parts.join(" · ");
+    }
+
+    function renderMetaRow(wrap, cache, consolidationScheduled, telemetry) {
       const metaBits = [];
+      const perfText = formatTelemetryLine(telemetry);
+      if (perfText) metaBits.push(`<span>⏱ ${escapeHtml(perfText)}</span>`);
       const cacheText = formatCacheLine(cache);
       if (cacheText) metaBits.push(`<span>⚡ ${escapeHtml(cacheText)}</span>`);
       if (consolidationScheduled) {
@@ -422,7 +439,7 @@
         }
       }
 
-      renderMetaRow(wrap, extra.cache, extra.consolidationScheduled);
+      renderMetaRow(wrap, extra.cache, extra.consolidationScheduled, extra.telemetry);
 
       chatEl.appendChild(wrap);
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -443,6 +460,10 @@
           cachePill.textContent = `累计缓存: ${(c.server_cache_hit_rate * 100).toFixed(1)}% (${c.cached_tokens}/${c.prompt_tokens})`;
         } else if (c.mean_prefix_reuse_rate != null) {
           cachePill.textContent = `前缀复用: ${(c.mean_prefix_reuse_rate * 100).toFixed(1)}%`;
+        }
+        const bg = data.telemetry && data.telemetry.telemetry && data.telemetry.telemetry.background;
+        if (bg && bg.runs > 0) {
+          cachePill.title = `后台沉淀: ${bg.runs} 次（最近 ${formatMs(bg.last_duration_ms)}，输入 ${bg.prompt_tokens} tok）`;
         }
       } catch (_) {}
     }
@@ -493,7 +514,7 @@
             const finalReply = String(ev.reply || replyText);
             bubble.innerHTML = renderMarkdownLite(finalReply);
             if (toolState.details) toolState.details.open = false;
-            renderMetaRow(wrap, ev.cache, ev.consolidation_scheduled);
+            renderMetaRow(wrap, ev.cache, ev.consolidation_scheduled, ev.telemetry);
             chatEl.scrollTop = chatEl.scrollHeight;
           } else if (ev.type === "error") {
             wrap.classList.add("error");

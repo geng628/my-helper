@@ -19,6 +19,10 @@
     "min_bm25_score": 0.1,
     "max_hits_per_file": 2
   },
+  "telemetry": {
+    "enabled": true,
+    "window_size": 200
+  },
   "web": {
     "timeout": 15,
     "max_download_bytes": 2097152,
