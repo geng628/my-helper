@@ -164,10 +164,11 @@ def multiply(x: str, y: str) -> str:
     assert messages[-2]["content"] == "42"
 
 
-# 测试外层统一主板基类 Plugin(ABC)（3 个同级插件：ToolsPlugin / FTS5RetrieverPlugin / ModelsDSLPlugin）与内层 4 个强类型极简子协议
+# 测试外层统一主板基类 Plugin(ABC)（4 个同级插件：ToolsPlugin / FTS5RetrieverPlugin / ModelsDSLPlugin / TelemetryPlugin）与内层 5 个子协议
 def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
         ConfigCompilerProtocol,
+        ObserverProtocol,
         Plugin,
         PluginManager,
         RetrieverProtocol,
@@ -179,19 +180,21 @@ def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
 
-    # 1. 外层：主板仅加载 3 个同级 Plugin(ABC) 实例（tools 文件夹插件 + fts5_bm25 / models_dsl 单文件插件）
-    assert len(manager.plugins) == 3
+    # 1. 外层：主板加载 4 个同级 Plugin(ABC) 实例（tools 文件夹插件 + fts5_bm25 / models_dsl / telemetry 单文件插件）
+    assert len(manager.plugins) == 4
     assert all(isinstance(p, Plugin) for p in manager.plugins)
     plugin_ids = {p.plugin_id for p in manager.plugins}
     assert plugin_ids == {
         "tools",
         "fts5_bm25",
         "models_dsl",
+        "telemetry",
     }
     assert {type(p).__name__ for p in manager.plugins} == {
         "ToolsPlugin",
         "FTS5RetrieverPlugin",
         "ModelsDSLPlugin",
+        "TelemetryPlugin",
     }
     assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
 
@@ -214,7 +217,12 @@ def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
-    # 5. 统一生命周期清理钩子可正常调用
+    # 5. 内层子协议 5：ObserverProtocol（AssistantApp 只认 on_event / snapshot）
+    obs = manager.observers["telemetry"]({})
+    assert isinstance(obs, ObserverProtocol)
+    assert obs.name == "telemetry"
+
+    # 6. 统一生命周期清理钩子可正常调用
     manager.terminate_all()
 
 
