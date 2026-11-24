@@ -6,12 +6,19 @@ import os
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from personal_assistant.ai.types import ModelProfile, ModelsConfig, TokenUsage
+from personal_assistant.ai.types import (
+    LLMStreamEvent,
+    ModelProfile,
+    ModelsConfig,
+    StreamDone,
+    TextDelta,
+    TokenUsage,
+)
 
 
 # 当未配置 LLM_MODE=on 或缺少 API Key 时抛出的异常
@@ -20,6 +27,7 @@ class LLMNotConfigured(RuntimeError):
 
 
 PostJson = Callable[[str, dict[str, object], dict[str, str]], dict[str, object]]
+PostStream = Callable[[str, dict[str, object], dict[str, str]], Iterator[str]]
 ProviderFactory = Callable[[Mapping[str, str]], "LLMClient"]
 
 
@@ -57,14 +65,14 @@ def extract_usage(response: dict[str, object]) -> TokenUsage | None:
     )
 
 
-# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求，并对瞬时网络/TLS 抖动自动退避重试
-def default_post_json(
+# 构造带退避重试的 POST HTTP 响应打开器（仅在连接建立前重试，避免流式中途重复发送）
+def _open_with_retry(
     url: str,
     payload: dict[str, object],
     headers: dict[str, str],
     *,
     max_retries: int = 2,
-) -> dict[str, object]:
+):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req_headers = {
         "Content-Type": "application/json",
@@ -74,8 +82,7 @@ def default_post_json(
     for attempt in range(max_retries + 1):
         request = Request(url, data=body, headers=req_headers, method="POST")
         try:
-            with urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
+            return urlopen(request, timeout=60)
         except HTTPError as error:
             # 4xx 客户端错误（429 限流除外）不重试，直接抛出
             if error.code < 500 and error.code != 429:
@@ -89,6 +96,92 @@ def default_post_json(
     raise RuntimeError("请求重试耗尽。")
 
 
+# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求，并对瞬时网络/TLS 抖动自动退避重试
+def default_post_json(
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    *,
+    max_retries: int = 2,
+) -> dict[str, object]:
+    with _open_with_retry(url, payload, headers, max_retries=max_retries) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+# 使用 Python 标准库 urllib 向指定接口发起 SSE 流式 POST 请求并逐行吐出 UTF-8 文本
+def default_post_stream(
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    *,
+    max_retries: int = 2,
+) -> Iterator[str]:
+    with _open_with_retry(url, payload, headers, max_retries=max_retries) as response:
+        for raw_line in response:
+            yield raw_line.decode("utf-8")
+
+
+# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并收尾 StreamDone
+def _consume_openai_sse(lines: Iterable[str], t0: float) -> Iterator[LLMStreamEvent]:
+    role, parts, tool_acc = "assistant", [], {}
+    usage: TokenUsage | None = None
+    ttft_ms: float | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if not data_str:
+            continue
+        if data_str == "[DONE]":
+            break
+        chunk = json.loads(data_str)
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("error") is not None:
+            raise RuntimeError(f"流式响应返回错误：{chunk['error']}")
+        usage = extract_usage(chunk) or usage
+        choices = chunk.get("choices") or []
+        delta = choices[0].get("delta") if choices and isinstance(choices[0], dict) else None
+        if not isinstance(delta, dict):
+            continue
+        if isinstance(delta.get("role"), str) and delta["role"]:
+            role = str(delta["role"])
+        piece = delta.get("content")
+        if isinstance(piece, str) and piece:
+            ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
+            parts.append(piece)
+            yield TextDelta(text=piece)
+        for tc in delta.get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
+            raw_idx = tc.get("index")
+            idx = raw_idx if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) else 0
+            acc = tool_acc.setdefault(idx, {"id": "", "type": "function", "name": "", "args": []})
+            if isinstance(tc.get("id"), str) and tc["id"]:
+                acc["id"] = tc["id"]
+            if isinstance(tc.get("type"), str) and tc["type"]:
+                acc["type"] = tc["type"]
+            fn = tc.get("function") or {}
+            if isinstance(fn, dict):
+                if isinstance(fn.get("name"), str) and fn["name"]:
+                    acc["name"] = f"{acc['name']}{fn['name']}"
+                if isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                    acc["args"].append(fn["arguments"])  # type: ignore[attr-defined]
+
+    full_text = "".join(parts)
+    calls = [
+        {"id": a["id"], "type": a["type"], "function": {"name": a["name"], "arguments": "".join(a["args"])}}
+        for _, a in sorted(tool_acc.items())
+    ]
+    msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
+    if calls:
+        msg["tool_calls"] = calls
+    yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=round((time.perf_counter() - t0) * 1000, 3))
+
+
 # 大模型客户端抽象基类，供上层 Agent 循环或独立脚本调用
 class LLMClient(ABC):
     last_usage: TokenUsage | None = None
@@ -100,6 +193,27 @@ class LLMClient(ABC):
         messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]: ...
+
+    # 流式发送对话历史与工具定义并吐出 TextDelta / StreamDone 事件；未重写时自动包装同步 respond()
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        t0 = time.perf_counter()
+        msg = self.respond(messages, tools)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
+        raw_usage = getattr(self, "last_usage", None)
+        usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls") or []
+        ttft_ms: float | None = None
+        if isinstance(content, str) and content and not tool_calls:
+            ttft_ms = elapsed_ms
+            yield TextDelta(text=content)
+        elif tool_calls:
+            ttft_ms = elapsed_ms
+        yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=elapsed_ms)
 
 
 # 占位客户端：未启用模型时给出友好提示，避免程序崩溃
@@ -123,6 +237,7 @@ class OpenAICompatibleLLM(LLMClient):
     model: str
     temperature: float = 0.2
     post_json: PostJson = default_post_json
+    post_stream: PostStream = default_post_stream
     _usage_local: threading.local = field(default_factory=threading.local, init=False, repr=False)
 
     # 读取当前线程最近一次调用记录的 Token 统计（避免多线程共享客户端串台）
@@ -135,31 +250,75 @@ class OpenAICompatibleLLM(LLMClient):
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
+    # 组装 /chat/completions 的请求地址、请求体与鉴权头（同步与流式调用共用）
+    def _build_request(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None,
+        *,
+        stream: bool,
+    ) -> tuple[str, dict[str, object], dict[str, str]]:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        return (
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            payload,
+            {"Authorization": f"Bearer {self.api_key}"},
+        )
+
     # 组装 OpenAI 格式请求体调用 /chat/completions，记录 usage 并返回首条 assistant 消息
     def respond(
         self,
         messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-
+        url, payload, headers = self._build_request(messages, tools, stream=False)
         self.last_usage = None
-        response = self.post_json(
-            f"{self.base_url.rstrip('/')}/chat/completions",
-            payload,
-            {"Authorization": f"Bearer {self.api_key}"},
-        )
+        response = self.post_json(url, payload, headers)
         msg = dict(response["choices"][0]["message"])
         self.last_usage = extract_usage(response)
         return msg
+
+    # 通过 SSE 流式调用 /chat/completions（兼容不支持 stream_options 返回 400 的端点）
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        if self.post_json is not default_post_json and self.post_stream is default_post_stream:
+            yield from super().stream(messages, tools)
+            return
+
+        url, payload, headers = self._build_request(messages, tools, stream=True)
+        self.last_usage = None
+        t0 = time.perf_counter()
+
+        # 打开 SSE 响应行流；若首包前因 stream_options 返回 HTTP 400 则去掉后重试一次
+        def _open_lines() -> Iterator[str]:
+            yielded_any = False
+            try:
+                for line in self.post_stream(url, payload, headers):
+                    yielded_any = True
+                    yield line
+            except HTTPError as error:
+                if error.code != 400 or yielded_any or "stream_options" not in payload:
+                    raise
+                fallback_payload = {k: v for k, v in payload.items() if k != "stream_options"}
+                yield from self.post_stream(url, fallback_payload, headers)
+
+        for event in _consume_openai_sse(_open_lines(), t0):
+            if isinstance(event, StreamDone):
+                self.last_usage = event.usage
+            yield event
 
 
 # 默认内建 OpenAI 兼容 Provider 构造器

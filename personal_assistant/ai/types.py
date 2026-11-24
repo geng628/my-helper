@@ -30,6 +30,24 @@ class TokenUsage:
         }
 
 
+# 单次大模型流式响应产生的文本增量片段
+@dataclass(frozen=True)
+class TextDelta:
+    text: str
+
+
+# 单次大模型流式响应结束事件（携带完整 assistant 消息、Token 统计与首字/总耗时）
+@dataclass(frozen=True)
+class StreamDone:
+    message: dict[str, object]
+    usage: TokenUsage | None = None
+    ttft_ms: float | None = None
+    latency_ms: float = 0.0
+
+
+LLMStreamEvent = TextDelta | StreamDone
+
+
 # 底层最小工具契约：仅描述暴露给模型的工具签名，不包含任何本地执行逻辑（供中层 Tool 递进继承）
 @dataclass(frozen=True)
 class ToolSchema:

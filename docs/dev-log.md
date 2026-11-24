@@ -546,3 +546,27 @@
   - **真实 API 5 题并发冒烟（`--mode memory --category single-session-assistant --max-cases 5 --workers 5`，跑于等价并发调度提交 `e7ab0a9`，`/tmp/issue_eval_workers_smoke5.json`）**：**5/5 (100.0%)**、服务端 KV 命中 **71.81%**、本地前缀复用 **65.62%**（`llm_calls=17`, `prompt_tokens=37,251`），总墙钟耗时 **`17.90s`**（5 题单题延迟之和 `68.2s`，逆序完成但输出列表严格保持原 JSONL 题序）。
   - **未验证项**：本次小 PR 未重跑完整 35 题 LME 与 16 场景全集（留作下一步 `rebase` PR `#33` 时直接使用 `--workers` 实测验收）。
 - **下一步**：合入本 PR 后，将 PR `#33`（`event_date` 结构化时间轴）rebase 到最新 `main`，用 `--workers 5` 快速完成全量 LME 35 + Memory 16 验收。
+
+
+---
+
+### [2026-11-24] `main` (`dba72a3`) LoCoMo 100 基线与 PR `#33` 复盘；微内核 SSE 流式管道、`AgentEvent` 与 `ObserverProtocol` 插槽（Issue `#40`）
+- **`main` (`dba72a3`) 基线补全与 PR `#33` 关闭记录**：
+  - 补跑严格同日 `--workers 5` LoCoMo 全量 100 题对比：`main`（`dba72a3`）取得 **`84/100 (84.00%)`**（前 50 题 **`43/50`**、后 50 题 **`41/50`**、`temporal` **`19/21`**、`WALL_TIME_SEC=300.65s`）；而 PR `#33`（`event_date`，`0290a97`）虽使 LongMemEval 35 由 `30/35 → 32/35`，但在 LoCoMo 两次独立重跑前 50 题均仅 `40/50`、全量 **`81/100`**（`temporal` `16/21` `-3`、QA `completion_tokens +18.3%`，且 `q006` 暴露强推精确日导致误猜 `Saturday, May 20, 2023`）。遵循“未证明跨集净进步不合入”原则关闭 PR `#33`（Issue `#32` 保持 `OPEN`），保持 `main` 简洁稳健。
+- **目标与思路（Issue `#40`，微内核机制与观测插件两 PR 拆分之 PR 1）**：按照“**机制在微内核，策略在插件**”与“**绝不重复造轮子**”原则，不在微内核塞入 `deque` / 统计策略，也不在 Layer 2 重包 Layer 1 流式事件类；仅在三层微内核焊好薄流式管道与第 5 个主板插槽 **`ObserverProtocol`**：
+  1. **Layer 1 (`personal_assistant/ai/`)**：`types.py` 新增 `TextDelta` / `StreamDone(message, usage, ttft_ms, latency_ms)`；`client.py` 抽离连接前退避重试 `_open_with_retry()`，实现纯标准库 `urllib` SSE `default_post_stream()` 与紧致的 `_consume_openai_sse()`（支持分片 `tool_calls` 拼装、空 `data:` 忽略、流内 `"error"` 帧抛错、`stream_options.include_usage` 回收 `cached_tokens` 并在首包前 HTTP 400 自动降级重试一次），自定义子类默认通过 `LLMClient.stream()` 兼容回退；`cache.py` 补充 `TrackingLLMClient.stream()` 单次去重记账与 `last_usage` 同步。
+  2. **Layer 2 (`personal_assistant/agent/`)**：`react.py` 彻底废除裸 3 参数 `on_step`，直接透传 Layer 1 的 `TextDelta` / `StreamDone`，仅补充 3 个极简事件 `ToolStep(duration_ms)`、`TurnEnd(reply, total_ms)` 与 `TaskEvent`（`iter_react()` 与 `run_react(..., on_event=...)` 保持会话无关）；`plugins.py` 通过共享助手 `_register_slot_factory()` 统一 `register_retriever()` 与新增的第 5 插槽 `register_observer()`，定义 `ObserverProtocol`（`name` / `on_event(session_key, event)` / `snapshot`）。
+  3. **Layer 3 (`personal_assistant/assistant/`) & 外围入口**：`commands.py` 解析可选 `telemetry` 配置并提供 `ToolsConfig.build_observers()`（支持 `enabled: false` 关闭）；`consolidator.py` 在 `BackgroundConsolidator._run_worker` 单点发送 `TaskEvent`；`app.py` 新增 `stream_chat()`（与 `chat()` 共享单一实现，先校验再开流）并通过 `_emit_event` / `_collect_telemetry` 对故障观测插件做异常隔离；`cli.py`（4 行 `_print_tool_step` + 实时增量打印）、[scripts/web_chat.py](scripts/web_chat.py)（`POST /api/chat/stream` SSE 与 `Connection: close`）、[scripts/web_ui.html](scripts/web_ui.html)（`ReadableStream` 实时渲染与工具耗时展示）、`scripts/demo.py` 与 `evals/agent_eval.py` 同步对齐 `ToolStep`。
+- **改动文件（Issue `#40`，精简收口提交 `bb7c650`）**：
+  - 核心：`personal_assistant/ai/{types,client,cache,__init__}.py`、`personal_assistant/agent/{react,plugins,__init__}.py`、`personal_assistant/assistant/{commands,consolidator,app,cli}.py`
+  - 入口与评测：`scripts/{web_chat,demo}.py`、`scripts/web_ui.html`、`evals/agent_eval.py`
+  - 单测：`tests/test_step1_react.py`、`tests/test_plugins.py`、新增 `tests/test_streaming.py`（共享单测模型 `ScriptedStreamLLM`，覆盖 SSE 文本/分片 `tool_calls`、HTTP 400 `stream_options` 降级、空 `data:`/流内错误帧、`ObserverProtocol` 工厂与故障隔离、`POST /api/chat/stream` 400/503/200 端到端）
+- **Layer 2 独立只读审查 trace**：
+  - 初版（`fa4f698`）→ **`Pass`**（0 Blocker，4 Nits）；
+  - 去套娃瘦身精简版（`bb7c650`，微内核净增压至 `+569 / -67` 行、`react.py` 净 diff 减半）→ **`Pass`**（0 Blocker，3 条非阻塞 Nits）。
+- **同口径验证对比（改前 `main` `dba72a3` → 改后 `bb7c650`）**：
+  - 单元测试 (`uv run pytest -v`)：**118 passed → 124 passed**（`7.37s`，含 `tests/test_architecture.py` 三层依赖守卫与流式/第 5 插槽/故障隔离全测）；AST 中文 `#` 注释校验：475 个定义/类 **0 缺失**。
+  - 离线演示与检索：[scripts/demo.py](scripts/demo.py) 离线演示通过；`fts5_bm25` 40 题保持 **38/40 (95.0%)**（`MRR=0.9483`），LoCoMo 200 题保持 **105/200 (52.5%)**，零退步。
+  - **真实模型（`deepseek-chat`）SSE 流式冒烟（测于底层流式一致的提交 `fa4f698`）**：Turn 1 直答实时收到 **6** 个 `text_delta` 分片（`ttft_ms=3129.6ms < turn_total_ms=3357.9ms`，`prompt_tokens=1773`, `completion_tokens=6`）；Turn 2 触发增量工具调用 `get_current_time`（`0.141ms`）并流式收到 **16** 个 `text_delta` 分片，服务端 KV 命中 **`91.2%` (`3328/3649`)**、前缀复用 **`96.1%`**（`stream_options.include_usage` 正常生效）。
+  - **退步与未验证项**：无退步；因本 PR 不改 `SYSTEM_PROMPT`、`CONSOLIDATION_SYSTEM_PROMPT`、检索算法及记忆写入逻辑，多轮记忆全集（Memory 16 / LongMemEval 35 / LoCoMo 100）未在本 PR 重跑，`bb7c650` 精简后端到端行为由覆盖完整 HTTP SSE 路径的 `test_streaming.py` 与 `124 passed` 守卫验证。
+- **下一步**：合入 PR `#41`（关联 Issue `#40`）后，开启 **PR 2（纯插件 `plugins/telemetry.py`）** 实现 `ObserverProtocol`，在不改动微内核机制代码的前提下落地有界窗口、分阶段耗时拆解与后台沉淀开销观测。

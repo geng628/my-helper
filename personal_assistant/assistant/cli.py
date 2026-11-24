@@ -9,8 +9,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.react import run_react
+from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
+from personal_assistant.ai import TextDelta
 from personal_assistant.ai.cache import format_cache_summary
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient, from_env
 from personal_assistant.ai.types import ModelsConfig
@@ -55,10 +56,35 @@ def build_repl_tools(
     return registry, memory
 
 
-# 终端回调函数：实时打印每一步工具调用（Act）与观察结果（Observe）
-def _print_step(name: str, args: str, observation: str) -> None:
-    print(f"  [Act] {name}({args})")
-    print(f"  [Observe] {observation}")
+# 打印单步工具执行日志与耗时
+def _print_tool_step(step: ToolStep) -> None:
+    print(f"  [Act] {step.tool}({step.arguments}) ({step.duration_ms:.1f}ms)")
+    print(f"  [Observe] {step.observation}")
+
+
+# 创建终端流式打印器：返回实时事件回调与回合收尾函数（直连工具模式与 AssistantApp 模式共用）
+def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], None]]:
+    streamed = False
+
+    # 实时打印单个 Agent 事件：文本增量逐字输出，工具步骤前先补换行
+    def on_event(ev: AgentEvent) -> None:
+        nonlocal streamed
+        if isinstance(ev, ToolStep):
+            if streamed:
+                print()
+                streamed = False
+            _print_tool_step(ev)
+        elif isinstance(ev, TextDelta) and ev.text:
+            if not streamed:
+                print("助手> ", end="", flush=True)
+                streamed = True
+            print(ev.text, end="", flush=True)
+
+    # 回合收尾：已流式输出则补换行，否则整段打印最终回复
+    def finish(reply: str) -> None:
+        print() if streamed else print(f"助手> {reply}")
+
+    return on_event, finish
 
 
 # 处理终端本地快捷命令（/status、/memory、/search、/refresh），不消耗模型 Token
@@ -76,7 +102,7 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     return None
 
 
-# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与加载白名单工具
+# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与实时流式输出
 def run_repl(
     app: AssistantApp | None = None,
     *,
@@ -99,13 +125,14 @@ def run_repl(
             if user_text.lower() in {"exit", "quit", "/quit"}:
                 break
             messages.append({"role": "user", "content": user_text})
+            on_event, finish = _stream_printer()
             try:
-                reply = run_react(client, messages, tools, on_step=_print_step)
+                reply = run_react(client, messages, tools, on_event=on_event)
             except LLMNotConfigured as error:
                 messages.pop()
                 print(f"助手> {error}")
                 continue
-            print(f"助手> {reply}")
+            finish(reply)
         return
 
     owned = app is None
@@ -127,12 +154,13 @@ def run_repl(
             if cmd_reply is not None:
                 print(f"助手>\n{cmd_reply}")
                 continue
+            on_event, finish = _stream_printer()
             try:
-                result = active_app.chat(user_text, chat_id=chat_id, on_step=_print_step)
+                result = active_app.chat(user_text, chat_id=chat_id, on_event=on_event)
             except LLMNotConfigured as error:
                 print(f"助手> {error}")
                 continue
-            print(f"助手> {result['reply']}")
+            finish(str(result.get("reply", "")))
             cache_info = result.get("cache")
             if isinstance(cache_info, dict) and cache_info.get("llm_calls"):
                 print(f"  [Cache] {format_cache_summary(cache_info)}")

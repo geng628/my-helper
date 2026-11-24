@@ -366,39 +366,11 @@
       return parts.join(" · ");
     }
 
-    function appendMessage(role, content, extra = {}) {
-      if (emptyEl) emptyEl.style.display = "none";
-      const wrap = document.createElement("div");
-      wrap.className = `msg ${role}${extra.error ? " error" : ""}`;
-
-      if (extra.toolCalls && extra.toolCalls.length > 0) {
-        const details = document.createElement("details");
-        details.className = "tools";
-        const summary = document.createElement("summary");
-        summary.textContent = `🔧 工具调用轨迹（${extra.toolCalls.length} 步）`;
-        details.appendChild(summary);
-        for (const step of extra.toolCalls) {
-          const item = document.createElement("div");
-          item.className = "tool-item";
-          const obs = String(step.observation || "");
-          const preview = obs.length > 600 ? obs.slice(0, 600) + "\n…（已折叠）" : obs;
-          item.innerHTML =
-            `<span class="tool-name">[Act] ${escapeHtml(step.tool)}</span>(${escapeHtml(step.arguments)})\n` +
-            `[Observe] ${escapeHtml(preview)}`;
-          details.appendChild(item);
-        }
-        wrap.appendChild(details);
-      }
-
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
-      bubble.innerHTML = role === "assistant" ? renderMarkdownLite(content) : escapeHtml(content);
-      wrap.appendChild(bubble);
-
+    function renderMetaRow(wrap, cache, consolidationScheduled) {
       const metaBits = [];
-      const cacheText = formatCacheLine(extra.cache);
+      const cacheText = formatCacheLine(cache);
       if (cacheText) metaBits.push(`<span>⚡ ${escapeHtml(cacheText)}</span>`);
-      if (extra.consolidationScheduled) {
+      if (consolidationScheduled) {
         metaBits.push(`<span class="badge-mem">🧠 已达阈值，后台正在自动沉淀记忆并压缩上下文</span>`);
       }
       if (metaBits.length > 0) {
@@ -407,6 +379,50 @@
         sub.innerHTML = metaBits.join("");
         wrap.appendChild(sub);
       }
+    }
+
+    function appendToolStep(wrap, bubble, state, step, { openOnCreate = true } = {}) {
+      if (!state.details) {
+        const details = document.createElement("details");
+        details.className = "tools";
+        details.open = openOnCreate;
+        const summary = document.createElement("summary");
+        details.appendChild(summary);
+        wrap.insertBefore(details, bubble);
+        state.details = details;
+        state.summary = summary;
+      }
+      state.count += 1;
+      state.summary.textContent = `🔧 工具调用轨迹（${state.count} 步）`;
+      const item = document.createElement("div");
+      item.className = "tool-item";
+      const obs = String(step.observation || "");
+      const preview = obs.length > 600 ? obs.slice(0, 600) + "\n…（已折叠）" : obs;
+      const durText = typeof step.duration_ms === "number" ? ` (${step.duration_ms.toFixed(1)}ms)` : "";
+      item.innerHTML =
+        `<span class="tool-name">[Act] ${escapeHtml(step.tool)}</span>(${escapeHtml(step.arguments)})${escapeHtml(durText)}\n` +
+        `[Observe] ${escapeHtml(preview)}`;
+      state.details.appendChild(item);
+    }
+
+    function appendMessage(role, content, extra = {}) {
+      if (emptyEl) emptyEl.style.display = "none";
+      const wrap = document.createElement("div");
+      wrap.className = `msg ${role}${extra.error ? " error" : ""}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = role === "assistant" ? renderMarkdownLite(content) : escapeHtml(content);
+      wrap.appendChild(bubble);
+
+      if (extra.toolCalls && extra.toolCalls.length > 0) {
+        const state = { details: null, summary: null, count: 0 };
+        for (const step of extra.toolCalls) {
+          appendToolStep(wrap, bubble, state, step, { openOnCreate: false });
+        }
+      }
+
+      renderMetaRow(wrap, extra.cache, extra.consolidationScheduled);
 
       chatEl.appendChild(wrap);
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -456,28 +472,71 @@
       inputEl.style.height = "44px";
 
       appendMessage("user", text);
-      const pending = appendMessage("assistant", "思考与执行工具中…");
+      const wrap = appendMessage("assistant", "思考与执行工具中…");
+      const bubble = wrap.querySelector(".bubble");
+      const toolState = { details: null, summary: null, count: 0 };
+      let replyText = "";
+
+      function handleSseBlock(block) {
+        for (const rawLine of block.split("\n")) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+          const ev = JSON.parse(line.slice(5).trim());
+          if (ev.type === "tool_step") {
+            appendToolStep(wrap, bubble, toolState, ev);
+            chatEl.scrollTop = chatEl.scrollHeight;
+          } else if (ev.type === "text_delta") {
+            replyText += String(ev.text || "");
+            bubble.innerHTML = renderMarkdownLite(replyText);
+            chatEl.scrollTop = chatEl.scrollHeight;
+          } else if (ev.type === "done") {
+            const finalReply = String(ev.reply || replyText);
+            bubble.innerHTML = renderMarkdownLite(finalReply);
+            if (toolState.details) toolState.details.open = false;
+            renderMetaRow(wrap, ev.cache, ev.consolidation_scheduled);
+            chatEl.scrollTop = chatEl.scrollHeight;
+          } else if (ev.type === "error") {
+            wrap.classList.add("error");
+            bubble.textContent = String(ev.error || "流式对话失败");
+          }
+        }
+      }
 
       try {
-        const res = await fetch("/api/chat", {
+        const res = await fetch("/api/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: text, chat_id: chatId }),
         });
-        const data = await res.json();
-        pending.remove();
         if (!res.ok) {
-          appendMessage("assistant", data.error || `请求失败（HTTP ${res.status}）`, { error: true });
-        } else {
-          appendMessage("assistant", data.reply, {
-            toolCalls: data.tool_calls,
-            cache: data.cache,
-            consolidationScheduled: data.consolidation_scheduled,
-          });
+          const data = await res.json();
+          wrap.classList.add("error");
+          bubble.textContent = data.error || `请求失败（HTTP ${res.status}）`;
+        } else if (res.body) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+          while (true) {
+            const { value, done } = await reader.read();
+            if (value) {
+              buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+              let sep;
+              while ((sep = buffer.indexOf("\n\n")) !== -1) {
+                const block = buffer.slice(0, sep);
+                buffer = buffer.slice(sep + 2);
+                if (block.trim()) handleSseBlock(block);
+              }
+            }
+            if (done) {
+              buffer += decoder.decode().replace(/\r\n/g, "\n");
+              if (buffer.trim()) handleSseBlock(buffer);
+              break;
+            }
+          }
         }
       } catch (err) {
-        pending.remove();
-        appendMessage("assistant", `网络异常：${err}`, { error: true });
+        wrap.classList.add("error");
+        bubble.textContent = `网络异常：${err}`;
       } finally {
         busy = false;
         sendBtn.disabled = false;

@@ -46,6 +46,12 @@ def create_web_server(
             self.end_headers()
             self.wfile.write(raw)
 
+        # 发送单帧 UTF-8 SSE 数据事件并立即刷新底层缓冲
+        def _send_sse_frame(self, payload: dict[str, object]) -> None:
+            raw = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+            self.wfile.write(raw)
+            self.wfile.flush()
+
         # 读取并校验 JSON 请求体（限制最大字节数防止异常大包）
         def _read_json_body(self) -> dict[str, object]:
             length_raw = self.headers.get("Content-Length", "0").strip()
@@ -124,6 +130,36 @@ def create_web_server(
                     )
                     return
                 self._send_json(HTTPStatus.OK, result)
+                return
+
+            if parsed.path == "/api/chat/stream":
+                message = str(body.get("message") or "")
+                chat_id = str(body.get("chat_id") or "web").strip() or "web"
+                try:
+                    frames = app.stream_chat(message, chat_id=chat_id)
+                except ValueError as error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                except LLMNotConfigured as error:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(error)})
+                    return
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    for frame in frames:
+                        self._send_sse_frame(frame)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                except Exception as error:  # noqa: BLE001
+                    try:
+                        self._send_sse_frame(
+                            {"type": "error", "error": f"对话执行失败：{type(error).__name__}: {error}"}
+                        )
+                    except OSError:
+                        return
                 return
 
             if parsed.path == "/api/refresh":

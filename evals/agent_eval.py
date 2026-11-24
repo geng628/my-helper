@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import mean
 from time import perf_counter
 
-from personal_assistant.agent.react import MAX_TOOL_ROUNDS, run_react
+from personal_assistant.agent.react import MAX_TOOL_ROUNDS, AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient
@@ -85,25 +85,27 @@ def evaluate_agent(
                 {"role": "system", "content": frozen_system_prompt},
                 {"role": "user", "content": query},
             ]
-            steps: list[dict[str, str]] = []
+            steps: list[dict[str, object]] = []
 
-            # 记录单题执行过程中的每一次工具调用与前 300 字符观察结果
-            def on_step(name: str, args: str, obs: str) -> None:
-                steps.append(
-                    {
-                        "tool": name,
-                        "arguments": args,
-                        "observation_preview": obs[:300],
-                    }
-                )
+            # 记录单题执行过程中的每一次工具调用、耗时与前 300 字符观察结果
+            def on_event(event: AgentEvent) -> None:
+                if isinstance(event, ToolStep):
+                    steps.append(
+                        {
+                            "tool": event.tool,
+                            "arguments": event.arguments,
+                            "observation_preview": event.observation[:300],
+                            "duration_ms": event.duration_ms,
+                        }
+                    )
 
             start_idx = monitor.snapshot_index()
             t0 = perf_counter()
-            reply = run_react(tracked_llm, messages, registry, max_rounds=max_rounds, on_step=on_step)
+            reply = run_react(tracked_llm, messages, registry, max_rounds=max_rounds, on_event=on_event)
             elapsed_ms = round((perf_counter() - t0) * 1000, 3)
             latencies.append(elapsed_ms)
 
-            called_tools = [step["tool"] for step in steps]
+            called_tools = [str(step["tool"]) for step in steps]
             tools_ok = all(req in called_tools for req in expected_tools)
             if not tools_ok:
                 failures.append(

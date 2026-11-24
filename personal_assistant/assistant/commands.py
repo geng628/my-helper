@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from personal_assistant.agent.plugins import PluginManager
+from personal_assistant.agent.plugins import ObserverProtocol, PluginManager
 from personal_assistant.agent.tools import (
     Tool,
     ToolRegistry,
@@ -284,7 +284,7 @@ def _atomic_write_private_json(target: Path, data: dict[str, object]) -> None:
     _atomic_write_private_text(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-# config/tools.json 的完整配置对象（管理白名单、插件管理器、检索/配置编译插件、文件策略与固定命令）
+# config/tools.json 的完整配置对象（管理白名单、插件管理器、检索/配置编译/观测插件、文件策略与固定命令）
 @dataclass(frozen=True)
 class ToolsConfig:
     enabled_tools: tuple[str, ...]
@@ -293,6 +293,7 @@ class ToolsConfig:
     plugin_manager: PluginManager
     plugins: tuple[str, ...] = ()
     retrieval: dict[str, object] = field(default_factory=dict)
+    telemetry: dict[str, object] = field(default_factory=dict)
     project_root: Path = REPO_ROOT
     config_path: Path | None = None
     raw_config: dict[str, object] = field(default_factory=dict)
@@ -321,6 +322,10 @@ class ToolsConfig:
         retrieval_raw = raw.get("retrieval", {})
         if not isinstance(retrieval_raw, dict):
             raise ValueError("retrieval 必须是 JSON 对象。")
+
+        telemetry_raw = raw.get("telemetry", {})
+        if not isinstance(telemetry_raw, dict):
+            raise ValueError("telemetry 必须是 JSON 对象。")
 
         commands_raw = raw.get("commands", [])
         if not isinstance(commands_raw, list):
@@ -351,10 +356,24 @@ class ToolsConfig:
             plugin_manager=manager,
             plugins=tuple(plugins_raw),
             retrieval=dict(retrieval_raw),
+            telemetry=dict(telemetry_raw),
             project_root=root,
             config_path=resolved_cfg,
             raw_config=dict(raw),
         )
+
+    # 按 telemetry 配置实例化全部已注册的观测插件；telemetry.enabled=false 时返回空列表
+    def build_observers(self) -> list[ObserverProtocol]:
+        if self.telemetry.get("enabled") is False:
+            return []
+        cfg = dict(self.telemetry)
+        instances: list[ObserverProtocol] = []
+        for name, factory in sorted(self.plugin_manager.observers.items()):
+            obs = factory(cfg)
+            if not isinstance(obs, ObserverProtocol):
+                raise TypeError(f"观测插件 {name!r} 返回值未实现 ObserverProtocol。")
+            instances.append(obs)
+        return instances
 
     # 加载模型配置：优先通过 models_dsl 插件编译 models.dsl（可选原子落盘为 0600 权限的 models.json），否则直接读 models.json
     def load_models_config(

@@ -13,17 +13,20 @@ from personal_assistant.ai import (
     OpenAICompatibleLLM,
     from_env,
 )
-from personal_assistant.agent.react import run_react
+from personal_assistant.agent.react import ToolStep, run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
+# 测试用确定性脚本模拟模型
 class ScriptedLLM(LLMClient):
     """Deterministic fake LLM that snapshots every request and replays scripted replies."""
 
+    # 初始化预设响应序列与请求记录列表
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = list(responses)
         self.requests: list[tuple[list[dict[str, object]], list[dict[str, object]] | None]] = []
 
+    # 记录请求快照并弹出下一条预设响应
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -35,6 +38,7 @@ class ScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
+# 构造标准 OpenAI 格式工具调用字典
 def _tool_call(call_id: str, name: str, arguments: str) -> dict[str, object]:
     return {
         "id": call_id,
@@ -43,9 +47,13 @@ def _tool_call(call_id: str, name: str, arguments: str) -> dict[str, object]:
     }
 
 
+# 测试无工具调用时直接返回文本并拒绝已废弃的旧参数 on_step
 def test_direct_answer_without_tool_calls() -> None:
     llm = ScriptedLLM([{"role": "assistant", "content": "你好，有什么可以帮你？"}])
     messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "你好"}]
+
+    with pytest.raises(TypeError):
+        run_react(llm, messages, build_demo_tools(), on_step=lambda *_: None)  # type: ignore[call-arg]
 
     reply = run_react(llm, messages, build_demo_tools())
 
@@ -55,8 +63,9 @@ def test_direct_answer_without_tool_calls() -> None:
     assert messages[-1] == {"role": "assistant", "content": "你好，有什么可以帮你？"}
 
 
+# 测试单步工具调用 ReAct 循环与 ToolStep 耗时采集
 def test_single_step_react_loop() -> None:
-    steps: list[tuple[str, str, str]] = []
+    steps: list[ToolStep] = []
     tools = ToolRegistry(
         Tool(
             name="lookup_weather",
@@ -81,11 +90,14 @@ def test_single_step_react_loop() -> None:
         llm,
         messages,
         tools,
-        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+        on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
 
     assert reply == "上海今天晴，气温 22°C。"
-    assert steps == [("lookup_weather", '{"city": "上海"}', "上海：晴，22°C")]
+    assert [(s.tool, s.arguments, s.observation) for s in steps] == [
+        ("lookup_weather", '{"city": "上海"}', "上海：晴，22°C")
+    ]
+    assert steps[0].duration_ms >= 0.0
     second_msgs = llm.requests[1][0]
     assert second_msgs[-1] == {
         "role": "tool",
@@ -94,8 +106,9 @@ def test_single_step_react_loop() -> None:
     }
 
 
+# 测试多步链式工具调用 ReAct 循环
 def test_multi_step_chained_react_loop() -> None:
-    steps: list[tuple[str, str, str]] = []
+    steps: list[ToolStep] = []
     tools = ToolRegistry(
         Tool(
             name="find_note",
@@ -131,16 +144,17 @@ def test_multi_step_chained_react_loop() -> None:
         llm,
         messages,
         tools,
-        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+        on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
 
     assert "禁止 sleep" in reply
-    assert [name for name, _, _ in steps] == ["find_note", "read_file"]
+    assert [s.tool for s in steps] == ["find_note", "read_file"]
     assert len(llm.requests) == 3
 
 
+# 测试工具错误作为观察结果回传并自愈
 def test_tool_error_as_observation_self_healing() -> None:
-    steps: list[tuple[str, str, str]] = []
+    steps: list[ToolStep] = []
     tools = ToolRegistry(
         Tool(
             name="add_numbers",
@@ -173,17 +187,18 @@ def test_tool_error_as_observation_self_healing() -> None:
         llm,
         messages,
         tools,
-        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+        on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
 
     assert reply == "19 + 23 = 42。"
-    assert "未知工具" in steps[0][2]
-    assert "JSON 解析失败" in steps[1][2]
-    assert steps[2][2] == "42"
+    assert "未知工具" in steps[0].observation
+    assert "JSON 解析失败" in steps[1].observation
+    assert steps[2].observation == "42"
 
 
+# 测试工具调用达到最大轮数上限时自动收束总结
 def test_max_rounds_limit_enforced() -> None:
-    steps: list[tuple[str, str, str]] = []
+    steps: list[ToolStep] = []
     tools = ToolRegistry(
         Tool(
             name="ping",
@@ -208,7 +223,7 @@ def test_max_rounds_limit_enforced() -> None:
         messages,
         tools,
         max_rounds=4,
-        on_step=lambda name, args, obs: steps.append((name, args, obs)),
+        on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
 
     assert reply == "已完成 4 轮探测，总结如下。"
@@ -221,6 +236,7 @@ def test_max_rounds_limit_enforced() -> None:
     assert "已达到工具调用轮次上限" in str(last_tool_msg["content"])
 
 
+# 测试从环境变量构造客户端及 OpenAI 请求负载格式
 def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_MODE", "off")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
@@ -231,6 +247,7 @@ def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> Non
 
     captured: dict[str, object] = {}
 
+    # 模拟捕获请求参数的同步 JSON 发送桩
     def fake_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
         captured["url"] = url
         captured["payload"] = payload
