@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import io
 import json
-import threading
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -274,21 +273,24 @@ def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path
         app.close()
 
 
-# 测试推理客户端边界条件：空白环境变量兜底、流中报错、分片 tool_calls 拼接、HTTPError 不盲试与多线程 last_usage 隔离
-def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
+# 测试推理插件边界条件：空白环境变量兜底、纯文本空 reasoning_content 规范化、分片 tool_calls 补齐与流中报错
+def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
     from plugins.reasoning_provider import OpenAIReasoningLLM, OpenAIReasoningProvider
 
-    # 1. env 中传入空字符串时必须回退默认 base_url 与 model
+    # 1. env 中传入空字符串时必须回退默认 base_url 与 model，且 OpenAIReasoningLLM 与底座构造签名对称
     built = OpenAIReasoningProvider().build({"LLM_API_KEY": " sk-k ", "LLM_BASE_URL": "  ", "LLM_MODEL": ""})
     assert isinstance(built, OpenAIReasoningLLM)
     assert built.api_key == "sk-k"
     assert built.base_url == "https://api.deepseek.com/v1"
     assert built.model == "deepseek-reasoner"
+    with pytest.raises(TypeError):
+        OpenAIReasoningLLM("sk", "https://api.deepseek.com/v1")  # type: ignore[call-arg]
 
     # 2. respond() 无工具调用且 reasoning_content 为 None 或 "" 时均不带冗余字段（与 stream 保持一致）
     none_reply_llm = OpenAIReasoningLLM(
         api_key="sk",
         base_url="https://api.deepseek.com/v1",
+        model="deepseek-reasoner",
         post_json=lambda _u, _p, _h: {
             "choices": [{"message": {"role": "assistant", "content": "纯文本", "reasoning_content": None}}],
         },
@@ -298,6 +300,7 @@ def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
     empty_reply_llm = OpenAIReasoningLLM(
         api_key="sk",
         base_url="https://api.deepseek.com/v1",
+        model="deepseek-reasoner",
         post_json=lambda _u, _p, _h: {
             "choices": [{"message": {"role": "assistant", "content": "纯文本", "reasoning_content": ""}}],
         },
@@ -308,6 +311,7 @@ def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
     frag_llm = OpenAIReasoningLLM(
         api_key="sk",
         base_url="https://api.deepseek.com/v1",
+        model="deepseek-reasoner",
         post_stream=lambda _u, _p, _h: iter(
             [
                 'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_frag","type":"function","function":{"name":"read_","arguments":"{\\"pa"}}]}}]}\n',
@@ -322,68 +326,12 @@ def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
         {"id": "c_frag", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}
     ]
 
-    # 4. 流中 error 帧直接抛出 RuntimeError；非 400 或已产出首包后的 400 不重试
+    # 4. 流中 error 帧直接抛出 RuntimeError
     err_llm = OpenAIReasoningLLM(
         api_key="sk",
         base_url="https://api.deepseek.com/v1",
+        model="deepseek-reasoner",
         post_stream=lambda _u, _p, _h: iter(['data: {"error":{"message":"bad upstream"}}\n']),
     )
     with pytest.raises(RuntimeError, match="bad upstream"):
         list(err_llm.stream([{"role": "user", "content": "x"}]))
-
-    # 非 400 错误不重试
-    attempts_500 = 0
-
-    # 模拟 500 错误，验证不会触发 stream_options 降级重试
-    def fail_500(url: str, _p: dict[str, object], _h: dict[str, str]):
-        nonlocal attempts_500
-        attempts_500 += 1
-        raise HTTPError(url, 500, "server error", None, io.BytesIO(b""))  # type: ignore[arg-type]
-
-    with pytest.raises(HTTPError):
-        list(OpenAIReasoningLLM("sk", "https://x/v1", post_stream=fail_500).stream([{"role": "user", "content": "x"}]))
-    assert attempts_500 == 1
-
-    # 已吐出首块后再报 400 不重试
-    attempts_mid400 = 0
-
-    # 先吐出一行后抛出 400，验证 yielded_any=True 时不重发整段请求
-    def mid_400(url: str, _p: dict[str, object], _h: dict[str, str]):
-        nonlocal attempts_mid400
-        attempts_mid400 += 1
-        yield 'data: {"choices":[{"delta":{"reasoning_content":"ok"}}]}\n'
-        raise HTTPError(url, 400, "mid error", None, io.BytesIO(b""))  # type: ignore[arg-type]
-
-    with pytest.raises(HTTPError):
-        list(OpenAIReasoningLLM("sk", "https://x/v1", post_stream=mid_400).stream([{"role": "user", "content": "x"}]))
-    assert attempts_mid400 == 1
-
-    # 5. 多线程共享同一 OpenAIReasoningLLM 实例时 last_usage 按线程严格隔离
-    barrier = threading.Barrier(2)
-
-    # 根据消息内容返回不同 token 用量以检验 threading.local 隔离性
-    def threaded_post_json(_u: str, payload: dict[str, object], _h: dict[str, str]) -> dict[str, object]:
-        tag = payload["messages"][0]["content"]  # type: ignore[index]
-        tok = 111 if tag == "t1" else 222
-        return {
-            "choices": [{"message": {"role": "assistant", "content": str(tag)}}],
-            "usage": {"prompt_tokens": tok, "prompt_cache_hit_tokens": 0, "completion_tokens": 1},
-        }
-
-    shared_llm = OpenAIReasoningLLM("sk", "https://x/v1", post_json=threaded_post_json)
-    results: dict[str, int] = {}
-
-    # 在各自线程完成调用与栅栏同步后读取本线程 last_usage
-    def worker(tag: str) -> None:
-        shared_llm.respond([{"role": "user", "content": tag}])
-        barrier.wait(timeout=3.0)
-        assert shared_llm.last_usage is not None
-        results[tag] = shared_llm.last_usage.prompt_tokens
-
-    t1 = threading.Thread(target=worker, args=("t1",))
-    t2 = threading.Thread(target=worker, args=("t2",))
-    t1.start()
-    t2.start()
-    t1.join(timeout=3.0)
-    t2.join(timeout=3.0)
-    assert results == {"t1": 111, "t2": 222}

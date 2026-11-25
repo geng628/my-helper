@@ -652,6 +652,26 @@ def _mock_choice_resp(content: str | None, prompt: int, cached: int, completion:
     }
 
 
+# 将测试用 /choices 字典转换为标准 OpenAI SSE 行流，供 OpenAICompatibleLLM.stream() 真流式并发测试复用
+def _mock_sse_from_choice_resp(resp: dict[str, object]) -> list[str]:
+    choices = resp["choices"]
+    assert isinstance(choices, list)
+    msg = choices[0]["message"]
+    assert isinstance(msg, dict)
+    delta: dict[str, object] = {"role": msg.get("role", "assistant")}
+    if msg.get("content"):
+        delta["content"] = msg["content"]
+    if msg.get("tool_calls"):
+        delta["tool_calls"] = [
+            {"index": i, **tc} for i, tc in enumerate(msg["tool_calls"])  # type: ignore[arg-type]
+        ]
+    lines = [f"data: {json.dumps({'choices': [{'index': 0, 'delta': delta}]}, ensure_ascii=False)}\n"]
+    if "usage" in resp:
+        lines.append(f"data: {json.dumps({'choices': [], 'usage': resp['usage']}, ensure_ascii=False)}\n")
+    lines.append("data: [DONE]\n")
+    return lines
+
+
 # 测试 evaluate_memory(workers>1) 参数校验、真并发执行、乱序完成保序汇总、shared_group 隔离与 CLI --workers 透传
 def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_arg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for bad in (0, -1, True):
@@ -674,7 +694,12 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         time.sleep((3 - idx) * 0.03)
         return _mock_choice_resp(f"ok-{idx}", 200 + idx, 50 + idx, 10 + idx)
 
-    shared_llm = OpenAICompatibleLLM(api_key="sk-test", base_url="https://example.com/v1", model="demo-model", post_json=concurrent_post)
+    shared_llm = OpenAICompatibleLLM(
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        model="demo-model",
+        post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(concurrent_post(u, p, h))),
+    )
     main_thread = threading.current_thread()
     progress_events: list[tuple[int, int, str, threading.Thread]] = []
     report = evaluate_memory(
@@ -736,7 +761,13 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         return _mock_choice_resp("Alice's dog is named Max.", 310, 120, 12)
 
     shared_report = evaluate_memory(
-        OpenAICompatibleLLM(api_key="sk-test", base_url="https://example.com/v1", model="demo-model", post_json=shared_post),
+        OpenAICompatibleLLM(
+            api_key="sk-test",
+            base_url="https://example.com/v1",
+            model="demo-model",
+            post_json=shared_post,
+            post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(shared_post(u, p, h))),
+        ),
         shared_scenarios,
         workers=3,
         git_commit="shared-conc-sha",

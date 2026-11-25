@@ -1,11 +1,11 @@
 """推理模型协议插件（Slot 4 LLMProviderProtocol）：支持 DeepSeek Reasoner / R1 等 reasoning_content 协议模型。"""
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from personal_assistant.agent.plugins import Plugin
-from personal_assistant.ai import LLMClient, LLMStreamEvent, OpenAIChatClient, consume_openai_sse
+from personal_assistant.ai import LLMClient, OpenAIChatClient
 
 PROVIDER_NAME = "openai_reasoning"
 
@@ -25,47 +25,26 @@ def _prepare_wire_messages(messages: list[dict[str, object]]) -> list[dict[str, 
     ]
 
 
-# 统一规范 assistant 消息的 reasoning_content：存在思维链或工具续传时保留字符串，否则移除冗余字段
-def _apply_reasoning_content(message: dict[str, object], reasoning_text: str) -> dict[str, object]:
-    if reasoning_text or message.get("tool_calls"):
-        message["reasoning_content"] = reasoning_text
-    else:
-        message.pop("reasoning_content", None)
-    return message
-
-
-# 原生推理模型客户端：复用微内核 OpenAIChatClient 底座，仅声明 reasoning_content 生命周期与 SSE 钩子差异
+# 原生推理模型客户端：复用微内核 OpenAIChatClient 底座，仅声明 reasoning_content 流式采集与消息边界差异
 @dataclass
 class OpenAIReasoningLLM(OpenAIChatClient):
-    model: str = "deepseek-reasoner"
+    # 声明流式增量中需聚合的思维链字段（计入 ttft_ms，不吐出主文本）
+    def _stream_delta_fields(self) -> tuple[str, ...]:
+        return ("reasoning_content",)
 
     # 发往接口前跨轮剥离历史 reasoning_content，轮内工具调用思维链保持透传
     def _prepare_messages(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         return _prepare_wire_messages(messages)
 
-    # 规范化同步响应中的 reasoning_content（工具续传时保底为字符串，纯文本空值时省去）
+    # 统一规范同步与流式响应中的 reasoning_content：存在思维链或工具续传时保留字符串，否则移除冗余键
     def _normalize_response_message(self, message: dict[str, object]) -> dict[str, object]:
         raw = message.get("reasoning_content")
         reasoning_text = raw if isinstance(raw, str) else ""
-        return _apply_reasoning_content(message, reasoning_text)
-
-    # 挂载推理增量与收尾钩子：思维链首包计入 ttft_ms、不吐出主文本、收尾统一写入 reasoning_content
-    def _consume_sse(self, lines: Iterable[str], t0: float) -> Iterator[LLMStreamEvent]:
-        reasoning_parts: list[str] = []
-
-        # 收集 reasoning_content 片段并告知底层将首包计入 ttft_ms
-        def _on_delta(delta: dict[str, object]) -> bool:
-            rc = delta.get("reasoning_content")
-            if isinstance(rc, str) and rc:
-                reasoning_parts.append(rc)
-                return True
-            return False
-
-        # 在 StreamDone 消息中回写聚合后的 reasoning_content
-        def _on_message(msg: dict[str, object]) -> None:
-            _apply_reasoning_content(msg, "".join(reasoning_parts))
-
-        return consume_openai_sse(lines, t0, on_delta=_on_delta, on_message=_on_message)
+        if reasoning_text or message.get("tool_calls"):
+            message["reasoning_content"] = reasoning_text
+        else:
+            message.pop("reasoning_content", None)
+        return message
 
 
 # 实现内层 LLMProviderProtocol 协议的推理模型构造器

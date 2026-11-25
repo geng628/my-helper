@@ -165,7 +165,7 @@ def multiply(x: str, y: str) -> str:
 
 
 # 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽
-def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
+def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
         ConfigCompilerProtocol,
         LLMProviderProtocol,

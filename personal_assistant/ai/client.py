@@ -121,14 +121,15 @@ def default_post_stream(
             yield raw_line.decode("utf-8")
 
 
-# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并支持增量/消息扩展钩子
-def consume_openai_sse(
+# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并按需聚合扩展文本增量字段
+def _consume_openai_sse(
     lines: Iterable[str],
     t0: float,
     *,
-    on_delta: Callable[[dict[str, object]], bool] | None = None,
-    on_message: Callable[[dict[str, object]], None] | None = None,
+    extra_delta_fields: Iterable[str] = (),
 ) -> Iterator[LLMStreamEvent]:
+    extra_fields = tuple(extra_delta_fields)
+    extra_parts: dict[str, list[str]] = {name: [] for name in extra_fields}
     role, parts, tool_acc = "assistant", [], {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
@@ -154,9 +155,11 @@ def consume_openai_sse(
             continue
         if isinstance(delta.get("role"), str) and delta["role"]:
             role = str(delta["role"])
-        if on_delta is not None and on_delta(delta):
-            if ttft_ms is None:
-                ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
+        for field_name in extra_fields:
+            extra_piece = delta.get(field_name)
+            if isinstance(extra_piece, str) and extra_piece:
+                ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
+                extra_parts[field_name].append(extra_piece)
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
@@ -188,13 +191,14 @@ def consume_openai_sse(
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
     if calls:
         msg["tool_calls"] = calls
-    if on_message is not None:
-        on_message(msg)
+    for field_name, chunks in extra_parts.items():
+        if chunks:
+            msg[field_name] = "".join(chunks)
     yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=round((time.perf_counter() - t0) * 1000, 3))
 
 
 # 打开 OpenAI 兼容 SSE 流；若首包前因 stream_options 返回 HTTP 400 则自动去掉该参数重试一次
-def open_openai_stream(
+def _open_openai_stream(
     post_stream: PostStream,
     url: str,
     payload: dict[str, object],
@@ -287,13 +291,13 @@ class OpenAIChatClient(LLMClient):
     def _extra_payload(self) -> dict[str, object]:
         return {}
 
-    # 规范化同步接口返回的 assistant 消息字典（子类可重写）
+    # 返回流式解析时需按字符串聚合的扩展增量字段名（默认为空）
+    def _stream_delta_fields(self) -> tuple[str, ...]:
+        return ()
+
+    # 规范化同步与流式响应产出的 assistant 消息字典（子类可重写）
     def _normalize_response_message(self, message: dict[str, object]) -> dict[str, object]:
         return message
-
-    # 消费 SSE 行流并产出标准化流式事件（子类可挂载自定义增量与收尾钩子）
-    def _consume_sse(self, lines: Iterable[str], t0: float) -> Iterator[LLMStreamEvent]:
-        return consume_openai_sse(lines, t0)
 
     # 组装 /chat/completions 的请求地址、请求体与鉴权头（同步与流式调用共用）
     def _build_request(
@@ -342,9 +346,15 @@ class OpenAIChatClient(LLMClient):
         url, payload, headers = self._build_request(messages, tools, stream=True)
         self.last_usage = None
         t0 = time.perf_counter()
-        lines = open_openai_stream(self.post_stream, url, payload, headers)
-        for event in self._consume_sse(lines, t0):
+        lines = _open_openai_stream(self.post_stream, url, payload, headers)
+        for event in _consume_openai_sse(lines, t0, extra_delta_fields=self._stream_delta_fields()):
             if isinstance(event, StreamDone):
+                event = StreamDone(
+                    message=self._normalize_response_message(event.message),
+                    usage=event.usage,
+                    ttft_ms=event.ttft_ms,
+                    latency_ms=event.latency_ms,
+                )
                 self.last_usage = event.usage
             yield event
 
@@ -358,17 +368,6 @@ class OpenAICompatibleLLM(OpenAIChatClient):
     def _extra_payload(self) -> dict[str, object]:
         return {"temperature": self.temperature}
 
-    # 流式调用：仅注入旧版 post_json 测试桩时包装同步 respond()，其余走原生 SSE 流
-    def stream(
-        self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> Iterator[LLMStreamEvent]:
-        if self.post_json is not default_post_json and self.post_stream is default_post_stream:
-            yield from LLMClient.stream(self, messages, tools)
-            return
-        yield from super().stream(messages, tools)
-
 
 # 默认内建 OpenAI 兼容 Provider 构造器
 def _build_openai_compatible(env: Mapping[str, str]) -> LLMClient:
@@ -376,8 +375,8 @@ def _build_openai_compatible(env: Mapping[str, str]) -> LLMClient:
     temp = float(raw_temp) if raw_temp else 0.2
     return OpenAICompatibleLLM(
         api_key=env.get("LLM_API_KEY", "").strip(),
-        base_url=env.get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
-        model=env.get("LLM_MODEL", "deepseek-chat"),
+        base_url=env.get("LLM_BASE_URL", "").strip() or "https://api.deepseek.com/v1",
+        model=env.get("LLM_MODEL", "").strip() or "deepseek-chat",
         temperature=temp,
     )
 

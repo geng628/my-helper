@@ -248,7 +248,7 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
     assert compiled["models"]["openai"]["model"] == "gpt-4o"
     assert compiled["models"]["openai"]["api_key"] == "sk-oa-override"
 
-    # 自定义接口覆写 reasoner 预设时，生成的 model 块必须保留 provider openai_reasoning 且拒绝换行注入
+    # 自定义接口覆写 reasoner 预设或显式传入 provider 时均须保留 provider，且拒绝换行与非法名称注入
     custom_r1 = compiler.render(
         preset="reasoner",
         api_key="sk-r1-proxy",
@@ -256,10 +256,21 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
     )
     assert "provider openai_reasoning" in custom_r1
     assert compiler.compile(custom_r1, "custom_r1.dsl")["models"]["deepseek_reasoner"]["provider"] == "openai_reasoning"
+    custom_provider_dsl = compiler.render(
+        preset="custom",
+        provider="openai_reasoning",
+        api_key="sk-r1-custom",
+        base_url="https://proxy.example.com/v1",
+        model="r1-proxy",
+        name="my_r1",
+    )
+    assert compiler.compile(custom_provider_dsl, "custom_prov.dsl")["models"]["my_r1"]["provider"] == "openai_reasoning"
     with pytest.raises(ValueError, match="换行"):
         compiler.render(preset="deepseek", api_key="sk-ok\nuse ollama")
-    with pytest.raises(ValueError, match="换行"):
+    with pytest.raises(ValueError, match="模型名称"):
         compiler.render(preset="custom", api_key="sk-ok", base_url="https://x.com/v1", model="m", name="bad\nuse ollama")
+    with pytest.raises(ValueError, match="模型名称"):
+        compiler.render(preset="custom", api_key="sk-ok", base_url="https://x.com/v1", model="m", name="good\n")
     with pytest.raises(ValueError, match="模型名称"):
         compiler.render(preset="custom", api_key="sk-ok", base_url="https://x.com/v1", model="m", name="bad name!")
 

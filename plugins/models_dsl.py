@@ -104,6 +104,7 @@ def render_models_dsl(
     model: str = "",
     base_url: str = "",
     name: str = "",
+    provider: str = "",
     temperature: float = 0.2,
 ) -> str:
     header = "# 由 My Helper 自动生成（已默认 .gitignore + 0600 权限 + 沙箱屏蔽保护）\n"
@@ -111,8 +112,10 @@ def render_models_dsl(
     clean_key = api_key.strip()
     clean_model = model.strip()
     clean_url = base_url.strip()
+    clean_provider = provider.strip(" \t").lower()
+    final_provider = clean_provider or (matched.provider if matched else "openai_compatible")
 
-    if matched is not None and not clean_url and temperature == 0.2:
+    if matched is not None and not clean_url and final_provider == matched.provider and temperature == 0.2:
         if matched.needs_key:
             if not clean_key:
                 raise ValueError(f"使用 {matched.label} 需要填写 API Key。")
@@ -124,9 +127,7 @@ def render_models_dsl(
         return f"{header}use {matched.id}\n"
 
     # 自定义接口或高级覆盖模式：生成清晰的标准 model 块
-    if "\n" in name or "\r" in name:
-        raise ValueError("模型名称不能包含换行符。")
-    profile_name = (name.strip() or (matched.id if matched else "custom")).lower()
+    profile_name = (name.strip(" \t") or (matched.id if matched else "custom")).lower()
     if not _MODEL_NAME_RE.fullmatch(profile_name):
         raise ValueError(f"模型名称 {profile_name!r} 仅允许字母、数字、下划线、点或连字符。")
     final_url = clean_url or (matched.base_url if matched else "")
@@ -142,8 +143,8 @@ def render_models_dsl(
         "",
         f"model {profile_name} {{",
     ]
-    if matched is not None and matched.provider != "openai_compatible":
-        lines.append(f"  provider {_format_dsl_value(matched.provider)}")
+    if final_provider != "openai_compatible":
+        lines.append(f"  provider {_format_dsl_value(final_provider)}")
     lines.extend(
         [
             f"  base_url {_format_dsl_value(final_url)}",
@@ -597,6 +598,7 @@ class ModelsDSLCompiler:
             model=str(kwargs.get("model") or ""),
             base_url=str(kwargs.get("base_url") or ""),
             name=str(kwargs.get("name") or ""),
+            provider=str(kwargs.get("provider") or ""),
             temperature=float(kwargs.get("temperature", 0.2)),  # type: ignore[arg-type]
         )
 
