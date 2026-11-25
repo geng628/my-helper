@@ -190,3 +190,43 @@ def test_web_chat_model_setup_api_auto_generates_and_hot_reloads(tmp_path: Path,
         server.server_close()
         thread.join(timeout=3.0)
         app.close()
+
+
+# 测试网页端零依赖 Markdown 渲染（标题/表格/列表/流式未闭合代码块）及防 XSS 安全性
+def test_web_ui_markdown_renderer_and_xss_safety() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("本机未安装 node，跳过前端 JS 渲染单测")
+
+    html = (Path(__file__).resolve().parent.parent / "scripts" / "web_ui.html").read_text(encoding="utf-8")
+    start = html.index("function escapeHtml(")
+    end = html.index("function formatCacheLine(")
+    js_snippet = html[start:end]
+
+    script = f"""
+{js_snippet}
+const assert = require("node:assert/strict");
+const h = renderMarkdownLite("## 二级标题");
+assert(h.includes("<h3") && !h.includes("##"), "heading failed: " + h);
+
+const tbl = renderMarkdownLite("| 场景 | 推荐 |\\n|---|---|\\n| 新项目 | Argon2id |");
+assert(tbl.includes("<table>") && tbl.includes("<th>场景</th>") && tbl.includes("<td>Argon2id</td>"), "table failed: " + tbl);
+
+const lst = renderMarkdownLite("- 第一项\\n- 第二项\\n\\n1. 步骤一\\n2. 步骤二");
+assert(lst.includes("<ul>") && lst.includes("<ol>") && lst.includes("<li>第一项</li>") && lst.includes("<li>步骤一</li>"), "list failed: " + lst);
+
+const streamFence = renderMarkdownLite("示例：\\n```c++\\nint x = 1;");
+assert(streamFence.includes("<pre><code>") && !streamFence.includes("```"), "unclosed fence failed: " + streamFence);
+
+const link = renderMarkdownLite("[**官网**](https://example.com/**path**) [bad](javascript:alert(1))");
+assert(link.includes('<a href="https://example.com/**path**"') && link.includes("<strong>官网</strong>") && !link.includes('href="javascript:'), "link failed: " + link);
+
+const xss = renderMarkdownLite("<script>alert('x')</script> <img src=x onerror=alert(1)> [bad](javascript:alert(1))");
+assert(!xss.toLowerCase().includes("<script") && !xss.toLowerCase().includes("<img") && !xss.toLowerCase().includes('href="javascript:') && xss.includes("&#39;"), "xss failed: " + xss);
+console.log("WEB_UI_RENDER_OK");
+"""
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Node 校验失败：{proc.stderr or proc.stdout}"
+    assert "WEB_UI_RENDER_OK" in proc.stdout
