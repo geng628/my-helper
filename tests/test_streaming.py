@@ -270,3 +270,47 @@ def test_web_chat_sse_stream_endpoint_end_to_end(tmp_path: Path) -> None:
         srv.shutdown()
         srv.server_close()
         app.close()
+
+
+# 测试 OpenAIChatClient 通用协议底座与 consume_openai_sse / open_openai_stream 公开复用原语
+def test_openai_chat_client_and_public_sse_primitives() -> None:
+    import time
+    from personal_assistant.ai import OpenAIChatClient, consume_openai_sse, open_openai_stream
+
+    assert issubclass(OpenAICompatibleLLM, OpenAIChatClient)
+    assert callable(open_openai_stream)
+
+    seen_deltas: list[dict[str, object]] = []
+
+    # 记录扩展增量并返回是否作为有效首包计入 ttft_ms
+    def on_delta(delta: dict[str, object]) -> bool:
+        seen_deltas.append(delta)
+        return isinstance(delta.get("extra"), str) and bool(delta["extra"])
+
+    # 在收尾消息上注入聚合后的扩展字段
+    def on_message(msg: dict[str, object]) -> None:
+        msg["extra"] = "".join(str(d.get("extra") or "") for d in seen_deltas)
+
+    sse_lines = [
+        'data: {"choices":[{"delta":{"role":"assistant","extra":"首段"}}]}\n',
+        'data: {"choices":[{"delta":{"extra":"续段","content":"正文"}}]}\n',
+        "data: [DONE]\n",
+    ]
+    events = list(consume_openai_sse(sse_lines, time.perf_counter(), on_delta=on_delta, on_message=on_message))
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["正文"]
+    done = next(e for e in events if isinstance(e, StreamDone))
+    assert done.ttft_ms is not None and done.ttft_ms >= 0.0
+    assert len(seen_deltas) == 2
+    assert done.message == {"role": "assistant", "content": "正文", "extra": "首段续段"}
+
+    captured_payloads: list[dict[str, object]] = []
+
+    # 记录同步请求载荷并验证默认底座不附带 temperature
+    def fake_post_json(_u: str, payload: dict[str, object], _h: dict[str, str]) -> dict[str, object]:
+        captured_payloads.append(payload)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    base_client = OpenAIChatClient(api_key="sk-base", base_url="https://api.example.com/v1", model="m-base", post_json=fake_post_json)
+    assert not hasattr(base_client, "temperature")
+    assert base_client.respond([{"role": "user", "content": "hi"}])["content"] == "ok"
+    assert "temperature" not in captured_payloads[0]

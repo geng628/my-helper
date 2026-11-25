@@ -121,8 +121,14 @@ def default_post_stream(
             yield raw_line.decode("utf-8")
 
 
-# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并收尾 StreamDone
-def _consume_openai_sse(lines: Iterable[str], t0: float) -> Iterator[LLMStreamEvent]:
+# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并支持增量/消息扩展钩子
+def consume_openai_sse(
+    lines: Iterable[str],
+    t0: float,
+    *,
+    on_delta: Callable[[dict[str, object]], bool] | None = None,
+    on_message: Callable[[dict[str, object]], None] | None = None,
+) -> Iterator[LLMStreamEvent]:
     role, parts, tool_acc = "assistant", [], {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
@@ -148,6 +154,9 @@ def _consume_openai_sse(lines: Iterable[str], t0: float) -> Iterator[LLMStreamEv
             continue
         if isinstance(delta.get("role"), str) and delta["role"]:
             role = str(delta["role"])
+        if on_delta is not None and on_delta(delta):
+            if ttft_ms is None:
+                ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
@@ -179,7 +188,28 @@ def _consume_openai_sse(lines: Iterable[str], t0: float) -> Iterator[LLMStreamEv
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
     if calls:
         msg["tool_calls"] = calls
+    if on_message is not None:
+        on_message(msg)
     yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=round((time.perf_counter() - t0) * 1000, 3))
+
+
+# 打开 OpenAI 兼容 SSE 流；若首包前因 stream_options 返回 HTTP 400 则自动去掉该参数重试一次
+def open_openai_stream(
+    post_stream: PostStream,
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+) -> Iterator[str]:
+    yielded_any = False
+    try:
+        for line in post_stream(url, payload, headers):
+            yielded_any = True
+            yield line
+    except HTTPError as error:
+        if error.code != 400 or yielded_any or "stream_options" not in payload:
+            raise
+        fallback_payload = {k: v for k, v in payload.items() if k != "stream_options"}
+        yield from post_stream(url, fallback_payload, headers)
 
 
 # 大模型客户端抽象基类，供上层 Agent 循环或独立脚本调用
@@ -229,15 +259,14 @@ class NoopLLMClient(LLMClient):
         )
 
 
-# OpenAI 兼容 Chat Completions 客户端（支持 DeepSeek / OpenAI / 通义千问等）
+# 通用 OpenAI Chat Completions 传输底座（不含 temperature 等方言字段，供标准版与插件扩展复用）
 @dataclass
-class OpenAICompatibleLLM(LLMClient):
+class OpenAIChatClient(LLMClient):
     api_key: str
     base_url: str
     model: str
-    temperature: float = 0.2
-    post_json: PostJson = default_post_json
-    post_stream: PostStream = default_post_stream
+    post_json: PostJson = field(default=default_post_json, kw_only=True)
+    post_stream: PostStream = field(default=default_post_stream, kw_only=True)
     _usage_local: threading.local = field(default_factory=threading.local, init=False, repr=False)
 
     # 读取当前线程最近一次调用记录的 Token 统计（避免多线程共享客户端串台）
@@ -250,6 +279,22 @@ class OpenAICompatibleLLM(LLMClient):
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
+    # 预处理发往接口的消息列表（子类可按协议边界重写，默认原样透传）
+    def _prepare_messages(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        return messages
+
+    # 返回附加到请求体顶层的协议参数（如 temperature，默认为空）
+    def _extra_payload(self) -> dict[str, object]:
+        return {}
+
+    # 规范化同步接口返回的 assistant 消息字典（子类可重写）
+    def _normalize_response_message(self, message: dict[str, object]) -> dict[str, object]:
+        return message
+
+    # 消费 SSE 行流并产出标准化流式事件（子类可挂载自定义增量与收尾钩子）
+    def _consume_sse(self, lines: Iterable[str], t0: float) -> Iterator[LLMStreamEvent]:
+        return consume_openai_sse(lines, t0)
+
     # 组装 /chat/completions 的请求地址、请求体与鉴权头（同步与流式调用共用）
     def _build_request(
         self,
@@ -260,8 +305,8 @@ class OpenAICompatibleLLM(LLMClient):
     ) -> tuple[str, dict[str, object], dict[str, str]]:
         payload: dict[str, object] = {
             "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
+            "messages": self._prepare_messages(messages),
+            **self._extra_payload(),
             "stream": stream,
         }
         if stream:
@@ -284,7 +329,7 @@ class OpenAICompatibleLLM(LLMClient):
         url, payload, headers = self._build_request(messages, tools, stream=False)
         self.last_usage = None
         response = self.post_json(url, payload, headers)
-        msg = dict(response["choices"][0]["message"])
+        msg = self._normalize_response_message(dict(response["choices"][0]["message"]))
         self.last_usage = extract_usage(response)
         return msg
 
@@ -294,31 +339,35 @@ class OpenAICompatibleLLM(LLMClient):
         messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> Iterator[LLMStreamEvent]:
-        if self.post_json is not default_post_json and self.post_stream is default_post_stream:
-            yield from super().stream(messages, tools)
-            return
-
         url, payload, headers = self._build_request(messages, tools, stream=True)
         self.last_usage = None
         t0 = time.perf_counter()
-
-        # 打开 SSE 响应行流；若首包前因 stream_options 返回 HTTP 400 则去掉后重试一次
-        def _open_lines() -> Iterator[str]:
-            yielded_any = False
-            try:
-                for line in self.post_stream(url, payload, headers):
-                    yielded_any = True
-                    yield line
-            except HTTPError as error:
-                if error.code != 400 or yielded_any or "stream_options" not in payload:
-                    raise
-                fallback_payload = {k: v for k, v in payload.items() if k != "stream_options"}
-                yield from self.post_stream(url, fallback_payload, headers)
-
-        for event in _consume_openai_sse(_open_lines(), t0):
+        lines = open_openai_stream(self.post_stream, url, payload, headers)
+        for event in self._consume_sse(lines, t0):
             if isinstance(event, StreamDone):
                 self.last_usage = event.usage
             yield event
+
+
+# OpenAI 兼容 Chat Completions 客户端（支持 DeepSeek / OpenAI / 通义千问等）
+@dataclass
+class OpenAICompatibleLLM(OpenAIChatClient):
+    temperature: float = 0.2
+
+    # 附带标准对话模型所需的 temperature 采样参数
+    def _extra_payload(self) -> dict[str, object]:
+        return {"temperature": self.temperature}
+
+    # 流式调用：仅注入旧版 post_json 测试桩时包装同步 respond()，其余走原生 SSE 流
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        if self.post_json is not default_post_json and self.post_stream is default_post_stream:
+            yield from LLMClient.stream(self, messages, tools)
+            return
+        yield from super().stream(messages, tools)
 
 
 # 默认内建 OpenAI 兼容 Provider 构造器

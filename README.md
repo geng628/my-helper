@@ -79,7 +79,7 @@ my_helper_v2/
 │   ├── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
 │   ├── fts5_retriever.py          # SQLite FTS5 + BM25 检索后端插件（受 tools.json 的 retrieval 段管控）
 │   ├── models_dsl.py              # 极简模型配置 DSL 外部编译插件（Lexer -> 递归下降 AST -> 语义校验 -> JSON）
-│   ├── reasoning_provider.py      # 原生推理模型协议插件（LLMProviderProtocol：deepseek-reasoner / R1 / o1/o3）
+│   ├── reasoning_provider.py      # 原生推理模型协议插件（LLMProviderProtocol：DeepSeek Reasoner / R1 等 reasoning_content 推理模型）
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   ├── telemetry.py               # 运行期耗时拆解与后台沉淀观测插件（ObserverProtocol，受 tools.json 的 telemetry 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）

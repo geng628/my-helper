@@ -12,6 +12,8 @@ import pytest
 from personal_assistant.agent import PluginManager, ToolStep, TurnEnd
 from personal_assistant.ai import (
     LLMClient,
+    OpenAIChatClient,
+    OpenAICompatibleLLM,
     StreamDone,
     TextDelta,
     TokenUsage,
@@ -58,6 +60,8 @@ def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
         assert "sk-r1-direct-secret" not in json.dumps(saved, ensure_ascii=False)
         assert app.status()["llm_configured"] is True
         assert isinstance(app.llm, LLMClient)
+        assert isinstance(app.llm, OpenAIChatClient)
+        assert not isinstance(app.llm, OpenAICompatibleLLM)
         assert type(app.llm).__name__ == "OpenAIReasoningLLM"
         assert app.llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
         assert not hasattr(app.llm, "temperature")
@@ -281,7 +285,7 @@ def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
     assert built.base_url == "https://api.deepseek.com/v1"
     assert built.model == "deepseek-reasoner"
 
-    # 2. respond() 无工具调用且 reasoning_content=None 时不带冗余字段
+    # 2. respond() 无工具调用且 reasoning_content 为 None 或 "" 时均不带冗余字段（与 stream 保持一致）
     none_reply_llm = OpenAIReasoningLLM(
         api_key="sk",
         base_url="https://api.deepseek.com/v1",
@@ -290,6 +294,15 @@ def test_reasoning_provider_edge_cases_errors_and_thread_isolation() -> None:
         },
     )
     assert "reasoning_content" not in none_reply_llm.respond([{"role": "user", "content": "hi"}])
+
+    empty_reply_llm = OpenAIReasoningLLM(
+        api_key="sk",
+        base_url="https://api.deepseek.com/v1",
+        post_json=lambda _u, _p, _h: {
+            "choices": [{"message": {"role": "assistant", "content": "纯文本", "reasoning_content": ""}}],
+        },
+    )
+    assert "reasoning_content" not in empty_reply_llm.respond([{"role": "user", "content": "hi"}])
 
     # 3. 多分片 tool_calls 拼接（不含 reasoning_content 时也必须补 reasoning_content=""）
     frag_llm = OpenAIReasoningLLM(
