@@ -596,3 +596,30 @@
     - `app.status()`：`observers=["telemetry"]`，累计 2 轮总命中率 `88.54% (4736/5349)`。
 - **未验证项**：因本 PR 零微内核改动、未修改任何 Prompt、检索算法与记忆写入逻辑，未重跑真实模型多轮记忆全集（`memory_scenarios` 16 / LongMemEval 35 / LoCoMo 100）。
 - **下一步**：合入 Issue `#42` 对应 PR 后，再评估基于实测遥测结果与未解决的检索/长记忆优化项（Issue `#32` / `#13`）。
+
+
+---
+
+### [2026-11-25] 零微内核改动 Slot-4 推理模型插件 `plugins/reasoning_provider.py`（Issue `#44`）
+- **目标与架构原则（零微内核侵入 + 补齐全部 5 个主板插槽）**：利用合入 `main` (`38dfa45`) 时已预留、但尚未落盘真实插件的第 4 主板插槽 `LLMProviderProtocol`，在不修改 `personal_assistant/` 任何一行代码的前提下，完成 `deepseek-reasoner` / R1 / o1/o3 等原生推理模型接入，彻底拒绝在通用层散落模型名正则或兼容补丁：
+  1. **`plugins/reasoning_provider.py`（`234` 行，仅依赖 `personal_assistant.ai` / `personal_assistant.agent.plugins` 公开契约）**：
+     - 外层 `ReasoningProviderPlugin(Plugin)`（`plugin_id = "openai_reasoning"`）向主板 Slot 4 注册 `OpenAIReasoningProvider`（`LLMProviderProtocol`，`build(env)` 对空白 `LLM_BASE_URL` / `LLM_MODEL` 自动兜底默认）；
+     - 内层 `OpenAIReasoningLLM(LLMClient)` 不携带也不向接口发送不兼容的 `temperature`；`_prepare_wire_messages()` 以最后一条 `"role": "user"` 为界，在不改动调用方原字典的前提下**跨轮剥离**历史 `reasoning_content`；轮内由 `_consume_reasoning_sse()` / `respond()` 保证工具续传携带字符串形式 `reasoning_content`；`_consume_reasoning_sse()` 将首包（含思维链/文本/工具片）计入 `ttft_ms`、仅将正式回答 `delta.content` 吐出为 `TextDelta`（不在主界面泄漏原始草稿），支持首包前 `stream_options` HTTP 400 自动降级重试、流中 `"error"` 帧抛错及 `threading.local` 线程安全 `last_usage`。
+  2. **`plugins/models_dsl.py` & `README.md`**：`ModelPreset` 新增 `provider` 字段并加入 `deepseek_reasoner`（别名 `ds-r1` / `reasoner` / `r1`，协议 `openai_reasoning`）；修复 `render_models_dsl` 自定义块模式下按语法顺序保留预设 `provider`，并校验取值与 `name` 的 `\n`/`\r` 及合法字符防 DSL 注入。至此 5 大主板插槽（`Tool`、`RetrieverProtocol`、`ConfigCompilerProtocol`、`LLMProviderProtocol`、`ObserverProtocol`）全部实现实装插件。
+- **改动文件（Commit `f1d690b`）**：
+  - [plugins/reasoning_provider.py](plugins/reasoning_provider.py)、[plugins/models_dsl.py](plugins/models_dsl.py)、[README.md](README.md)
+  - [tests/test_reasoning_provider.py](tests/test_reasoning_provider.py)、[tests/test_plugins.py](tests/test_plugins.py)（校验 5 大插件与 5 大协议插槽）、[tests/test_history_plugin.py](tests/test_history_plugin.py)、[tests/test_models_dsl.py](tests/test_models_dsl.py)
+  - 微内核核查：`git diff --exit-code main -- personal_assistant/` 确认 **`0` 行改动**。
+- **Layer 2 独立只读审查与精简 trace**：
+  - **Round 1（`8f5a412`）→ `Request Changes`**（`0 Blocker / 3 Nits`：补齐 `render_models_dsl` 的 `name` 防换行注入校验、`OpenAIReasoningProvider.build` 空白 env 兜底、流中 error/分片/并发 `last_usage` 等边界单测）；
+  - **Round 2（`ea550b1`）→ `Pass`**（`0 Blockers / 0 Nits`）；
+  - **二次去补丁清理（`f1d690b`）**：移除 `render_models_dsl` `lines.insert(4)` 硬编码插队、移除 `stream()` 中抄来的 `post_json` 同步降级后门，以及 `_prepare_wire_messages()` 中与 `respond`/`_consume_reasoning_sse` 重叠的轮内补 `""` 分支，使每个函数职责纯粹。
+- **同口径验证对比（改前 `main` `38dfa45` → 改后 `f1d690b`）**：
+  - 单元测试 (`uv run pytest -v`)：**128 passed → 132 passed**（`6.55s`，含 `tests/test_architecture.py` 三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`mean_mrr=0.9483`, `negative_clean_rate=1.0`），零退步。
+  - **真实模型（`deepseek-reasoner`）2 轮 + 工具调用端到端冒烟（`/tmp/reasoner_slot4_smoke`，测于热路径逻辑等价的提交 `8f5a412`，已清理）**：
+    - `app.configure_model(preset="reasoner", ...)` 热生效为 `OpenAIReasoningLLM`；
+    - **Turn 1**（触发 `get_current_time`）：轮内回传 `reasoning_content` 顺利完成多跳回答（`"现在是北京时间 2026-11-25 12:32:24..."`），`total_ms=7581.498`, `ttft_ms=4881.155`, `llm_ms=7580.936`, `tool_ms=0.04`, `cached_tokens=1664/3643 (45.68%)`；
+    - **Turn 2**（跨轮追问，触发 `get_current_time`）：跨轮剥离旧思维链无 HTTP 400，`total_ms=9487.951`, `ttft_ms=3066.208`, `llm_ms=9487.072`, `tool_ms=0.043`, `cached_tokens=3712/4021 (92.32%)`。
+- **退步与未验证项**：无退步；`deepseek-reasoner` 真机双轮冒烟跑于提交 `8f5a412`（`f1d690b` 去除了冗余后门分支与重复兜底并补全检验，`132` 项全量单测与 `fts5_bm25` 均于 `f1d690b` 等价工作树重跑通过）；因零微内核与 Prompt/检索改动，未重跑多轮长记忆全集（Memory 16 / LongMemEval 35 / LoCoMo 100）。
+- **下一步**：待 PR `#45`（`reasoning_provider`）与 PR `#47`（网页端零依赖 XSS 安全 Markdown 渲染）经用户确认并合入后，推进混合检索插件 `plugins/hybrid_retriever.py`（向量嵌入 + SQLite BLOB 缓存 + RRF）。
