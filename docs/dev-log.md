@@ -596,3 +596,36 @@
     - `app.status()`：`observers=["telemetry"]`，累计 2 轮总命中率 `88.54% (4736/5349)`。
 - **未验证项**：因本 PR 零微内核改动、未修改任何 Prompt、检索算法与记忆写入逻辑，未重跑真实模型多轮记忆全集（`memory_scenarios` 16 / LongMemEval 35 / LoCoMo 100）。
 - **下一步**：合入 Issue `#42` 对应 PR 后，再评估基于实测遥测结果与未解决的检索/长记忆优化项（Issue `#32` / `#13`）。
+
+
+---
+
+### [2026-11-25] Slot-4 推理模型插件 `plugins/reasoning_provider.py` 与微内核通用传输底座抽离（Issue `#44`）
+- **目标与架构演进（方案 A：微内核纯协议复用底座 + 推理插件零重复与去补丁收口）**：补齐第 4 主板插槽 `LLMProviderProtocol`，完成 `DeepSeek Reasoner / R1` 等 `reasoning_content` 协议推理模型接入；在 `2740c57` 抽离通用底座后，进一步于 `cf85539` 清除了流式兼容后门与隐式回调胶水：
+  1. **微内核 Layer 1 通用底座（[personal_assistant/ai/client.py](personal_assistant/ai/client.py) & [personal_assistant/ai/__init__.py](personal_assistant/ai/__init__.py)，零推理特判、零测试兼容后门）**：
+     - 仅向外新增暴露 `OpenAIChatClient` 一个通用传输底座，将 `_consume_openai_sse` 与 `_open_openai_stream` 收回模块私有，避免过度暴露内部传输细节；
+     - `OpenAIChatClient(LLMClient)` 提供四个对称受保护钩子：`_prepare_messages`、`_extra_payload`、`_stream_delta_fields`（声明式聚合扩展文本增量并计入 `ttft_ms`，取代隐式 `on_delta -> bool` / `on_message` 闭包胶水）与 `_normalize_response_message`（同步 `respond()` 与流式 `stream()` 统一复用）；
+     - 彻底移除 `OpenAICompatibleLLM.stream()` 中为旧版 `post_json`-only 测试桩保留的兼容分支（`OpenAICompatibleLLM.stream is OpenAIChatClient.stream`），并将 `_build_openai_compatible` 的空白环境变量兜底风格与插件对齐。
+  2. **`plugins/reasoning_provider.py`（`234` 行 → `90` 行 → **`69` 行**，零克隆、零闭包胶水）**：
+     - 外层 `ReasoningProviderPlugin(Plugin)`（`plugin_id = "openai_reasoning"`）向主板 Slot 4 注册 `OpenAIReasoningProvider`（`LLMProviderProtocol`，`build(env)` 对空白 `LLM_BASE_URL` / `LLM_MODEL` 自动兜底）；
+     - 内层 `OpenAIReasoningLLM(OpenAIChatClient)` 与父类构造签名完全对称（`model` 必填，默认模型收敛在 Provider 工厂），仅声明 `_stream_delta_fields() -> ("reasoning_content",)`、跨轮剥离历史 `reasoning_content`（`_prepare_messages`）与同步/流式统一的 `_normalize_response_message`（工具续传保留字符串、无工具空值省去冗余键）。
+  3. **`plugins/models_dsl.py` & `README.md`**：`ModelPreset` 新增 `provider` 字段并加入 `deepseek_reasoner`（别名 `ds-r1` / `reasoner` / `r1`，协议 `openai_reasoning`）；`render_models_dsl` / `ModelsDSLCompiler.render` 支持显式 `provider` 参数并在非 `openai_compatible` 时输出 `provider` 字段，统一用水平空白裁剪 + `_MODEL_NAME_RE.fullmatch` 防止模型名换行/非法字符注入；修正文案为 `DeepSeek Reasoner / R1 等 reasoning_content 推理模型`。至此 5 大主板插槽（`Tool`、`RetrieverProtocol`、`ConfigCompilerProtocol`、`LLMProviderProtocol`、`ObserverProtocol`）全部实现实装插件。
+- **改动文件（最终代码提交 `cf85539`）**：
+  - [personal_assistant/ai/client.py](personal_assistant/ai/client.py)、[personal_assistant/ai/__init__.py](personal_assistant/ai/__init__.py)
+  - [plugins/reasoning_provider.py](plugins/reasoning_provider.py)、[plugins/models_dsl.py](plugins/models_dsl.py)、[README.md](README.md)
+  - [tests/test_reasoning_provider.py](tests/test_reasoning_provider.py)、[tests/test_streaming.py](tests/test_streaming.py)、[tests/test_memory_eval.py](tests/test_memory_eval.py)、[tests/test_plugins.py](tests/test_plugins.py)、[tests/test_history_plugin.py](tests/test_history_plugin.py)、[tests/test_models_dsl.py](tests/test_models_dsl.py)
+- **审查与重构 trace**：
+  - **Round 1（`8f5a412`）→ `Request Changes`**（`0 Blocker / 3 Nits`）；
+  - **Round 2（`ea550b1`）→ `Pass`**（`0 Blockers / 0 Nits`）；
+  - **去补丁清理（`f1d690b`）**：移除 `lines.insert(4)`、同步降级后门与重叠兜底分支；
+  - **Round 3（方案 A 去重重构 `2740c57`）→ `Pass`**；
+  - **优雅度终审清理（`cf85539`）**：删除 `OpenAICompatibleLLM.stream()` 旧测试桩兼容分支（[tests/test_memory_eval.py](tests/test_memory_eval.py) 改用真 SSE `post_stream` 并发测试）、收回 `_open_openai_stream`/`_consume_openai_sse` 为私有实现、用 `_stream_delta_fields` + 统一 `_normalize_response_message` 取代 `on_delta -> bool`/`on_message` 胶水、统一 `OpenAIReasoningLLM` 构造签名并将底座通用流/线程单测归位至 [tests/test_streaming.py](tests/test_streaming.py)。
+- **同口径验证对比（`main` `38dfa45` / 清理前 `7b1c4fe` → 清理后 `cf85539`）**：
+  - 单元测试 (`uv run pytest -v`)：**128 passed (`38dfa45`) → 133 passed (`7b1c4fe`, `7.63s`) → 133 passed (`cf85539`, `5.08s`)**（含 `tests/test_architecture.py` 三层依赖守卫与子进程独立运行测试）；CI AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`mean_mrr=0.9483`, `negative_clean_rate=1.0`，失败题维持 `para-search-fallback`、`multi-honest-eval-discipline`），零退步。
+  - **真实模型（`deepseek-reasoner`）2 轮 + 工具调用端到端冒烟（`/tmp/reasoner_slot4_smoke`，测于提交 `8f5a412`，已清理）**：
+    - `app.configure_model(preset="reasoner", ...)` 热生效为 `OpenAIReasoningLLM`；
+    - **Turn 1**（触发 `get_current_time`）：轮内回传 `reasoning_content` 顺利完成多跳回答（`"现在是北京时间 2026-11-25 12:32:24..."`），`total_ms=7581.498`, `ttft_ms=4881.155`, `llm_ms=7580.936`, `tool_ms=0.04`, `cached_tokens=1664/3643 (45.68%)`；
+    - **Turn 2**（跨轮追问，触发 `get_current_time`）：跨轮剥离旧思维链无 HTTP 400，`total_ms=9487.951`, `ttft_ms=3066.208`, `llm_ms=9487.072`, `tool_ms=0.043`, `cached_tokens=3712/4021 (92.32%)`。
+- **退步与未验证项**：无退步；`deepseek-reasoner` 真机双轮冒烟跑于早期提交 `8f5a412`，本次去补丁与声明式收口重构（`cf85539`）已重跑全部 `133` 项确定性单测、`fts5_bm25` 40 题与 AST 校验，未重跑真机实模冒烟及多轮长记忆全集（Memory 16 / LongMemEval 35 / LoCoMo 100）。
+- **下一步**：待 PR `#45`（`reasoning_provider` + 通用底座重构）与 PR `#47`（网页端零依赖 XSS 安全 Markdown 渲染）经用户确认并合入后，推进混合检索插件 `plugins/hybrid_retriever.py`（向量嵌入 + SQLite BLOB 缓存 + RRF）。

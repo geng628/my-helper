@@ -21,6 +21,7 @@ class ModelPreset:
     default_model: str
     needs_key: bool = True
     aliases: tuple[str, ...] = ()
+    provider: str = "openai_compatible"
 
     # 导出给终端向导与网页下拉框使用的展示字典
     def to_dict(self) -> dict[str, object]:
@@ -30,11 +31,21 @@ class ModelPreset:
             "base_url": self.base_url,
             "default_model": self.default_model,
             "needs_key": self.needs_key,
+            "provider": self.provider,
         }
 
 
 MODEL_PRESETS: tuple[ModelPreset, ...] = (
     ModelPreset("deepseek", "DeepSeek（推荐）", "https://api.deepseek.com/v1", "deepseek-chat", True, ("ds",)),
+    ModelPreset(
+        "deepseek_reasoner",
+        "DeepSeek Reasoner (R1 深度推理)",
+        "https://api.deepseek.com/v1",
+        "deepseek-reasoner",
+        True,
+        ("ds-r1", "reasoner", "r1"),
+        "openai_reasoning",
+    ),
     ModelPreset(
         "qwen",
         "通义千问 (Qwen)",
@@ -74,6 +85,8 @@ def list_presets() -> list[dict[str, object]]:
 
 # 为 DSL 文本安全格式化取值（含空格或特殊字符时自动加双引号）
 def _format_dsl_value(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise ValueError("配置取值不能包含换行符。")
     clean = value.strip()
     if not clean:
         return '""'
@@ -91,6 +104,7 @@ def render_models_dsl(
     model: str = "",
     base_url: str = "",
     name: str = "",
+    provider: str = "",
     temperature: float = 0.2,
 ) -> str:
     header = "# 由 My Helper 自动生成（已默认 .gitignore + 0600 权限 + 沙箱屏蔽保护）\n"
@@ -98,8 +112,10 @@ def render_models_dsl(
     clean_key = api_key.strip()
     clean_model = model.strip()
     clean_url = base_url.strip()
+    clean_provider = provider.strip(" \t").lower()
+    final_provider = clean_provider or (matched.provider if matched else "openai_compatible")
 
-    if matched is not None and not clean_url and temperature == 0.2:
+    if matched is not None and not clean_url and final_provider == matched.provider and temperature == 0.2:
         if matched.needs_key:
             if not clean_key:
                 raise ValueError(f"使用 {matched.label} 需要填写 API Key。")
@@ -111,7 +127,9 @@ def render_models_dsl(
         return f"{header}use {matched.id}\n"
 
     # 自定义接口或高级覆盖模式：生成清晰的标准 model 块
-    profile_name = (name.strip() or (matched.id if matched else "custom")).lower()
+    profile_name = (name.strip(" \t") or (matched.id if matched else "custom")).lower()
+    if not _MODEL_NAME_RE.fullmatch(profile_name):
+        raise ValueError(f"模型名称 {profile_name!r} 仅允许字母、数字、下划线、点或连字符。")
     final_url = clean_url or (matched.base_url if matched else "")
     final_model = clean_model or (matched.default_model if matched else "")
     final_key = clean_key or ("" if (matched is None or matched.needs_key) else "ollama")
@@ -124,9 +142,15 @@ def render_models_dsl(
         f"default {profile_name}",
         "",
         f"model {profile_name} {{",
-        f"  base_url {_format_dsl_value(final_url)}",
-        f"  model    {_format_dsl_value(final_model)}",
     ]
+    if final_provider != "openai_compatible":
+        lines.append(f"  provider {_format_dsl_value(final_provider)}")
+    lines.extend(
+        [
+            f"  base_url {_format_dsl_value(final_url)}",
+            f"  model    {_format_dsl_value(final_model)}",
+        ]
+    )
     if final_key:
         lines.append(f"  api_key  {_format_dsl_value(final_key)}")
     if temperature != 0.2:
@@ -406,7 +430,7 @@ class _DSLParser:
                 key_loc = (args[1].line, args[1].col)
 
         fields: dict[str, tuple[str, int, int]] = {
-            "provider": ("openai_compatible", preset_tok.line, preset_tok.col),
+            "provider": (preset.provider, preset_tok.line, preset_tok.col),
             "base_url": (preset.base_url, preset_tok.line, preset_tok.col),
             "model": (model_val, model_loc[0], model_loc[1]),
             "api_key": (api_key_val, key_loc[0], key_loc[1]),
@@ -574,6 +598,7 @@ class ModelsDSLCompiler:
             model=str(kwargs.get("model") or ""),
             base_url=str(kwargs.get("base_url") or ""),
             name=str(kwargs.get("name") or ""),
+            provider=str(kwargs.get("provider") or ""),
             temperature=float(kwargs.get("temperature", 0.2)),  # type: ignore[arg-type]
         )
 

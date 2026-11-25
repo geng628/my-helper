@@ -164,36 +164,41 @@ def multiply(x: str, y: str) -> str:
     assert messages[-2]["content"] == "42"
 
 
-# 测试外层统一主板基类 Plugin(ABC)（4 个同级插件：ToolsPlugin / FTS5RetrieverPlugin / ModelsDSLPlugin / TelemetryPlugin）与内层 5 个子协议
-def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
+# 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽
+def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
         ConfigCompilerProtocol,
+        LLMProviderProtocol,
         ObserverProtocol,
         Plugin,
         PluginManager,
         RetrieverProtocol,
     )
     from personal_assistant.agent.tools import Tool
+    from personal_assistant.ai import LLMClient
     from personal_assistant.assistant.common import REPO_ROOT
     from plugins.models_dsl import ModelsDSLCompiler
+    from plugins.reasoning_provider import OpenAIReasoningProvider
     from plugins.tools import ToolsPlugin
 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
 
-    # 1. 外层：主板加载 4 个同级 Plugin(ABC) 实例（tools 文件夹插件 + fts5_bm25 / models_dsl / telemetry 单文件插件）
-    assert len(manager.plugins) == 4
+    # 1. 外层：主板加载 5 个同级 Plugin(ABC) 实例（tools 文件夹插件 + 4 个单文件插件）
+    assert len(manager.plugins) == 5
     assert all(isinstance(p, Plugin) for p in manager.plugins)
     plugin_ids = {p.plugin_id for p in manager.plugins}
     assert plugin_ids == {
         "tools",
         "fts5_bm25",
         "models_dsl",
+        "openai_reasoning",
         "telemetry",
     }
     assert {type(p).__name__ for p in manager.plugins} == {
         "ToolsPlugin",
         "FTS5RetrieverPlugin",
         "ModelsDSLPlugin",
+        "ReasoningProviderPlugin",
         "TelemetryPlugin",
     }
     assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
@@ -217,12 +222,21 @@ def test_plugin_motherboard_abc_and_four_inner_protocols() -> None:
     compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
-    # 5. 内层子协议 5：ObserverProtocol（AssistantApp 只认 on_event / snapshot）
+    # 5. 内层子协议 4：LLMProviderProtocol（from_model_profile / from_env 只认已注册 Provider 工厂）
+    reasoning_provider = OpenAIReasoningProvider()
+    assert isinstance(reasoning_provider, LLMProviderProtocol)
+    assert not callable(reasoning_provider)
+    assert "openai_reasoning" in manager.providers
+    reasoning_client = manager.providers["openai_reasoning"]({"LLM_API_KEY": "sk-slot4-test"})
+    assert isinstance(reasoning_client, LLMClient)
+    assert type(reasoning_client).__name__ == "OpenAIReasoningLLM"
+
+    # 6. 内层子协议 5：ObserverProtocol（AssistantApp 只认 on_event / snapshot）
     obs = manager.observers["telemetry"]({})
     assert isinstance(obs, ObserverProtocol)
     assert obs.name == "telemetry"
 
-    # 6. 统一生命周期清理钩子可正常调用
+    # 7. 统一生命周期清理钩子可正常调用
     manager.terminate_all()
 
 

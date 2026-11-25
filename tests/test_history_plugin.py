@@ -39,9 +39,9 @@ class ScriptedHistoryLLM(LLMClient):
 # 测试插件发现、ToolsConfig 白名单门控、单参数契约及对 chat_history.sqlite3 的只读零侵入边界
 def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) -> None:
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
-    assert len(manager.plugins) == 4
+    assert len(manager.plugins) == 5
     assert all(isinstance(p, Plugin) for p in manager.plugins)
-    assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "telemetry"}
+    assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "openai_reasoning", "telemetry"}
     assert "search_chat_history" in {t.name for t in manager.default_tools}
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)

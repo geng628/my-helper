@@ -270,3 +270,119 @@ def test_web_chat_sse_stream_endpoint_end_to_end(tmp_path: Path) -> None:
         srv.shutdown()
         srv.server_close()
         app.close()
+
+
+# 测试 OpenAIChatClient 通用协议底座、声明式 _stream_delta_fields 扩展与底层流/线程语义
+def test_openai_chat_client_base_and_delta_field_extension() -> None:
+    from dataclasses import dataclass
+    from personal_assistant import ai as ai_pkg
+    from personal_assistant.ai import OpenAIChatClient
+
+    assert issubclass(OpenAICompatibleLLM, OpenAIChatClient)
+    assert OpenAICompatibleLLM.stream is OpenAIChatClient.stream
+    assert not hasattr(ai_pkg, "open_openai_stream")
+    assert not hasattr(ai_pkg, "consume_openai_sse")
+
+    # 声明式扩展子类：收集自定义字符串 delta 字段并统一规范化同步与流式响应
+    @dataclass
+    class _ExtraDeltaClient(OpenAIChatClient):
+        # 声明需从 SSE delta 中聚合的扩展文本字段
+        def _stream_delta_fields(self) -> tuple[str, ...]:
+            return ("extra",)
+
+        # 同步与流式共用响应规范化钩子
+        def _normalize_response_message(self, message: dict[str, object]) -> dict[str, object]:
+            if isinstance(message.get("extra"), str):
+                message["extra"] = f"[{message['extra']}]"
+            return message
+
+    sse_lines = [
+        'data: {"choices":[{"delta":{"role":"assistant","extra":"首段"}}]}\n',
+        'data: {"choices":[{"delta":{"extra":"续段","content":"正文"}}]}\n',
+        "data: [DONE]\n",
+    ]
+    ext_client = _ExtraDeltaClient(
+        api_key="sk-ext",
+        base_url="https://api.example.com/v1",
+        model="m-ext",
+        post_stream=lambda _u, _p, _h: iter(sse_lines),
+        post_json=lambda _u, _p, _h: {"choices": [{"message": {"role": "assistant", "content": "同步", "extra": "元"}}]},
+    )
+    events = list(ext_client.stream([{"role": "user", "content": "hi"}]))
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["正文"]
+    done = next(e for e in events if isinstance(e, StreamDone))
+    assert done.ttft_ms is not None and done.ttft_ms >= 0.0
+    assert done.message == {"role": "assistant", "content": "正文", "extra": "[首段续段]"}
+    assert ext_client.respond([{"role": "user", "content": "hi"}]) == {
+        "role": "assistant",
+        "content": "同步",
+        "extra": "[元]",
+    }
+
+    captured_payloads: list[dict[str, object]] = []
+
+    # 记录同步请求载荷并验证默认底座不附带 temperature
+    def fake_post_json(_u: str, payload: dict[str, object], _h: dict[str, str]) -> dict[str, object]:
+        captured_payloads.append(payload)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    base_client = OpenAIChatClient(api_key="sk-base", base_url="https://api.example.com/v1", model="m-base", post_json=fake_post_json)
+    assert not hasattr(base_client, "temperature")
+    assert base_client.respond([{"role": "user", "content": "hi"}])["content"] == "ok"
+    assert "temperature" not in captured_payloads[0]
+
+    # 底座流打开器对非 400 错误或已吐出首包后的 400 绝不盲目重试
+    attempts_500 = 0
+
+    # 模拟 500 错误验证不触发 stream_options 降级重试
+    def fail_500(url: str, _p: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        nonlocal attempts_500
+        attempts_500 += 1
+        raise HTTPError(url, 500, "server error", {}, io.BytesIO(b""))
+
+    with pytest.raises(HTTPError):
+        list(OpenAIChatClient("sk", "https://x/v1", "m", post_stream=fail_500).stream([{"role": "user", "content": "x"}]))
+    assert attempts_500 == 1
+
+    attempts_mid400 = 0
+
+    # 模拟吐出首行后再抛 400，验证不重发整段请求
+    def mid_400(url: str, _p: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        nonlocal attempts_mid400
+        attempts_mid400 += 1
+        yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n'
+        raise HTTPError(url, 400, "mid error", {}, io.BytesIO(b""))
+
+    with pytest.raises(HTTPError):
+        list(OpenAIChatClient("sk", "https://x/v1", "m", post_stream=mid_400).stream([{"role": "user", "content": "x"}]))
+    assert attempts_mid400 == 1
+
+    # 多线程共享同一 OpenAIChatClient 实例时 last_usage 按线程严格隔离
+    barrier = threading.Barrier(2)
+    results: dict[str, int] = {}
+
+    # 按请求内容返回不同 token 用量以检验 threading.local 隔离
+    def threaded_post_json(_u: str, payload: dict[str, object], _h: dict[str, str]) -> dict[str, object]:
+        tag = str(payload["messages"][0]["content"])  # type: ignore[index]
+        tok = 111 if tag == "t1" else 222
+        return {
+            "choices": [{"message": {"role": "assistant", "content": tag}}],
+            "usage": {"prompt_tokens": tok, "prompt_cache_hit_tokens": 0, "completion_tokens": 1},
+        }
+
+    shared_base = OpenAIChatClient("sk", "https://x/v1", "m", post_json=threaded_post_json)
+
+    # 在各自线程调用并栅栏同步后读取本线程 last_usage
+    def worker(tag: str) -> None:
+        shared_base.respond([{"role": "user", "content": tag}])
+        barrier.wait(timeout=3.0)
+        assert shared_base.last_usage is not None
+        results[tag] = shared_base.last_usage.prompt_tokens
+
+    t1 = threading.Thread(target=worker, args=("t1",))
+    t2 = threading.Thread(target=worker, args=("t2",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
+    assert results == {"t1": 111, "t2": 222}
