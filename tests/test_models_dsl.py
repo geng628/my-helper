@@ -226,21 +226,42 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
     dsl = """
     # 非程序员极简写法：一行自动补全网址、默认模型、provider 与 temperature
     use deepseek sk-ds-one-line
+    add reasoner sk-r1-one-line
     add 通义千问 sk-qwen-one-line
     add ollama
     add openai gpt-4o sk-oa-override
     """
     compiled = compiler.compile(dsl, "simple.dsl")
     assert compiled["default"] == "deepseek"
+    assert compiled["models"]["deepseek"]["provider"] == "openai_compatible"
     assert compiled["models"]["deepseek"]["base_url"] == "https://api.deepseek.com/v1"
     assert compiled["models"]["deepseek"]["model"] == "deepseek-chat"
     assert compiled["models"]["deepseek"]["api_key"] == "sk-ds-one-line"
+    assert compiled["models"]["deepseek_reasoner"]["provider"] == "openai_reasoning"
+    assert compiled["models"]["deepseek_reasoner"]["base_url"] == "https://api.deepseek.com/v1"
+    assert compiled["models"]["deepseek_reasoner"]["model"] == "deepseek-reasoner"
+    assert compiled["models"]["deepseek_reasoner"]["api_key"] == "sk-r1-one-line"
     assert compiled["models"]["qwen"]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert compiled["models"]["qwen"]["model"] == "qwen-plus"
     assert compiled["models"]["ollama"]["base_url"] == "http://127.0.0.1:11434/v1"
     assert compiled["models"]["ollama"]["api_key"] == "ollama"
     assert compiled["models"]["openai"]["model"] == "gpt-4o"
     assert compiled["models"]["openai"]["api_key"] == "sk-oa-override"
+
+    # 自定义接口覆写 reasoner 预设时，生成的 model 块必须保留 provider openai_reasoning 且拒绝换行注入
+    custom_r1 = compiler.render(
+        preset="reasoner",
+        api_key="sk-r1-proxy",
+        base_url="https://proxy.example.com/v1",
+    )
+    assert "provider openai_reasoning" in custom_r1
+    assert compiler.compile(custom_r1, "custom_r1.dsl")["models"]["deepseek_reasoner"]["provider"] == "openai_reasoning"
+    with pytest.raises(ValueError, match="换行"):
+        compiler.render(preset="deepseek", api_key="sk-ok\nuse ollama")
+    with pytest.raises(ValueError, match="换行"):
+        compiler.render(preset="custom", api_key="sk-ok", base_url="https://x.com/v1", model="m", name="bad\nuse ollama")
+    with pytest.raises(ValueError, match="模型名称"):
+        compiler.render(preset="custom", api_key="sk-ok", base_url="https://x.com/v1", model="m", name="bad name!")
 
     # 测试自动生成向导底层 save_model_setup：自动生成 0600 权限的 models.dsl + models.json，并支持 app.reload_llm 热切换
     cfg_dir = tmp_path / "config"

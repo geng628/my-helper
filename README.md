@@ -79,6 +79,7 @@ my_helper_v2/
 │   ├── custom_tools.py            # 可自由编辑的工具插件文件（@tool 声明即插即用）
 │   ├── fts5_retriever.py          # SQLite FTS5 + BM25 检索后端插件（受 tools.json 的 retrieval 段管控）
 │   ├── models_dsl.py              # 极简模型配置 DSL 外部编译插件（Lexer -> 递归下降 AST -> 语义校验 -> JSON）
+│   ├── reasoning_provider.py      # 原生推理模型协议插件（LLMProviderProtocol：deepseek-reasoner / R1 / o1/o3）
 │   ├── shell_tools.py             # 受控白名单命令插件（run_command，受 tools.json 的 shell 段管控）
 │   ├── telemetry.py               # 运行期耗时拆解与后台沉淀观测插件（ObserverProtocol，受 tools.json 的 telemetry 段管控）
 │   └── web_tools.py               # 联网搜索与防 SSRF 网页正文提取插件（web_search / fetch_webpage）
@@ -130,6 +131,7 @@ my_helper_v2/
 │   ├── test_step2_tools.py        # 工具白名单与命令执行器单元测试
 │   ├── test_plugins.py            # 插件发现、加载与白名单隔离单元测试
 │   ├── test_models_dsl.py         # 模型配置 DSL 编译插件、直写密钥与系统级防泄漏单元测试
+│   ├── test_reasoning_provider.py # Slot-4 推理模型协议插件、报文格式与多轮工具集成测试
 │   ├── test_fts5_plugin.py        # SQLite FTS5 + BM25 检索插件单元测试
 │   ├── test_shell_plugin.py       # 受控白名单 Shell 插件安全边界单元测试
 │   ├── test_web_plugin.py         # 联网搜索与防 SSRF 抓网页插件单元测试
