@@ -440,3 +440,240 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
     env_llm = tcfg.build_llm(ext_cfg_dir, model_name="env_backed", env={"CUSTOM_DSL_KEY": "sk-passed-via-env"})
     assert isinstance(env_llm, OpenAICompatibleLLM)
     assert env_llm.api_key == "sk-passed-via-env"
+
+
+# 测试 agent_eval 逐题沙箱隔离（目录/记忆/规则/KV缓存不串台）与生产一致的 tool_names 系统提示词
+def test_agent_eval_isolates_per_case_sandbox_prompt_and_cache(tmp_path: Path) -> None:
+    data_dir = tmp_path / "real_data"
+    (data_dir / "memory").mkdir(parents=True)
+    (data_dir / "memory" / "MEMORY.md").write_text("# 记忆索引\n- [projects](data/memory/projects.md)\n", encoding="utf-8")
+    (data_dir / "memory" / "projects.md").write_text("# 项目\n- 基线项目状态正常。\n", encoding="utf-8")
+
+    # 录制两道题各自的 system prompt 与第二题读到的文件清单，验证题间完全隔离
+    seen_system_prompts: list[str] = []
+    case2_observations: list[str] = []
+
+    # 捕获每道题请求体并模拟第一题写入污染、第二题读取文件检查隔离
+    class IsolatingAgentLLM(LLMClient):
+        # 初始化轮次计数
+        def __init__(self) -> None:
+            self._turn = 0
+
+        # 第一题调用 write_file/remember_fact/save_rule；第二题调用 list_files 核查隔离环境
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            self._turn += 1
+            if messages and messages[0].get("role") == "system":
+                if not any(m.get("role") == "tool" for m in messages):
+                    seen_system_prompts.append(str(messages[0].get("content") or ""))
+            if self._turn == 1:
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "w1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "data/workspace/leak.txt", "content": "leaked", "mode": "create"}',
+                            },
+                        },
+                        {
+                            "id": "r1",
+                            "type": "function",
+                            "function": {"name": "remember_fact", "arguments": "{}"},
+                        },
+                        {
+                            "id": "s1",
+                            "type": "function",
+                            "function": {"name": "save_rule", "arguments": '{"statement": "LEAKED_RULE_MARKER"}'},
+                        },
+                    ],
+                }
+            if self._turn == 2:
+                return {"role": "assistant", "content": "第一题已完成写入。"}
+            if self._turn == 3:
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "l1",
+                            "type": "function",
+                            "function": {"name": "list_files", "arguments": '{"root": "data/memory", "pattern": "*"}'},
+                        },
+                        {
+                            "id": "l2",
+                            "type": "function",
+                            "function": {"name": "list_files", "arguments": '{"root": "data/workspace", "pattern": "*"}'},
+                        },
+                    ],
+                }
+            for msg in messages:
+                if msg.get("role") == "tool":
+                    case2_observations.append(str(msg.get("content") or ""))
+            return {"role": "assistant", "content": "第二题环境干净。"}
+
+    cases = [
+        {"id": "case-mutate", "query": "CASE1_LEAK_FACT", "answerable": True, "expected_sources": [], "expected_tools": ["write_file"]},
+        {"id": "case-clean", "query": "检查目录", "answerable": True, "expected_sources": [], "expected_tools": ["list_files"]},
+    ]
+    report = evaluate_agent(IsolatingAgentLLM(), data_dir, cases, git_commit="iso-sha")
+
+    assert len(seen_system_prompts) == 2
+    assert "【可用白名单工具】" in seen_system_prompts[0]
+    assert "search_markdown" in seen_system_prompts[0]
+    assert "LEAKED_RULE_MARKER" not in seen_system_prompts[1]
+
+    joined_obs = "\n".join(case2_observations)
+    assert "leak.txt" not in joined_obs
+    assert "facts.md" not in joined_obs
+    assert "rules/" not in joined_obs
+
+    # 两题各自拥有独立 session_key，第二题首轮必须冷启动（warm_calls=0）
+    assert report["cases"][0]["cache"]["llm_calls"] == 2
+    assert report["cases"][0]["cache"]["warm_calls"] == 1
+    assert report["cases"][1]["cache"]["llm_calls"] == 2
+    assert report["cases"][1]["cache"]["warm_calls"] == 1
+
+    # 跨题 session_key 隔离验证：第二题首轮不应借用第一题前缀
+    single_turn_cases = [
+        {"id": "cold-1", "query": "q1", "answerable": False, "expected_sources": []},
+        {"id": "cold-2", "query": "q2", "answerable": False, "expected_sources": []},
+    ]
+    cold_llm = ScriptedLLM(
+        [
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a2"},
+        ]
+    )
+    cold_report = evaluate_agent(cold_llm, data_dir, single_turn_cases, git_commit="cold-sha")
+    assert cold_report["cases"][0]["cache"]["warm_calls"] == 0
+    assert cold_report["cases"][1]["cache"]["warm_calls"] == 0
+    assert cold_report["summary"]["cache"]["warm_calls"] == 0
+
+
+# 测试 CLI --fail-under 参数在 search 与 memory 模式下低于阈值返回 1，达标返回 0，非法范围抛错
+def test_eval_cli_fail_under_threshold_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="fail-under"):
+        main(["--mode", "search", "--fail-under", "-0.1"])
+    with pytest.raises(ValueError, match="fail-under"):
+        main(["--mode", "search", "--fail-under", "1.2"])
+
+    data_dir = tmp_path / "data"
+    (data_dir / "memory").mkdir(parents=True)
+    (data_dir / "memory" / "doc.md").write_text("# 文档\n命中关键词 alpha。\n", encoding="utf-8")
+    search_cases = tmp_path / "search_cases.jsonl"
+    search_cases.write_text(
+        json.dumps({"id": "hit", "query": "alpha", "expected_sources": [{"path": "data/memory/doc.md", "quote": "命中关键词 alpha"}]})
+        + "\n"
+        + json.dumps({"id": "miss", "query": "nonexistent_zzz", "expected_sources": [{"path": "data/memory/doc.md", "quote": "命中关键词 alpha"}]})
+        + "\n",
+        encoding="utf-8",
+    )
+    out_report = tmp_path / "gate_report.json"
+    assert (
+        main(
+            [
+                "--mode",
+                "search",
+                "--retriever",
+                "linear",
+                "--data-dir",
+                str(data_dir),
+                "--cases",
+                str(search_cases),
+                "--output",
+                str(out_report),
+                "--fail-under",
+                "0.8",
+            ]
+        )
+        == 1
+    )
+    assert out_report.is_file()
+    assert (
+        main(
+            [
+                "--mode",
+                "search",
+                "--retriever",
+                "linear",
+                "--data-dir",
+                str(data_dir),
+                "--cases",
+                str(search_cases),
+                "--fail-under",
+                "0.5",
+            ]
+        )
+        == 0
+    )
+
+    mem_cases = tmp_path / "mem_cases.jsonl"
+    mem_cases.write_text(
+        json.dumps({"id": "m1", "steps": [{"action": "ask", "message": "hi"}]}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "evals.cli.evaluate_memory",
+        lambda *_a, **_kw: {"mode": "memory", "git_commit": "t", "summary": {"pass_rate": 0.75}, "failures": [], "scenarios": []},
+    )
+    assert main(["--mode", "memory", "--cases", str(mem_cases), "--no-judge", "--fail-under", "0.8"]) == 1
+    assert main(["--mode", "memory", "--cases", str(mem_cases), "--no-judge", "--fail-under", "0.75"]) == 0
+
+
+# 测试 conftest 宿主机隔离第一段：向 _PROVIDERS 注册脏 Provider 且从临时 .env 加载变量，确保下个测试零残留
+def test_conftest_isolation_step1_mutates_providers_and_loads_tmp_dotenv(tmp_path: Path) -> None:
+    from personal_assistant.ai import client as client_mod
+    from personal_assistant.assistant.common import load_dotenv
+
+    client_mod.register_provider("ephemeral_conftest_leak", lambda _env: None)  # type: ignore[arg-type,return-value]
+    assert "ephemeral_conftest_leak" in client_mod.available_providers()
+
+    tmp_env = tmp_path / ".env"
+    tmp_env.write_text("LLM_MODE=on\nLLM_API_KEY=sk-tmp-dotenv\n", encoding="utf-8")
+    load_dotenv(tmp_env)
+    import os
+
+    assert os.environ["LLM_API_KEY"] == "sk-tmp-dotenv"
+
+
+# 测试 conftest 宿主机隔离第二段：验证上个测试的 _PROVIDERS 与环境变量已自动还原，且仓库真实 .env 被拦截
+def test_conftest_isolation_step2_verifies_clean_state_and_repo_dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    from personal_assistant.ai import client as client_mod
+    from personal_assistant.assistant import common as common_mod
+
+    assert "ephemeral_conftest_leak" not in client_mod.available_providers()
+    assert "LLM_API_KEY" not in os.environ
+    assert "LLM_MODE" not in os.environ
+
+    called_paths: list[Path] = []
+    # 验证调用 load_dotenv(REPO_ROOT / ".env") 会被 conftest 守卫拦截而不读取宿主根目录 .env
+    real_repo_dotenv = common_mod.REPO_ROOT / ".env"
+    orig_is_file = Path.is_file
+    orig_read_text = Path.read_text
+
+    # 模拟宿主 .env 存在以检验守卫是否提前短路
+    def spy_is_file(self: Path) -> bool:
+        if self.resolve() == real_repo_dotenv.resolve():
+            return True
+        return orig_is_file(self)
+
+    # 监控对真实 .env 路径的读取调用并返回假密钥以检测泄漏
+    def spy_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.resolve() == real_repo_dotenv.resolve():
+            called_paths.append(self)
+            return "LLM_API_KEY=sk-leaked-from-repo-dotenv\n"
+        return orig_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_file", spy_is_file)
+    monkeypatch.setattr(Path, "read_text", spy_read_text)
+    common_mod.load_dotenv(real_repo_dotenv)
+    assert called_paths == []
+    assert "LLM_API_KEY" not in os.environ

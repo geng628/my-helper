@@ -1,6 +1,7 @@
 """多轮记忆与生命周期端到端评测：验证跨会话沉淀、冲突替换、过期归档、公开基准与 KV 缓存。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -40,10 +41,13 @@ JUDGE_SYSTEM_PROMPT = (
     "adopt the false premise for the asked-about person/entity and does NOT fabricate unrecorded details, "
     "AND clearly rejects the false premise or states that the required information is missing/not recorded/"
     "insufficient. Clarifying from memory that the event actually happened to a different person/entity "
-    "(valid premise correction, e.g., stating Caroline has no camping record and it was Melanie's family "
-    "who went camping) counts as valid premise rejection (correct=true), NOT fabrication. Answering as if "
-    "the false premise were true or speculating/fabricating unrecorded facts is correct=false."
+    "(valid premise correction, e.g., stating Person A has no record of the asked activity and clarifying "
+    "from memory that the activity actually involved Person B) counts as valid premise rejection "
+    "(correct=true), NOT fabrication. Answering as if the false premise were true or speculating/"
+    "fabricating unrecorded facts is correct=false."
 )
+JUDGE_PROMPT_VERSION = "v2-neutral"
+JUDGE_PROMPT_SHA256 = hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
 
 ABSTENTION_MARKERS = (
     "没有",
@@ -207,6 +211,21 @@ def judge_answer(
     }
 
 
+# 判断文本是否包含目标词条：长度 <= 3 的纯 ASCII 词条按大小写不敏感词边界匹配，其余保留子串匹配
+def _contains_keyword(text: str, keyword: str) -> bool:
+    if not keyword:
+        return True
+    if keyword.isascii() and len(keyword) <= 3 and keyword.isalnum():
+        if keyword.isalpha():
+            boundary = "[A-Za-z]"
+        elif keyword.isdigit():
+            boundary = "[0-9]"
+        else:
+            boundary = "[A-Za-z0-9]"
+        return bool(re.search(rf"(?<!{boundary}){re.escape(keyword)}(?!{boundary})", text, re.IGNORECASE))
+    return keyword.lower() in text.lower()
+
+
 # 校验单步 ask 的回复内容、工具调用、磁盘记忆文件、缓存命中阈值与可选 Judge 评判
 def _check_ask_assertions(
     app: AssistantApp,
@@ -217,7 +236,6 @@ def _check_ask_assertions(
 ) -> tuple[list[str], dict[str, object] | None]:
     reasons: list[str] = []
     reply = str(result.get("reply") or "")
-    reply_lower = reply.lower()
     called_tools = [str(item.get("tool") or "") for item in (result.get("tool_calls") or [])]
 
     expect_tools_any = step.get("expect_tools_any")
@@ -227,17 +245,17 @@ def _check_ask_assertions(
 
     for kw in step.get("must_include") or []:
         token = str(kw)
-        if token.lower() not in reply_lower:
+        if not _contains_keyword(reply, token):
             reasons.append(f"must_include 缺失：{token!r}")
 
     must_include_any = step.get("must_include_any")
     if isinstance(must_include_any, list) and must_include_any:
-        if not any(str(kw).lower() in reply_lower for kw in must_include_any):
+        if not any(_contains_keyword(reply, str(kw)) for kw in must_include_any):
             reasons.append(f"must_include_any 未命中任何词：{must_include_any}")
 
     for bad in step.get("must_not_include") or []:
         token = str(bad)
-        if token.lower() in reply_lower:
+        if _contains_keyword(reply, token):
             reasons.append(f"must_not_include 违规出现：{token!r}")
 
     for fc in step.get("file_checks") or []:
@@ -251,10 +269,14 @@ def _check_ask_assertions(
             reasons.append(f"file_checks 路径非法 {rel_path}: {error}")
             continue
         for kw in fc.get("must_include") or []:
-            if str(kw).lower() not in content.lower():
+            if not _contains_keyword(content, str(kw)):
                 reasons.append(f"file_checks({rel_path}) 缺少 {kw!r}")
+        fc_any = fc.get("must_include_any")
+        if isinstance(fc_any, list) and fc_any:
+            if not any(_contains_keyword(content, str(kw)) for kw in fc_any):
+                reasons.append(f"file_checks({rel_path}) 未命中任何词：{fc_any}")
         for bad in fc.get("must_not_include") or []:
-            if str(bad).lower() in content.lower():
+            if _contains_keyword(content, str(bad)):
                 reasons.append(f"file_checks({rel_path}) 残留禁用内容 {bad!r}")
 
     cache = app.cache_monitor.summary()
@@ -408,7 +430,7 @@ def _execute_steps(
             must_hit = raw_step.get("must_include")
             if isinstance(must_hit, str) and must_hit:
                 joined = "\n".join(h.snippet for h in hits)
-                if must_hit.lower() not in joined.lower():
+                if not _contains_keyword(joined, must_hit):
                     reasons.append(f"step#{idx} check_search({query!r}) 未包含 {must_hit!r}")
             step_logs.append(
                 {
@@ -463,16 +485,22 @@ def _build_shared_setup(
     def current_today() -> date:
         return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
-    app = AssistantApp(
-        data_root=base_data_dir,
-        config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
-        project_root=project_root,
-        llm=llm,
-        consolidation_policy=policy,
-        consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
-        today_fn=current_today,
-    )
+    app: AssistantApp | None = None
+    step_logs: list[dict[str, object]] = []
+    reasons: list[str] = []
+    records: list[CallCacheRecord] = []
+    cache_summary = summarize_records([])
+    setup_exception: str | None = None
     try:
+        app = AssistantApp(
+            data_root=base_data_dir,
+            config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
+            project_root=project_root,
+            llm=llm,
+            consolidation_policy=policy,
+            consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+            today_fn=current_today,
+        )
         for seed in setup_spec.get("seed_memories") or []:
             if not isinstance(seed, dict):
                 continue
@@ -488,21 +516,30 @@ def _build_shared_setup(
         )
         records = list(app.cache_monitor.records)
         cache_summary = app.cache_monitor.summary()
+    except Exception as exc:  # noqa: BLE001
+        setup_exception = f"{type(exc).__name__}: {exc}"
+        reasons = [f"shared_setup_exception: {setup_exception}"]
+        if app is not None:
+            records = list(app.cache_monitor.records)
+            cache_summary = app.cache_monitor.summary()
     finally:
-        app.close()
+        if app is not None:
+            app.close()
 
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
-    summary = {
+    summary: dict[str, object] = {
         "shared_group": group_id,
         "steps_executed": len(step_logs),
         "errors": reasons,
         "latency_ms": elapsed_ms,
         "cache": cache_summary,
     }
+    if setup_exception is not None:
+        summary["exception"] = setup_exception
     return summary, records
 
 
-# 在完全隔离的临时目录中执行单个端到端记忆场景（支持从共享沉淀快照拷贝初始状态）
+# 在完全隔离的临时目录中执行单个端到端记忆场景（支持从共享沉淀快照拷贝初始状态，并隔离单题运行时异常）
 def _run_single_scenario(
     llm: LLMClient,
     scenario: dict[str, object],
@@ -513,9 +550,26 @@ def _run_single_scenario(
     base_data_dir: Path | None = None,
     steps_override: list[dict[str, object]] | None = None,
     disable_auto_consolidation: bool = False,
+    setup_error: str | None = None,
 ) -> tuple[dict[str, object], list[CallCacheRecord]]:
     sc_id = str(scenario["id"])
     category = str(scenario.get("category") or "uncategorized").strip() or "uncategorized"
+    group_id = str(scenario.get("shared_group") or "").strip()
+    if setup_error is not None:
+        fail_record: dict[str, object] = {
+            "id": sc_id,
+            "category": category,
+            "description": str(scenario.get("description") or ""),
+            "passed": False,
+            "reasons": [f"scenario_exception: shared_setup({group_id}) failed: {setup_error}"],
+            "latency_ms": 0.0,
+            "cache": summarize_records([]),
+            "steps": [],
+        }
+        if group_id:
+            fail_record["shared_group"] = group_id
+        return fail_record, []
+
     policy = _build_policy(scenario.get("policy"))
     steps = list(steps_override) if steps_override is not None else list(scenario.get("steps") or [])
     has_explicit_consolidate = disable_auto_consolidation or any(
@@ -529,21 +583,27 @@ def _run_single_scenario(
     def current_today() -> date:
         return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
-    with tempfile.TemporaryDirectory(prefix=f"my-helper-memeval-{sc_id}-") as tmp:
+    step_logs: list[dict[str, object]] = []
+    reasons: list[str] = []
+    records: list[CallCacheRecord] = []
+    cache_summary = summarize_records([])
+    safe_sc_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", sc_id) or "scenario"
+    with tempfile.TemporaryDirectory(prefix=f"my-helper-memeval-{safe_sc_id}-") as tmp:
         data_root = Path(tmp) / "data"
-        if base_data_dir is not None:
-            _copy_data_snapshot(base_data_dir, data_root)
-        app = AssistantApp(
-            data_root=data_root,
-            config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
-            project_root=project_root,
-            llm=llm,
-            consolidation_policy=policy,
-            # 含显式 consolidate 步骤时关闭自动后台线程，保证步骤顺序确定不竞争
-            consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
-            today_fn=current_today,
-        )
+        app: AssistantApp | None = None
         try:
+            if base_data_dir is not None:
+                _copy_data_snapshot(base_data_dir, data_root)
+            app = AssistantApp(
+                data_root=data_root,
+                config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
+                project_root=project_root,
+                llm=llm,
+                consolidation_policy=policy,
+                # 含显式 consolidate 步骤时关闭自动后台线程，保证步骤顺序确定不竞争
+                consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+                today_fn=current_today,
+            )
             # 非共享快照场景下，注入场景预设的初始记忆
             if base_data_dir is None:
                 for seed in scenario.get("seed_memories") or []:
@@ -562,8 +622,14 @@ def _run_single_scenario(
             )
             records = list(app.cache_monitor.records)
             cache_summary = app.cache_monitor.summary()
+        except Exception as exc:  # noqa: BLE001
+            reasons = [f"scenario_exception: {type(exc).__name__}: {exc}"]
+            if app is not None:
+                records = list(app.cache_monitor.records)
+                cache_summary = app.cache_monitor.summary()
         finally:
-            app.close()
+            if app is not None:
+                app.close()
 
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
     record: dict[str, object] = {
@@ -576,7 +642,6 @@ def _run_single_scenario(
         "cache": cache_summary,
         "steps": step_logs,
     }
-    group_id = str(scenario.get("shared_group") or "").strip()
     if group_id:
         record["shared_group"] = group_id
     return record, records
@@ -707,6 +772,7 @@ def evaluate_memory(
                         for s in (shared_specs.get(gid, {}).get("steps") or [])
                     )
                 ),
+                cast(str | None, shared_setups_report.get(gid, {}).get("exception")) if gid else None,
             )
             for scenario, gid, qa_steps in prepared_items
         ]
@@ -721,6 +787,7 @@ def evaluate_memory(
                 base_data_dir=job[2],
                 steps_override=job[1],
                 disable_auto_consolidation=job[3],
+                setup_error=job[4],
             ),
             workers=workers,
             on_done=(lambda done, total_n, item: on_progress(done, total_n, item[0]))
@@ -743,6 +810,19 @@ def evaluate_memory(
                     }
                 )
 
+    effective_judge = judge_llm
+    use_judge = effective_judge is not None and not isinstance(effective_judge, NoopLLMClient)
+    judge_meta: dict[str, object] = {
+        "enabled": use_judge,
+        "model": (
+            getattr(effective_judge, "model", None) or type(effective_judge).__name__
+            if use_judge
+            else None
+        ),
+        "self_judged": bool(use_judge and (judge_llm is None or judge_llm is llm)),
+        "prompt_version": JUDGE_PROMPT_VERSION if use_judge else None,
+        "prompt_sha256": JUDGE_PROMPT_SHA256 if use_judge else None,
+    }
     summary = _aggregate_scenario_records(per_scenario)
     summary["mean_latency_ms"] = round(mean(latencies), 3) if latencies else 0.0
     summary["by_category"] = {
@@ -753,6 +833,7 @@ def evaluate_memory(
         "mode": "memory",
         "git_commit": git_commit or current_git_commit(),
         "timestamp": datetime.now(UTC).isoformat(),
+        "judge": judge_meta,
         "summary": summary,
         "failures": failures,
         "scenarios": per_scenario,

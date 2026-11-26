@@ -1,16 +1,19 @@
 """记忆与多轮端到端评测器（memory_eval）自身单元测试（TDD）。"""
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
 from evals import evaluate_memory, judge_answer, load_scenarios, main, write_scenarios_jsonl
 from evals.memory_eval import JUDGE_SYSTEM_PROMPT
-from personal_assistant.ai import LLMClient, OpenAICompatibleLLM, TokenUsage
+from personal_assistant.ai import LLMClient, NoopLLMClient, OpenAICompatibleLLM, TokenUsage
 
 
 # 可按序返回预设消息与 usage 的脚本化假模型，用于确定性测试 memory_eval
@@ -787,3 +790,251 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
     )
     assert main(["--mode", "memory", "--cases", str(cli_cases), "--workers", "4", "--no-judge"]) == 0
     assert captured == [4]
+
+
+# 静态守卫：JUDGE_SYSTEM_PROMPT 不得泄漏 LoCoMo / LongMemEval 测试集专有实体与场景名，且须暴露版本与 SHA256 指纹
+def test_judge_system_prompt_has_no_benchmark_entity_leakage_and_exports_fingerprint() -> None:
+    from evals.memory_eval import JUDGE_PROMPT_SHA256, JUDGE_PROMPT_VERSION
+
+    forbidden_entities = (
+        "caroline",
+        "melanie",
+        "jon",
+        "gina",
+        "joanna",
+        "nate",
+        "tim",
+        "maria",
+        "camping",
+    )
+    prompt_lower = JUDGE_SYSTEM_PROMPT.lower()
+    for entity in forbidden_entities:
+        assert not re.search(rf"(?<![a-z]){re.escape(entity)}(?![a-z])", prompt_lower), (
+            f"JUDGE_SYSTEM_PROMPT 泄漏测试集实体：{entity!r}"
+        )
+
+    assert JUDGE_PROMPT_VERSION == "v2-neutral"
+    expected_sha = hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
+    assert JUDGE_PROMPT_SHA256 == expected_sha
+
+
+# 测试 evaluate_memory 报告顶层记录 judge 元数据（含禁用、Noop、自评与独立评判四种组合）
+def test_evaluate_memory_records_judge_metadata() -> None:
+    from evals.memory_eval import JUDGE_PROMPT_SHA256, JUDGE_PROMPT_VERSION
+
+    # 带 model 属性的脚本化假模型，便于验证 judge.model 记录
+    class NamedScriptedLLM(ScriptedMemoryEvalLLM):
+        # 初始化模型名称与预设回复队列
+        def __init__(self, model: str, responses: list[tuple[dict[str, object], TokenUsage | None]]) -> None:
+            super().__init__(responses)
+            self.model = model
+
+    scenarios = [
+        {
+            "id": "sc-judge-meta",
+            "category": "extraction",
+            "steps": [{"action": "ask", "chat_id": "s1", "message": "hi", "must_include": ["ok"]}],
+        }
+    ]
+
+    rep_none = evaluate_memory(
+        NamedScriptedLLM("agent-m", [({"role": "assistant", "content": "ok"}, None)]),
+        scenarios,
+        judge_llm=None,
+        git_commit="meta-1",
+    )
+    assert rep_none["judge"] == {
+        "enabled": False,
+        "model": None,
+        "self_judged": False,
+        "prompt_version": None,
+        "prompt_sha256": None,
+    }
+
+    rep_noop = evaluate_memory(
+        NamedScriptedLLM("agent-m", [({"role": "assistant", "content": "ok"}, None)]),
+        scenarios,
+        judge_llm=NoopLLMClient(),
+        git_commit="meta-2",
+    )
+    assert rep_noop["judge"] == {
+        "enabled": False,
+        "model": None,
+        "self_judged": False,
+        "prompt_version": None,
+        "prompt_sha256": None,
+    }
+
+    self_llm = NamedScriptedLLM("deepseek-chat", [({"role": "assistant", "content": "ok"}, None)])
+    rep_self = evaluate_memory(self_llm, scenarios, judge_llm=self_llm, git_commit="meta-3")
+    assert rep_self["judge"] == {
+        "enabled": True,
+        "model": "deepseek-chat",
+        "self_judged": True,
+        "prompt_version": JUDGE_PROMPT_VERSION,
+        "prompt_sha256": JUDGE_PROMPT_SHA256,
+    }
+
+    agent_llm = NamedScriptedLLM("deepseek-reasoner", [({"role": "assistant", "content": "ok"}, None)])
+    judge_llm = NamedScriptedLLM("deepseek-chat", [])
+    rep_sep = evaluate_memory(agent_llm, scenarios, judge_llm=judge_llm, git_commit="meta-4")
+    assert rep_sep["judge"] == {
+        "enabled": True,
+        "model": "deepseek-chat",
+        "self_judged": False,
+        "prompt_version": JUDGE_PROMPT_VERSION,
+        "prompt_sha256": JUDGE_PROMPT_SHA256,
+    }
+
+
+# 测试单场景与 shared_setup 异常容错隔离：并发中单题抛网络/运行时异常不拖垮其余场景，KeyboardInterrupt 照常抛出
+def test_evaluate_memory_isolates_scenario_and_shared_setup_exceptions() -> None:
+    # 根据消息关键词按需抛出指定异常的并发假模型
+    class FaultyScenarioLLM(LLMClient):
+        # 按场景内容决定返回正常答案、触发沉淀失败或抛出网络异常
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            sys_text = str(messages[0].get("content") or "")
+            joined = "\n".join(str(m.get("content") or "") for m in messages)
+            if tools is None and "后台记忆整理器" in sys_text:
+                if "FAIL_SETUP" in joined:
+                    raise RuntimeError("shared setup boom")
+                return {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "session_summary": "ok",
+                            "memories": [
+                                {
+                                    "topic": "facts",
+                                    "title": "事实",
+                                    "index_summary": "摘要",
+                                    "operations": [{"op": "add", "text": "fact-ok"}],
+                                }
+                            ],
+                        }
+                    ),
+                }
+            if "RAISE_URL_ERROR" in joined:
+                raise URLError("temporary network glitch")
+            if "RAISE_KB_INT" in joined:
+                raise KeyboardInterrupt("user aborted")
+            return {"role": "assistant", "content": "ok-reply"}
+
+    scenarios = [
+        {"id": "sc-ok-1", "category": "extraction", "steps": [{"action": "ask", "message": "hello 1", "must_include": ["ok-reply"]}]},
+        {"id": "sc-net-err", "category": "extraction", "steps": [{"action": "ask", "message": "RAISE_URL_ERROR", "must_include": ["ok-reply"]}]},
+        {"id": "sc-ok-2", "category": "extraction", "steps": [{"action": "ask", "message": "hello 2", "must_include": ["ok-reply"]}]},
+        {
+            "id": "sc-bad-setup",
+            "category": "multi-session",
+            "shared_group": "bad-grp",
+            "setup_step_count": 2,
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [
+                {"action": "seed_history", "chat_id": "b1", "messages": [{"role": "user", "content": "FAIL_SETUP"}, {"role": "assistant", "content": "ack"}]},
+                {"action": "consolidate", "chat_id": "b1", "today": "2026-11-20"},
+                {"action": "ask", "chat_id": "b2", "message": "should skip", "must_include": ["ok-reply"]},
+            ],
+        },
+        {
+            "id": "sc-good-setup",
+            "category": "multi-session",
+            "shared_group": "good-grp",
+            "setup_step_count": 2,
+            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "steps": [
+                {"action": "seed_history", "chat_id": "g1", "messages": [{"role": "user", "content": "GOOD_SETUP"}, {"role": "assistant", "content": "ack"}]},
+                {"action": "consolidate", "chat_id": "g1", "today": "2026-11-20"},
+                {"action": "ask", "chat_id": "g2", "message": "ask good", "must_include": ["ok-reply"]},
+            ],
+        },
+    ]
+
+    report = evaluate_memory(FaultyScenarioLLM(), scenarios, workers=3, git_commit="err-iso")
+    assert report["summary"]["total_scenarios"] == 5
+    assert report["summary"]["passed_scenarios"] == 3
+    assert report["summary"]["failed_scenarios"] == 2
+    by_id = {item["id"]: item for item in report["scenarios"]}
+    assert by_id["sc-ok-1"]["passed"] is True
+    assert by_id["sc-ok-2"]["passed"] is True
+    assert by_id["sc-good-setup"]["passed"] is True
+    assert by_id["sc-net-err"]["passed"] is False
+    assert by_id["sc-net-err"]["reasons"] == ["scenario_exception: URLError: <urlopen error temporary network glitch>"]
+    assert by_id["sc-bad-setup"]["passed"] is False
+    assert any("scenario_exception" in str(r) and "RuntimeError" in str(r) for r in by_id["sc-bad-setup"]["reasons"])
+
+    # KeyboardInterrupt 绝不能被容错层吞掉
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_memory(
+            FaultyScenarioLLM(),
+            [{"id": "sc-kb", "category": "extraction", "steps": [{"action": "ask", "message": "RAISE_KB_INT"}]}],
+            workers=1,
+        )
+
+
+# 测试词面校验对短 ASCII 词（如 Go / 90）执行词边界匹配防止 Google/900 假阳性，并检查场景集收紧规则
+def test_lexical_word_boundary_and_tightened_memory_scenarios() -> None:
+    scenarios = [
+        {
+            "id": "boundary-check",
+            "category": "compaction-cache",
+            "steps": [
+                {
+                    "action": "ask",
+                    "chat_id": "s1",
+                    "message": "总结选型",
+                    "must_include": ["Go", "90", "Parquet"],
+                    "must_include_any": ["企微", "企业微信"],
+                }
+            ],
+        }
+    ]
+
+    # 1. Google/good 不应误命中 Go，900 不应误命中 90
+    false_pos_llm = ScriptedMemoryEvalLLM(
+        [
+            ({"role": "assistant", "content": "Google 的 good 方案，企业微信通知，90 天，Parquet。"}, None),
+            ({"role": "assistant", "content": "采用 Go 语言，企业微信通知，900 天，Parquet。"}, None),
+        ]
+    )
+    rep_go_fail = evaluate_memory(false_pos_llm, scenarios, git_commit="wb-1")
+    assert rep_go_fail["summary"]["passed_scenarios"] == 0
+    assert "must_include 缺失：'Go'" in str(rep_go_fail["failures"][0]["reasons"])
+
+    rep_90_fail = evaluate_memory(false_pos_llm, scenarios, git_commit="wb-2")
+    assert rep_90_fail["summary"]["passed_scenarios"] == 0
+    assert "must_include 缺失：'90'" in str(rep_90_fail["failures"][0]["reasons"])
+
+    # 2. 中文紧贴边界（如 Go语言 / 90天）与企业微信全称应正常通过
+    valid_llm = ScriptedMemoryEvalLLM(
+        [
+            ({"role": "assistant", "content": "采用Go语言编写，接入企业微信机器人，冷数据归档90天，格式为Parquet。"}, None),
+        ]
+    )
+    rep_pass = evaluate_memory(valid_llm, scenarios, git_commit="wb-3")
+    assert rep_pass["summary"]["passed_scenarios"] == 1
+
+    # 3. 校验 evals/memory_scenarios.jsonl 已收紧过短数字与全简称兼容
+    repo_root = Path(__file__).resolve().parent.parent
+    loaded = {item["id"]: item for item in load_scenarios(repo_root / "evals" / "memory_scenarios.jsonl")}
+
+    rolling_ask = loaded["rolling-multi-compaction"]["steps"][-1]
+    assert rolling_ask["must_include"] == ["Go", "90", "Parquet"]
+    assert rolling_ask["must_include_any"] == ["企微", "企业微信"]
+
+    synth_ask = loaded["cross-session-synthesis"]["steps"][-1]
+    assert synth_ask["must_include"] == ["京都", "12000", "祇园"]
+    assert synth_ask["must_include_any"] == ["4 晚", "4晚", "四晚"]
+
+    partial_ask = loaded["partial-attribute-update"]["steps"][-1]
+    assert partial_ask["must_include"] == ["法兰克福", "8080"]
+    assert partial_ask["must_include_any"] == ["30 秒", "30秒", "30s"]
+
+    accum_ask = loaded["multi-session-accumulation"]["steps"][-1]
+    assert accum_ask["must_include"] == ["DDIA", "SICP", "CSAPP"]
+    assert "3" not in accum_ask["must_include_any"]
+    assert "三" not in accum_ask["must_include_any"]
