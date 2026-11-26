@@ -26,6 +26,7 @@ from personal_assistant.agent.tools import (
     ToolMetadata,
     ToolRegistry,
     ToolsetProvider,
+    bind_tool_context,
     build_tool,
     tool,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "ToolStep",
     "ToolsetProvider",
     "TurnEnd",
+    "bind_tool_context",
     "build_tool",
     "iter_react",
     "run_react",

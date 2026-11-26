@@ -666,3 +666,68 @@ class MixedCustomPlugin(Plugin):
     )
     assert reg2.execute("probe_omitted_source", '{"tag": "t2"}') == "t2:data_turn_b:tools.json:9:45"
     assert reg2._tools["sub_with_src"] is not sub_a
+
+
+# 测试 PluginContext.tool_bindings 通用顶层配置映射与裸 Tool 实例零猴子补丁签名解析
+def test_plugin_context_generic_section_config_mapping_and_bare_tool_rebind(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import Tool, ToolRegistry
+
+    # 验证任意顶层 Mapping 配置自动按 <section>_config 注入，且不覆盖显式 extra_bindings
+    ctx = PluginContext(
+        project_root=tmp_path,
+        raw_config={
+            "custom_search": {"top_k": 8},
+            "web": {"timeout": 12},
+            "enabled_tools": ["demo"],
+        },
+        extra_bindings={"custom_search_config": {"top_k": 3}},
+    )
+    bindings = ctx.tool_bindings()
+    assert bindings["web_config"] == {"timeout": 12}
+    assert bindings["custom_search_config"] == {"top_k": 3}
+    assert "enabled_tools_config" not in bindings
+
+    # 验证插件注册裸 Tool(handler=...) 时自动解析 accepted_context_keys 与 optional required，且后续 build_tools 轻量化重绑
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "bare_tool_plugin.py").write_text(
+        """
+from collections.abc import Mapping
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool
+
+
+# 测试裸 Tool 实例通过主板按通用配置键注入
+class BareToolPlugin(Plugin):
+    plugin_id = "bare_tool"
+
+    # 注册带可选参数与配置键的裸 Tool 实例
+    def initialize(self) -> None:
+        # 接收模型参数与自动映射的 custom_mod_config 上下文
+        def _run(query: str, mode: str = "fast", *, custom_mod_config: Mapping[str, object] | None = None) -> str:
+            limit = custom_mod_config.get("limit") if custom_mod_config else "none"
+            return f"{query}:{mode}:{limit}"
+
+        self.context.register_tool(
+            Tool(
+                name="bare_probe",
+                description="裸 Tool 探针",
+                parameters={"query": "查询", "mode": "模式"},
+                handler=_run,
+            )
+        )
+""",
+        encoding="utf-8",
+    )
+    manager = PluginManager.from_entries(
+        ["plugins/bare_tool_plugin.py"],
+        tmp_path,
+        context={"raw_config": {"custom_mod": {"limit": 7}}},
+    )
+    reg = ToolRegistry(allowed_names=["bare_probe"])
+    manager.register_into(reg)
+    assert reg.execute("bare_probe", '{"query": "hello"}') == "hello:fast:7"
+
+    reg_override = ToolRegistry(allowed_names=["bare_probe"])
+    manager.register_into(reg_override, context={"raw_config": {"custom_mod": {"limit": 15}}})
+    assert reg_override.execute("bare_probe", '{"query": "hi", "mode": "deep"}') == "hi:deep:15"

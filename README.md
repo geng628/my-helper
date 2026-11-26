@@ -33,7 +33,7 @@
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)（`models_dsl`），手写 Lexer + 递归下降 AST + 精确行列报错，支持 8 项内置模型预设、`use`/`add` 一行语法、`default`/`consolidator` 顶层指令与 `model <name> { ... }` 块语法。
   4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），复用 Layer 1 `OpenAIChatClient` 传输底座，声明 `reasoning_content` 流式 `ThinkingDelta`、轮内工具续传保留与跨轮安全剥离。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)（`telemetry`），线程安全、零微内核侵入收集 `total_ms` / `ttft_ms` / `llm_ms` / `tool_ms` / `overhead_ms` 分阶段耗时拆解及后台 `TaskEvent` 账本，配合有界环形窗口与 MRU 会话淘汰。
-- **单次初始化解耦**：`PluginManager.from_entries()` 仅在装配期执行一次 `Plugin.initialize()` 并缓存工具规格；每轮 `build_tools(context)` 只按函数签名重绑运行时上下文并克隆自定义 `Tool` 子类，不再重跑初始化。
+- **单次初始化与执行期上下文注入**：`PluginManager.from_entries()` 仅在装配期执行一次 `Plugin.initialize()`，插件通过 `<section>_config` 通用约定接收配置而无需在微内核硬编码业务键；`AssistantApp` 启动时单次构建常驻 `_tool_registry`，每轮对话通过 `iter_react(..., tool_context=turn_ctx)` 与 `Tool.run_with_context()` 动态注入当前回合上下文，零动态 `type()` 造类、零 `object.__setattr__` 猴子补丁、零每轮重建注册表；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 - **有界观测与传输加固**：`CacheMonitor(max_records=2000, max_sessions=256)` 配合单调 `snapshot_index()` 与 $O(1)$ 累计账本；`default_post_json` / `default_post_stream` 支持瞬时网络/TLS 异常（`IncompleteRead`、`SSLError`、`429`/`5xx`）指数退避重试；大输出通过 [personal_assistant/assistant/common.py](personal_assistant/assistant/common.py) `truncate_or_offload()` 分级卸载至 `data/workspace/tool_outputs/`（`head` / `head_tail` 预览 + `read_markdown` 续读）。
 
 ### 2. KV Cache 优先的纯 Markdown 记忆与成对原子会话存储
@@ -185,24 +185,27 @@ my_helper_v2/
 │   ├── __main__.py                    # `python -m personal_assistant` 入口
 │   ├── ai/                            # Layer 1（零内部依赖）：LLM 传输底座、事件契约与缓存观测
 │   │   ├── __init__.py
-│   │   ├── types.py                   # ToolSchema、ToolCall、TextDelta、ThinkingDelta、StreamDone、ModelProfile、ModelsConfig
+│   │   ├── types.py                   # ToolSchema（含精确 required）、ToolCall、TextDelta、ThinkingDelta、StreamDone、ModelProfile、ModelsConfig
 │   │   ├── client.py                  # LLMClient、OpenAIChatClient、OpenAICompatibleLLM、重试/SSE 与 Provider 注册中心
 │   │   └── cache.py                   # CacheMonitor 有界滑动窗口（max_records=2000, max_sessions=256）与 TrackingLLMClient
-│   ├── agent/                         # Layer 2（仅依赖 ai）：通用 ReAct 微内核与五大插件主板插槽
+│   ├── agent/                         # Layer 2（仅依赖 ai，零业务字面量泄漏）：通用 ReAct 微内核与五大插件主板插槽
 │   │   ├── __init__.py
-│   │   ├── tools.py                   # Tool(ToolSchema)、ToolMetadata、ToolDocument、build_tool、ToolsetProvider、ToolRegistry
-│   │   ├── react.py                   # 30 余行单层 while True ReAct 循环、transform_context -> convert_to_llm 与强类型事件
-│   │   └── plugins.py                 # Plugin(ABC)、PluginContext（5 插槽）与 PluginManager（单次初始化 + 签名重绑）
-│   └── assistant/                     # Layer 3（个人与学习助手业务层）：记忆、SQLite 历史、沉淀、编排与终端
+│   │   ├── tools.py                   # Tool(ToolSchema)、run_with_context、bind_tool_context、build_tool（默认参数推断）、ToolRegistry
+│   │   ├── react.py                   # 30 余行单层 while True ReAct 循环、transform_context -> convert_to_llm、tool_context 与强类型事件
+│   │   └── plugins.py                 # Plugin(ABC)、PluginContext（5 插槽 + <section>_config 通用绑定）与 PluginManager
+│   └── assistant/                     # Layer 3（个人与学习助手业务层）：记忆、分词、安全策略、SQLite 历史、沉淀、编排与终端
 │       ├── __init__.py
 │       ├── common.py                  # 无内部依赖底座：REPO_ROOT、load_dotenv、星期格式与 TOAST 卸载原语
+│       ├── text_search.py             # 无内部依赖中英双语分词底座（供检索与历史插件正交共享，零跨插件耦合）
+│       ├── files_policy.py            # 无内部依赖目录读写白名单策略（FilesPolicy）与原子写盘原语
 │       ├── prompts.py                 # 个人助手系统提示词与前缀分段拼装（从通用 react.py 剥离）
-│       ├── memory.py                  # FilesPolicy、MemoryStore（写锁/turn_tag 暂存/原子写盘）与 MemoryToolsetProvider
+│       ├── memory.py                  # MemoryStore（写锁/turn_tag 暂存/审计日志/按需检索）
+│       ├── builtin_tools.py           # BuiltinTool 与 MemoryToolsetProvider（6 个内置工具，支持可选默认参数与执行期上下文）
 │       ├── memory_lifecycle.py        # add/merge/replace/remove 冲突替换、superseded_by 软退休与 (until:) 过期归档
 │       ├── db.py                      # 无内部依赖线程安全 SQLite（messages 成对原子 append_turn + session_compactions）
 │       ├── consolidator.py            # 阈值触发后台记忆沉淀与滚动压缩（支持独立 consolidator_llm 分槽）
 │       ├── commands.py                # tools.json 解析、CommandToolWrapper 与五大插槽/双模型装配
-│       ├── app.py                     # AssistantApp 核心编排（stream_chat 单一主流程、会话串行锁与前缀冻结）
+│       ├── app.py                     # AssistantApp 核心编排（启动期常驻 _tool_registry、stream_chat 单一主流程、会话串行锁）
 │       └── cli.py                     # 终端 REPL（/status /memory /search /refresh、setup、compile-config、流式思维链展示）
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示与 --ask 单句实测脚本

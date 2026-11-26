@@ -1,11 +1,10 @@
-"""Layer 2 通用工具抽象、统一构建器（build_tool）与统一注册表（ToolRegistry）。"""
+"""Layer 2 通用工具抽象、统一构建器（build_tool）、上下文重绑器与统一注册表（ToolRegistry）。"""
 from __future__ import annotations
 
 import inspect
 import json
-import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from personal_assistant.ai.types import ToolSchema
 
@@ -24,19 +23,65 @@ class ToolDocument:
     source_name: str = "core"
 
 
-# 内层子协议 1：可执行工具基类（继承底层 ToolSchema，ToolRegistry 与 run_react 只认此基类的 run 契约）
+# 按工具接受键白名单与非空约束过滤上下文参数，绝不覆盖模型声明参数
+def _filter_context_kwargs(
+    parameters: Mapping[str, str],
+    accepted_keys: frozenset[str] | None,
+    context: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if not context:
+        return {}
+    return {
+        key: val
+        for key, val in context.items()
+        if key not in parameters
+        and val is not None
+        and (accepted_keys is None or key in accepted_keys)
+    }
+
+
+# 内层子协议 1：可执行工具基类（继承底层 ToolSchema，承载治理元数据、静态绑定参数与执行期上下文白名单）
 @dataclass(frozen=True)
 class Tool(ToolSchema):
     handler: Callable[..., str] | None = None
+    metadata: ToolMetadata = field(default_factory=ToolMetadata, kw_only=True, repr=False, compare=False)
+    document: ToolDocument = field(default_factory=ToolDocument, kw_only=True, repr=False, compare=False)
+    bound_kwargs: Mapping[str, object] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+    accepted_context_keys: frozenset[str] | None = field(
+        default=frozenset(), kw_only=True, repr=False, compare=False
+    )
 
-    # 执行工具核心逻辑；子类可重写此方法，默认调用 handler 回调
-    def run(self, **values: str) -> str:
+    # 合并预绑定上下文、执行期动态上下文与模型入参后执行 handler
+    def _invoke_handler(
+        self,
+        values: Mapping[str, str],
+        context: Mapping[str, object] | None = None,
+    ) -> str:
         if self.handler is None:
             raise NotImplementedError(f"工具 {self.name} 未实现 run() 或 handler。")
-        return str(self.handler(**values))
+        call_kwargs = dict(self.bound_kwargs)
+        call_kwargs.update(_filter_context_kwargs(self.parameters, self.accepted_context_keys, context))
+        call_kwargs.update(values)
+        return str(self.handler(**call_kwargs))
+
+    # 携带执行期上下文运行工具；若子类重写了 run() 则严格隔离，绝不混入上下文参数
+    def run_with_context(
+        self,
+        values: Mapping[str, str],
+        context: Mapping[str, object] | None = None,
+    ) -> str:
+        if type(self).run is not Tool.run:
+            return str(self.run(**values))
+        return self._invoke_handler(values, context)
+
+    # 执行工具核心逻辑；委托 run_with_context（若由子类 super().run() 进入则直连 handler）
+    def run(self, **values: str) -> str:
+        if type(self).run is not Tool.run:
+            return self._invoke_handler(values, None)
+        return self.run_with_context(values, None)
 
 
-# 统一工具构建器：将执行函数适配为指定 Tool 子类（或动态 type() 生成的 Tool 子类），自动按函数签名绑定上下文参数并挂载 ToolMetadata 与 ToolDocument
+# 统一工具构建器：仅在构造期解析一次函数签名，推断必填参数与可接受上下文键并构造 Tool 实例
 def build_tool(
     fn: Callable[..., str],
     *,
@@ -44,6 +89,7 @@ def build_tool(
     parameters: dict[str, str] | None = None,
     name: str | None = None,
     param_enums: dict[str, tuple[str, ...]] | None = None,
+    required: Iterable[str] | None = None,
     risk: str = "read",
     always_on: bool = False,
     source_type: str = "builtin",
@@ -54,39 +100,52 @@ def build_tool(
 ) -> Tool:
     tool_name = name or fn.__name__
     schema_params = dict(parameters or {})
+    target_cls = base_cls or Tool
 
-    bound_context: dict[str, object] = {}
-    if context:
-        try:
-            sig = inspect.signature(fn)
-            accepts_var_kw = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-            for key, val in context.items():
-                if key in schema_params or val is None:
-                    continue
-                if accepts_var_kw or key in sig.parameters:
-                    bound_context[key] = val
-        except (TypeError, ValueError):
-            pass
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        sig = None
 
-    if base_cls is not None and base_cls is not Tool:
-        target_cls = base_cls
+    if required is not None:
+        required_set = set(required)
+        resolved_required = tuple(k for k in schema_params if k in required_set)
+    elif sig is None:
+        resolved_required = tuple(schema_params)
     else:
-        safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", tool_name).title().replace("_", "") or "Dynamic"
-        kind_label = source_type.title() or "Dynamic"
-
-        # 动态 Tool 子类的 run 实现：合并预绑定运行时上下文与模型传入参数
-        def _run(self: Tool, **values: str) -> str:
-            call_kwargs: dict[str, object] = dict(bound_context)
-            call_kwargs.update(values)
-            return str(fn(**call_kwargs))
-
-        target_cls = type(
-            f"{safe_suffix}{kind_label}Tool",
-            (Tool,),
-            {"run": _run, "__doc__": f"动态生成的 {source_type} 工具子类：{tool_name}"},
+        optional_kinds = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
         )
+        resolved_required = tuple(
+            k
+            for k in schema_params
+            if (param := sig.parameters.get(k)) is None
+            or param.kind not in optional_kinds
+            or param.default is inspect.Parameter.empty
+        )
+
+    if target_cls.run is not Tool.run or sig is None:
+        accepted_keys: frozenset[str] | None = frozenset()
+    elif any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
+        accepted_keys = None
+    else:
+        ctx_kinds = (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        accepted_keys = frozenset(
+            param_name
+            for param_name, param in sig.parameters.items()
+            if param_name not in schema_params and param.kind in ctx_kinds
+        )
+
+    bound_context = (
+        _filter_context_kwargs(schema_params, accepted_keys, context)
+        if target_cls.run is Tool.run
+        else {}
+    )
 
     init_kwargs: dict[str, object] = {
         "name": tool_name,
@@ -94,27 +153,42 @@ def build_tool(
         "parameters": schema_params,
         "handler": fn,
         "param_enums": param_enums,
+        "required": resolved_required,
+        "metadata": ToolMetadata(risk=risk, always_on=always_on),
+        "document": ToolDocument(source_type=source_type, source_name=source_name),
+        "bound_kwargs": bound_context,
+        "accepted_context_keys": accepted_keys,
     }
     if extra_fields:
         init_kwargs.update(extra_fields)
-
-    instance: Tool = target_cls(**init_kwargs)
-    object.__setattr__(instance, "_raw_fn", fn)
-    object.__setattr__(instance, "__tool_metadata__", ToolMetadata(risk=risk, always_on=always_on))
-    object.__setattr__(
-        instance,
-        "__tool_document__",
-        ToolDocument(source_type=source_type, source_name=source_name),
-    )
-    return instance
+    return target_cls(**init_kwargs)
 
 
-# 统一工具集提供方基类（内置 MemoryToolsetProvider / 插件 PluginManager / 命令 CommandToolsetProvider 均继承此类）
+# 纯函数重绑工具上下文与治理元数据（基于 dataclasses.replace，零反射、零属性猴子补丁）
+def bind_tool_context(
+    item: Tool,
+    context: Mapping[str, object] | None = None,
+    *,
+    metadata: ToolMetadata | None = None,
+    document: ToolDocument | None = None,
+) -> Tool:
+    changes: dict[str, object] = {
+        "metadata": metadata if metadata is not None else item.metadata,
+        "document": document if document is not None else item.document,
+    }
+    if type(item).run is Tool.run:
+        merged = dict(item.bound_kwargs)
+        merged.update(_filter_context_kwargs(item.parameters, item.accepted_context_keys, context))
+        changes["bound_kwargs"] = merged
+    return replace(item, **changes)
+
+
+# 统一工具集提供方基类（内置 / 插件 / 命令等均继承此类）
 class ToolsetProvider:
     source_type: str = "builtin"
     source_name: str = "core"
 
-    # 按可选运行时上下文产出当前提供方的全部 Tool 子类实例
+    # 按可选运行时上下文产出当前提供方的全部 Tool 实例
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         return self.tools()
 
@@ -122,33 +196,32 @@ class ToolsetProvider:
     def tools(self) -> list[Tool]:
         raise NotImplementedError
 
-    # 将当前提供方的全部 Tool 实例连同 _metadata 与 _documents 统一注册进目标 ToolRegistry
+    # 将当前提供方的全部 Tool 实例连同 metadata 与 document 统一注册进目标 ToolRegistry
     def register_into(
         self,
         registry: "ToolRegistry",
         *,
         context: Mapping[str, object] | None = None,
     ) -> None:
+        default_doc = ToolDocument()
+        provider_doc = ToolDocument(source_type=self.source_type, source_name=self.source_name)
         for item in self.build_tools(context=context):
-            meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
-            doc = getattr(item, "__tool_document__", None) or ToolDocument(
-                source_type=self.source_type,
-                source_name=self.source_name,
-            )
-            registry.register(item, metadata=meta, document=doc)
+            doc = provider_doc if item.document == default_doc else item.document
+            registry.register(item, metadata=item.metadata, document=doc)
 
 
-# 装饰器：将普通 Python 函数统一通过 build_tool 包装为动态 type() Tool 子类，同时保持原函数可直接调用
+# 装饰器：将普通 Python 函数统一通过 build_tool 包装为纯净 Tool 实例，同时保持原函数可直接调用
 def tool(
     *,
     description: str,
     parameters: dict[str, str] | None = None,
     name: str | None = None,
     param_enums: dict[str, tuple[str, ...]] | None = None,
+    required: Iterable[str] | None = None,
     risk: str = "read",
     always_on: bool = False,
 ) -> Callable[[Callable[..., str]], Callable[..., str]]:
-    # 为被装饰函数构造动态 Tool 子类实例并挂载到 __agent_tool__
+    # 为被装饰函数构造 Tool 实例并挂载到 __agent_tool__
     def decorator(fn: Callable[..., str]) -> Callable[..., str]:
         mod_name = (getattr(fn, "__module__", "") or "plugin").rsplit(".", 1)[-1]
         spec = build_tool(
@@ -157,6 +230,7 @@ def tool(
             parameters=parameters,
             name=name,
             param_enums=param_enums,
+            required=required,
             risk=risk,
             always_on=always_on,
             source_type="plugin",
@@ -183,7 +257,7 @@ def extract_tool(item: object) -> Tool:
     raise TypeError(f"对象不是合法的 Tool 或 @tool 函数：{item!r}")
 
 
-# 统一工具注册表：汇聚所有 ToolsetProvider 与 Plugin 产出的 Tool 子类，维护 _tools / _metadata / _documents 并按需激活
+# 统一工具注册表：汇聚所有 ToolsetProvider 与 Plugin 产出的 Tool，维护 _tools / _metadata / _documents 并按需激活
 class ToolRegistry:
     # 初始化统一工具表、元数据表与来源文档表；若指定 allowed_names 则按白名单（含 always_on）按需激活
     def __init__(
@@ -201,7 +275,7 @@ class ToolRegistry:
         for item in tools:
             self.register(item)
 
-    # 将单个 Tool 子类实例注册入表，同步写入 _metadata 与 _documents 并按需激活到 _tools
+    # 将单个 Tool 实例注册入表，同步写入 _metadata 与 _documents 并按需激活到 _tools
     def register(
         self,
         item: Tool,
@@ -211,16 +285,8 @@ class ToolRegistry:
     ) -> None:
         if item.name in self._all_tools:
             raise ValueError(f"工具名称不能重复：{item.name}")
-        resolved_meta = (
-            metadata
-            or getattr(item, "__tool_metadata__", None)
-            or ToolMetadata()
-        )
-        resolved_doc = (
-            document
-            or getattr(item, "__tool_document__", None)
-            or ToolDocument()
-        )
+        resolved_meta = metadata if metadata is not None else item.metadata
+        resolved_doc = document if document is not None else item.document
         self._all_tools[item.name] = item
         self._metadata[item.name] = resolved_meta
         self._documents[item.name] = resolved_doc
@@ -273,8 +339,14 @@ class ToolRegistry:
     def definitions(self) -> list[dict[str, object]]:
         return [item.to_openai_schema() for item in self._tools.values()]
 
-    # 按名称执行已激活工具的 item.run(**values)；参数或执行错误统一转为文本回传模型自愈
-    def execute(self, name: str, raw_arguments: str) -> str:
+    # 按名称并携带可选执行期上下文运行已激活工具；参数或执行错误统一转为文本回传模型自愈
+    def execute(
+        self,
+        name: str,
+        raw_arguments: str,
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> str:
         item = self._tools.get(name)
         if item is None:
             available = "、".join(self._tools) or "（无）"
@@ -290,23 +362,32 @@ class ToolRegistry:
             return f"错误：{error}"
 
         try:
-            return str(item.run(**values))
+            return str(item.run_with_context(values, context))
         except Exception as error:
             return f"错误：工具执行异常（{type(error).__name__}: {error}）。"
 
-    # 校验模型传入的 JSON 参数键名、非空字符串类型及可选 enum 取值范围
+    # 校验模型传入的 JSON 参数键名、非空字符串类型、必填约束及可选 enum 取值范围
     @staticmethod
     def _validate_values(item: Tool, parsed: object) -> tuple[dict[str, str], str]:
         if not isinstance(parsed, dict):
             return {}, f"{item.name} 的参数必须是 JSON 对象。"
-        if set(parsed) != set(item.parameters):
-            if not item.parameters:
+        if not item.parameters:
+            if parsed:
                 return {}, f"{item.name} 不接受参数，请传空对象 {{}}。"
+            return {}, ""
+        required_keys = (
+            set(item.parameters)
+            if item.required is None
+            else (set(item.required) & set(item.parameters))
+        )
+        if any(k not in item.parameters for k in parsed) or any(k not in parsed for k in required_keys):
             return {}, f"{item.name} 需要参数：{', '.join(item.parameters)}。"
         clean: dict[str, str] = {}
         for key in item.parameters:
+            if key not in parsed or (parsed[key] is None and key not in required_keys):
+                continue
             val = parsed[key]
-            # 兼容模型直接传入数字参数（如行号 start_line: 1），同时严格拒绝布尔值与空串
+            # 兼容模型直接传入数字参数（如 start_line: 1），同时严格拒绝布尔值与空串
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 val = str(val)
             if not isinstance(val, str) or not val.strip():

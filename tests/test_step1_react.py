@@ -674,3 +674,104 @@ def test_sync_post_json_body_read_retry_and_openai_response_validation(monkeypat
     with pytest.raises(RuntimeError, match="JSON 对象|格式"):
         client.respond([{"role": "user", "content": "hi"}])
 
+
+# 测试复用同一 ToolRegistry 实例跨多轮调用 run_react/iter_react 透传当轮 tool_context 且隔离自定义子类
+def test_react_forwards_runtime_tool_context_across_turns() -> None:
+    from personal_assistant.agent.tools import build_tool
+
+    # 记录模型参数与执行期注入上下文的函数工具
+    def probe_ctx(
+        query: str,
+        limit: str = "5",
+        *,
+        turn_id: int | None = None,
+        label: str = "base",
+    ) -> str:
+        return f"q={query}|limit={limit}|turn={turn_id}|label={label}"
+
+    # 重写 run() 的自定义 Tool 子类：绝不能被注入 tool_context
+    class PureSubclassTool(Tool):
+        # 仅接受模型声明参数并断言未混入上下文键
+        def run(self, **values: str) -> str:
+            assert set(values) == {"msg"}, f"unexpected keys: {values!r}"
+            return f"pure:{values['msg']}"
+
+    probe_tool = build_tool(
+        probe_ctx,
+        description="探针工具",
+        parameters={"query": "关键词", "limit": "条数"},
+        context={"label": "pinned"},
+    )
+    sub_tool = PureSubclassTool(
+        name="pure_sub",
+        description="纯子类工具",
+        parameters={"msg": "消息"},
+    )
+    registry = ToolRegistry(probe_tool, sub_tool)
+
+    # 第 1 轮：仅传必选参数 query 并注入 turn_id=1（同时包含未声明键与同名参数干扰键）
+    llm1 = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    _tool_call("c1", "probe_ctx", '{"query": "alpha"}'),
+                    _tool_call("c2", "pure_sub", '{"msg": "hi"}'),
+                ],
+            },
+            {"role": "assistant", "content": "轮次1完成"},
+        ]
+    )
+    msgs1: list[dict[str, object]] = [{"role": "user", "content": "r1"}]
+    steps1: list[ToolStep] = []
+    reply1 = run_react(
+        llm1,
+        msgs1,
+        registry,
+        on_event=lambda ev: steps1.append(ev) if isinstance(ev, ToolStep) else None,
+        tool_context={"turn_id": 1, "unused_ctx": "skip", "query": "HIJACK"},
+    )
+    assert reply1 == "轮次1完成"
+    assert steps1[0].observation == "q=alpha|limit=5|turn=1|label=pinned"
+    assert steps1[1].observation == "pure:hi"
+
+    # 第 2 轮复用同一 registry：切换为 turn_id=2 与新 label，验证不残留上一轮状态
+    llm2 = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_tool_call("c3", "probe_ctx", '{"query": "beta", "limit": 10}')],
+            },
+            {"role": "assistant", "content": "轮次2完成"},
+        ]
+    )
+    msgs2: list[dict[str, object]] = [{"role": "user", "content": "r2"}]
+    steps2: list[ToolStep] = []
+    reply2 = run_react(
+        llm2,
+        msgs2,
+        registry,
+        on_event=lambda ev: steps2.append(ev) if isinstance(ev, ToolStep) else None,
+        tool_context={"turn_id": 2, "label": "override"},
+    )
+    assert reply2 == "轮次2完成"
+    assert steps2[0].observation == "q=beta|limit=10|turn=2|label=override"
+
+    # 第 3 轮直接消费 iter_react 并省略 tool_context，确认回到初始绑定值且不残留 turn_id=2
+    llm3 = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_tool_call("c4", "probe_ctx", '{"query": "gamma"}')],
+            },
+            {"role": "assistant", "content": "轮次3完成"},
+        ]
+    )
+    msgs3: list[dict[str, object]] = [{"role": "user", "content": "r3"}]
+    events3 = list(iter_react(llm3, msgs3, registry))
+    step3 = next(ev for ev in events3 if isinstance(ev, ToolStep))
+    assert step3.observation == "q=gamma|limit=5|turn=None|label=pinned"
+
