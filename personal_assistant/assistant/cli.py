@@ -32,7 +32,7 @@ def _print_tool_step(step: ToolStep) -> None:
     print(f"  [Observe] {step.observation}")
 
 
-# 创建终端流式打印器：返回实时事件回调与回合收尾函数（直连工具模式与 AssistantApp 模式共用）
+# 创建终端流式打印器：返回实时事件回调与回合收尾函数
 def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], None]]:
     mode = "idle"
     streamed_text = False

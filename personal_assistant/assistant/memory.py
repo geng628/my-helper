@@ -488,16 +488,30 @@ class MemoryStore:
             rebuilt = "\n".join(line for line in content.splitlines() if marker not in line).rstrip()
             _atomic_write(self.facts_file, f"{rebuilt}\n" if rebuilt else "")
 
-    # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
+    # 对指定主题记忆文件执行 add / merge / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
-        self, topic: str, title: str, index_summary: str,
-        operations: list[dict[str, object]], *, today: date | None = None,
+        self,
+        topic: str,
+        title: str,
+        index_summary: str,
+        operations: list[dict[str, object]],
+        *,
+        today: date | None = None,
+        applied_texts: list[str] | None = None,
     ) -> str | None:
         with self._write_lock:
             return apply_topic_operations(
-                self.memory_dir, topic=topic, title=title, index_summary=index_summary,
-                operations=operations, write_fn=_atomic_write, ensure_index_fn=self._ensure_index_entry,
-                audit_fn=self.record_audit, archive_dir=self.archive_dir, today=today,
+                self.memory_dir,
+                topic=topic,
+                title=title,
+                index_summary=index_summary,
+                operations=operations,
+                write_fn=_atomic_write,
+                ensure_index_fn=self._ensure_index_entry,
+                audit_fn=self.record_audit,
+                archive_dir=self.archive_dir,
+                today=today,
+                applied_texts=applied_texts,
             )
 
     # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md

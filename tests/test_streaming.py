@@ -50,15 +50,10 @@ class ScriptedStreamLLM(LLMClient):
         assert isinstance(item, dict)
         return item
 
-    # 回放逐轮流式事件序列；字典剧本若声明 finish_reason 则取出传给 StreamDone 强类型字段
+    # 回放逐轮流式事件序列；非列表剧本回退走基类 respond() 包装
     def stream(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None) -> Iterator[LLMStreamEvent]:
         if not callable(self._turns) and self._turns and isinstance(self._turns[0], list):
             yield from self._turns.pop(0)
-            return
-        if not callable(self._turns) and self._turns and isinstance(self._turns[0], dict) and "finish_reason" in self._turns[0]:
-            raw = dict(self._turns.pop(0))
-            fr = raw.pop("finish_reason", None)
-            yield StreamDone(message=raw, finish_reason=str(fr) if isinstance(fr, str) and fr else None)
             return
         yield from super().stream(messages, tools)
 

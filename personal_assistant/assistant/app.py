@@ -506,7 +506,7 @@ class AssistantApp:
 
     # 在应用启动时一次性构建受白名单管控的常驻工具注册表（跨轮复用，动态上下文走执行期 tool_context）
     def _build_base_registry(self) -> ToolRegistry:
-        provider = MemoryToolsetProvider(self.memory, get_today=self._today)
+        provider = MemoryToolsetProvider(self.memory)
         if self.tools_config is not None:
             return self.tools_config.build_registry(
                 providers=[provider],

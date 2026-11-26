@@ -33,30 +33,22 @@ class MemoryToolsetProvider(ToolsetProvider):
     source_type = "builtin"
     source_name = "memory"
 
-    # 绑定当前实例的 MemoryStore 与可选逻辑时钟回调
-    def __init__(
-        self,
-        memory: Any,
-        *,
-        get_today: Callable[[], date] | None = None,
-    ) -> None:
+    # 绑定当前实例的 MemoryStore
+    def __init__(self, memory: Any) -> None:
         self.memory = memory
-        self.get_today = get_today
 
     # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
     def tools(self) -> list[Tool]:
         memory = self.memory
-        get_today = self.get_today
 
-        # 适配 search_markdown 工具：优先取执行期 today 参数，缺省回退构造期时钟回调并归一化为 date
+        # 适配 search_markdown 工具：将执行期可选注入的 today 参数归一化为标准 date 对象
         def search_markdown(
             query: str,
             root: str = "data/memory",
             *,
             today: date | str | None = None,
         ) -> str:
-            raw_day = today if today is not None else (get_today() if get_today is not None else None)
-            return memory.search_markdown(query, root=root, today=_coerce_date(raw_day))
+            return memory.search_markdown(query, root=root, today=_coerce_date(today))
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:

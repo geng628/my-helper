@@ -508,10 +508,9 @@ def test_builtin_tools_defaults_and_runtime_keyword_overrides(tmp_path: Path) ->
     def _rt_cb() -> None:
         rt_calls.append("runtime")
 
-    provider = MemoryToolsetProvider(
-        memory,
-        get_today=lambda: date(2026, 11, 25),
-    )
+    provider = MemoryToolsetProvider(memory)
+    with pytest.raises(TypeError):
+        MemoryToolsetProvider(memory, get_today=lambda: date(2026, 11, 25))  # type: ignore[call-arg]
     tools_by_name = {t.name: t for t in provider.tools()}
 
     read_tool = tools_by_name["read_markdown"]
@@ -529,12 +528,24 @@ def test_builtin_tools_defaults_and_runtime_keyword_overrides(tmp_path: Path) ->
         read_tool.run(path="data/memory/long.md", start_line=True, end_line=False)  # type: ignore[arg-type]
 
     search_tool = tools_by_name["search_markdown"]
-    assert "未在 data/memory 下找到" in search_tool.run(query="冬季压测演练")
-    found = search_tool.run(query="冬季压测演练", today=date(2026, 11, 20))
+    assert "未在 data/memory 下找到" in search_tool.run_with_context(
+        {"query": "冬季压测演练"},
+        {"today": date(2026, 11, 25)},
+    )
+    found = search_tool.run_with_context(
+        {"query": "冬季压测演练"},
+        {"today": date(2026, 11, 20)},
+    )
     assert "冬季压测演练" in found
-    found_dt = search_tool.run(query="冬季压测演练", today=datetime(2026, 11, 20, 18, 30))
+    found_dt = search_tool.run_with_context(
+        {"query": "冬季压测演练"},
+        {"today": datetime(2026, 11, 20, 18, 30)},
+    )
     assert "冬季压测演练" in found_dt
-    found_iso = search_tool.run(query="冬季压测演练", today="2026-11-20")
+    found_iso = search_tool.run_with_context(
+        {"query": "冬季压测演练"},
+        {"today": "2026-11-20"},
+    )
     assert "冬季压测演练" in found_iso
 
     remember_tool = tools_by_name["remember_fact"]

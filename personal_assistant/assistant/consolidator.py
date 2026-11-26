@@ -194,13 +194,7 @@ class MemoryConsolidator:
         self.memory.archive_expired_memories(today=ref_day)
 
         index_text = self.memory.read_memory_index() or "（暂无记忆索引）"
-        raw_snapshots = self.memory.read_topic_snapshots()
-        if raw_snapshots:
-            # 过滤掉前台流内尚未提交的 (turn#...) 暂存行，避免后台沉淀提前改写或误删在途事实
-            filtered_lines = [line for line in raw_snapshots.splitlines() if "(turn#" not in line]
-            topic_snapshots = "\n".join(filtered_lines).strip() or "（暂无已有主题记忆）"
-        else:
-            topic_snapshots = "（暂无已有主题记忆）"
+        topic_snapshots = self.memory.read_topic_snapshots() or "（暂无已有主题记忆）"
         transcript = _format_transcript(batch)
         user_payload = (
             f"【当前日期】{format_date_with_weekday(ref_day)}\n\n"
@@ -222,7 +216,7 @@ class MemoryConsolidator:
             raise ValueError("模型未返回有效的 session_summary，取消推进压缩游标。")
 
         saved_files: list[str] = []
-        written_texts: list[str] = []
+        applied_texts: list[str] = []
         raw_memories = parsed.get("memories")
         if isinstance(raw_memories, list):
             for entry in raw_memories:
@@ -243,28 +237,22 @@ class MemoryConsolidator:
                 try:
                     with self.memory._write_lock:
                         saved = self.memory.apply_memory_operations(
-                            topic, title, index_summary, ops, today=ref_day
+                            topic,
+                            title,
+                            index_summary,
+                            ops,
+                            today=ref_day,
+                            applied_texts=applied_texts,
                         )
                 except ValueError:
                     continue
-                if saved:
-                    if saved not in saved_files:
-                        saved_files.append(saved)
-                    for op_item in ops:
-                        op_name = str(op_item.get("op") or "add").strip().lower()
-                        if op_name in {"add", "merge"}:
-                            val = str(op_item.get("text") or op_item.get("new") or "").strip()
-                        elif op_name == "replace":
-                            val = str(op_item.get("new") or op_item.get("text") or "").strip()
-                        else:
-                            val = ""
-                        if val:
-                            written_texts.append(val)
+                if saved and saved not in saved_files:
+                    saved_files.append(saved)
 
-        # 兜底清理 facts.md 中已被本次沉淀规范化的原始 (msg#...) 幽灵行，避免临时事实漏过期
+        # 兜底清理 facts.md 中已被本次沉淀实际落盘吸收的原始 (msg#...) 幽灵行，避免临时事实漏过期
         batch_ids = {int(msg["id"]) for msg in batch if msg.get("id") is not None}
-        if written_texts:
-            self.memory.prune_consolidated_raw_facts(batch_ids, written_texts)
+        if applied_texts:
+            self.memory.prune_consolidated_raw_facts(batch_ids, applied_texts)
 
         # 只有长期记忆文件落盘与摘要解析均成功后，才推进 SQLite 压缩游标
         cutoff_id = int(batch[-1]["id"])

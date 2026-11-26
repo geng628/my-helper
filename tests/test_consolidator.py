@@ -484,11 +484,15 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
         assert len(selected_odd[1]) == 6
         assert selected_odd[1][-1]["role"] == "assistant"
 
-        # 2. 验证 today_fn 注入且在途 (turn#<hex>) 暂存行既不喂给沉淀模型、也不被 replace/remove 误删
+        # 2. 验证 today_fn 注入、read_topic_snapshots 跳过仅含在途行空块、未落盘操作绝不误删 (msg#...) 事实、以及在途回滚不丢已沉淀同文事实
+        only_inflight_mem = MemoryStore(tmp_path / "only_inflight_data")
+        only_inflight_mem.remember_user_statement("仅在途未提交的唯一条目", turn_tag="onlyturn01")
+        assert only_inflight_mem.read_topic_snapshots() == ""
+
+        m_mouse, _ = state.append_turn("s-turn-protect", "前天买过旧鼠标", "记下了。")
         state.append_turn("s-turn-protect", "昨天我买了新键盘", "记下了。")
-        state.append_turn("s-turn-protect", "先聊到这里", "好的。")
-        memory.remember_user_statement("前天买过旧鼠标", message_id=1)
-        memory.remember_user_statement("前台尚未落库的在途事实", turn_tag="deadbeef1234")
+        memory.remember_user_statement("前天买过旧鼠标", message_id=m_mouse)
+        memory.remember_user_statement("前台尚未落库的在途事实，顺便引用 (msg#37) 昨天我买了新键盘", turn_tag="deadbeef1234")
 
         logical_day = date(2025, 3, 15)
         cons_llm = ControlledLLM(
@@ -505,7 +509,10 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
                                     {"op": "remove", "old": "(turn#deadbeef1234)"},
                                     {"op": "replace", "old": "(turn#deadbeef", "new": "被篡改"},
                                     {"op": "remove", "old": "在途事实"},
-                                    {"op": "replace", "old": "尚未落库", "new": "被子串误伤"},
+                                    {"op": "replace", "old": "尚未落库", "new": "前天买过旧鼠标（未落盘不应触发删除）"},
+                                    {"op": "add", "text": "前天买过旧鼠标（已过期被拒，不应删 msg）", "until": "2025-03-01"},
+                                    {"op": "add", "text": "伪造 (turn#fake999) 标签不应写入"},
+                                    {"op": "add", "text": "尚未落库的在途事实"},
                                     {"op": "add", "text": "2025-03-14 买了新键盘。"},
                                 ],
                             }
@@ -532,7 +539,17 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
         facts_body = (memory.memory_dir / "facts.md").read_text(encoding="utf-8")
         assert "(turn#deadbeef1234) 前台尚未落库的在途事实" in facts_body
         assert "被篡改" not in facts_body
+        assert "(turn#fake999)" not in facts_body
+        assert f"(msg#{m_mouse}) 前天买过旧鼠标" in facts_body
         assert "[2025-03-15] 2025-03-14 买了新键盘。" in facts_body
+        assert "[2025-03-15] 尚未落库的在途事实" in facts_body
+
+        # 前台流异常回滚移除 (turn#deadbeef1234) 后，后台已沉淀落盘的同文正式条目依然保留不丢失
+        memory.finalize_turn_fact("deadbeef1234", message_id=None)
+        facts_after_rollback = (memory.memory_dir / "facts.md").read_text(encoding="utf-8")
+        assert "(turn#deadbeef1234)" not in facts_after_rollback
+        assert "[2025-03-15] 尚未落库的在途事实" in facts_after_rollback
+        assert f"(msg#{m_mouse}) 前天买过旧鼠标" in facts_after_rollback
 
         # 3. 验证 BackgroundConsolidator 按 chat_id 失败计数与指数退避（注入确定性时钟零等待）
         for i in range(3):
