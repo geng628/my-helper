@@ -1,21 +1,24 @@
-"""纯 Markdown 记忆、规则存储以及受目录白名单保护的文件读写工具。"""
+"""纯 Markdown 记忆、规则存储以及受目录白名单保护的文件读写核心存储层。"""
 from __future__ import annotations
 
 import json
 import os
 import re
 import shutil
-import tempfile
 import threading
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
+from personal_assistant.assistant.builtin_tools import BuiltinTool, MemoryToolsetProvider
 from personal_assistant.assistant.common import truncate_utf8
+from personal_assistant.assistant.files_policy import (
+    DEFAULT_REJECT_SEGMENTS,
+    FilesPolicy,
+    _atomic_write,
+)
 from personal_assistant.assistant.memory_lifecycle import (
     apply_topic_operations,
     archive_expired_topics,
@@ -25,96 +28,17 @@ from personal_assistant.assistant.memory_lifecycle import (
     today_shanghai as _today_shanghai,
 )
 
-DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads", "models.dsl", "models.json")
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
-
-
-# 校验配置中的整数项必须为正整数，缺省时返回默认值
-def _positive_int(value: object, default: int, name: str) -> int:
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} 必须是正整数。")
-    return value
-
-
-# 将配置里的相对目录安全解析为绝对路径，data/* 前缀自动映射到自定义 data_root
-def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | None) -> Path:
-    if not isinstance(entry, str) or not entry.strip():
-        raise ValueError("目录配置必须是非空字符串。")
-    rel = Path(entry.strip())
-    if rel.is_absolute() or ".." in rel.parts:
-        raise ValueError(f"目录配置必须是相对路径且不能包含 ..：{entry}")
-    if data_root is not None and rel.parts and rel.parts[0] == "data":
-        resolved_data = data_root.resolve()
-        sub = Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path(".")
-        target = resolved_data / sub
-        if not target.resolve().is_relative_to(resolved_data):
-            raise ValueError(f"目录配置超出 data_root 范围：{entry}")
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-    target = project_root / rel
-    if not target.resolve().is_relative_to(project_root.resolve()):
-        raise ValueError(f"目录配置超出项目范围：{entry}")
-    return target
-
-
-# 文件访问白名单策略（允许读写根目录、行数/字节限制与禁止访问目录段）
-@dataclass(frozen=True)
-class FilesPolicy:
-    project_root: Path
-    read_roots: tuple[Path, ...]
-    write_root: Path
-    max_read_bytes: int = 65536
-    max_write_bytes: int = 65536
-    max_lines: int = 400
-    max_results: int = 100
-    reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS
-
-    # 从 tools.json 的 files 字段字典构造并校验 FilesPolicy
-    @classmethod
-    def from_dict(
-        cls,
-        raw: dict[str, object] | None,
-        project_root: Path,
-        data_root: Path | None = None,
-    ) -> "FilesPolicy":
-        root = project_root.resolve()
-        cfg = raw or {}
-        if not isinstance(cfg, dict):
-            raise ValueError("files 配置必须是 JSON 对象。")
-        raw_reads = cfg.get("read_roots", ["data/memory", "data/workspace", "docs"])
-        if not isinstance(raw_reads, list) or not raw_reads:
-            raise ValueError("files.read_roots 必须是非空数组。")
-        read_roots = tuple(_resolve_config_dir(item, root, data_root) for item in raw_reads)
-        write_root = _resolve_config_dir(cfg.get("write_root", "data/workspace"), root, data_root)
-        raw_rejects = cfg.get("reject_segments", list(DEFAULT_REJECT_SEGMENTS))
-        if not isinstance(raw_rejects, list) or not all(isinstance(x, str) and x for x in raw_rejects):
-            raise ValueError("files.reject_segments 必须是字符串数组。")
-        return cls(
-            project_root=root,
-            read_roots=read_roots,
-            write_root=write_root,
-            max_read_bytes=_positive_int(cfg.get("max_read_bytes"), 65536, "max_read_bytes"),
-            max_write_bytes=_positive_int(cfg.get("max_write_bytes"), 65536, "max_write_bytes"),
-            max_lines=_positive_int(cfg.get("max_lines"), 400, "max_lines"),
-            max_results=_positive_int(cfg.get("max_results"), 100, "max_results"),
-            reject_segments=tuple(raw_rejects),
-        )
-
-
-# 通过同目录临时文件 + os.replace 实现原子写入，防止写到一半断电损坏文件
-def _atomic_write(target: Path, content: str) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_path, target)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+__all__ = [
+    "BuiltinTool",
+    "DEFAULT_REJECT_SEGMENTS",
+    "FilesPolicy",
+    "MAX_SEARCH_FILE_BYTES",
+    "MemoryStore",
+    "MemoryToolsetProvider",
+    "SearchHit",
+    "_atomic_write",
+]
 
 
 # 从中英文查询语句提取主检索词（primary）与中文二元组兜底词（secondary）
@@ -166,11 +90,7 @@ class MemoryStore:
             proj = self.data_root.parent
             self.policy = FilesPolicy(
                 project_root=proj,
-                read_roots=(
-                    self.data_root / "memory",
-                    self.data_root / "workspace",
-                    proj / "docs",
-                ),
+                read_roots=(self.data_root / "memory", self.data_root / "workspace", proj / "docs"),
                 write_root=self.data_root / "workspace",
             )
         else:
@@ -192,34 +112,7 @@ class MemoryStore:
                 self.workspace_dir / ".tmp",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
-        self._roots = self._build_roots()
-
-    # 预先整理所有允许根目录的（逻辑路径、真实路径、展示前缀、短别名）映射表
-    def _build_roots(self) -> list[tuple[Path, Path, str, str]]:
-        seen: set[Path] = set()
-        entries: list[tuple[Path, Path, str, str]] = []
-        for raw in (*self.policy.read_roots, self.policy.write_root):
-            resolved = raw.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            entries.append((raw, resolved, *self._root_labels(raw)))
-        return entries
-
-    # 计算单个允许根目录的标准展示路径（如 data/memory）和简写别名（如 memory）
-    def _root_labels(self, raw_root: Path) -> tuple[str, str]:
-        for base, prefix in ((self.data_root, "data"), (self.project_root, "")):
-            try:
-                rel = raw_root.relative_to(base)
-                if prefix:
-                    display = ("data" / rel).as_posix() if rel.parts else "data"
-                    alias = rel.as_posix() if rel.parts else ""
-                    return display, alias
-                display = rel.as_posix() if rel.parts else "."
-                return display, display
-            except ValueError:
-                continue
-        return raw_root.name, raw_root.name
+        self._roots = self.policy.build_roots(self.data_root)
 
     # 将磁盘绝对路径转换为统一的相对展示路径（供外部模块如 eval 调用）
     def display_path(self, resolved: Path) -> str:
@@ -227,97 +120,11 @@ class MemoryStore:
 
     # 内部路径格式化：按允许根目录把真实路径转回统一的相对展示路径
     def _to_display_path(self, resolved: Path) -> str:
-        for _, root_resolved, display_prefix, _ in self._roots:
-            if resolved.is_relative_to(root_resolved):
-                rel = resolved.relative_to(root_resolved)
-                return f"{display_prefix}/{rel.as_posix()}" if rel.parts else display_prefix
-        if resolved.is_relative_to(self.data_root):
-            return ("data" / resolved.relative_to(self.data_root)).as_posix()
-        return resolved.name
+        return self.policy.to_display_path(resolved, self.data_root, roots=self._roots)
 
-    # 检查路径中是否包含受保护的敏感目录段（如 .env、.git、state）
-    def _check_segments(self, parts: tuple[str, ...]) -> None:
-        for part in parts:
-            if part in self.policy.reject_segments:
-                raise ValueError(f"禁止访问受保护路径：{part}")
-
-    # 安全解析相对路径：校验读写白名单、拒绝 .. 穿越、敏感目录与越权软链接
+    # 安全解析相对路径：委托 FilesPolicy 校验读写白名单、拒绝 .. 穿越、敏感目录与越权软链接
     def resolve_path(self, rel_path: str, *, write: bool = False) -> Path:
-        if not isinstance(rel_path, str) or not rel_path.strip() or "\x00" in rel_path:
-            raise ValueError("路径必须是非空字符串。")
-        rel = Path(rel_path.strip().replace("\\", "/"))
-        if rel.is_absolute() or ".." in rel.parts:
-            raise ValueError("路径必须是项目内相对路径，且不能包含 ..。")
-        self._check_segments(rel.parts)
-
-        if write:
-            return self._resolve_write_path(rel)
-
-        unresolved = self._map_read_candidate(rel)
-        resolved = unresolved.resolve(strict=False)
-        for raw_root in self.policy.read_roots:
-            root_resolved = raw_root.resolve()
-            if resolved.is_relative_to(root_resolved):
-                self._check_segments(resolved.relative_to(root_resolved).parts)
-                return resolved
-        allowed = "、".join(self._root_labels(r)[0] for r in self.policy.read_roots)
-        raise ValueError(f"路径不在允许读取的目录内；允许范围：{allowed}")
-
-    # 解析并校验写入路径：限制在 write_root（data/workspace）内且禁止任何软链接组件
-    def _resolve_write_path(self, rel: Path) -> Path:
-        parts = rel.parts
-        write_root = self.policy.write_root
-        write_resolved = write_root.resolve()
-        write_display, write_alias = self._root_labels(write_root)
-        display_parts = Path(write_display).parts
-
-        if parts[: len(display_parts)] == display_parts:
-            unresolved = write_root / Path(*parts[len(display_parts) :])
-        elif write_alias and parts[0] == write_alias:
-            unresolved = write_root / Path(*parts[1:])
-        elif self._matches_other_root(parts):
-            raise ValueError(f"只能写入 {write_display} 目录。")
-        else:
-            unresolved = write_root / rel
-
-        current = write_root
-        for part in unresolved.relative_to(write_root).parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("写入路径不能包含符号链接。")
-        resolved = unresolved.resolve(strict=False)
-        if not resolved.is_relative_to(write_resolved):
-            raise ValueError(f"只能写入 {write_display} 目录。")
-        self._check_segments(resolved.relative_to(write_resolved).parts)
-        return resolved
-
-    # 判断写入路径是否误指向其他只读根目录（如 data/memory、docs 等）
-    def _matches_other_root(self, parts: tuple[str, ...]) -> bool:
-        if not parts:
-            return False
-        if parts[0] == "data":
-            return True
-        for raw_root in self.policy.read_roots:
-            display, alias = self._root_labels(raw_root)
-            d_parts = Path(display).parts
-            if parts[: len(d_parts)] == d_parts or (alias and parts[0] == Path(alias).parts[0]):
-                return True
-        return False
-
-    # 将用户传入的读取路径（支持 data/memory/... 或简写 memory/...）映射到磁盘路径
-    def _map_read_candidate(self, rel: Path) -> Path:
-        parts = rel.parts
-        for raw_root, _, display_prefix, short_alias in self._roots:
-            d_parts = Path(display_prefix).parts
-            if parts[: len(d_parts)] == d_parts:
-                return raw_root / Path(*parts[len(d_parts) :])
-            if short_alias:
-                a_parts = Path(short_alias).parts
-                if parts[: len(a_parts)] == a_parts:
-                    return raw_root / Path(*parts[len(a_parts) :])
-        if parts and parts[0] == "data":
-            return self.data_root / Path(*parts[1:])
-        return self.project_root / rel
+        return self.policy.resolve_path(rel_path, self.data_root, write=write, roots=self._roots)
 
     # ---- 常驻提示词直读：MEMORY.md 目录索引与 rules/*.md ----
 
@@ -329,11 +136,8 @@ class MemoryStore:
         if not text:
             return ""
         lines = text.splitlines()
-        truncated = False
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            truncated = True
-        body = "\n".join(lines)
+        truncated = len(lines) > max_lines
+        body = "\n".join(lines[:max_lines])
         if len(body) > max_chars:
             body = body[:max_chars]
             if "\n" in body:
@@ -347,11 +151,7 @@ class MemoryStore:
     def read_recent_facts(self, limit: int = 20) -> str:
         if not self.facts_file.is_file() or limit <= 0:
             return ""
-        items = [
-            line
-            for line in self.facts_file.read_text(encoding="utf-8").splitlines()
-            if line.strip().startswith("- ")
-        ]
+        items = [ln for ln in self.facts_file.read_text(encoding="utf-8").splitlines() if ln.strip().startswith("- ")]
         if not items:
             return ""
         shown = items[-limit:]
@@ -373,11 +173,11 @@ class MemoryStore:
     # 从单篇规则 Markdown 文件中提取 Statement 或首行标题
     @staticmethod
     def _rule_statement(rule: Path) -> str:
-        content = rule.read_text(encoding="utf-8")
-        for line in content.splitlines():
+        lines = rule.read_text(encoding="utf-8").splitlines()
+        for line in lines:
             if line.startswith("- Statement:"):
                 return line.removeprefix("- Statement:").strip()
-        for line in content.splitlines():
+        for line in lines:
             if line.strip():
                 return line.strip().lstrip("# ").removeprefix("Rule:").strip() or "（无标题）"
         return "（空规则文件）"
@@ -401,9 +201,8 @@ class MemoryStore:
             if not resolved.is_relative_to(target):
                 continue
             parts = resolved.relative_to(target).parts
-            if any(p in self.policy.reject_segments or p.startswith(".") for p in parts):
-                continue
-            files.append(resolved)
+            if not any(p in self.policy.reject_segments or p.startswith(".") for p in parts):
+                files.append(resolved)
         return files
 
     # 按 glob 模式列出允许读取目录内的所有文件路径（默认排除 data/memory/archive/ 归档目录）
@@ -420,8 +219,7 @@ class MemoryStore:
         archive_resolved = self.archive_dir.resolve()
         listing_archive = target.is_relative_to(archive_resolved)
         candidates = [
-            p
-            for p in self._safe_files(target, iterator)
+            p for p in self._safe_files(target, iterator)
             if listing_archive or not p.is_relative_to(archive_resolved)
         ]
         found = [self._to_display_path(p) for p in candidates[: self.policy.max_results]]
@@ -431,14 +229,11 @@ class MemoryStore:
         return "\n".join(found) + suffix
 
     # 安全枚举允许检索的 Markdown/文本文件列表（os.scandir 快速遍历，同时严格守住白名单、敏感段、软链接与归档隔离）
-    def iter_searchable_files(
-        self, root: str = "data/memory"
-    ) -> tuple[list[tuple[Path, str, bool]], bool]:
+    def iter_searchable_files(self, root: str = "data/memory") -> tuple[list[tuple[Path, str, bool]], bool]:
         target = self.resolve_path(root, write=False)
         if not target.is_dir():
             raise ValueError(f"目录不存在：{root}")
-        archive_resolved = self.archive_dir.resolve()
-        memory_resolved = self.memory_dir.resolve()
+        archive_resolved, memory_resolved = self.archive_dir.resolve(), self.memory_dir.resolve()
         searching_archive = target.is_relative_to(archive_resolved)
         reject = set(self.policy.reject_segments)
 
@@ -452,8 +247,7 @@ class MemoryStore:
             except OSError:
                 continue
             for entry in entries:
-                name = entry.name
-                if name.startswith(".") or name in reject:
+                if entry.name.startswith(".") or entry.name in reject:
                     continue
                 is_link = entry.is_symlink()
                 entry_path = Path(entry.path)
@@ -462,23 +256,20 @@ class MemoryStore:
                         resolved = entry_path.resolve()
                     except OSError:
                         continue
-                    if not resolved.is_relative_to(target):
-                        continue
-                    rel_parts = resolved.relative_to(target).parts
-                    if any(p in reject or p.startswith(".") for p in rel_parts):
+                    if not resolved.is_relative_to(target) or any(
+                        p in reject or p.startswith(".") for p in resolved.relative_to(target).parts
+                    ):
                         continue
                 else:
                     resolved = entry_path
 
-                if not searching_archive and resolved == archive_resolved:
+                if not searching_archive and resolved.is_relative_to(archive_resolved):
                     continue
                 if resolved.is_dir():
                     if not is_link:
                         stack.append(resolved)
                     continue
                 if resolved.suffix.lower() not in {".md", ".txt"}:
-                    continue
-                if not searching_archive and resolved.is_relative_to(archive_resolved):
                     continue
                 try:
                     st = resolved.stat() if is_link else entry.stat(follow_symlinks=False)
@@ -494,12 +285,7 @@ class MemoryStore:
 
     # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（优先委派已启用的检索插件）
     def search_hits(
-        self,
-        query: str,
-        root: str = "data/memory",
-        limit: int = 10,
-        *,
-        today: date | None = None,
+        self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
     ) -> list[SearchHit]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("搜索关键词不能为空。")
@@ -518,17 +304,12 @@ class MemoryStore:
                 text = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            skip_expired = ref_day if is_memory else None
             candidates.extend(
                 self._score_file(
-                    display_path,
-                    text,
-                    primary,
-                    secondary,
-                    skip_expired_today=skip_expired,
+                    display_path, text, primary, secondary,
+                    skip_expired_today=ref_day if is_memory else None,
                 )
             )
-
         candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
         return [
             SearchHit(path=path, line=line_no, section=section, snippet=snippet, score=score)
@@ -537,36 +318,25 @@ class MemoryStore:
 
     # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
     def search_markdown(
-        self,
-        query: str,
-        root: str = "data/memory",
-        limit: int = 10,
-        *,
-        today: date | None = None,
+        self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
     ) -> str:
         hits = self.search_hits(query, root=root, limit=limit, today=today)
         if not hits:
             return f"未在 {root} 下找到匹配「{query}」的 Markdown 内容。"
         return "\n\n".join(
-            f"{hit.path}:{hit.line} [章节: {hit.section or '正文'}]\n{hit.snippet}"
-            for hit in hits
+            f"{hit.path}:{hit.line} [章节: {hit.section or '正文'}]\n{hit.snippet}" for hit in hits
         )
 
     # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段（支持跳过已过期记忆行）
     def _score_file(
-        self,
-        display_path: str,
-        text: str,
-        primary: list[str],
-        secondary: list[str],
-        *,
-        skip_expired_today: date | None = None,
+        self, display_path: str, text: str, primary: list[str], secondary: list[str],
+        *, skip_expired_today: date | None = None,
     ) -> list[tuple[float, str, int, str, str]]:
         lines = text.splitlines()
         if not lines:
             return []
         expired_flags = [
-            (skip_expired_today is not None and is_line_expired(line, today=skip_expired_today))
+            skip_expired_today is not None and is_line_expired(line, today=skip_expired_today)
             for line in lines
         ]
         path_bonus = sum(4.0 for t in primary if t in display_path.lower())
@@ -632,7 +402,10 @@ class MemoryStore:
             return f"文件：{display_path} 共 {total} 行，没有第 {start_line} 行。"
         actual_end = min(total, end_line)
         body = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start_line, actual_end + 1))
-        return truncate_utf8(f"文件：{display_path}（共 {total} 行，显示第 {start_line}-{actual_end} 行）\n{body}", self.policy.max_read_bytes)
+        return truncate_utf8(
+            f"文件：{display_path}（共 {total} 行，显示第 {start_line}-{actual_end} 行）\n{body}",
+            self.policy.max_read_bytes,
+        )
 
     # ---- 白名单受控写入（workspace / MEMORY.md / rules） ----
 
@@ -651,7 +424,6 @@ class MemoryStore:
                 raise ValueError("目标路径是目录，不能写入文件。")
             if mode == "create" and target.exists():
                 raise ValueError("目标文件已存在；create 模式不会覆盖，请换路径或使用 overwrite。")
-
             backup_rel: str | None = None
             if mode == "overwrite" and target.exists():
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -663,20 +435,23 @@ class MemoryStore:
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
                 backup_rel = self._to_display_path(backup)
-
             _atomic_write(target, content)
             rel_path = self._to_display_path(target)
-            self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
+            self.record_audit(
+                action="write_file", actor="agent", target=rel_path,
+                old_value=backup_rel, new_value=f"{len(content)} chars ({mode})",
+            )
             return rel_path
+
+    # 读取已有 UTF-8 文本，文件不存在时返回默认表头
+    @staticmethod
+    def _read_or_default(path: Path, default: str) -> str:
+        return path.read_text(encoding="utf-8") if path.is_file() else default
 
     # 确保指定记忆文件已在 MEMORY.md 索引中登记一次，避免重复改写索引破坏 KV Cache
     def _ensure_index_entry(self, target_path: str, entry_line: str) -> None:
         with self._write_lock:
-            existing = (
-                self.memory_file.read_text(encoding="utf-8")
-                if self.memory_file.is_file()
-                else "# 记忆索引 (MEMORY.md)\n\n"
-            )
+            existing = self._read_or_default(self.memory_file, "# 记忆索引 (MEMORY.md)\n\n")
             if target_path in existing or f"/{Path(target_path).name})" in existing:
                 return
             sep = "" if not existing or existing.endswith("\n") else "\n"
@@ -684,33 +459,20 @@ class MemoryStore:
 
     # 将用户原话按时间戳与消息/回合编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
     def remember_user_statement(
-        self,
-        user_text: str,
-        message_id: int | None = None,
-        *,
-        turn_tag: str | None = None,
+        self, user_text: str, message_id: int | None = None, *, turn_tag: str | None = None
     ) -> str:
         clean = " ".join(user_text.split())
         if not clean:
             raise ValueError("要记住的内容不能为空。")
         with self._write_lock:
             self.memory_dir.mkdir(parents=True, exist_ok=True)
-            existing = (
-                self.facts_file.read_text(encoding="utf-8")
-                if self.facts_file.is_file()
-                else "# 事实备忘 (facts.md)\n\n"
-            )
+            existing = self._read_or_default(self.facts_file, "# 事实备忘 (facts.md)\n\n")
             if message_id is not None and f"(msg#{message_id})" in existing:
                 return "data/memory/facts.md"
             if turn_tag and f"(turn#{turn_tag})" in existing:
                 return "data/memory/facts.md"
             stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
-            if message_id is not None:
-                tag = f" (msg#{message_id})"
-            elif turn_tag:
-                tag = f" (turn#{turn_tag})"
-            else:
-                tag = ""
+            tag = f" (msg#{message_id})" if message_id is not None else (f" (turn#{turn_tag})" if turn_tag else "")
             sep = "" if not existing or existing.endswith("\n") else "\n"
             _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
             self._ensure_index_entry(
@@ -734,57 +496,35 @@ class MemoryStore:
             if message_id is not None:
                 _atomic_write(self.facts_file, content.replace(marker, f"(msg#{message_id})"))
                 return
-            kept = [line for line in content.splitlines() if marker not in line]
-            rebuilt = "\n".join(kept).rstrip()
+            rebuilt = "\n".join(line for line in content.splitlines() if marker not in line).rstrip()
             _atomic_write(self.facts_file, f"{rebuilt}\n" if rebuilt else "")
 
     # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
-        self,
-        topic: str,
-        title: str,
-        index_summary: str,
-        operations: list[dict[str, object]],
-        *,
-        today: date | None = None,
+        self, topic: str, title: str, index_summary: str,
+        operations: list[dict[str, object]], *, today: date | None = None,
     ) -> str | None:
         with self._write_lock:
             return apply_topic_operations(
-                self.memory_dir,
-                topic=topic,
-                title=title,
-                index_summary=index_summary,
-                operations=operations,
-                write_fn=_atomic_write,
-                ensure_index_fn=self._ensure_index_entry,
-                audit_fn=self.record_audit,
-                archive_dir=self.archive_dir,
-                today=today,
+                self.memory_dir, topic=topic, title=title, index_summary=index_summary,
+                operations=operations, write_fn=_atomic_write, ensure_index_fn=self._ensure_index_entry,
+                audit_fn=self.record_audit, archive_dir=self.archive_dir, today=today,
             )
 
     # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md
     def archive_expired_memories(self, today: date | None = None) -> dict[str, int]:
         with self._write_lock:
             return archive_expired_topics(
-                self.memory_dir,
-                self.archive_dir,
-                write_fn=_atomic_write,
-                audit_fn=self.record_audit,
-                ensure_index_fn=self._ensure_index_entry,
-                today=today,
+                self.memory_dir, self.archive_dir, write_fn=_atomic_write,
+                audit_fn=self.record_audit, ensure_index_fn=self._ensure_index_entry, today=today,
             )
 
     # 清理 facts.md 中已被本次沉淀规范化吸收的原始 (msg#...) 裸行，防止残留无有效期副本
-    def prune_consolidated_raw_facts(
-        self, batch_msg_ids: set[int], written_texts: list[str]
-    ) -> int:
+    def prune_consolidated_raw_facts(self, batch_msg_ids: set[int], written_texts: list[str]) -> int:
         with self._write_lock:
             return prune_raw_facts_for_batch(
-                self.memory_dir,
-                batch_msg_ids,
-                written_texts,
-                write_fn=_atomic_write,
-                audit_fn=self.record_audit,
+                self.memory_dir, batch_msg_ids, written_texts,
+                write_fn=_atomic_write, audit_fn=self.record_audit,
             )
 
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
@@ -811,13 +551,9 @@ class MemoryStore:
         self, *, action: str, actor: str, target: str, old_value: str | None, new_value: str | None
     ) -> dict[str, object]:
         entry: dict[str, object] = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "trace_id": uuid.uuid4().hex[:16],
-            "actor": actor,
-            "action": action,
-            "target": target,
-            "old_value": old_value,
-            "new_value": new_value,
+            "timestamp": datetime.now(UTC).isoformat(), "trace_id": uuid.uuid4().hex[:16],
+            "actor": actor, "action": action, "target": target,
+            "old_value": old_value, "new_value": new_value,
         }
         with self._write_lock:
             self.audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -832,141 +568,3 @@ class MemoryStore:
                 return []
             lines = [line for line in self.audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         return [json.loads(line) for line in lines[-limit:]]
-
-
-# 内核内置工具子类：承载记忆与文件操作，由统一 build_tool 构建并注入 ToolRegistry
-@dataclass(frozen=True)
-class BuiltinTool(Tool):
-    pass
-
-
-# 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 向 ToolRegistry 提供 6 个 BuiltinTool 子类实例
-class MemoryToolsetProvider(ToolsetProvider):
-    source_type = "builtin"
-    source_name = "memory"
-
-    # 绑定当前实例的 MemoryStore、用户消息回调、逻辑时钟回调与流式回合暂存标记
-    def __init__(
-        self,
-        memory: MemoryStore,
-        get_user_message: Callable[[], tuple[str, int | None]] | None = None,
-        get_today: Callable[[], date] | None = None,
-        *,
-        turn_tag: str | None = None,
-        on_remember: Callable[[], None] | None = None,
-    ) -> None:
-        self.memory = memory
-        self.get_user_message = get_user_message
-        self.get_today = get_today
-        self.turn_tag = turn_tag
-        self.on_remember = on_remember
-
-    # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
-    def tools(self) -> list[Tool]:
-        memory = self.memory
-        get_user_message = self.get_user_message
-        get_today = self.get_today
-        turn_tag = self.turn_tag
-        on_remember = self.on_remember
-
-        # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
-        def search_markdown(query: str, root: str = "data/memory") -> str:
-            ref_day = get_today() if get_today is not None else None
-            return memory.search_markdown(query, root=root, today=ref_day)
-
-        # 适配 read_markdown 工具参数（将模型传入的字符串行号转为整数）
-        def read_markdown(path: str, start_line: str, end_line: str) -> str:
-            try:
-                start, end = int(start_line), int(end_line)
-            except ValueError as error:
-                raise ValueError("start_line 和 end_line 必须是整数。") from error
-            return memory.read_markdown(path, start, end)
-
-        # 适配 write_file 工具：写入工作区并返回相对路径提示
-        def write_file(path: str, content: str, mode: str) -> str:
-            saved = memory.write_workspace_file(path, content, mode=mode)
-            return f"已写入：{saved}"
-
-        # 适配 remember_fact 工具：直接保存当前轮用户原话，防止模型篡改事实
-        def remember_fact() -> str:
-            if get_user_message is None:
-                raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
-            user_text, message_id = get_user_message()
-            target = memory.remember_user_statement(
-                user_text,
-                message_id=message_id,
-                turn_tag=turn_tag,
-            )
-            if on_remember is not None:
-                on_remember()
-            return f"已记录用户原话到 {target}"
-
-        # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
-        def save_rule(statement: str) -> str:
-            path = memory.save_rule(statement, source="agent")
-            return f"已保存行为规则：data/memory/rules/{path.name}"
-
-        specs: list[tuple[str, str, dict[str, str], Callable[..., str], str, dict[str, tuple[str, ...]] | None]] = [
-            (
-                "list_files",
-                "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
-                {"root": "目录起点，如 data/memory、data/memory/archive、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
-                memory.list_files,
-                "read",
-                None,
-            ),
-            (
-                "search_markdown",
-                "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
-                {"query": "搜索关键词", "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs"},
-                search_markdown,
-                "read",
-                None,
-            ),
-            (
-                "read_markdown",
-                "按路径和行号读取允许目录内的 Markdown/文本文件。",
-                {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始）", "end_line": "结束行号"},
-                read_markdown,
-                "read",
-                None,
-            ),
-            (
-                "write_file",
-                "在 data/workspace 目录内创建或覆盖文本文件（覆盖前自动备份）。",
-                {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
-                write_file,
-                "write",
-                {"mode": ("create", "overwrite")},
-            ),
-            (
-                "remember_fact",
-                "仅在用户明确要求记住信息时调用，将当前用户原话追加到 data/memory/facts.md（按需检索，不膨胀索引）。",
-                {},
-                remember_fact,
-                "write",
-                None,
-            ),
-            (
-                "save_rule",
-                "将用户要求遵守的行为规则保存到 data/memory/rules/。",
-                {"statement": "规则内容"},
-                save_rule,
-                "write",
-                None,
-            ),
-        ]
-        return [
-            build_tool(
-                fn,
-                name=name,
-                description=desc,
-                parameters=params,
-                param_enums=enums,
-                risk=risk,
-                source_type=self.source_type,
-                source_name=self.source_name,
-                base_cls=BuiltinTool,
-            )
-            for name, desc, params, fn, risk, enums in specs
-        ]

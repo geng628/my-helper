@@ -1,0 +1,161 @@
+"""内核内置工具定义与提供方（记忆读写、工作区落盘与行为规则工具集，零反向依赖 memory.py）。"""
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date
+from typing import Any
+
+from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
+
+
+# 内核内置工具子类：承载记忆与文件操作，由统一 build_tool 构建并注入 ToolRegistry
+@dataclass(frozen=True)
+class BuiltinTool(Tool):
+    pass
+
+
+# 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 向 ToolRegistry 提供 6 个 BuiltinTool 子类实例
+class MemoryToolsetProvider(ToolsetProvider):
+    source_type = "builtin"
+    source_name = "memory"
+
+    # 绑定当前实例的 MemoryStore、用户消息回调、逻辑时钟回调与流式回合暂存标记
+    def __init__(
+        self,
+        memory: Any,
+        get_user_message: Callable[[], tuple[str, int | None]] | None = None,
+        get_today: Callable[[], date] | None = None,
+        *,
+        turn_tag: str | None = None,
+        on_remember: Callable[[], None] | None = None,
+    ) -> None:
+        self.memory = memory
+        self.get_user_message = get_user_message
+        self.get_today = get_today
+        self.turn_tag = turn_tag
+        self.on_remember = on_remember
+
+    # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
+    def tools(self) -> list[Tool]:
+        memory = self.memory
+        get_user_message = self.get_user_message
+        get_today = self.get_today
+
+        # 适配 search_markdown 工具：优先取执行期 today 参数，缺省回退构造期时钟回调
+        def search_markdown(
+            query: str,
+            root: str = "data/memory",
+            *,
+            today: date | None = None,
+        ) -> str:
+            ref_day = today if today is not None else (get_today() if get_today is not None else None)
+            return memory.search_markdown(query, root=root, today=ref_day)
+
+        # 适配 read_markdown 工具参数（支持默认行号 1..120 并将字符串行号转为整数）
+        def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:
+            try:
+                start, end = int(start_line), int(end_line)
+            except (ValueError, TypeError) as error:
+                raise ValueError("start_line 和 end_line 必须是整数。") from error
+            return memory.read_markdown(path, start, end)
+
+        # 适配 write_file 工具：写入工作区并返回相对路径提示
+        def write_file(path: str, content: str, mode: str) -> str:
+            saved = memory.write_workspace_file(path, content, mode=mode)
+            return f"已写入：{saved}"
+
+        # 适配 remember_fact 工具：优先使用执行期注入的用户原话与回调，缺省回退构造期上下文
+        def remember_fact(
+            *,
+            user_text: str = "",
+            message_id: int | None = None,
+            turn_tag: str | None = None,
+            on_remember: Callable[[], None] | None = None,
+        ) -> str:
+            if user_text:
+                resolved_text, resolved_msg_id = user_text, message_id
+            else:
+                if get_user_message is None:
+                    raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
+                resolved_text, resolved_msg_id = get_user_message()
+            effective_tag = turn_tag if turn_tag is not None else self.turn_tag
+            effective_cb = on_remember if on_remember is not None else self.on_remember
+            target = memory.remember_user_statement(
+                resolved_text,
+                message_id=resolved_msg_id,
+                turn_tag=effective_tag,
+            )
+            if effective_cb is not None:
+                effective_cb()
+            return f"已记录用户原话到 {target}"
+
+        # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
+        def save_rule(statement: str) -> str:
+            path = memory.save_rule(statement, source="agent")
+            return f"已保存行为规则：data/memory/rules/{path.name}"
+
+        specs: list[tuple[str, str, dict[str, str], Callable[..., str], str, dict[str, tuple[str, ...]] | None]] = [
+            (
+                "list_files",
+                "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
+                {"root": "目录起点，如 data/memory、data/memory/archive、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
+                memory.list_files,
+                "read",
+                None,
+            ),
+            (
+                "search_markdown",
+                "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
+                {"query": "搜索关键词", "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs"},
+                search_markdown,
+                "read",
+                None,
+            ),
+            (
+                "read_markdown",
+                "按路径和行号读取允许目录内的 Markdown/文本文件。",
+                {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始，默认 1）", "end_line": "结束行号（默认 120）"},
+                read_markdown,
+                "read",
+                None,
+            ),
+            (
+                "write_file",
+                "在 data/workspace 目录内创建或覆盖文本文件（覆盖前自动备份）。",
+                {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
+                write_file,
+                "write",
+                {"mode": ("create", "overwrite")},
+            ),
+            (
+                "remember_fact",
+                "仅在用户明确要求记住信息时调用，将当前用户原话追加到 data/memory/facts.md（按需检索，不膨胀索引）。",
+                {},
+                remember_fact,
+                "write",
+                None,
+            ),
+            (
+                "save_rule",
+                "将用户要求遵守的行为规则保存到 data/memory/rules/。",
+                {"statement": "规则内容"},
+                save_rule,
+                "write",
+                None,
+            ),
+        ]
+        return [
+            build_tool(
+                fn,
+                name=name,
+                description=desc,
+                parameters=params,
+                param_enums=enums,
+                risk=risk,
+                source_type=self.source_type,
+                source_name=self.source_name,
+                base_cls=BuiltinTool,
+            )
+            for name, desc, params, fn, risk, enums in specs
+        ]
