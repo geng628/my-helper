@@ -318,6 +318,7 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
         if attempts["count"] < 3:
             raise URLError(ssl.SSLEOFError("EOF occurred in violation of protocol"))
 
+        # 模拟成功 JSON 响应的上下文管理器
         class _Resp:
             # 进入上下文返回自身
             def __enter__(self):
@@ -555,3 +556,121 @@ def test_transform_context_and_convert_to_llm_pipeline() -> None:
     assert run_react(clean_llm, filtered_msgs, ToolRegistry(), convert_to_llm=mutating_convert) == "ok"
     assert [m["role"] for m in filtered_msgs] == ["artifact", "user", "assistant"]
     assert [m["role"] for m in clean_llm.requests[0][0]] == ["user", "user"]
+
+
+# 测试 default_post_json 读取响应体中途发生 IncompleteRead/SSLError/ConnectionError 等瞬时异常时退避重试，且对损坏 JSON 不重试；同步 respond 校验 error 帧与空 choices
+def test_sync_post_json_body_read_retry_and_openai_response_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    import http.client
+    import ssl
+    from urllib.error import URLError
+    from personal_assistant.ai import OpenAIChatClient, TokenUsage
+    from personal_assistant.ai import client as llm_mod
+
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda _: None)
+
+    # 构造可定制 read() 与退出回调的模拟 HTTP 响应上下文对象
+    def _make_resp(read_fn, on_exit=None):
+        # 模拟标准库 HTTPResponse 上下文协议
+        class _FakeResp:
+            # 进入上下文返回自身
+            def __enter__(self):
+                return self
+
+            # 退出上下文并触发可选清理回调
+            def __exit__(self, *args):
+                if on_exit is not None:
+                    on_exit()
+                return False
+
+            # 执行注入的响应体读取行为
+            def read(self) -> bytes:
+                return read_fn()
+
+        return _FakeResp()
+
+    read_attempts = {"count": 0, "closed": 0}
+
+    # 模拟连接建立成功但 response.read() 前两次分别抛 IncompleteRead 与 SSLError，第三次完整返回 JSON
+    def flaky_body_urlopen(request, timeout=60):
+        read_attempts["count"] += 1
+        attempt = read_attempts["count"]
+
+        # 按调用次数返回瞬时读取异常或最终正常载荷
+        def _read() -> bytes:
+            if attempt == 1:
+                raise http.client.IncompleteRead(b'{"choices":', 12)
+            if attempt == 2:
+                raise ssl.SSLError("TLS read timed out")
+            return b'{"ok": true}'
+
+        return _make_resp(_read, on_exit=lambda: read_attempts.__setitem__("closed", read_attempts["closed"] + 1))
+
+    monkeypatch.setattr(llm_mod, "urlopen", flaky_body_urlopen)
+    assert llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
+    assert read_attempts["count"] == 3
+    assert read_attempts["closed"] == 3
+
+    # 验证 read() 抛 ConnectionResetError / TimeoutError / URLError 时同样触发重试并受 max_retries 上限约束
+    err_seq = [ConnectionResetError("reset"), TimeoutError("timed out"), URLError("eof")]
+    seq_attempts = {"count": 0}
+
+    # 依次抛出不同类型的读取阶段瞬时异常直至重试耗尽
+    def exhausted_body_urlopen(request, timeout=60):
+        idx = seq_attempts["count"]
+        seq_attempts["count"] += 1
+
+        # 抛出当前索引对应的瞬时异常
+        def _read_fail() -> bytes:
+            raise err_seq[idx]
+
+        return _make_resp(_read_fail)
+
+    monkeypatch.setattr(llm_mod, "urlopen", exhausted_body_urlopen)
+    with pytest.raises(URLError):
+        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+    assert seq_attempts["count"] == 3
+
+    # 模拟响应体读取成功但为语法损坏的 JSON：不得盲目重试
+    bad_json_attempts = {"count": 0}
+
+    # 返回语法错误 JSON 字节流
+    def bad_json_urlopen(request, timeout=60):
+        bad_json_attempts["count"] += 1
+        return _make_resp(lambda: b"{broken-json")
+
+    monkeypatch.setattr(llm_mod, "urlopen", bad_json_urlopen)
+    with pytest.raises(json.JSONDecodeError):
+        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+    assert bad_json_attempts["count"] == 1
+
+    # 测试 OpenAIChatClient.respond() 在 HTTP 200 error 帧、空 choices、非 dict 响应时抛出清晰 RuntimeError 且清理 last_usage
+    scripted_payloads: list[object] = [
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+        {"error": {"message": "rate_limit_exceeded", "code": 429}},
+        {"choices": [], "usage": {"prompt_tokens": 99, "completion_tokens": 0}},
+        {"choices": [{"message": "not-a-dict"}]},
+        ["unexpected-list"],
+    ]
+    client = OpenAIChatClient(
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        model="demo-model",
+        post_json=lambda _u, _p, _h: scripted_payloads.pop(0),  # type: ignore[return-value]
+    )
+    assert client.respond([{"role": "user", "content": "hi"}])["content"] == "ok"
+    assert client.last_usage == TokenUsage(prompt_tokens=10, cached_tokens=0, completion_tokens=2)
+
+    with pytest.raises(RuntimeError, match="模型接口返回错误.*rate_limit_exceeded"):
+        client.respond([{"role": "user", "content": "hi"}])
+    assert client.last_usage is None
+
+    with pytest.raises(RuntimeError, match="choices"):
+        client.respond([{"role": "user", "content": "hi"}])
+    assert client.last_usage is None
+
+    with pytest.raises(RuntimeError, match="message"):
+        client.respond([{"role": "user", "content": "hi"}])
+
+    with pytest.raises(RuntimeError, match="JSON 对象|格式"):
+        client.respond([{"role": "user", "content": "hi"}])
+

@@ -722,3 +722,18 @@
   - 单元测试 (`uv run pytest -v`)：**+4 用例全量通过**（含 `tests/test_architecture.py` 三层依赖漏斗与子进程断层隔离验证）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：合入 Issue `#52`（`shell_tools.py` 沙箱加固），随后推进工具执行期上下文解耦（消除每轮重跑插件 `initialize()`）与学习助手特色叠加功能。
+
+
+---
+
+### [2026-11-26] `CacheMonitor` 有界窗口化与同步 `respond` / `default_post_json` 传输异常加固（Issue `#59`）
+- **背景与设计目标**：对齐 `TelemetryObserver` 的有界内存模型与流式 SSE 的异常处理，消除长驻服务下 `CacheMonitor` 无限增长的内存隐患，并补齐后台记忆沉淀与评测 Judge 同步 JSON 调用的响应体读取重试和错误帧校验。
+- **改动文件（代码提交 `95383b1`）**：
+  - [personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)：`CacheMonitor` 支持 `max_records=2000`、`max_sessions=256` 有界滑动窗口与 MRU 会话前缀淘汰；维护单调递增游标 `snapshot_index()` 与 $O(1)$ 内存精确累计账本，确保 `summary(since=0)` 全局统计与 `summary(since=idx)` 单轮切片在窗口淘汰后依然精确兼容。
+  - [personal_assistant/ai/client.py](personal_assistant/ai/client.py)：抽离 `_post_with_retry`，`default_post_json` 将响应体读取纳入瞬时网络/TLS 异常（含 `IncompleteRead`、`SSLError`、`URLError`、`TimeoutError`、`ConnectionError`）的指数退避重试闭环（保持 4xx 与确定性解码/JSON 语法错误不盲目重试，流式 `default_post_stream` 仍仅在建连前重试）；`OpenAIChatClient.respond()` 补齐 HTTP 200 错误帧与空/畸形 `choices` 的 `RuntimeError` 防护。
+  - [tests/test_cache_metrics.py](tests/test_cache_metrics.py)、[tests/test_step1_react.py](tests/test_step1_react.py)：新增滑动窗口淘汰、单调游标切片、中途读取断流重试与异常响应体拦截单测。
+- **Layer 2 独立只读审查 trace**：**Round 1（`95383b1`）→ `Pass`**（`0 Blockers / 3 Nits`）。
+- **同口径验证对比（改前 `main` `b463026` → 改后 `95383b1`）**：
+  - 单元测试 (`uv run pytest -v`)：**143 passed → 145 passed**（含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：继续验收合入 Issue `#58`（插件单次初始化解耦与会话并发防护）与 Issue `#52`（`shell_tools.py` 沙箱收尾），随后进入学习助手体验叠加阶段。
