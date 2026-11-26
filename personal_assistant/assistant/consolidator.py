@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -52,6 +53,7 @@ class ConsolidationPolicy:
     max_active_chars: int = 8000
     keep_recent_messages: int = 6
     min_batch_messages: int = 4
+    max_batch_messages: int = 24
 
 
 # 单次沉淀与压缩完成后的结构化结果
@@ -120,7 +122,7 @@ def _format_transcript(batch: list[dict[str, object]], max_item_chars: int = 100
 
 # 纯同步记忆沉淀与上下文压缩核心（不绑定线程，未来可直接挂载到独立 worker）
 class MemoryConsolidator:
-    # 绑定状态存储、Markdown 记忆库、大模型客户端与触发策略
+    # 绑定状态存储、Markdown 记忆库、大模型客户端、触发策略与可选逻辑时钟
     def __init__(
         self,
         state: StateStore,
@@ -128,11 +130,13 @@ class MemoryConsolidator:
         llm: LLMClient,
         *,
         policy: ConsolidationPolicy | None = None,
+        today_fn: Callable[[], date] | None = None,
     ) -> None:
         self.state = state
         self.memory = memory
         self.llm = llm
         self.policy = policy or ConsolidationPolicy()
+        self._today_fn = today_fn
 
     # 检查指定会话是否达到沉淀阈值；若达到则返回（旧摘要，待沉淀旧消息批次），否则返回 None
     def select_batch(self, chat_id: str) -> tuple[str, list[dict[str, object]]] | None:
@@ -149,6 +153,17 @@ class MemoryConsolidator:
         cutoff = len(active) - max(0, self.policy.keep_recent_messages)
         if cutoff < self.policy.min_batch_messages:
             return None
+        max_batch = self.policy.max_batch_messages
+        if max_batch > 0 and cutoff > max_batch:
+            cap = max_batch - (max_batch % 2) if max_batch >= 2 else max_batch
+            if (
+                cap > 1
+                and cap < len(active)
+                and active[cap - 1].get("role") == "user"
+                and active[cap].get("role") == "assistant"
+            ):
+                cap -= 1
+            cutoff = max(1, cap)
         existing_summary = str(self.state.get_compaction(chat_id).get("summary") or "")
         return existing_summary, active[:cutoff]
 
@@ -165,13 +180,27 @@ class MemoryConsolidator:
         if selected is None:
             return None
         existing_summary, batch = selected
-        ref_day = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        ref_day = (
+            today
+            if today is not None
+            else (
+                self._today_fn()
+                if self._today_fn is not None
+                else datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            )
+        )
 
         # 沉淀前先零成本归档已过期的临时记忆，避免把过期条目再喂给模型
         self.memory.archive_expired_memories(today=ref_day)
 
         index_text = self.memory.read_memory_index() or "（暂无记忆索引）"
-        topic_snapshots = self.memory.read_topic_snapshots() or "（暂无已有主题记忆）"
+        raw_snapshots = self.memory.read_topic_snapshots()
+        if raw_snapshots:
+            # 过滤掉前台流内尚未提交的 (turn#...) 暂存行，避免后台沉淀提前改写或误删在途事实
+            filtered_lines = [line for line in raw_snapshots.splitlines() if "(turn#" not in line]
+            topic_snapshots = "\n".join(filtered_lines).strip() or "（暂无已有主题记忆）"
+        else:
+            topic_snapshots = "（暂无已有主题记忆）"
         transcript = _format_transcript(batch)
         user_payload = (
             f"【当前日期】{format_date_with_weekday(ref_day)}\n\n"
@@ -205,9 +234,22 @@ class MemoryConsolidator:
                 if not topic:
                     continue
 
-                # 仅解析结构化 operations（add/merge/replace/remove）
+                # 仅解析结构化 operations（add/merge/replace/remove），并跳过触碰在途 (turn#...) 的操作
                 raw_ops = entry.get("operations")
-                ops = [op for op in raw_ops if isinstance(op, dict)] if isinstance(raw_ops, list) else []
+                ops = (
+                    [
+                        op
+                        for op in raw_ops
+                        if isinstance(op, dict)
+                        and "(turn#" not in str(op.get("old") or "").lower()
+                        and not (
+                            str(op.get("op") or "").strip().lower() == "remove"
+                            and "(turn#" in str(op.get("text") or "").lower()
+                        )
+                    ]
+                    if isinstance(raw_ops, list)
+                    else []
+                )
                 if not ops:
                     continue
                 try:
@@ -247,24 +289,38 @@ class MemoryConsolidator:
         )
 
 
-# 进程内后台调度器：用标准库线程异步执行沉淀，不阻塞对话回复并确保同会话互斥
+# 进程内后台调度器：用标准库线程异步执行沉淀，不阻塞对话回复并确保同会话互斥与失败指数退避
 class BackgroundConsolidator:
-    # 初始化后台调度锁、在途会话集合、最近执行状态记录与可选事件回调；回调异常由调用方隔离（AssistantApp._emit_event 已统一兜底）
+    # 初始化后台调度锁、在途会话集合、按会话失败退避表与可选事件回调；回调异常由调用方隔离（AssistantApp._emit_event 已统一兜底）
     def __init__(
         self,
         consolidator: MemoryConsolidator,
         *,
         on_event: Callable[[str, TaskEvent], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        base_backoff_seconds: float = 2.0,
+        max_failures_tracked: int = 256,
     ) -> None:
         self.consolidator = consolidator
         self.on_event = on_event
+        self._clock = clock
+        self._base_backoff_seconds = max(0.0, float(base_backoff_seconds))
+        self._max_failures_tracked = max(1, int(max_failures_tracked))
         self._lock = threading.Lock()
         self._in_flight: set[str] = set()
         self._threads: dict[str, threading.Thread] = {}
+        self._failures: dict[str, tuple[int, float]] = {}
         self.last_result: dict[str, object] | None = None
         self.last_error: str | None = None
 
-    # 检查阈值并按需拉起后台线程执行沉淀；若已触发返回 True，未达阈值或正在执行返回 False
+    # 判断指定会话当前是否处于失败冷却期（需在持有 self._lock 时调用）
+    def _is_in_cooldown(self, chat_id: str) -> bool:
+        entry = self._failures.get(chat_id)
+        if entry is None:
+            return False
+        return self._clock() < entry[1]
+
+    # 检查阈值与冷却期后按需拉起后台线程执行沉淀；已触发返回 True，未达阈值/在途/冷却中返回 False
     def maybe_schedule(
         self,
         chat_id: str,
@@ -273,11 +329,14 @@ class BackgroundConsolidator:
     ) -> bool:
         if isinstance(self.consolidator.llm, NoopLLMClient):
             return False
+        with self._lock:
+            if chat_id in self._in_flight or self._is_in_cooldown(chat_id):
+                return False
         if self.consolidator.select_batch(chat_id) is None:
             return False
 
         with self._lock:
-            if chat_id in self._in_flight:
+            if chat_id in self._in_flight or self._is_in_cooldown(chat_id):
                 return False
             self._in_flight.add(chat_id)
             worker = threading.Thread(
@@ -290,7 +349,7 @@ class BackgroundConsolidator:
             worker.start()
         return True
 
-    # 后台工作线程主体：捕获异常不崩溃主进程，完成后记录状态、单点广播事件并触发回调
+    # 后台工作线程主体：捕获异常并按 chat_id 记录指数退避，完成后记录状态、单点广播事件并触发回调
     def _run_worker(
         self,
         chat_id: str,
@@ -301,16 +360,24 @@ class BackgroundConsolidator:
         err_text: str | None = None
         try:
             result = self.consolidator.consolidate_once(chat_id)
-            if result is not None:
-                with self._lock:
+            with self._lock:
+                self._failures.pop(chat_id, None)
+                if result is not None:
                     self.last_result = result.to_dict()
                     self.last_error = None
-                if on_complete is not None:
-                    on_complete(result)
+            if result is not None and on_complete is not None:
+                on_complete(result)
         except Exception as error:  # noqa: BLE001
             err_text = f"{type(error).__name__}: {error}"
+            now = self._clock()
             with self._lock:
                 self.last_error = err_text
+                prev = self._failures.pop(chat_id, None)
+                count = (prev[0] if prev is not None else 0) + 1
+                backoff = min(300.0, self._base_backoff_seconds * (2 ** min(count - 1, 7)))
+                if len(self._failures) >= self._max_failures_tracked:
+                    self._failures.pop(next(iter(self._failures)))
+                self._failures[chat_id] = (count, now + backoff)
         finally:
             try:
                 if self.on_event is not None and (result is not None or err_text is not None):
@@ -346,11 +413,12 @@ class BackgroundConsolidator:
         for thread in threads:
             thread.join(timeout=timeout)
 
-    # 返回当前后台沉淀运行状态与最近一次结果/错误信息，供 /status 展示
+    # 返回当前后台沉淀运行状态、退避中会话数与最近一次结果/错误信息，供 /status 展示
     def status(self) -> dict[str, object]:
         with self._lock:
             return {
                 "running_sessions": sorted(self._in_flight),
+                "backoff_sessions": len(self._failures),
                 "last_result": self.last_result,
                 "last_error": self.last_error,
             }

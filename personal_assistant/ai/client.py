@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
+import re
 import ssl
 import threading
 import time
@@ -78,9 +80,84 @@ _TRANSIENT_HTTP_ERRORS = (
     http.client.IncompleteRead,
     ssl.SSLError,
 )
+_BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_SK_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]+")
+_MAX_HTTP_ERROR_BODY_BYTES = 1024
+_STREAM_OPTIONS_INCOMPAT_MARKERS = (
+    "stream_options",
+    "include_usage",
+    "unknown",
+    "unrecognized",
+    "extra",
+    "unsupported",
+)
+_CONTEXT_LIMIT_MARKERS = ("context_length", "maximum context", "tokens")
+_GENERIC_400_REASONS = frozenset({"", "bad request", "http error 400", "400", "client error"})
 
 
-# 构造 JSON POST 请求，并在连接或指定读取阶段遇到瞬时网络/TLS/5xx/429 异常时按指数退避重试
+# 脱敏 HTTP 错误文本中的疑似 Bearer 或 sk- 令牌，防止错误透出泄漏密钥
+def _redact_error_tokens(text: str) -> str:
+    masked = _BEARER_SECRET_RE.sub("Bearer ***", text)
+    return _SK_SECRET_RE.sub("sk-***", masked)
+
+
+# 安全读取最多 1024 字节的 HTTPError 响应体并脱敏缓存，同时拼入异常 reason 便于上层观测真实错误
+def _attach_http_error_body(error: HTTPError) -> str:
+    cached = getattr(error, "_cached_error_body", None)
+    if isinstance(cached, str):
+        return cached
+    orig_reason = str(getattr(error, "reason", "") or "").strip()
+    error._orig_reason = orig_reason  # type: ignore[attr-defined]
+    body = ""
+    try:
+        raw = error.read(_MAX_HTTP_ERROR_BODY_BYTES)
+    except (OSError, ValueError, AttributeError):
+        raw = b""
+    if isinstance(raw, (bytes, bytearray)):
+        body = raw.decode("utf-8", errors="replace").strip()
+    elif isinstance(raw, str):
+        body = raw.strip()
+    clean_body = _redact_error_tokens(body)
+    error._cached_error_body = clean_body  # type: ignore[attr-defined]
+    if clean_body and clean_body not in orig_reason:
+        error.msg = f"{orig_reason} | {clean_body}" if orig_reason else clean_body
+    return clean_body
+
+
+# 从 HTTP 429 响应头解析合法数字 Retry-After，并夹紧在 [0.1, 10.0] 秒内
+def _parse_retry_after_seconds(headers: Any) -> float | None:
+    if headers is None:
+        return None
+    raw_val = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw_val is None and isinstance(headers, Mapping):
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == "retry-after":
+                raw_val = value
+                break
+    if isinstance(raw_val, bool) or raw_val is None:
+        return None
+    try:
+        parsed = float(str(raw_val).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    return max(0.1, min(10.0, parsed))
+
+
+# 判断 HTTP 400 是否属于 stream_options 参数不兼容（明确排除上下文或 Token 超长错误）
+def _should_fallback_without_stream_options(error: HTTPError) -> bool:
+    body = _attach_http_error_body(error)
+    orig_reason = str(getattr(error, "_orig_reason", getattr(error, "reason", "")) or "").strip()
+    combined = f"{orig_reason} {body}".lower()
+    if any(marker in combined for marker in _CONTEXT_LIMIT_MARKERS):
+        return False
+    if not body and orig_reason.lower() in _GENERIC_400_REASONS:
+        return True
+    return any(marker in combined for marker in _STREAM_OPTIONS_INCOMPAT_MARKERS)
+
+
+# 构造 JSON POST 请求，并在连接或指定读取阶段遇到瞬时网络/TLS/5xx/429 异常时按指数退避或 Retry-After 重试
 def _post_with_retry(
     url: str,
     payload: dict[str, object],
@@ -97,18 +174,22 @@ def _post_with_retry(
     }
     for attempt in range(max_retries + 1):
         request = Request(url, data=body, headers=req_headers, method="POST")
+        delay = 0.5 * (2**attempt)
         try:
             return operation(urlopen(request, timeout=60))
         except HTTPError as error:
-            # 4xx 客户端错误（429 限流除外）不重试，直接抛出
-            if error.code < 500 and error.code != 429:
+            # 4xx 客户端错误（429 限流除外）不重试，附带脱敏错误体直接抛出
+            if (error.code < 500 and error.code != 429) or attempt >= max_retries:
+                _attach_http_error_body(error)
                 raise
-            if attempt >= max_retries:
-                raise
+            if error.code == 429:
+                retry_after = _parse_retry_after_seconds(getattr(error, "headers", None))
+                if retry_after is not None:
+                    delay = retry_after
         except _TRANSIENT_HTTP_ERRORS:
             if attempt >= max_retries:
                 raise
-        time.sleep(0.5 * (2**attempt))
+        time.sleep(delay)
     raise RuntimeError("请求重试耗尽。")
 
 
@@ -167,6 +248,8 @@ def _consume_openai_sse(
     role, parts, tool_acc = "assistant", [], {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
+    finish_reason: str | None = None
+    last_implicit_idx: int | None = None
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -184,7 +267,12 @@ def _consume_openai_sse(
             raise RuntimeError(f"流式响应返回错误：{chunk['error']}")
         usage = extract_usage(chunk) or usage
         choices = chunk.get("choices") or []
-        delta = choices[0].get("delta") if choices and isinstance(choices[0], dict) else None
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else None
+        if first_choice is not None:
+            raw_finish = first_choice.get("finish_reason")
+            if isinstance(raw_finish, str) and raw_finish:
+                finish_reason = raw_finish
+        delta = first_choice.get("delta") if first_choice is not None else None
         if not isinstance(delta, dict):
             continue
         if isinstance(delta.get("role"), str) and delta["role"]:
@@ -200,30 +288,56 @@ def _consume_openai_sse(
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
             parts.append(piece)
             yield TextDelta(text=piece)
-        for tc in delta.get("tool_calls") or ():
-            if not isinstance(tc, dict):
-                continue
-            ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
-            raw_idx = tc.get("index")
-            idx = raw_idx if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) else 0
-            acc = tool_acc.setdefault(idx, {"id": "", "name": "", "args": []})
-            if isinstance(tc.get("id"), str) and tc["id"]:
-                acc["id"] = tc["id"]
-            fn = tc.get("function") or {}
-            if isinstance(fn, dict):
-                if isinstance(fn.get("name"), str) and fn["name"]:
-                    acc["name"] = f"{acc['name']}{fn['name']}"
-                if isinstance(fn.get("arguments"), str) and fn["arguments"]:
-                    acc["args"].append(fn["arguments"])  # type: ignore[attr-defined]
+        raw_tool_calls = delta.get("tool_calls") or ()
+        if isinstance(raw_tool_calls, (list, tuple)):
+            frame_slots_seen: set[int] = set()
+            for tc in raw_tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
+                raw_idx = tc.get("index")
+                tc_id = tc["id"] if isinstance(tc.get("id"), str) and tc["id"] else ""
+                fn = tc.get("function") or {}
+                fn_name = (
+                    fn["name"]
+                    if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"]
+                    else ""
+                )
+                fn_args = (
+                    fn["arguments"]
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str) and fn["arguments"]
+                    else ""
+                )
+                if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and raw_idx >= 0:
+                    idx = raw_idx
+                elif last_implicit_idx is None:
+                    idx = (max(tool_acc) + 1) if tool_acc else 0
+                else:
+                    curr = tool_acc[last_implicit_idx]
+                    diff_id = bool(tc_id and curr["id"] and tc_id != curr["id"])
+                    new_fn_after_args = bool(fn_name and curr["name"] and curr["args"])
+                    if last_implicit_idx in frame_slots_seen or diff_id or new_fn_after_args:
+                        idx = (max(tool_acc) + 1) if tool_acc else 0
+                    else:
+                        idx = last_implicit_idx
+                last_implicit_idx = idx
+                frame_slots_seen.add(idx)
+                acc = tool_acc.setdefault(idx, {"id": "", "name": "", "args": []})
+                if tc_id:
+                    acc["id"] = tc_id
+                if fn_name:
+                    acc["name"] = f"{acc['name']}{fn_name}"
+                if fn_args:
+                    acc["args"].append(fn_args)  # type: ignore[attr-defined]
 
     full_text = "".join(parts)
     calls = [
         ToolCall(
-            id=str(a["id"]),
+            id=str(a["id"]) or f"call_{slot_idx}",
             name=str(a["name"]),
             arguments="".join(a["args"]) or "{}",  # type: ignore[arg-type]
         ).to_openai_dict()
-        for _, a in sorted(tool_acc.items())
+        for slot_idx, a in sorted(tool_acc.items())
     ]
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
     if calls:
@@ -231,10 +345,12 @@ def _consume_openai_sse(
     for field_name, chunks in thinking_parts.items():
         if chunks:
             msg[field_name] = "".join(chunks)
+    if finish_reason:
+        msg["finish_reason"] = finish_reason
     yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=round((time.perf_counter() - t0) * 1000, 3))
 
 
-# 打开 OpenAI 兼容 SSE 流；若首包前因 stream_options 返回 HTTP 400 则自动去掉该参数重试一次
+# 打开 OpenAI 兼容 SSE 流；若首包前因 stream_options 不兼容返回 HTTP 400 则自动去掉该参数重试一次
 def _open_openai_stream(
     post_stream: PostStream,
     url: str,
@@ -248,9 +364,16 @@ def _open_openai_stream(
             yield line
     except HTTPError as error:
         if error.code != 400 or yielded_any or "stream_options" not in payload:
+            _attach_http_error_body(error)
+            raise
+        if not _should_fallback_without_stream_options(error):
             raise
         fallback_payload = {k: v for k, v in payload.items() if k != "stream_options"}
-        yield from post_stream(url, fallback_payload, headers)
+        try:
+            yield from post_stream(url, fallback_payload, headers)
+        except HTTPError as retry_error:
+            _attach_http_error_body(retry_error)
+            raise
 
 
 # 大模型客户端抽象基类，供上层 Agent 循环或独立脚本调用
@@ -385,7 +508,11 @@ class OpenAIChatClient(LLMClient):
         raw_message = first.get("message") if isinstance(first, dict) else None
         if not isinstance(raw_message, dict):
             raise RuntimeError("模型接口返回 choices[0] 缺少有效的 message 对象。")
-        msg = self._normalize_response_message(dict(raw_message))
+        raw_msg = dict(raw_message)
+        raw_finish = first.get("finish_reason") if isinstance(first, dict) else None
+        if isinstance(raw_finish, str) and raw_finish:
+            raw_msg["finish_reason"] = raw_finish
+        msg = self._normalize_response_message(raw_msg)
         self.last_usage = extract_usage(response)
         return msg
 

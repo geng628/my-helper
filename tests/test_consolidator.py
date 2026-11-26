@@ -452,3 +452,153 @@ def test_consolidator_ignores_legacy_items_format(tmp_path: Path) -> None:
         assert not (memory.memory_dir / "preferences.md").exists()
     finally:
         state.close()
+
+
+# 测试沉淀分批上限与偶数对对齐、today_fn 逻辑日期注入、保护在途 (turn#...) 暂存行以及失败指数退避与恢复
+def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_path: Path) -> None:
+    state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
+    memory = MemoryStore(tmp_path / "data")
+    try:
+        # 1. 验证 max_batch_messages=24（默认）与奇数配额时均按偶数对截取且不劈开 user+assistant
+        for i in range(18):
+            state.append_turn("s-batch", f"u-{i}", f"a-{i}")
+        policy_default = ConsolidationPolicy(max_active_messages=16, keep_recent_messages=6, min_batch_messages=4)
+        assert policy_default.max_batch_messages == 24
+        llm_noop = ControlledLLM([])
+        cons_default = MemoryConsolidator(state, memory, llm_noop, policy=policy_default)
+        selected_default = cons_default.select_batch("s-batch")
+        assert selected_default is not None
+        assert len(selected_default[1]) == 24
+        assert selected_default[1][0]["role"] == "user"
+        assert selected_default[1][-1]["role"] == "assistant"
+
+        policy_odd = ConsolidationPolicy(
+            max_active_messages=10,
+            keep_recent_messages=2,
+            min_batch_messages=4,
+            max_batch_messages=7,
+        )
+        cons_odd = MemoryConsolidator(state, memory, llm_noop, policy=policy_odd)
+        selected_odd = cons_odd.select_batch("s-batch")
+        assert selected_odd is not None
+        assert len(selected_odd[1]) == 6
+        assert selected_odd[1][-1]["role"] == "assistant"
+
+        # 2. 验证 today_fn 注入且在途 (turn#<hex>) 暂存行既不喂给沉淀模型、也不被 replace/remove 误删
+        state.append_turn("s-turn-protect", "昨天我买了新键盘", "记下了。")
+        state.append_turn("s-turn-protect", "先聊到这里", "好的。")
+        memory.remember_user_statement("前天买过旧鼠标", message_id=1)
+        memory.remember_user_statement("前台尚未落库的在途事实", turn_tag="deadbeef1234")
+
+        logical_day = date(2025, 3, 15)
+        cons_llm = ControlledLLM(
+            [
+                json.dumps(
+                    {
+                        "session_summary": "用户昨天买了新键盘。",
+                        "memories": [
+                            {
+                                "topic": "facts",
+                                "title": "事实备忘",
+                                "index_summary": "近期事实",
+                                "operations": [
+                                    {"op": "remove", "old": "(turn#deadbeef1234)"},
+                                    {"op": "replace", "old": "(turn#deadbeef", "new": "被篡改"},
+                                    {"op": "add", "text": "2025-03-14 买了新键盘。"},
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        cons_day = MemoryConsolidator(
+            state,
+            memory,
+            cons_llm,
+            policy=ConsolidationPolicy(max_active_messages=4, keep_recent_messages=0, min_batch_messages=4),
+            today_fn=lambda: logical_day,
+        )
+        res_day = cons_day.consolidate_once("s-turn-protect")
+        assert res_day is not None
+        prompt_sent = str(cons_llm.requests[0][1]["content"])
+        assert "【当前日期】2025-03-15" in prompt_sent
+        assert "(turn#deadbeef1234)" not in prompt_sent
+        assert "前台尚未落库的在途事实" not in prompt_sent
+
+        facts_body = (memory.memory_dir / "facts.md").read_text(encoding="utf-8")
+        assert "(turn#deadbeef1234) 前台尚未落库的在途事实" in facts_body
+        assert "被篡改" not in facts_body
+        assert "[2025-03-15] 2025-03-14 买了新键盘。" in facts_body
+
+        # 3. 验证 BackgroundConsolidator 按 chat_id 失败计数与指数退避（注入确定性时钟零等待）
+        for i in range(3):
+            state.append_turn("s-backoff", f"bu-{i}", f"ba-{i}")
+            state.append_turn("s-other", f"ou-{i}", f"oa-{i}")
+
+        now_ts = [1000.0]
+        # 记录并响应不同会话请求的受控模型：s-backoff 前两次失败、第三次成功；s-other 立即成功
+        class BackoffProbeLLM(LLMClient):
+            # 初始化状态计数器
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            # 根据批次内容决定抛错或返回合法 JSON
+            def respond(
+                self,
+                messages: list[dict[str, object]],
+                tools: list[dict[str, object]] | None = None,
+            ) -> dict[str, object]:
+                content = str(messages[1]["content"])
+                if "bu-" in content:
+                    self.calls.append("s-backoff")
+                    if self.calls.count("s-backoff") <= 2:
+                        raise RuntimeError("transient llm error")
+                    return {"role": "assistant", "content": json.dumps({"session_summary": "backoff recovered", "memories": []})}
+                self.calls.append("s-other")
+                return {"role": "assistant", "content": json.dumps({"session_summary": "other ok", "memories": []})}
+
+        probe_llm = BackoffProbeLLM()
+        bg = BackgroundConsolidator(
+            MemoryConsolidator(
+                state,
+                memory,
+                probe_llm,
+                policy=ConsolidationPolicy(max_active_messages=6, keep_recent_messages=2, min_batch_messages=4),
+            ),
+            clock=lambda: now_ts[0],
+            base_backoff_seconds=2.0,
+        )
+        assert bg.status()["backoff_sessions"] == 0
+
+        # 第 1 次失败：退避 2.0s（1000 -> 1002）
+        assert bg.maybe_schedule("s-backoff") is True
+        bg.wait(timeout=5.0)
+        assert bg.status()["backoff_sessions"] == 1
+        assert probe_llm.calls == ["s-backoff"]
+
+        # 冷却期内同会话直接跳过，但另一会话 s-other 不受任何影响可正常调度
+        now_ts[0] = 1001.5
+        assert bg.maybe_schedule("s-backoff") is False
+        assert bg.maybe_schedule("s-other") is True
+        bg.wait(timeout=5.0)
+        assert probe_llm.calls == ["s-backoff", "s-other"]
+
+        # 到达 1002.0s 后第 2 次重试仍失败：退避翻倍至 4.0s（1002 -> 1006）
+        now_ts[0] = 1002.0
+        assert bg.maybe_schedule("s-backoff") is True
+        bg.wait(timeout=5.0)
+        assert bg.status()["backoff_sessions"] == 1
+
+        now_ts[0] = 1005.9
+        assert bg.maybe_schedule("s-backoff") is False
+
+        # 到达 1006.0s 后第 3 次重试成功：立即清除失败计数
+        now_ts[0] = 1006.0
+        assert bg.maybe_schedule("s-backoff") is True
+        bg.wait(timeout=5.0)
+        assert bg.status()["backoff_sessions"] == 0
+        assert bg.status()["last_error"] is None
+    finally:
+        state.close()

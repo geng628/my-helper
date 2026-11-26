@@ -182,10 +182,15 @@ class CacheMonitor:
                 self._total_prefix_rate_sum += Fraction(reuse_rate)
             return entry
 
-    # 汇总从 since 位置起的调用统计（since=0 返回全生命周期精确累计，since>0 按单调游标切片当前窗口）
-    def summary(self, since: int = 0) -> dict[str, object]:
+    # 汇总从 since 位置起的调用统计（支持按 session_key 切片隔离；since=0 且未指定会话时走 O(1) 全局累计）
+    def summary(
+        self,
+        since: int = 0,
+        *,
+        session_key: str | None = None,
+    ) -> dict[str, object]:
         with self._lock:
-            if since == 0:
+            if since == 0 and session_key is None:
                 return _build_summary(
                     llm_calls=self._total_recorded,
                     prompt_tokens=self._total_prompt_tokens,
@@ -194,12 +199,16 @@ class CacheMonitor:
                     warm_calls=self._total_warm_calls,
                     prefix_rate_sum=self._total_prefix_rate_sum,
                 )
-            if since < 0:
+            if since == 0:
+                snapshot = list(self._records)
+            elif since < 0:
                 snapshot = list(self._records)[since:]
             else:
                 window_start = self._total_recorded - len(self._records)
                 offset = max(0, since - window_start)
                 snapshot = list(self._records)[offset:]
+        if session_key is not None:
+            snapshot = [rec for rec in snapshot if rec.session_key == session_key]
         return summarize_records(snapshot)
 
     # 包装任意 LLMClient，在不侵入上层循环的前提下自动采集缓存统计

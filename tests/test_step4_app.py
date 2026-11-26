@@ -726,3 +726,448 @@ def test_assistant_app_reuses_single_tool_registry_with_turn_context_and_optiona
         assert "read_markdown" in st["tools"]
     finally:
         app.close()
+
+
+# 测试 StateStore.append_turn 对 KeyboardInterrupt 回滚以及 get_context_snapshot 单锁原子快照无空洞
+def test_state_store_keyboard_interrupt_rollback_and_atomic_context_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pytest
+
+    store = StateStore(tmp_path / "snapshot.sqlite3")
+    try:
+        # 1. append_turn 中途遭遇 KeyboardInterrupt 必须回滚事务，绝不留下孤儿 user 消息
+        orig_conn = store.conn
+        calls = 0
+
+        # 代理连接包装器：在第二次 INSERT 时注入 KeyboardInterrupt 验证 BaseException 回滚
+        class InterruptOnSecondInsert:
+            # 绑定真实连接
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            # 拦截第二次 INSERT 语句抛 KeyboardInterrupt
+            def execute(self, sql: str, params=()):
+                nonlocal calls
+                if "INSERT INTO messages" in sql:
+                    calls += 1
+                    if calls == 2:
+                        raise KeyboardInterrupt("ctrl-c during turn commit")
+                return self._inner.execute(sql, params)
+
+            # 透传其余连接属性
+            def __getattr__(self, name: str):
+                return getattr(self._inner, name)
+
+        monkeypatch.setattr(store, "conn", InterruptOnSecondInsert(orig_conn))
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c"):
+            store.append_turn("s-ki", "孤儿风险提问", "不应半途提交的回答")
+        monkeypatch.setattr(store, "conn", orig_conn)
+        assert store.count_messages("s-ki") == 0
+
+        # 2. get_context_snapshot 必须在单锁临界区内返回完全一致的 (compaction, active_messages)
+        for i in range(4):
+            store.append_turn("s-snap", f"u-{i}", f"a-{i}")
+
+        import threading
+        import time
+
+        orig_get_compaction = store.get_compaction
+        hook_entered = threading.Event()
+        writer_done = threading.Event()
+
+        # 注入钩子：读取 compaction 瞬间异步并发线程推进游标，验证同一 RLock 阻止撕裂读
+        def hooking_get_compaction(chat_id: str) -> dict[str, object]:
+            comp = orig_get_compaction(chat_id)
+            hook_entered.set()
+            time.sleep(0.03)
+            return comp
+
+        monkeypatch.setattr(store, "get_compaction", hooking_get_compaction)
+
+        # 并发写线程尝试推进游标至 id=4
+        def advance_compaction() -> None:
+            hook_entered.wait(timeout=2.0)
+            store.save_compaction("s-snap", "前两轮摘要", 4)
+            writer_done.set()
+
+        t_w = threading.Thread(target=advance_compaction)
+        t_w.start()
+        comp, msgs = store.get_context_snapshot("s-snap")
+        t_w.join(timeout=2.0)
+        assert writer_done.is_set()
+        assert int(comp["compacted_until_id"]) == 0
+        assert [int(m["id"]) for m in msgs] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+        comp_after, msgs_after = store.get_context_snapshot("s-snap", limit=2)
+        assert int(comp_after["compacted_until_id"]) == 4
+        assert [int(m["id"]) for m in msgs_after] == [7, 8]
+    finally:
+        store.close()
+
+
+# 测试 AssistantApp 回合预算熔断（步数/Token/墙钟/重复工具/长度截断）、自适应滑窗、untrusted_tool_seen 及生命周期闭环
+def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import threading
+    from datetime import date
+
+    from personal_assistant.ai import StreamDone, TextDelta, TokenUsage
+    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded
+    from personal_assistant.assistant.consolidator import ConsolidationPolicy
+    from tests.test_streaming import ScriptedStreamLLM
+
+    assert issubclass(TurnBudgetExceeded, RuntimeError)
+
+    # 1. 超过 20 条未压缩活跃消息时（例如后台沉淀滞后/退避），自适应滑窗应保留更早未压缩消息而不静默蒸发
+    history_probe_llm = RecordingLLM([{"role": "assistant", "content": "已看到第1条消息"}])
+    app_hist = AssistantApp(
+        data_root=tmp_path / "hist_data",
+        llm=history_probe_llm,
+        consolidation_policy=ConsolidationPolicy(max_active_messages=100, keep_recent_messages=6, min_batch_messages=4),
+    )
+    try:
+        for i in range(13):
+            app_hist.state.append_turn("s-adapt", f"第{i+1}轮问题", f"第{i+1}轮回答")
+        # 此时共 26 条活跃消息，超过 MAX_HISTORY_MESSAGES=20
+        res_hist = app_hist.chat("总结一下第1轮问题是什么", chat_id="s-adapt")
+        assert res_hist["reply"] == "已看到第1条消息"
+        sent_msgs = history_probe_llm.requests[0][0]
+        all_sent_text = "\n".join(str(m.get("content") or "") for m in sent_msgs)
+        assert "第1轮问题" in all_sent_text
+        assert "第13轮回答" in all_sent_text
+    finally:
+        app_hist.close()
+
+    # 2. 四种外层预算熔断场景均优雅收束（不调下一轮 API、释放会话锁、可继续下一轮对话）
+    # 2a) 重复相同工具（含 JSON 键序不同的等价参数）达到 max_repeated_tool_calls=3
+    repeat_llm = ScriptedStreamLLM(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "r1", "type": "function", "function": {"name": "search_markdown", "arguments": '{"query":"abc","root":"data/memory"}'}}]},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "r2", "type": "function", "function": {"name": "search_markdown", "arguments": '{"root": "data/memory", "query": "abc"}'}}]},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "r3", "type": "function", "function": {"name": "search_markdown", "arguments": '{"query":"abc",  "root":"data/memory"}'}}]},
+            {"role": "assistant", "content": "不应再调用第4次模型"},
+        ]
+    )
+    app_guard = AssistantApp(
+        data_root=tmp_path / "guard_data",
+        llm=repeat_llm,
+        max_repeated_tool_calls=3,
+    )
+    try:
+        r_rep = app_guard.chat("死循环测试", chat_id="s-rep")
+        assert "安全预算上限" in str(r_rep["reply"])
+        assert len(r_rep["tool_calls"]) == 3
+        assert len(repeat_llm._turns) == 1  # 第 4 步模型未被消耗
+
+        # 熔断后会话锁已释放，历史成对落库，后续正常轮次仍可无缝对话
+        repeat_llm._turns = [{"role": "assistant", "content": "已恢复正常"}]  # type: ignore[assignment]
+        r_next = app_guard.chat("恢复了吗", chat_id="s-rep")
+        assert r_next["reply"] == "已恢复正常"
+    finally:
+        app_guard.close()
+
+    # 2b) max_turn_steps=2 熔断
+    step_llm = ScriptedStreamLLM(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "s1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "s2", "type": "function", "function": {"name": "list_files", "arguments": '{"root":"data/workspace"}'}}]},
+            {"role": "assistant", "content": "不应触发第3步"},
+        ]
+    )
+    app_steps = AssistantApp(data_root=tmp_path / "steps_data", llm=step_llm, max_turn_steps=2)
+    try:
+        r_step = app_steps.chat("步数上限测试", chat_id="s-steps")
+        assert "安全预算上限" in str(r_step["reply"])
+        assert len(step_llm._turns) == 1
+    finally:
+        app_steps.close()
+
+    # 2c) max_turn_tokens=100 熔断
+    token_llm = ScriptedStreamLLM(
+        [
+            [
+                StreamDone(
+                    message={"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
+                    usage=TokenUsage(prompt_tokens=90, cached_tokens=0, completion_tokens=20),
+                )
+            ],
+            [TextDelta(text="不应请求"), StreamDone(message={"role": "assistant", "content": "不应请求"})],
+        ]
+    )
+    app_tok = AssistantApp(data_root=tmp_path / "tok_data", llm=token_llm, max_turn_tokens=100)
+    try:
+        r_tok = app_tok.chat("Token 上限测试", chat_id="s-tok")
+        assert "安全预算上限" in str(r_tok["reply"])
+        assert len(token_llm._turns) == 1
+    finally:
+        app_tok.close()
+
+    # 2d) max_turn_seconds 墙钟超时熔断（注入确定性时钟） + finish_reason == "length" 残缺 tool_calls JSON 熔断
+    now_clock = [100.0]
+
+    # 在第 1 轮返回 tool_call 并推进逻辑时钟越过墙钟上限的假模型
+    class SlowClockLLM(LLMClient):
+        # 初始化调用计数器
+        def __init__(self) -> None:
+            self.calls = 0
+
+        # 第 1 次返回 tool_call 并推进时钟，第 2 次不应被调用
+        def respond(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None) -> dict[str, object]:
+            self.calls += 1
+            now_clock[0] += 12.0
+            return {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]}
+
+    slow_llm = SlowClockLLM()
+    app_wall = AssistantApp(
+        data_root=tmp_path / "wall_data",
+        llm=slow_llm,
+        max_turn_seconds=10.0,
+        clock=lambda: now_clock[0],
+    )
+    try:
+        r_wall = app_wall.chat("超时测试", chat_id="s-wall")
+        assert "安全预算上限" in str(r_wall["reply"])
+        assert slow_llm.calls == 1
+    finally:
+        app_wall.close()
+
+    trunc_llm = ScriptedStreamLLM(
+        [
+            [
+                StreamDone(
+                    message={
+                        "role": "assistant",
+                        "content": None,
+                        "finish_reason": "length",
+                        "tool_calls": [{"id": "tc_bad", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "a.md", "content": "half'}}],
+                    }
+                )
+            ],
+            [StreamDone(message={"role": "assistant", "content": "不应重试残缺工具调用"})],
+        ]
+    )
+    app_trunc = AssistantApp(data_root=tmp_path / "trunc_data", llm=trunc_llm)
+    try:
+        r_trunc = app_trunc.chat("截断工具参数测试", chat_id="s-trunc")
+        assert "安全预算上限" in str(r_trunc["reply"])
+        assert len(trunc_llm._turns) == 1
+    finally:
+        app_trunc.close()
+
+    # 3. 验证 turn_ctx 注入 untrusted_tool_seen 回调（network 工具触发后翻 True、新轮次重置、未声明工具无感），且 close() 触发 plugin_manager.terminate_all()
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "guard_probe.py").write_text(
+        """
+from collections.abc import Callable
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import tool
+
+TERMINATED = False
+
+# 模拟 network 风险工具
+@tool(description="模拟抓取公网内容", parameters={"url": "网址"}, risk="network")
+def mock_net_fetch(url: str) -> str:
+    return f"fetched:{url}"
+
+# 声明接收 untrusted_tool_seen 回调的本地执行探针
+@tool(description="读取当前回合是否出现过 network 工具", parameters={"tag": "标签"}, risk="exec")
+def probe_untrusted(tag: str, *, untrusted_tool_seen: Callable[[], bool] | None = None) -> str:
+    seen = untrusted_tool_seen() if untrusted_tool_seen is not None else "missing"
+    return f"{tag}:{seen}"
+
+# 记录 terminate 钩子调用的插件类
+class ProbeLifecyclePlugin(Plugin):
+    plugin_id = "guard_probe"
+
+    # 注册两个测试工具
+    def initialize(self) -> None:
+        self.context.register_tool(mock_net_fetch, source_name="guard_probe")
+        self.context.register_tool(probe_untrusted, source_name="guard_probe")
+
+    # 标记 terminate 已被 AssistantApp.close() 调用
+    def terminate(self) -> None:
+        global TERMINATED
+        TERMINATED = True
+""",
+        encoding="utf-8",
+    )
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    tools_json = cfg_dir / "tools.json"
+    tools_json.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["mock_net_fetch", "probe_untrusted", "list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    untrusted_llm = ScriptedStreamLLM(
+        [
+            # Turn 1：先调 probe_untrusted(False) -> 再调 mock_net_fetch -> 再调 probe_untrusted(True) -> 最终答复
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "p1", "type": "function", "function": {"name": "probe_untrusted", "arguments": '{"tag":"before"}'}}]},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "n1", "type": "function", "function": {"name": "mock_net_fetch", "arguments": '{"url":"https://example.com"}'}}]},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "p2", "type": "function", "function": {"name": "probe_untrusted", "arguments": '{"tag":"after"}'}}]},
+            {"role": "assistant", "content": "Turn1 完成"},
+            # Turn 2：新回合必须重置为 False
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "p3", "type": "function", "function": {"name": "probe_untrusted", "arguments": '{"tag":"fresh"}'}}]},
+            {"role": "assistant", "content": "Turn2 完成"},
+        ]
+    )
+    logical_today = date(2026, 4, 1)
+    app_plug = AssistantApp(
+        data_root=tmp_path / "plug_data",
+        config_path=tools_json,
+        project_root=tmp_path,
+        llm=untrusted_llm,
+        today_fn=lambda: logical_today,
+    )
+    plugin_mod = app_plug.tools_config.plugin_manager.modules[0][1]  # type: ignore[union-attr]
+    try:
+        # 确认 MemoryConsolidator 绑定了 app._today
+        assert app_plug.consolidator._today_fn is not None
+        assert app_plug.consolidator._today_fn() == date(2026, 4, 1)
+        logical_today = date(2026, 4, 2)
+        assert app_plug.consolidator._today_fn() == date(2026, 4, 2)
+
+        t1 = app_plug.chat("测试 untrusted_tool_seen", chat_id="s-untrusted")
+        assert [c["observation"] for c in t1["tool_calls"]] == ["before:False", "fetched:https://example.com", "after:True"]
+        t2 = app_plug.chat("新一轮应重置", chat_id="s-untrusted")
+        assert [c["observation"] for c in t2["tool_calls"]] == ["fresh:False"]
+        assert plugin_mod.TERMINATED is False
+    finally:
+        app_plug.close()
+    assert plugin_mod.TERMINATED is True
+
+    # 4. 验证 done["cache"] 按 chat_id 隔离（并发两会话不串台）以及 reload_llm 线程安全
+    barrier = threading.Barrier(2, timeout=5.0)
+
+    # 模拟两会话并发响应各自 usage 并交叠返回
+    class ConcurrentCacheLLM(LLMClient):
+        # 初始化线程局部 usage
+        def __init__(self) -> None:
+            self._local = threading.local()
+
+        # 读取当前线程 usage
+        @property
+        def last_usage(self) -> TokenUsage | None:
+            return getattr(self._local, "usage", None)
+
+        # 写入当前线程 usage
+        @last_usage.setter
+        def last_usage(self, value: TokenUsage | None) -> None:
+            self._local.usage = value
+
+        # 按会话内容返回不同 token 用量并等待栅栏交叠
+        def respond(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None) -> dict[str, object]:
+            q = str(messages[-1]["content"])
+            barrier.wait()
+            tok = 111 if q == "问A" else 999
+            self.last_usage = TokenUsage(prompt_tokens=tok, cached_tokens=0, completion_tokens=1)
+            return {"role": "assistant", "content": f"答:{q}"}
+
+    app_conc = AssistantApp(data_root=tmp_path / "conc_data", llm=ConcurrentCacheLLM())
+    try:
+        res_map: dict[str, dict[str, object]] = {}
+
+        # 执行指定会话并保存返回字典
+        def run_sess(cid: str, text: str) -> None:
+            res_map[cid] = app_conc.chat(text, chat_id=cid)
+
+        ta = threading.Thread(target=run_sess, args=("chat-A", "问A"))
+        tb = threading.Thread(target=run_sess, args=("chat-B", "问B"))
+        ta.start()
+        tb.start()
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+        assert res_map["chat-A"]["cache"]["prompt_tokens"] == 111  # type: ignore[index]
+        assert res_map["chat-B"]["cache"]["prompt_tokens"] == 999  # type: ignore[index]
+        assert hasattr(app_conc, "_llm_lock")
+
+        # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及自适应滑窗有界上限（60 条 / 24000 字符）
+        from personal_assistant.assistant.app import _select_adaptive_history
+
+        big_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
+        capped = _select_adaptive_history(big_active)
+        assert len(capped) == 24  # 24 * 1000 == 24000 字符上限
+
+        short_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
+        capped_count = _select_adaptive_history(short_active)
+        assert len(capped_count) == 60
+
+        stream_guard_llm = ScriptedStreamLLM(
+            [
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "sg1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
+                {"role": "assistant", "content": "不应触发第二步"},
+            ]
+        )
+        app_sg = AssistantApp(data_root=tmp_path / "sg_data", llm=stream_guard_llm, max_turn_steps=1)
+        try:
+            sg_frames = list(app_sg.stream_chat("流式步数熔断", chat_id="s-sg"))
+            assert [f["type"] for f in sg_frames] == ["tool_start", "tool_step", "text_delta", "done"]
+            assert "安全预算上限" in str(sg_frames[2]["text"])
+            assert "推理步数达到上限 1" in str(sg_frames[3]["budget_exceeded"])
+        finally:
+            app_sg.close()
+
+        # 6. 验证多线程并发 reload_llm 时受 _llm_lock 保护串行化执行，绝不发生主从模型交错覆盖
+        import time
+
+        app_reload = AssistantApp(data_root=tmp_path / "reload_data", llm=RecordingLLM([]))
+        try:
+            active_reloads = 0
+            max_concurrent_reloads = 0
+            seq = 0
+            probe_lock = threading.Lock()
+            r_errs: list[BaseException] = []
+
+            # 模拟耗时构建主从模型对，并检测是否发生并发重入
+            def fake_from_env(env=None) -> LLMClient:
+                nonlocal active_reloads, max_concurrent_reloads, seq
+                if env is None:
+                    with probe_lock:
+                        active_reloads += 1
+                        max_concurrent_reloads = max(max_concurrent_reloads, active_reloads)
+                        seq += 1
+                        cur_seq = seq
+                    time.sleep(0.02)
+                    llm_obj = RecordingLLM([{"role": "assistant", "content": f"main-{cur_seq}"}])
+                    llm_obj._reload_seq = cur_seq  # type: ignore[attr-defined]
+                    return llm_obj
+                cons_obj = RecordingLLM([{"role": "assistant", "content": f"cons-{seq}"}])
+                cons_obj._reload_seq = seq  # type: ignore[attr-defined]
+                with probe_lock:
+                    active_reloads -= 1
+                return cons_obj
+
+            monkeypatch.setattr("personal_assistant.assistant.app.from_env", fake_from_env)
+            monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "cons-m")
+
+            # 并发触发 reload_llm 并验证主模型与沉淀模型序号始终一致
+            def do_reload() -> None:
+                try:
+                    app_reload.reload_llm()
+                except BaseException as exc:  # noqa: BLE001
+                    r_errs.append(exc)
+
+            rt1 = threading.Thread(target=do_reload)
+            rt2 = threading.Thread(target=do_reload)
+            rt1.start()
+            rt2.start()
+            rt1.join(timeout=5.0)
+            rt2.join(timeout=5.0)
+            assert not r_errs
+            assert max_concurrent_reloads == 1
+            assert app_reload.llm._reload_seq == app_reload.consolidator.llm._reload_seq  # type: ignore[attr-defined]
+        finally:
+            app_reload.close()
+    finally:
+        app_conc.close()
