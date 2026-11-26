@@ -381,3 +381,288 @@ class MemObserverPlugin(Plugin):
         ctx.register_observer("obs1", obs_list_b[0])
     with pytest.raises((TypeError, ValueError)):
         ctx.register_observer("bad", 123)  # type: ignore[arg-type]
+
+
+# 测试自定义 Plugin 与非工具插件在多次 build_tools/app.chat 中仅 initialize() 一次，且工具每轮拿到最新动态上下文
+def test_plugin_initialize_runs_once_while_tools_rebind_dynamic_context(tmp_path: Path) -> None:
+    from personal_assistant.assistant.app import AssistantApp
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "counter_plugins.py").write_text(
+        """
+from pathlib import Path
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool, ToolDocument, ToolMetadata, tool
+
+TOOL_INIT_CALLS = 0
+OBSERVER_INIT_CALLS = 0
+
+
+# 记录运行期动态注入参数的插件工具
+@tool(description="返回当前注入的 before_msg_id 与 db 路径", parameters={"tag": "标签"})
+def peek_turn_ctx(
+    tag: str,
+    *,
+    before_msg_id: int | None = None,
+    history_db_path: Path | None = None,
+) -> str:
+    return f"{tag}:{before_msg_id}:{Path(history_db_path).name if history_db_path else 'none'}"
+
+
+# 测试用工具插件：统计 initialize() 调用次数并注册 @tool 与显式 Tool 两种工具
+class CounterToolPlugin(Plugin):
+    plugin_id = "counter_tools"
+
+    # 首次初始化时累加计数并向主板注册工具
+    def initialize(self) -> None:
+        global TOOL_INIT_CALLS
+        TOOL_INIT_CALLS += 1
+        self.context.register_tool(peek_turn_ctx, source_name="counter_plugins")
+        self.context.register_tool(
+            Tool(
+                name="peek_explicit_tool",
+                description="显式 Tool 上下文探针",
+                parameters={},
+                handler=lambda before_msg_id=None: f"explicit:{before_msg_id}",
+            ),
+            source_name="counter_plugins",
+            metadata=ToolMetadata(risk="read", always_on=True),
+            document=ToolDocument(source_type="plugin", source_name="custom_doc"),
+        )
+
+
+# 测试用非工具观测插件：验证每轮 build_tools 绝不再重新实例化并执行 initialize()
+class CounterObserver:
+    name = "counter_obs"
+
+    # 忽略事件广播
+    def on_event(self, session_key: str, event: object) -> None:
+        return None
+
+    # 返回观测插件自身初始化计数
+    def snapshot(self, *, session_key: str | None = None) -> dict[str, object]:
+        return {"observer_init_calls": OBSERVER_INIT_CALLS}
+
+
+# 测试用非工具插件子类
+class CounterObserverPlugin(Plugin):
+    plugin_id = "counter_obs"
+
+    # 注册观测器工厂并统计初始化次数
+    def initialize(self) -> None:
+        global OBSERVER_INIT_CALLS
+        OBSERVER_INIT_CALLS += 1
+        self.context.register_observer("counter_obs", lambda _cfg: CounterObserver())
+""",
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "config" / "tools.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["peek_turn_ctx"],
+                "plugins": ["plugins"],
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = ToolsConfig.load(cfg_path, project_root=tmp_path)
+    mod = cfg.plugin_manager.modules[0][1]
+    assert mod.TOOL_INIT_CALLS == 1
+    assert mod.OBSERVER_INIT_CALLS == 1
+
+    # 1. 多次 build_tools(ctx) 绝不再触发 initialize()，且每轮动态上下文与元数据完整生效
+    reg1 = cfg.build_registry(data_root=tmp_path / "data", tool_context={"before_msg_id": 10})
+    reg2 = cfg.build_registry(data_root=tmp_path / "data", tool_context={"before_msg_id": 25})
+    assert mod.TOOL_INIT_CALLS == 1
+    assert mod.OBSERVER_INIT_CALLS == 1
+    assert reg1.execute("peek_turn_ctx", '{"tag": "t1"}') == "t1:10:none"
+    assert reg2.execute("peek_turn_ctx", '{"tag": "t2"}') == "t2:25:none"
+    assert reg1.execute("peek_explicit_tool", "{}") == "explicit:10"
+    assert reg2.execute("peek_explicit_tool", "{}") == "explicit:25"
+    assert reg2.document("peek_explicit_tool").source_name == "custom_doc"  # type: ignore[union-attr]
+    assert reg2.metadata("peek_explicit_tool").always_on is True  # type: ignore[union-attr]
+
+    # 2. 跨多轮 AssistantApp.chat() 与 status()：initialize() 仍严格保持 1 次，before_msg_id 逐轮递增
+    llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r1"}'}}
+                ],
+            },
+            {"role": "assistant", "content": "第1轮完成"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c2", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r2"}'}}
+                ],
+            },
+            {"role": "assistant", "content": "第2轮完成"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c3", "type": "function", "function": {"name": "peek_explicit_tool", "arguments": "{}"}}
+                ],
+            },
+            {"role": "assistant", "content": "第3轮完成"},
+        ]
+    )
+    app = AssistantApp(data_root=tmp_path / "app_data", config_path=cfg_path, project_root=tmp_path, llm=llm)
+    try:
+        app_mod = app.tools_config.plugin_manager.modules[0][1]  # type: ignore[union-attr]
+        # 新建 AssistantApp 时再次执行 ToolsConfig.load 初始化 1 次（累计 2 次），后续每轮对话不得再递增
+        assert app_mod.TOOL_INIT_CALLS == 2
+        assert app_mod.OBSERVER_INIT_CALLS == 2
+
+        t1 = app.chat("第一句", chat_id="s1")
+        t2 = app.chat("第二句", chat_id="s1")
+        t3 = app.chat("第三句", chat_id="s1")
+        _ = app.status()
+
+        assert app_mod.TOOL_INIT_CALLS == 2
+        assert app_mod.OBSERVER_INIT_CALLS == 2
+        assert t1["tool_calls"][0]["observation"] == "r1:1:chat_history.sqlite3"
+        assert t2["tool_calls"][0]["observation"] == "r2:3:chat_history.sqlite3"
+        assert t3["tool_calls"][0]["observation"] == "explicit:5"
+    finally:
+        app.close()
+
+    # 3. 验证项目自带 5 个真实插件在真实 config/tools.json 下多轮调用同样只初始化一次
+    real_cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
+    for msg_id in (1, 3, 5):
+        reg = real_cfg.build_registry(data_root=tmp_path / "real", tool_context={"before_msg_id": msg_id})
+        assert "search_chat_history" in reg.names
+
+
+# 测试自定义 Tool 子类保留子类类型/重写 run/always_on 且不污染 **values，以及省略 source_name 的函数工具重绑与 base_context 合并
+def test_custom_tool_subclass_preserved_and_base_context_merged(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import Tool, ToolMetadata, ToolRegistry
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "subclass_and_fn_plugin.py").write_text(
+        """
+from collections.abc import Mapping
+from pathlib import Path
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool, ToolMetadata, build_tool
+
+
+# 真正的自定义 Tool 子类（重写 run 且含 **values），绝不能被 build_tool 洗壳或注入上下文参数
+class StrictSubclassTool(Tool):
+    # 直接校验只收到模型声明的 text 参数，绝无 project_root/data_root 混入
+    def run(self, **values: str) -> str:
+        assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
+        return f"subclass:{self.name}:{values['text']}"
+
+
+# 测试用函数型工具：省略 source_name 注册时也必须能动态绑定 data_root / config_path / web_config
+def probe_omitted_source(
+    tag: str,
+    *,
+    data_root: Path | None = None,
+    config_path: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+    before_msg_id: int | None = None,
+) -> str:
+    data_name = Path(data_root).name if data_root is not None else "none"
+    cfg_name = Path(config_path).name if config_path is not None else "none"
+    timeout_val = web_config.get("timeout") if web_config is not None else "none"
+    return f"{tag}:{data_name}:{cfg_name}:{timeout_val}:{before_msg_id}"
+
+
+FN_BUILT_TOOL = build_tool(
+    probe_omitted_source,
+    description="省略 source_name 的 build_tool 产物",
+    parameters={"tag": "标签"},
+)
+
+
+# 同时注册自定义 Tool 子类（带/不带 source_name）与省略 source_name 的函数型工具
+class MixedCustomPlugin(Plugin):
+    plugin_id = "mixed_custom"
+
+    # 注册三类工具
+    def initialize(self) -> None:
+        self.context.register_tool(
+            StrictSubclassTool(
+                name="sub_with_src",
+                description="带 source_name 的自定义子类",
+                parameters={"text": "文本"},
+            ),
+            source_name="subclass_src",
+            metadata=ToolMetadata(risk="read", always_on=True),
+        )
+        self.context.register_tool(
+            StrictSubclassTool(
+                name="sub_no_src",
+                description="省略 source_name 的自定义子类",
+                parameters={"text": "文本"},
+            ),
+            metadata=ToolMetadata(risk="exec", always_on=True),
+        )
+        self.context.register_tool(FN_BUILT_TOOL)
+""",
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "tools.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+    manager = PluginManager.from_entries(
+        ["plugins/subclass_and_fn_plugin.py"],
+        tmp_path,
+        context={
+            "project_root": tmp_path,
+            "config_path": cfg_path,
+            "raw_config": {"web": {"timeout": 9}},
+        },
+    )
+    mod = manager.modules[0][1]
+
+    # 局部上下文仅传 data_root 与 extra_bindings，必须保留 base_context 中的 config_path 与 web_config
+    reg = ToolRegistry(allowed_names=["probe_omitted_source"])
+    manager.register_into(
+        reg,
+        context={
+            "data_root": tmp_path / "data_turn_a",
+            "extra_bindings": {"before_msg_id": 31},
+        },
+    )
+
+    # 自定义子类保持原子类类型、always_on=True 常驻激活，且 **values 不被上下文参数污染
+    assert set(reg.names) == {"probe_omitted_source", "sub_with_src", "sub_no_src"}
+    sub_a = reg._tools["sub_with_src"]
+    sub_b = reg._tools["sub_no_src"]
+    assert type(sub_a) is mod.StrictSubclassTool
+    assert type(sub_b) is mod.StrictSubclassTool
+    assert reg.metadata("sub_with_src").always_on is True  # type: ignore[union-attr]
+    assert reg.metadata("sub_no_src").risk == "exec"  # type: ignore[union-attr]
+    assert reg.document("sub_with_src").source_name == "subclass_src"  # type: ignore[union-attr]
+    assert reg.document("sub_no_src").source_name == "mixed_custom"  # type: ignore[union-attr]
+    assert reg.execute("sub_with_src", '{"text": "ok"}') == "subclass:sub_with_src:ok"
+    assert reg.execute("sub_no_src", '{"text": "ok"}') == "subclass:sub_no_src:ok"
+
+    # 省略 source_name 的函数型工具同样在 build_tools(ctx) 中拿到动态覆盖 + 初始 base_context
+    assert reg.execute("probe_omitted_source", '{"tag": "t1"}') == "t1:data_turn_a:tools.json:9:31"
+
+    reg2 = ToolRegistry(allowed_names=["probe_omitted_source"])
+    manager.register_into(
+        reg2,
+        context={
+            "data_root": tmp_path / "data_turn_b",
+            "extra_bindings": {"before_msg_id": 45},
+        },
+    )
+    assert reg2.execute("probe_omitted_source", '{"tag": "t2"}') == "t2:data_turn_b:tools.json:9:45"
+    assert reg2._tools["sub_with_src"] is not sub_a

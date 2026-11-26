@@ -1,6 +1,7 @@
 """Layer 2 统一插件主板（Plugin ABC + PluginContext）与内层强类型极简子协议（RetrieverProtocol / ConfigCompilerProtocol / LLMProviderProtocol）。"""
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import sys
@@ -109,6 +110,50 @@ class ObserverProtocol(Protocol):
     def snapshot(self, *, session_key: str | None = None) -> dict[str, object]: ...
 
 
+# 缓存插件首次 initialize() 收集到的工具注册规格，区分函数型工具与自定义 Tool 子类
+@dataclass(frozen=True)
+class _PluginToolSpec:
+    raw_tool: Tool
+    is_function_tool: bool
+    source_name: str | None
+    metadata: ToolMetadata | None
+    document: ToolDocument | None
+
+
+# 判断传入对象是否为函数型工具（@tool / build_tool 产物或带 handler 的基类 Tool），区分于自定义 Tool 子类
+def _is_function_tool(item: Tool | Callable[..., str]) -> bool:
+    return (
+        not isinstance(item, Tool)
+        or hasattr(item, "_raw_fn")
+        or (type(item) is Tool and item.handler is not None)
+    )
+
+
+# 克隆自定义 Tool 子类实例并挂载元数据与来源文档，完整保留子类重写 run() 且不混入额外上下文参数
+def _clone_custom_tool(
+    item: Tool,
+    *,
+    source_name: str | None = None,
+    metadata: ToolMetadata | None = None,
+    document: ToolDocument | None = None,
+) -> tuple[Tool, ToolMetadata, ToolDocument]:
+    resolved_meta = metadata or getattr(item, "__tool_metadata__", None) or ToolMetadata()
+    existing_doc = getattr(item, "__tool_document__", None)
+    if document is not None:
+        resolved_doc = document
+    elif existing_doc is not None and source_name is None:
+        resolved_doc = existing_doc
+    else:
+        resolved_doc = ToolDocument(
+            source_type=getattr(existing_doc, "source_type", "plugin") if existing_doc else "plugin",
+            source_name=source_name or getattr(existing_doc, "source_name", "plugin") or "plugin",
+        )
+    cloned = copy.copy(item)
+    object.__setattr__(cloned, "__tool_metadata__", resolved_meta)
+    object.__setattr__(cloned, "__tool_document__", resolved_doc)
+    return cloned, resolved_meta, resolved_doc
+
+
 # 插件主板上下文（PluginContext）：统一向所有 Plugin 子类提供系统资源与 5 个标准子协议插槽
 @dataclass
 class PluginContext:
@@ -119,6 +164,8 @@ class PluginContext:
     raw_config: Mapping[str, object] = field(default_factory=dict)
     extra_bindings: Mapping[str, object] = field(default_factory=dict)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+    tool_specs: list[_PluginToolSpec] = field(default_factory=list)
+    active_plugin_id: str = ""
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
@@ -144,7 +191,7 @@ class PluginContext:
         )
         return bindings
 
-    # 插槽 1：向主板 ToolRegistry 注册一个 Tool 子类实例或 @tool 函数（自动通过 build_tool 绑定当前上下文）
+    # 插槽 1：向主板 ToolRegistry 注册工具（函数型工具按签名重绑上下文；自定义 Tool 子类保留原样与元数据）
     def register_tool(
         self,
         item: Tool | Callable[..., str],
@@ -153,17 +200,53 @@ class PluginContext:
         metadata: ToolMetadata | None = None,
         document: ToolDocument | None = None,
     ) -> None:
-        raw_tool = extract_tool(item)
-        if source_name is not None or not isinstance(item, Tool):
-            src = source_name or getattr(getattr(raw_tool, "__tool_document__", None), "source_name", "plugin")
+        if _is_function_tool(item):
+            raw_tool = extract_tool(item)
+            existing_doc = getattr(raw_tool, "__tool_document__", None)
+            existing_src = getattr(existing_doc, "source_name", None)
+            src = (
+                source_name
+                or self.active_plugin_id
+                or (existing_src if existing_src and existing_src != "core" else None)
+                or "plugin"
+            )
             normalized = _normalize_plugin_tool(
                 raw_tool,
                 source_name=src,
                 context=self.tool_bindings(),
+                metadata=metadata,
+                document=document,
             )
-        else:
-            normalized = raw_tool
-        self.tool_registry.register(normalized, metadata=metadata, document=document)
+            self.tool_registry.register(normalized, metadata=metadata, document=document)
+            self.tool_specs.append(
+                _PluginToolSpec(
+                    raw_tool=raw_tool,
+                    is_function_tool=True,
+                    source_name=src,
+                    metadata=metadata,
+                    document=document,
+                )
+            )
+            return
+
+        assert isinstance(item, Tool)
+        src_hint = source_name or self.active_plugin_id or None
+        cloned, resolved_meta, resolved_doc = _clone_custom_tool(
+            item,
+            source_name=src_hint,
+            metadata=metadata,
+            document=document,
+        )
+        self.tool_registry.register(cloned, metadata=resolved_meta, document=resolved_doc)
+        self.tool_specs.append(
+            _PluginToolSpec(
+                raw_tool=item,
+                is_function_tool=False,
+                source_name=src_hint,
+                metadata=metadata,
+                document=document,
+            )
+        )
 
     # 插槽 2：向主板注册检索引擎子协议实现（支持传入 RetrieverProtocol 实例或工厂函数）
     def register_retriever(
@@ -334,8 +417,10 @@ def _normalize_plugin_tool(
     source_name: str,
     *,
     context: Mapping[str, object] | None = None,
+    metadata: ToolMetadata | None = None,
+    document: ToolDocument | None = None,
 ) -> Tool:
-    meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
+    meta = metadata or getattr(item, "__tool_metadata__", None) or ToolMetadata()
     raw_fn = getattr(item, "_raw_fn", None) or item.handler or item.run
     return build_tool(
         raw_fn,
@@ -345,8 +430,8 @@ def _normalize_plugin_tool(
         param_enums=item.param_enums,
         risk=meta.risk,
         always_on=meta.always_on,
-        source_type="plugin",
-        source_name=source_name,
+        source_type=document.source_type if document is not None else "plugin",
+        source_name=document.source_name if document is not None else source_name,
         context=context,
     )
 
@@ -381,7 +466,12 @@ def _initialize_modules(
         if plugin_classes:
             for plugin_cls in plugin_classes:
                 instance = plugin_cls(context)
-                instance.initialize()
+                prev_id = context.active_plugin_id
+                context.active_plugin_id = getattr(plugin_cls, "plugin_id", "").strip()
+                try:
+                    instance.initialize()
+                finally:
+                    context.active_plugin_id = prev_id
                 active_plugins.append(instance)
         else:
             auto_plugin = _AutoScriptPlugin(context, module, file_path)
@@ -400,6 +490,9 @@ class PluginManager(ToolsetProvider):
     compilers: dict[str, ConfigCompilerProtocol]
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
     plugins: tuple[Plugin, ...] = ()
+    tool_specs: tuple[_PluginToolSpec, ...] = ()
+    project_root: Path | None = None
+    base_context: Mapping[str, object] = field(default_factory=dict)
     source_type: str = "plugin"
     source_name: str = "plugins"
 
@@ -418,7 +511,8 @@ class PluginManager(ToolsetProvider):
             module = _import_plugin_module(file_path)
             loaded_modules.append((file_path, module))
 
-        ctx = cls._build_plugin_context(root, context)
+        base_ctx = dict(context) if context else {}
+        ctx = cls._build_plugin_context(root, base_ctx)
         active_plugins = _initialize_modules(loaded_modules, ctx)
         return cls(
             modules=tuple(loaded_modules),
@@ -428,6 +522,9 @@ class PluginManager(ToolsetProvider):
             compilers=dict(ctx.compilers),
             observers=dict(ctx.observers),
             plugins=tuple(active_plugins),
+            tool_specs=tuple(ctx.tool_specs),
+            project_root=root,
+            base_context=base_ctx,
         )
 
     # 将外部传入的上下文字典组装为强类型 PluginContext
@@ -465,15 +562,46 @@ class PluginManager(ToolsetProvider):
     def tools(self) -> list[Tool]:
         return list(self.default_tools)
 
-    # 按给定运行时上下文构造 PluginContext 并执行全部 Plugin.initialize()，产出绑定好实例资源的 Tool 列表
+    # 按给定运行时上下文基于缓存的原始工具定义重新绑定实例资源，不再重跑全部 Plugin.initialize()
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         if context is None:
             return list(self.default_tools)
-        raw_proj = context.get("project_root")
-        proj = Path(str(raw_proj)).resolve() if isinstance(raw_proj, (str, Path)) else Path.cwd()
-        ctx = self._build_plugin_context(proj, context)
-        _initialize_modules(self.modules, ctx)
-        return list(ctx.tool_registry)
+        if not self.tool_specs:
+            return list(self.default_tools)
+        merged_ctx: dict[str, object] = dict(self.base_context)
+        merged_ctx.update(context)
+        base_extra = self.base_context.get("extra_bindings")
+        turn_extra = context.get("extra_bindings")
+        if isinstance(base_extra, Mapping) and isinstance(turn_extra, Mapping):
+            merged_ctx["extra_bindings"] = {**base_extra, **turn_extra}
+        raw_proj = merged_ctx.get("project_root")
+        proj = (
+            Path(str(raw_proj)).resolve()
+            if isinstance(raw_proj, (str, Path))
+            else (self.project_root or Path.cwd())
+        )
+        bindings = self._build_plugin_context(proj, merged_ctx).tool_bindings()
+        tools: list[Tool] = []
+        for spec in self.tool_specs:
+            if spec.is_function_tool:
+                tools.append(
+                    _normalize_plugin_tool(
+                        spec.raw_tool,
+                        source_name=spec.source_name or "plugin",
+                        context=bindings,
+                        metadata=spec.metadata,
+                        document=spec.document,
+                    )
+                )
+            else:
+                cloned, _, _ = _clone_custom_tool(
+                    spec.raw_tool,
+                    source_name=spec.source_name,
+                    metadata=spec.metadata,
+                    document=spec.document,
+                )
+                tools.append(cloned)
+        return tools
 
     # 统一触发全部已加载 Plugin 实例的 terminate() 停止清理钩子
     def terminate_all(self) -> None:

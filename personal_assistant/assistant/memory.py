@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -160,6 +161,7 @@ class MemoryStore:
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.retriever = retriever
+        self._write_lock = threading.RLock()
         if policy is None:
             proj = self.data_root.parent
             self.policy = FilesPolicy(
@@ -643,63 +645,98 @@ class MemoryStore:
         if len(content.encode("utf-8")) > self.policy.max_write_bytes:
             raise ValueError(f"内容超过 {self.policy.max_write_bytes} 字节写入上限。")
         target = self.resolve_path(path, write=True)
-        if target.exists() and target.is_dir():
-            raise ValueError("目标路径是目录，不能写入文件。")
-        if mode == "create" and target.exists():
-            raise ValueError("目标文件已存在；create 模式不会覆盖，请换路径或使用 overwrite。")
 
-        backup_rel: str | None = None
-        if mode == "overwrite" and target.exists():
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            backup = self.workspace_dir / ".backups" / f"{stamp}-{target.name}"
-            counter = 2
-            while backup.exists():
-                backup = self.workspace_dir / ".backups" / f"{stamp}-{counter}-{target.name}"
-                counter += 1
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, backup)
-            backup_rel = self._to_display_path(backup)
+        with self._write_lock:
+            if target.exists() and target.is_dir():
+                raise ValueError("目标路径是目录，不能写入文件。")
+            if mode == "create" and target.exists():
+                raise ValueError("目标文件已存在；create 模式不会覆盖，请换路径或使用 overwrite。")
 
-        _atomic_write(target, content)
-        rel_path = self._to_display_path(target)
-        self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
-        return rel_path
+            backup_rel: str | None = None
+            if mode == "overwrite" and target.exists():
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup = self.workspace_dir / ".backups" / f"{stamp}-{target.name}"
+                counter = 2
+                while backup.exists():
+                    backup = self.workspace_dir / ".backups" / f"{stamp}-{counter}-{target.name}"
+                    counter += 1
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                backup_rel = self._to_display_path(backup)
+
+            _atomic_write(target, content)
+            rel_path = self._to_display_path(target)
+            self.record_audit(action="write_file", actor="agent", target=rel_path, old_value=backup_rel, new_value=f"{len(content)} chars ({mode})")
+            return rel_path
 
     # 确保指定记忆文件已在 MEMORY.md 索引中登记一次，避免重复改写索引破坏 KV Cache
     def _ensure_index_entry(self, target_path: str, entry_line: str) -> None:
-        existing = (
-            self.memory_file.read_text(encoding="utf-8")
-            if self.memory_file.is_file()
-            else "# 记忆索引 (MEMORY.md)\n\n"
-        )
-        if target_path in existing or f"/{Path(target_path).name})" in existing:
-            return
-        sep = "" if not existing or existing.endswith("\n") else "\n"
-        _atomic_write(self.memory_file, f"{existing}{sep}{entry_line}\n")
+        with self._write_lock:
+            existing = (
+                self.memory_file.read_text(encoding="utf-8")
+                if self.memory_file.is_file()
+                else "# 记忆索引 (MEMORY.md)\n\n"
+            )
+            if target_path in existing or f"/{Path(target_path).name})" in existing:
+                return
+            sep = "" if not existing or existing.endswith("\n") else "\n"
+            _atomic_write(self.memory_file, f"{existing}{sep}{entry_line}\n")
 
-    # 将用户原话按时间戳与消息编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
-    def remember_user_statement(self, user_text: str, message_id: int | None = None) -> str:
+    # 将用户原话按时间戳与消息/回合编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
+    def remember_user_statement(
+        self,
+        user_text: str,
+        message_id: int | None = None,
+        *,
+        turn_tag: str | None = None,
+    ) -> str:
         clean = " ".join(user_text.split())
         if not clean:
             raise ValueError("要记住的内容不能为空。")
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        existing = (
-            self.facts_file.read_text(encoding="utf-8")
-            if self.facts_file.is_file()
-            else "# 事实备忘 (facts.md)\n\n"
-        )
-        if message_id is not None and f"(msg#{message_id})" in existing:
+        with self._write_lock:
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
+            existing = (
+                self.facts_file.read_text(encoding="utf-8")
+                if self.facts_file.is_file()
+                else "# 事实备忘 (facts.md)\n\n"
+            )
+            if message_id is not None and f"(msg#{message_id})" in existing:
+                return "data/memory/facts.md"
+            if turn_tag and f"(turn#{turn_tag})" in existing:
+                return "data/memory/facts.md"
+            stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+            if message_id is not None:
+                tag = f" (msg#{message_id})"
+            elif turn_tag:
+                tag = f" (turn#{turn_tag})"
+            else:
+                tag = ""
+            sep = "" if not existing or existing.endswith("\n") else "\n"
+            _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
+            self._ensure_index_entry(
+                "data/memory/facts.md",
+                "- [事实备忘](data/memory/facts.md) — 通过 remember_fact 记录的长期事实，需要时请按需检索",
+            )
+            self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
             return "data/memory/facts.md"
-        stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
-        tag = f" (msg#{message_id})" if message_id is not None else ""
-        sep = "" if not existing or existing.endswith("\n") else "\n"
-        _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
-        self._ensure_index_entry(
-            "data/memory/facts.md",
-            "- [事实备忘](data/memory/facts.md) — 通过 remember_fact 记录的长期事实，需要时请按需检索",
-        )
-        self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
-        return "data/memory/facts.md"
+
+    # 提交或回滚流内暂存的 (turn#...) 事实标记：成功时绑定正式 (msg#<id>)，失败中断时移除未提交行
+    def finalize_turn_fact(self, turn_tag: str, *, message_id: int | None) -> None:
+        if not turn_tag:
+            return
+        marker = f"(turn#{turn_tag})"
+        with self._write_lock:
+            if not self.facts_file.is_file():
+                return
+            content = self.facts_file.read_text(encoding="utf-8")
+            if marker not in content:
+                return
+            if message_id is not None:
+                _atomic_write(self.facts_file, content.replace(marker, f"(msg#{message_id})"))
+                return
+            kept = [line for line in content.splitlines() if marker not in line]
+            rebuilt = "\n".join(kept).rstrip()
+            _atomic_write(self.facts_file, f"{rebuilt}\n" if rebuilt else "")
 
     # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
@@ -711,59 +748,63 @@ class MemoryStore:
         *,
         today: date | None = None,
     ) -> str | None:
-        return apply_topic_operations(
-            self.memory_dir,
-            topic=topic,
-            title=title,
-            index_summary=index_summary,
-            operations=operations,
-            write_fn=_atomic_write,
-            ensure_index_fn=self._ensure_index_entry,
-            audit_fn=self.record_audit,
-            archive_dir=self.archive_dir,
-            today=today,
-        )
+        with self._write_lock:
+            return apply_topic_operations(
+                self.memory_dir,
+                topic=topic,
+                title=title,
+                index_summary=index_summary,
+                operations=operations,
+                write_fn=_atomic_write,
+                ensure_index_fn=self._ensure_index_entry,
+                audit_fn=self.record_audit,
+                archive_dir=self.archive_dir,
+                today=today,
+            )
 
     # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md
     def archive_expired_memories(self, today: date | None = None) -> dict[str, int]:
-        return archive_expired_topics(
-            self.memory_dir,
-            self.archive_dir,
-            write_fn=_atomic_write,
-            audit_fn=self.record_audit,
-            ensure_index_fn=self._ensure_index_entry,
-            today=today,
-        )
+        with self._write_lock:
+            return archive_expired_topics(
+                self.memory_dir,
+                self.archive_dir,
+                write_fn=_atomic_write,
+                audit_fn=self.record_audit,
+                ensure_index_fn=self._ensure_index_entry,
+                today=today,
+            )
 
     # 清理 facts.md 中已被本次沉淀规范化吸收的原始 (msg#...) 裸行，防止残留无有效期副本
     def prune_consolidated_raw_facts(
         self, batch_msg_ids: set[int], written_texts: list[str]
     ) -> int:
-        return prune_raw_facts_for_batch(
-            self.memory_dir,
-            batch_msg_ids,
-            written_texts,
-            write_fn=_atomic_write,
-            audit_fn=self.record_audit,
-        )
+        with self._write_lock:
+            return prune_raw_facts_for_batch(
+                self.memory_dir,
+                batch_msg_ids,
+                written_texts,
+                write_fn=_atomic_write,
+                audit_fn=self.record_audit,
+            )
 
     # 将一条行为规则保存为 data/memory/rules/ 下独立可读的 Markdown 文件
     def save_rule(self, statement: str, source: str = "agent") -> Path:
         clean = " ".join(statement.split())
         if not clean:
             raise ValueError("规则内容不能为空。")
-        self.rules_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        slug = re.sub(r"[^\w]+", "-", clean).strip("-").lower() or "rule"
-        path = self.rules_dir / f"{timestamp}-{slug[:40]}.md"
-        counter = 2
-        while path.exists():
-            path = self.rules_dir / f"{timestamp}-{slug[:36]}-{counter}.md"
-            counter += 1
-        body = f"# Rule: {clean}\n\n- Statement: {clean}\n- Source: {source}\n- Created: {datetime.now(UTC).isoformat()}\n"
-        _atomic_write(path, body)
-        self.record_audit(action="save_rule", actor=source, target=f"data/memory/rules/{path.name}", old_value=None, new_value=clean)
-        return path
+        with self._write_lock:
+            self.rules_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            slug = re.sub(r"[^\w]+", "-", clean).strip("-").lower() or "rule"
+            path = self.rules_dir / f"{timestamp}-{slug[:40]}.md"
+            counter = 2
+            while path.exists():
+                path = self.rules_dir / f"{timestamp}-{slug[:36]}-{counter}.md"
+                counter += 1
+            body = f"# Rule: {clean}\n\n- Statement: {clean}\n- Source: {source}\n- Created: {datetime.now(UTC).isoformat()}\n"
+            _atomic_write(path, body)
+            self.record_audit(action="save_rule", actor=source, target=f"data/memory/rules/{path.name}", old_value=None, new_value=clean)
+            return path
 
     # 向 data/memory/audit.jsonl 追加一条写入或记忆变更审计日志
     def record_audit(
@@ -778,16 +819,18 @@ class MemoryStore:
             "old_value": old_value,
             "new_value": new_value,
         }
-        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.audit_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with self._write_lock:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry
 
     # 读取最近 limit 条记忆与文件操作审计记录
     def audit_entries(self, limit: int = 50) -> list[dict[str, object]]:
-        if not self.audit_path.is_file():
-            return []
-        lines = [line for line in self.audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with self._write_lock:
+            if not self.audit_path.is_file():
+                return []
+            lines = [line for line in self.audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         return [json.loads(line) for line in lines[-limit:]]
 
 
@@ -802,22 +845,29 @@ class MemoryToolsetProvider(ToolsetProvider):
     source_type = "builtin"
     source_name = "memory"
 
-    # 绑定当前实例的 MemoryStore、用户消息回调与逻辑时钟回调
+    # 绑定当前实例的 MemoryStore、用户消息回调、逻辑时钟回调与流式回合暂存标记
     def __init__(
         self,
         memory: MemoryStore,
         get_user_message: Callable[[], tuple[str, int | None]] | None = None,
         get_today: Callable[[], date] | None = None,
+        *,
+        turn_tag: str | None = None,
+        on_remember: Callable[[], None] | None = None,
     ) -> None:
         self.memory = memory
         self.get_user_message = get_user_message
         self.get_today = get_today
+        self.turn_tag = turn_tag
+        self.on_remember = on_remember
 
     # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
     def tools(self) -> list[Tool]:
         memory = self.memory
         get_user_message = self.get_user_message
         get_today = self.get_today
+        turn_tag = self.turn_tag
+        on_remember = self.on_remember
 
         # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
         def search_markdown(query: str, root: str = "data/memory") -> str:
@@ -842,7 +892,13 @@ class MemoryToolsetProvider(ToolsetProvider):
             if get_user_message is None:
                 raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
             user_text, message_id = get_user_message()
-            target = memory.remember_user_statement(user_text, message_id=message_id)
+            target = memory.remember_user_statement(
+                user_text,
+                message_id=message_id,
+                turn_tag=turn_tag,
+            )
+            if on_remember is not None:
+                on_remember()
             return f"已记录用户原话到 {target}"
 
         # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
