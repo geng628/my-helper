@@ -203,8 +203,11 @@ class ToolsetProvider:
         *,
         context: Mapping[str, object] | None = None,
     ) -> None:
+        default_doc = ToolDocument()
+        provider_doc = ToolDocument(source_type=self.source_type, source_name=self.source_name)
         for item in self.build_tools(context=context):
-            registry.register(item, metadata=item.metadata, document=item.document)
+            doc = provider_doc if item.document == default_doc else item.document
+            registry.register(item, metadata=item.metadata, document=doc)
 
 
 # 装饰器：将普通 Python 函数统一通过 build_tool 包装为纯净 Tool 实例，同时保持原函数可直接调用
@@ -372,7 +375,11 @@ class ToolRegistry:
             if parsed:
                 return {}, f"{item.name} 不接受参数，请传空对象 {{}}。"
             return {}, ""
-        required_keys = set(item.parameters) if item.required is None else set(item.required)
+        required_keys = (
+            set(item.parameters)
+            if item.required is None
+            else (set(item.required) & set(item.parameters))
+        )
         if any(k not in item.parameters for k in parsed) or any(k not in parsed for k in required_keys):
             return {}, f"{item.name} 需要参数：{', '.join(item.parameters)}。"
         clean: dict[str, str] = {}

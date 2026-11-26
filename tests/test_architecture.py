@@ -396,21 +396,16 @@ def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None
                     assert bad not in node.value, (
                         f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 泄漏业务字面量 {bad!r}：{node.value!r}"
                     )
-            if isinstance(node, ast.Call):
-                if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "__setattr__"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "object"
-                ):
-                    raise AssertionError(
-                        f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止调用 object.__setattr__"
-                    )
-                if (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "type"
-                    and len(node.args) == 3
-                ):
-                    raise AssertionError(
-                        f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止动态 type() 造类"
-                    )
+            if isinstance(node, ast.Attribute) and node.attr == "__setattr__":
+                raise AssertionError(
+                    f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止访问 __setattr__"
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "type"
+                and (len(node.args) != 1 or bool(node.keywords))
+            ):
+                raise AssertionError(
+                    f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止动态 type() 造类"
+                )

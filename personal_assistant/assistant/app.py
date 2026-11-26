@@ -23,6 +23,7 @@ from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
 from personal_assistant.ai.types import TextDelta, ThinkingDelta
+from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
@@ -30,11 +31,8 @@ from personal_assistant.assistant.consolidator import (
     MemoryConsolidator,
 )
 from personal_assistant.assistant.db import StateStore
-from personal_assistant.assistant.memory import (
-    FilesPolicy,
-    MemoryStore,
-    MemoryToolsetProvider,
-)
+from personal_assistant.assistant.files_policy import FilesPolicy
+from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.assistant.prompts import format_system_prompt
 
 MAX_HISTORY_MESSAGES = 20
@@ -159,6 +157,7 @@ class AssistantApp:
             self.consolidator,
             on_event=self._emit_event,
         )
+        self._tool_registry = self._build_base_registry()
 
     # 安全向所有已装配观测插件广播运行期事件，确保任何插件异常不拖垮微内核
     def _emit_event(self, session_key: str, event: RuntimeEvent) -> None:
@@ -284,7 +283,20 @@ class AssistantApp:
             return self._today_fn()
         return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
-    # 为单轮对话构建受白名单管控的统一工具注册表（汇聚 MemoryToolsetProvider、PluginManager 与 CommandToolWrapper）
+    # 在应用启动时一次性构建受白名单管控的常驻工具注册表（跨轮复用，动态上下文走执行期 tool_context）
+    def _build_base_registry(self) -> ToolRegistry:
+        provider = MemoryToolsetProvider(self.memory, get_today=self._today)
+        if self.tools_config is not None:
+            return self.tools_config.build_registry(
+                providers=[provider],
+                data_root=self.data_root,
+                tool_context={"history_db_path": self.state.db_path},
+            )
+        registry = ToolRegistry()
+        registry.register_provider(provider)
+        return registry
+
+    # 构建隔离的工具注册表快照（供外部调用方或单测独立使用；主对话循环直接复用 self._tool_registry）
     def build_tools(
         self,
         user_text: str = "",
@@ -491,12 +503,15 @@ class AssistantApp:
 
             turn_persisted = False
             try:
-                registry = self.build_tools(
-                    user_text=clean_text,
-                    before_msg_id=before_msg_id,
-                    turn_tag=turn_tag,
-                    on_remember=_mark_fact_used,
-                )
+                registry = self._tool_registry
+                turn_ctx: dict[str, object] = {
+                    "user_text": clean_text,
+                    "before_msg_id": before_msg_id,
+                    "turn_tag": turn_tag,
+                    "on_remember": _mark_fact_used,
+                    "today": self._today(),
+                    "history_db_path": self.state.db_path,
+                }
                 system_prompt = self.get_session_system_prompt(chat_id, registry)
                 summary_text = str(compaction.get("summary") or "").strip()
                 messages = self._assemble_context_messages(
@@ -513,6 +528,7 @@ class AssistantApp:
                     messages,
                     registry,
                     convert_to_llm=self._convert_context_to_llm,
+                    tool_context=turn_ctx,
                 ):
                     self._emit_event(chat_id, event)
                     if on_event is not None:
@@ -616,13 +632,12 @@ class AssistantApp:
             if self.memory.memory_dir.is_dir()
             else 0
         )
-        registry = self.build_tools()
         return {
             "status": "ok",
             "llm_configured": not isinstance(self.llm, NoopLLMClient),
             "memory_files": memory_count,
             "messages": self.state.count_messages(),
-            "tools": registry.names,
+            "tools": self._tool_registry.names,
             "plugins": list(self.tools_config.plugins) if self.tools_config else [],
             "retriever": str(getattr(self.memory.retriever, "name", "linear")),
             "observers": [obs.name for obs in self.observers],

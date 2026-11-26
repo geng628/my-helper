@@ -640,3 +640,89 @@ def test_chat_turn_lock_interrupt_during_acquire_does_not_leak_refs(
         assert app._chat_locks["lock-err"][1] == 0
     finally:
         app.close()
+
+
+# 测试 AssistantApp 启动时单次构建常驻 _tool_registry，跨多轮对话零重建并通过 tool_context 注入动态上下文及生效可选默认参数
+def test_assistant_app_reuses_single_tool_registry_with_turn_context_and_optional_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date
+
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    current_day = date(2026, 11, 16)
+    llm = RecordingLLM(
+        [
+            # 第 1 轮：调用 remember_fact + 无参 list_files({}) + 省略行号 read_markdown({"path": ...}) + get_current_time
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "list_files", "arguments": "{}"}},
+                    {
+                        "id": "c3",
+                        "type": "function",
+                        "function": {"name": "read_markdown", "arguments": '{"path": "data/memory/facts.md"}'},
+                    },
+                    {"id": "c4", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}},
+                ],
+            },
+            {"role": "assistant", "content": "已记录量子计算笔记偏好"},
+            # 第 2 轮（推进逻辑日期至 11-18）：调用 search_chat_history 与 get_current_time
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c5",
+                        "type": "function",
+                        "function": {"name": "search_chat_history", "arguments": '{"query": "量子计算"}'},
+                    },
+                    {"id": "c6", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}},
+                ],
+            },
+            {"role": "assistant", "content": "查到上一轮历史"},
+        ]
+    )
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=REPO_ROOT / "config" / "tools.json",
+        project_root=REPO_ROOT,
+        llm=llm,
+        today_fn=lambda: current_day,
+    )
+    try:
+        initial_reg = app._tool_registry
+        # 封死 build_tools，证明 chat / stream_chat / status 全程零每轮重建注册表
+        monkeypatch.setattr(
+            app,
+            "build_tools",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("禁止每轮重建 ToolRegistry")),
+        )
+
+        # 验证导出给大模型的 Schema 已将默认参数精简为非必填
+        defs = {d["function"]["name"]: d["function"]["parameters"]["required"] for d in initial_reg.definitions()}
+        assert defs["list_files"] == []
+        assert defs["search_markdown"] == ["query"]
+        assert defs["read_markdown"] == ["path"]
+
+        r1 = app.chat("请记住我最近在钻研量子计算纠错码", chat_id="single-reg")
+        assert app._tool_registry is initial_reg
+        assert "data/memory/facts.md" in r1["tool_calls"][0]["observation"]
+        assert "data/memory/facts.md" in r1["tool_calls"][1]["observation"]
+        assert "量子计算纠错码" in r1["tool_calls"][2]["observation"]
+        assert r1["tool_calls"][3]["observation"].startswith("2026-11-16 ")
+        assert "(msg#1) 请记住我最近在钻研量子计算纠错码" in app.memory.read_recent_facts()
+
+        current_day = date(2026, 11, 18)
+        r2 = app.chat("回顾一下上一轮提到的量子计算内容", chat_id="single-reg")
+        assert app._tool_registry is initial_reg
+        assert "量子计算纠错码" in r2["tool_calls"][0]["observation"]
+        assert r2["tool_calls"][1]["observation"].startswith("2026-11-18 ")
+
+        st = app.status()
+        assert st["status"] == "ok"
+        assert "read_markdown" in st["tools"]
+    finally:
+        app.close()
