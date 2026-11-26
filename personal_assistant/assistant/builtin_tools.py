@@ -3,10 +3,23 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
+
+
+# 将可选日期参数（date / datetime / ISO 字符串）安全归一化为标准 date 对象
+def _coerce_date(raw: date | str | None) -> date | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        return date.fromisoformat(raw.strip()[:10])
+    return None
 
 
 # 内核内置工具子类：承载记忆与文件操作，由统一 build_tool 构建并注入 ToolRegistry
@@ -42,18 +55,20 @@ class MemoryToolsetProvider(ToolsetProvider):
         get_user_message = self.get_user_message
         get_today = self.get_today
 
-        # 适配 search_markdown 工具：优先取执行期 today 参数，缺省回退构造期时钟回调
+        # 适配 search_markdown 工具：优先取执行期 today 参数，缺省回退构造期时钟回调并归一化为 date
         def search_markdown(
             query: str,
             root: str = "data/memory",
             *,
-            today: date | None = None,
+            today: date | str | None = None,
         ) -> str:
-            ref_day = today if today is not None else (get_today() if get_today is not None else None)
-            return memory.search_markdown(query, root=root, today=ref_day)
+            raw_day = today if today is not None else (get_today() if get_today is not None else None)
+            return memory.search_markdown(query, root=root, today=_coerce_date(raw_day))
 
-        # 适配 read_markdown 工具参数（支持默认行号 1..120 并将字符串行号转为整数）
+        # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:
+            if isinstance(start_line, bool) or isinstance(end_line, bool):
+                raise ValueError("start_line 和 end_line 必须是整数。")
             try:
                 start, end = int(start_line), int(end_line)
             except (ValueError, TypeError) as error:
@@ -65,7 +80,7 @@ class MemoryToolsetProvider(ToolsetProvider):
             saved = memory.write_workspace_file(path, content, mode=mode)
             return f"已写入：{saved}"
 
-        # 适配 remember_fact 工具：优先使用执行期注入的用户原话与回调，缺省回退构造期上下文
+        # 适配 remember_fact 工具：优先使用执行期注入的非空用户原话与消息号，缺省回退构造期上下文
         def remember_fact(
             *,
             user_text: str = "",
@@ -73,13 +88,20 @@ class MemoryToolsetProvider(ToolsetProvider):
             turn_tag: str | None = None,
             on_remember: Callable[[], None] | None = None,
         ) -> str:
-            if user_text:
-                resolved_text, resolved_msg_id = user_text, message_id
+            if isinstance(user_text, str) and user_text.strip():
+                resolved_text = user_text
+                resolved_msg_id = message_id
             else:
                 if get_user_message is None:
                     raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
-                resolved_text, resolved_msg_id = get_user_message()
-            effective_tag = turn_tag if turn_tag is not None else self.turn_tag
+                ctor_text, ctor_msg_id = get_user_message()
+                resolved_text = ctor_text
+                resolved_msg_id = message_id if message_id is not None else ctor_msg_id
+            effective_tag = (
+                None
+                if resolved_msg_id is not None
+                else (turn_tag if turn_tag is not None else self.turn_tag)
+            )
             effective_cb = on_remember if on_remember is not None else self.on_remember
             target = memory.remember_user_statement(
                 resolved_text,

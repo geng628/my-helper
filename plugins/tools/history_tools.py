@@ -33,8 +33,10 @@ class HistorySearchConfig:
     min_term_coverage: float = 0.22
     min_bm25_score: float = 0.1
 
-    # 校验覆盖率与 BM25 下限取值合法性
+    # 校验覆盖率与 BM25 下限取值合法性（严格拒绝布尔值）
     def __post_init__(self) -> None:
+        if isinstance(self.min_term_coverage, bool) or isinstance(self.min_bm25_score, bool):
+            raise ValueError("retrieval 阈值参数不能为布尔值。")
         if not (0.0 <= self.min_term_coverage <= 1.0):
             raise ValueError("retrieval.min_term_coverage 必须在 [0, 1] 之间。")
         if not (self.min_bm25_score >= 0.0):

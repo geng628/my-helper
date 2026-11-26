@@ -469,7 +469,7 @@ class MemoryStore:
             existing = self._read_or_default(self.facts_file, "# 事实备忘 (facts.md)\n\n")
             if message_id is not None and f"(msg#{message_id})" in existing:
                 return "data/memory/facts.md"
-            if turn_tag and f"(turn#{turn_tag})" in existing:
+            if message_id is None and turn_tag and f"(turn#{turn_tag})" in existing:
                 return "data/memory/facts.md"
             stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
             tag = f" (msg#{message_id})" if message_id is not None else (f" (turn#{turn_tag})" if turn_tag else "")
