@@ -45,10 +45,11 @@ def isolate_host_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         monkeypatch.delenv(var, raising=False)
 
     # 跳过仓库根目录真实 .env 防止宿主配置污染测试；测试临时目录中的 .env 正常执行原加载逻辑
-    def _guarded_load_dotenv(path: Path = Path(".env")) -> None:
-        if Path(path).resolve() == _REPO_DOTENV:
+    def _guarded_load_dotenv(dotenv_path: Path | None = None) -> None:
+        target = (dotenv_path if dotenv_path is not None else (common_mod.REPO_ROOT / ".env")).resolve()
+        if target == _REPO_DOTENV:
             return
-        _ORIG_LOAD_DOTENV(path)
+        _ORIG_LOAD_DOTENV(target)
 
     monkeypatch.setattr(common_mod, "load_dotenv", _guarded_load_dotenv)
     for mod in list(sys.modules.values()):
@@ -64,13 +65,18 @@ def isolate_host_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # 拦截读取仓库真实 config/models.dsl 或 models.json；测试构造的临时配置目录正常放行
     def _guarded_load_models_config(
         self: commands_mod.ToolsConfig,
-        config_dir: Path,
+        config_dir: Path | None = None,
         *,
         write_json: bool = False,
     ) -> object:
-        if Path(config_dir).resolve() == _REPO_CONFIG_DIR:
+        resolved_dir = (
+            Path(config_dir).resolve()
+            if config_dir is not None
+            else (self.config_path.parent.resolve() if self.config_path is not None else None)
+        )
+        if resolved_dir is None or resolved_dir == _REPO_CONFIG_DIR:
             return None
-        return _ORIG_LOAD_MODELS_CONFIG(self, config_dir, write_json=write_json)
+        return _ORIG_LOAD_MODELS_CONFIG(self, resolved_dir, write_json=write_json)
 
     monkeypatch.setattr(commands_mod.ToolsConfig, "load_models_config", _guarded_load_models_config)
 

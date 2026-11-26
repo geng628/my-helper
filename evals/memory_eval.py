@@ -13,12 +13,11 @@ from pathlib import Path
 from statistics import mean
 from time import perf_counter
 from typing import TypeVar, cast
-from zoneinfo import ZoneInfo
 
 from personal_assistant.ai.cache import CallCacheRecord, summarize_records
 from personal_assistant.ai.client import LLMClient, NoopLLMClient
 from personal_assistant.assistant.app import AssistantApp
-from personal_assistant.assistant.common import REPO_ROOT
+from personal_assistant.assistant.common import REPO_ROOT, today_shanghai
 from personal_assistant.assistant.consolidator import (
     ConsolidationPolicy,
     MemoryConsolidator,
@@ -483,7 +482,7 @@ def _build_shared_setup(
 
     # 返回当前共享前置构建的逻辑日期
     def current_today() -> date:
-        return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return clock_day[0] or today_shanghai()
 
     app: AssistantApp | None = None
     step_logs: list[dict[str, object]] = []
@@ -498,7 +497,7 @@ def _build_shared_setup(
             project_root=project_root,
             llm=llm,
             consolidation_policy=policy,
-            consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+            auto_consolidate=not has_explicit_consolidate,
             today_fn=current_today,
         )
         for seed in setup_spec.get("seed_memories") or []:
@@ -581,7 +580,7 @@ def _run_single_scenario(
 
     # 返回当前场景逻辑日期（若未指定则回退北京时间当日）
     def current_today() -> date:
-        return clock_day[0] or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return clock_day[0] or today_shanghai()
 
     step_logs: list[dict[str, object]] = []
     reasons: list[str] = []
@@ -601,7 +600,7 @@ def _run_single_scenario(
                 llm=llm,
                 consolidation_policy=policy,
                 # 含显式 consolidate 步骤时关闭自动后台线程，保证步骤顺序确定不竞争
-                consolidator_llm=NoopLLMClient() if has_explicit_consolidate else llm,
+                auto_consolidate=not has_explicit_consolidate,
                 today_fn=current_today,
             )
             # 非共享快照场景下，注入场景预设的初始记忆

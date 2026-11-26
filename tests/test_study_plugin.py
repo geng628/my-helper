@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.tools import ToolDocument, ToolMetadata
+from personal_assistant.agent.tools import ToolMetadata
 from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
@@ -35,7 +35,7 @@ class ScriptedStudyLLM(LLMClient):
 # 测试 ToolsPlugin 自动发现、默认 tools.json 白名单启用、Schema 隐藏注入参数与关闭拦截
 def test_study_plugin_discovery_allowlist_and_schema_isolation(tmp_path: Path) -> None:
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
-    tool_names = {item.name for item in manager.default_tools}
+    tool_names = {item.name for item in manager.build_tools()}
     assert {"save_study_card", "list_due_reviews"}.issubset(tool_names)
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
@@ -50,14 +50,6 @@ def test_study_plugin_discovery_allowlist_and_schema_isolation(tmp_path: Path) -
     assert "list_due_reviews" in registry.names
     assert registry.metadata("save_study_card") == ToolMetadata(risk="write", always_on=False)
     assert registry.metadata("list_due_reviews") == ToolMetadata(risk="read", always_on=False)
-    assert registry.document("save_study_card") == ToolDocument(
-        source_type="plugin",
-        source_name="study_tools",
-    )
-    assert registry.document("list_due_reviews") == ToolDocument(
-        source_type="plugin",
-        source_name="study_tools",
-    )
 
     save_tool = next(t for t in registry if t.name == "save_study_card")
     list_tool = next(t for t in registry if t.name == "list_due_reviews")

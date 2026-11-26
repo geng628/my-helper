@@ -72,16 +72,22 @@ class StateStore:
             "created_at": str(row["created_at"]),
         }
 
+    # 在已持有锁的事务内插入单条消息并返回自增编号
+    def _insert_message(self, chat_id: str, role: str, content: str, created_at: str) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, role, content, created_at),
+        )
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
     # 追加一条对话消息（user 或 assistant），返回自增消息编号
     def append_message(self, chat_id: str, role: str, content: str) -> int:
         created_at = datetime.now(UTC).isoformat()
         with self._lock:
-            cursor = self.conn.execute(
-                "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (chat_id, role, content, created_at),
-            )
+            msg_id = self._insert_message(chat_id, role, content, created_at)
             self.conn.commit()
-            return int(cursor.lastrowid)
+            return msg_id
 
     # 在同一事务内原子成对写入本轮 user 与 assistant 消息，返回 (user_msg_id, assistant_msg_id)
     def append_turn(
@@ -90,16 +96,8 @@ class StateStore:
         created_at = datetime.now(UTC).isoformat()
         with self._lock:
             try:
-                user_cursor = self.conn.execute(
-                    "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                    (chat_id, "user", user_content, created_at),
-                )
-                user_id = int(user_cursor.lastrowid)
-                assistant_cursor = self.conn.execute(
-                    "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                    (chat_id, "assistant", assistant_content, created_at),
-                )
-                assistant_id = int(assistant_cursor.lastrowid)
+                user_id = self._insert_message(chat_id, "user", user_content, created_at)
+                assistant_id = self._insert_message(chat_id, "assistant", assistant_content, created_at)
                 self.conn.commit()
             except BaseException:
                 self.conn.rollback()
@@ -113,23 +111,6 @@ class StateStore:
                 "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages"
             ).fetchone()
         return int(row["max_id"]) if row is not None else 0
-
-    # 按时间正序返回指定会话最近 limit 条对话记录（不区分是否已压缩）
-    def recent_messages(self, chat_id: str, limit: int = 12) -> list[dict[str, object]]:
-        if limit <= 0:
-            return []
-        with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT id, chat_id, role, content, created_at
-                FROM messages
-                WHERE chat_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (chat_id, limit),
-            ).fetchall()
-        return [self._row_to_message(row) for row in reversed(rows)]
 
     # 读取指定会话的上下文压缩状态（前情摘要与已沉淀截止消息编号）
     def get_compaction(self, chat_id: str) -> dict[str, object]:

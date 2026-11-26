@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import sys
 import threading
 from abc import ABC, abstractmethod
@@ -12,13 +13,32 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
-from personal_assistant.agent.react import RuntimeEvent
+from personal_assistant.agent.react import AgentEvent
 from personal_assistant.agent.tools import (
-    Tool, ToolDocument, ToolMetadata, ToolRegistry, ToolsetProvider, bind_tool_context, build_tool, extract_tool,
+    Tool,
+    ToolMetadata,
+    ToolsetProvider,
+    bind_tool_context,
+    build_tool,
+    extract_tool,
+    is_tool,
 )
 from personal_assistant.ai.client import LLMClient, ProviderFactory
+from personal_assistant.ai.types import ModelProfile, TokenUsage
 
-RetrieverFactory = Callable[[dict[str, object]], object]
+
+# 通用后台任务完成事件：供上层广播异步任务耗时与 Token 开销，不侵入微内核业务实现
+@dataclass(frozen=True)
+class TaskEvent:
+    kind: str
+    duration_ms: float = 0.0
+    usage: TokenUsage | None = None
+    details: dict[str, object] = field(default_factory=dict)
+    error: str | None = None
+
+
+RuntimeEvent = AgentEvent | TaskEvent
+RetrieverFactory = Callable[[dict[str, object]], "RetrieverProtocol"]
 ObserverFactory = Callable[[dict[str, object]], "ObserverProtocol"]
 
 
@@ -48,13 +68,13 @@ class ConfigCompilerProtocol(Protocol):
     def render(self, **kwargs: object) -> str: ...
 
 
-# 内层子协议 4：大模型客户端驱动极简协议
+# 内层子协议 4：大模型客户端驱动极简协议（单轨直通已实化的 ModelProfile）
 @runtime_checkable
 class LLMProviderProtocol(Protocol):
     name: str
 
-    # 根据环境变量或配置映射构建 LLMClient 实例
-    def build(self, env: Mapping[str, str]) -> LLMClient: ...
+    # 根据已解析密钥的 ModelProfile 构建 LLMClient 实例
+    def build(self, profile: ModelProfile) -> LLMClient: ...
 
 
 # 内层子协议 5：运行期可观测器极简协议（微内核仅按 session_key 广播事件与导出快照）
@@ -69,15 +89,13 @@ class ObserverProtocol(Protocol):
     def snapshot(self, *, session_key: str | None = None) -> dict[str, object]: ...
 
 
-# 校验并向主板插槽注册子协议实例或工厂函数，复用检索与观测插件的统一装配逻辑
+# 校验并向主板插槽注册子协议实例或工厂函数，非法对象统一抛出 TypeError
 def _register_slot_factory(
     slot: dict[str, Callable[[dict[str, object]], Any]],
     name: str,
     item: Any,
     protocol_cls: type[object],
     label: str,
-    *,
-    invalid_exc: type[Exception] = ValueError,
 ) -> None:
     clean_name = name.strip()
     if not clean_name:
@@ -95,7 +113,7 @@ def _register_slot_factory(
     elif callable(item):
         slot[clean_name] = item
     else:
-        raise invalid_exc(f"{label}必须实现 {protocol_cls.__name__} 或可调用工厂：{clean_name}")
+        raise TypeError(f"{label}必须实现 {protocol_cls.__name__} 或可调用工厂：{clean_name}")
 
 
 # 校验并向主板插槽注册单实例强类型协议对象（供配置编译器与模型驱动插槽共用）
@@ -117,73 +135,59 @@ def _register_named_protocol(
     slot[clean_name] = transform(item) if transform is not None else item
 
 
-# 插件主板上下文（PluginContext）：统一向所有 Plugin 子类提供系统资源与 5 个标准子协议插槽
+# 插件主板通用上下文（PluginContext）：零业务字段泄漏，仅承载通用根路径、配置、绑定字典与 5 个标准插槽
 @dataclass
 class PluginContext:
     project_root: Path
-    data_root: Path | None = None
-    config_path: Path | None = None
-    offload_dir: Path | None = None
-    raw_config: Mapping[str, object] = field(default_factory=dict)
-    extra_bindings: Mapping[str, object] = field(default_factory=dict)
-    tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+    config: Mapping[str, object] = field(default_factory=dict)
+    bindings: Mapping[str, object] = field(default_factory=dict)
     tool_specs: list[Tool] = field(default_factory=list)
-    active_plugin_id: str = ""
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
 
-    # 提取供工具按签名绑定的系统资源上下文，并将顶层配置段通用映射为 <section>_config
-    def tool_bindings(self) -> dict[str, object]:
-        bindings: dict[str, object] = {
-            **self.extra_bindings,
-            "project_root": self.project_root,
-            "data_root": self.data_root,
-            "config_path": self.config_path,
-            "offload_dir": self.offload_dir,
-            "raw_config": dict(self.raw_config),
-        }
-        for sec_key, sec_val in self.raw_config.items():
-            if isinstance(sec_key, str) and sec_key and isinstance(sec_val, Mapping):
-                bindings.setdefault(f"{sec_key}_config", dict(sec_val))
-        return bindings
-
-    # 插槽 1：向主板 ToolRegistry 注册工具（裸 Tool 实例首次解析签名，其余直接轻量重绑上下文与元数据）
+    # 插槽 1：向主板登记单个工具（裸 Tool 实例首次解析函数签名，绑定初始上下文并拦截重名）
     def register_tool(
         self,
         item: Tool | Callable[..., str],
         *,
-        source_name: str | None = None,
         metadata: ToolMetadata | None = None,
-        document: ToolDocument | None = None,
     ) -> None:
         raw_tool = extract_tool(item)
         resolved_meta = metadata if metadata is not None else raw_tool.metadata
-        if document is not None:
-            resolved_doc = document
-        else:
-            existing_doc = raw_tool.document
-            existing_src = existing_doc.source_name if existing_doc.source_name != "core" else None
-            if source_name is None and not self.active_plugin_id and existing_src is not None:
-                resolved_doc = existing_doc
-            else:
-                resolved_src = source_name or self.active_plugin_id or existing_src or "plugin"
-                resolved_doc = ToolDocument(source_type="plugin", source_name=resolved_src)
-
-        if isinstance(item, Tool) and type(raw_tool) is Tool and raw_tool.handler is not None and not raw_tool.accepted_context_keys:
-            extra = {"bound_kwargs": dict(raw_tool.bound_kwargs)} if raw_tool.bound_kwargs else None
+        if (
+            isinstance(item, Tool)
+            and raw_tool.handler is not None
+            and raw_tool.required is None
+            and raw_tool.accepted_context_keys == frozenset()
+        ):
             raw_tool = build_tool(
                 raw_tool.handler,
-                name=raw_tool.name, description=raw_tool.description, parameters=raw_tool.parameters,
-                param_enums=raw_tool.param_enums, required=raw_tool.required,
-                risk=resolved_meta.risk, always_on=resolved_meta.always_on,
-                source_type=resolved_doc.source_type, source_name=resolved_doc.source_name, extra_fields=extra,
+                name=raw_tool.name,
+                description=raw_tool.description,
+                parameters=raw_tool.parameters,
+                param_enums=raw_tool.param_enums,
+                risk=resolved_meta.risk,
+                always_on=resolved_meta.always_on,
+                context=raw_tool.bound_kwargs,
             )
-
-        base_tool = bind_tool_context(raw_tool, None, metadata=resolved_meta, document=resolved_doc)
+        init_bindings = {"project_root": self.project_root, **self.bindings}
+        base_tool = bind_tool_context(raw_tool, init_bindings, metadata=resolved_meta)
+        if any(existing.name == base_tool.name for existing in self.tool_specs):
+            raise ValueError(f"工具名称不能重复：{base_tool.name}")
         self.tool_specs.append(base_tool)
-        self.tool_registry.register(bind_tool_context(base_tool, self.tool_bindings()))
+
+    # 扫描指定 Python 模块文件中的全部 @tool 装饰函数并去重注册进当前主板插槽
+    def register_tools_from_module(self, file_path: Path) -> None:
+        module = _import_plugin_module(file_path)
+        seen_in_file: set[str] = set()
+        for value in vars(module).values():
+            if is_tool(value):
+                spec = extract_tool(value)
+                if spec.name not in seen_in_file:
+                    seen_in_file.add(spec.name)
+                    self.register_tool(spec)
 
     # 插槽 2：向主板注册检索引擎子协议实现（支持传入 RetrieverProtocol 实例或工厂函数）
     def register_retriever(self, name: str, retriever_or_factory: RetrieverProtocol | RetrieverFactory) -> None:
@@ -201,32 +205,18 @@ class PluginContext:
 
     # 插槽 5：向主板注册运行观测器子协议实现（支持传入 ObserverProtocol 实例或工厂函数）
     def register_observer(self, name: str, observer_or_factory: ObserverProtocol | ObserverFactory) -> None:
-        _register_slot_factory(
-            self.observers, name, observer_or_factory, ObserverProtocol, "观测插件", invalid_exc=TypeError
-        )
+        _register_slot_factory(self.observers, name, observer_or_factory, ObserverProtocol, "观测插件")
 
 
-# 外层统一主板基类：所有插件均继承此类，通过 __init_subclass__ 自动发现与统一生命周期
+# 外层统一主板基类：所有插件均显式继承此类，统一 initialize / terminate 生命周期
 class Plugin(ABC):
     plugin_id: ClassVar[str] = ""
-
-    # 子类定义时自动登记到所属模块的 __plugin_classes__ 表，便于 PluginManager 自动发现
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        super().__init_subclass__(**kwargs)
-        if not getattr(cls, "plugin_id", "").strip():
-            return
-        mod = sys.modules.get(cls.__module__)
-        if mod is not None:
-            registered: list[type[Plugin]] = list(getattr(mod, "__plugin_classes__", ()))
-            if cls not in registered:
-                registered.append(cls)
-                setattr(mod, "__plugin_classes__", registered)
 
     # 绑定统一系统资源上下文 PluginContext
     def __init__(self, context: PluginContext) -> None:
         self.context = context
 
-    # 统一初始化生命周期：从 self.context 获取配置/路径资源，并将内层子协议实现插入对应主板插槽
+    # 统一初始化生命周期：从 self.context 获取配置/绑定资源，并将内层子协议实现插入对应主板插槽
     @abstractmethod
     def initialize(self) -> None: ...
 
@@ -313,117 +303,71 @@ def _import_plugin_module(file_path: Path) -> ModuleType:
         return module
 
 
-# 为仅写了 @tool 函数而未显式声明 Plugin 子类的简单脚本模块自动生成统一 Plugin 外壳
-class _AutoScriptPlugin(Plugin):
-    # 绑定待包装的脚本模块与文件名
-    def __init__(self, context: PluginContext, module: ModuleType, file_path: Path) -> None:
-        super().__init__(context)
-        self.module = module
-        self.file_path = file_path
-
-    # 扫描脚本中的 @tool 装饰函数并统一注册进 self.context 插槽
-    def initialize(self) -> None:
-        source_name = self.file_path.stem
-        seen_in_file: set[str] = set()
-        for value in vars(self.module).values():
-            marked = getattr(value, "__agent_tool__", None)
-            if isinstance(marked, Tool) and marked.name not in seen_in_file:
-                seen_in_file.add(marked.name)
-                self.context.register_tool(marked, source_name=source_name)
-
-
-# 在给定 PluginContext 上实例化并执行全部插件模块的 Plugin.initialize() 生命周期
-def _initialize_modules(modules: Iterable[tuple[Path, ModuleType]], context: PluginContext) -> list[Plugin]:
+# 扫描模块命名空间内定义的具体 Plugin 子类并依次执行 initialize() 生命周期（无 Plugin 子类的模块直接忽略）
+def _initialize_modules(modules: Iterable[ModuleType], context: PluginContext) -> list[Plugin]:
     active_plugins: list[Plugin] = []
-    for file_path, module in modules:
-        plugin_classes: list[type[Plugin]] = list(getattr(module, "__plugin_classes__", ()))
-        if not plugin_classes:
-            auto_plugin = _AutoScriptPlugin(context, module, file_path)
-            auto_plugin.initialize()
-            active_plugins.append(auto_plugin)
-            continue
-        for plugin_cls in plugin_classes:
-            instance = plugin_cls(context)
-            prev_id = context.active_plugin_id
-            context.active_plugin_id = getattr(plugin_cls, "plugin_id", "").strip()
-            try:
+    for module in modules:
+        for obj in vars(module).values():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, Plugin)
+                and obj is not Plugin
+                and not inspect.isabstract(obj)
+                and obj.__module__ == module.__name__
+            ):
+                instance = obj(context)
                 instance.initialize()
-            finally:
-                context.active_plugin_id = prev_id
-            active_plugins.append(instance)
+                active_plugins.append(instance)
     return active_plugins
 
 
-# 解析可选路径值为绝对 Path
-def _opt_path(raw: object) -> Path | None:
-    return Path(str(raw)).resolve() if isinstance(raw, (str, Path)) else None
-
-
-# 插件管理器（继承 ToolsetProvider）：负责加载全部 Plugin(ABC) 子类并驱动 initialize/terminate 与轻量工具上下文重绑
+# 插件管理器（继承 ToolsetProvider）：加载全部显式 Plugin(ABC) 子类并支持轻量工具上下文重绑
 @dataclass(frozen=True)
 class PluginManager(ToolsetProvider):
-    modules: tuple[tuple[Path, ModuleType], ...]
-    default_tools: tuple[Tool, ...]
-    retrievers: dict[str, RetrieverFactory]
-    providers: dict[str, ProviderFactory]
-    compilers: dict[str, ConfigCompilerProtocol]
+    retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
+    providers: dict[str, ProviderFactory] = field(default_factory=dict)
+    compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
     plugins: tuple[Plugin, ...] = ()
     tool_specs: tuple[Tool, ...] = ()
     project_root: Path | None = None
-    base_context: Mapping[str, object] = field(default_factory=dict)
-    source_type: str = "plugin"
-    source_name: str = "plugins"
+    bindings: Mapping[str, object] = field(default_factory=dict)
 
-    # 扫描并导入配置的全部插件模块，创建 PluginContext 并统一执行 Plugin.initialize()
+    # 扫描并导入配置的全部插件模块，创建纯净 PluginContext 并统一执行 Plugin.initialize()
     @classmethod
     def from_entries(
-        cls, entries: Iterable[str], project_root: Path, *, context: Mapping[str, object] | None = None
+        cls,
+        entries: Iterable[str],
+        project_root: Path,
+        *,
+        config: Mapping[str, object] | None = None,
+        bindings: Mapping[str, object] | None = None,
     ) -> "PluginManager":
         root = project_root.resolve()
-        loaded_modules = [(fp, _import_plugin_module(fp)) for fp in _resolve_plugin_targets(entries, root)]
-        base_ctx = dict(context) if context else {}
-        ctx = cls._build_plugin_context(root, base_ctx)
+        loaded_modules = [_import_plugin_module(fp) for fp in _resolve_plugin_targets(entries, root)]
+        base_cfg = dict(config) if config else {}
+        base_bindings: dict[str, object] = {"project_root": root, **(dict(bindings) if bindings else {})}
+        ctx = PluginContext(project_root=root, config=base_cfg, bindings=base_bindings)
         active_plugins = _initialize_modules(loaded_modules, ctx)
         return cls(
-            modules=tuple(loaded_modules), default_tools=tuple(ctx.tool_registry),
-            retrievers=dict(ctx.retrievers), providers=dict(ctx.providers),
-            compilers=dict(ctx.compilers), observers=dict(ctx.observers),
-            plugins=tuple(active_plugins), tool_specs=tuple(ctx.tool_specs),
-            project_root=root, base_context=base_ctx,
+            retrievers=dict(ctx.retrievers),
+            providers=dict(ctx.providers),
+            compilers=dict(ctx.compilers),
+            observers=dict(ctx.observers),
+            plugins=tuple(active_plugins),
+            tool_specs=tuple(ctx.tool_specs),
+            project_root=root,
+            bindings=base_bindings,
         )
 
-    # 将外部传入的上下文字典组装为强类型 PluginContext（零业务路径硬编码）
-    @staticmethod
-    def _build_plugin_context(project_root: Path, context: Mapping[str, object] | None = None) -> PluginContext:
-        if not context:
-            return PluginContext(project_root=project_root)
-        raw_cfg = context.get("raw_config")
-        raw_extra = context.get("extra_bindings")
-        return PluginContext(
-            project_root=project_root,
-            data_root=_opt_path(context.get("data_root")),
-            config_path=_opt_path(context.get("config_path")),
-            offload_dir=_opt_path(context.get("offload_dir")),
-            raw_config=raw_cfg if isinstance(raw_cfg, Mapping) else {},
-            extra_bindings=dict(raw_extra) if isinstance(raw_extra, Mapping) else {},
-        )
-
-    # 返回默认无额外上下文时的插件工具列表（实现 ToolsetProvider.tools）
-    def tools(self) -> list[Tool]:
-        return list(self.default_tools)
-
-    # 按给定运行时上下文基于缓存的 Tool 规格调用 bind_tool_context 轻量重绑，不再重跑 initialize()
+    # 按可选运行时上下文基于缓存的 Tool 规格调用 bind_tool_context 轻量重绑，不再重跑 initialize()
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
-        if context is None or not self.tool_specs:
-            return list(self.default_tools)
-        merged_ctx: dict[str, object] = {**self.base_context, **context}
-        base_extra, turn_extra = self.base_context.get("extra_bindings"), context.get("extra_bindings")
-        if isinstance(base_extra, Mapping) and isinstance(turn_extra, Mapping):
-            merged_ctx["extra_bindings"] = {**base_extra, **turn_extra}
-        proj = _opt_path(merged_ctx.get("project_root")) or self.project_root or Path.cwd()
-        bindings = self._build_plugin_context(proj, merged_ctx).tool_bindings()
-        return [bind_tool_context(spec, bindings) for spec in self.tool_specs]
+        if not self.tool_specs:
+            return []
+        if not context:
+            return list(self.tool_specs)
+        merged = {**self.bindings, **context}
+        return [bind_tool_context(spec, merged) for spec in self.tool_specs]
 
     # 统一触发全部已加载 Plugin 实例的 terminate() 停止清理钩子
     def terminate_all(self) -> None:

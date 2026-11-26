@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from zoneinfo import ZoneInfo
+
+from personal_assistant.assistant.common import parse_iso_date, today_shanghai
+from personal_assistant.assistant.text_search import tokenize_text
 
 UNTIL_PATTERN = re.compile(r"\(until:\s*(\d{4}-\d{2}-\d{2})\)")
 MSG_TAG_PATTERN = re.compile(r"\(msg#(\d+)\)")
@@ -23,21 +25,6 @@ ARCHIVE_INDEX_LINE = (
 WriteFn = Callable[[Path, str], None]
 IndexFn = Callable[[str, str], None]
 AuditFn = Callable[..., dict[str, object]]
-
-
-# 获取北京时间当天日期，用于统一的记忆有效期与时间戳判断
-def today_shanghai() -> date:
-    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
-
-
-# 安全解析 YYYY-MM-DD 格式日期，非法输入返回 None
-def parse_iso_date(raw: object) -> date | None:
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        return date.fromisoformat(raw.strip())
-    except ValueError:
-        return None
 
 
 # 判断单行记忆是否带 (until: YYYY-MM-DD) 且已严格过期（until < today 为过期，当天仍有效）
@@ -160,6 +147,31 @@ def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
     return "\n\n".join(chunks)
 
 
+# 将一批归档或软退休记录以统一表头单次追加写入 archive/YYYY-MM.md，返回规范相对路径
+def _append_to_monthly_archive(
+    archive_dir: Path,
+    ref_day: date,
+    entries: list[str],
+    *,
+    write_fn: WriteFn,
+) -> str:
+    if not entries:
+        return ""
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    month_key = ref_day.strftime("%Y-%m")
+    archive_name = f"{month_key}.md"
+    archive_path = archive_dir / archive_name
+    existing = (
+        archive_path.read_text(encoding="utf-8")
+        if archive_path.is_file()
+        else f"# 记忆归档与历史变更账本 ({month_key})\n\n"
+    )
+    sep = "" if not existing or existing.endswith("\n") else "\n"
+    moved = "".join(f"{line}\n" for line in entries)
+    write_fn(archive_path, f"{existing}{sep}{moved}")
+    return f"data/memory/archive/{archive_name}"
+
+
 # 将被 replace/remove 软退休的旧事实及替代链追加写入 archive/YYYY-MM.md（跳过正在规范化的 msg# 裸原话）
 def _append_superseded_records(
     archive_dir: Path,
@@ -169,24 +181,12 @@ def _append_superseded_records(
     write_fn: WriteFn,
     ref_day: date,
 ) -> str:
-    effective = [(old_line, repl) for old_line, repl in retired if not MSG_TAG_PATTERN.search(old_line)]
-    if not effective:
-        return ""
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_name = f"{ref_day.strftime('%Y-%m')}.md"
-    archive_path = archive_dir / archive_name
-    existing_archive = (
-        archive_path.read_text(encoding="utf-8")
-        if archive_path.is_file()
-        else f"# 记忆归档与历史变更账本 ({ref_day.strftime('%Y-%m')})\n\n"
-    )
-    sep = "" if not existing_archive or existing_archive.endswith("\n") else "\n"
-    moved = "".join(
-        f"- [superseded {ref_day.isoformat()} | from: {source_name}] {old_line} -> superseded_by: {repl}\n"
-        for old_line, repl in effective
-    )
-    write_fn(archive_path, f"{existing_archive}{sep}{moved}")
-    return f"data/memory/archive/{archive_name}"
+    entries = [
+        f"- [superseded {ref_day.isoformat()} | from: {source_name}] {old_line} -> superseded_by: {repl}"
+        for old_line, repl in retired
+        if not MSG_TAG_PATTERN.search(old_line)
+    ]
+    return _append_to_monthly_archive(archive_dir, ref_day, entries, write_fn=write_fn)
 
 
 # 对指定主题记忆文件执行 add / merge / replace / remove 操作，写入期消解冲突并将退场旧事实软退休进 archive 账本
@@ -346,7 +346,7 @@ def apply_topic_operations(
     return rel_path
 
 
-# 扫描活跃主题记忆文件，将已过期的 (until: YYYY-MM-DD) 条目原子归档至 archive/YYYY-MM.md
+# 扫描活跃主题记忆文件，将已过期的 (until: YYYY-MM-DD) 条目收集后单次归档至 archive/YYYY-MM.md
 def archive_expired_topics(
     memory_dir: Path,
     archive_dir: Path,
@@ -360,9 +360,8 @@ def archive_expired_topics(
         return {}
     ref_day = today or today_shanghai()
     archived_counts: dict[str, int] = {}
-    archive_name = f"{ref_day.strftime('%Y-%m')}.md"
-    archive_path = archive_dir / archive_name
-    archive_rel = f"data/memory/archive/{archive_name}"
+    pending_entries: list[str] = []
+    pending_audits: list[tuple[str, list[str]]] = []
 
     for path in sorted(memory_dir.glob("*.md")):
         if path.name == "MEMORY.md" or path.name.startswith(".") or not path.is_file():
@@ -383,18 +382,16 @@ def archive_expired_topics(
             continue
 
         write_fn(path, "\n".join(active_lines).rstrip() + "\n")
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        existing_archive = (
-            archive_path.read_text(encoding="utf-8")
-            if archive_path.is_file()
-            else f"# 过期记忆归档 ({ref_day.strftime('%Y-%m')})\n\n"
-        )
-        sep = "" if not existing_archive or existing_archive.endswith("\n") else "\n"
-        moved = "".join(f"{line} (from: {path.name})\n" for line in expired_lines)
-        write_fn(archive_path, f"{existing_archive}{sep}{moved}")
-
+        pending_entries.extend(f"{line} (from: {path.name})" for line in expired_lines)
         rel_path = f"data/memory/{path.name}"
         archived_counts[rel_path] = len(expired_lines)
+        pending_audits.append((rel_path, expired_lines))
+
+    if not pending_entries:
+        return {}
+
+    archive_rel = _append_to_monthly_archive(archive_dir, ref_day, pending_entries, write_fn=write_fn)
+    for rel_path, expired_lines in pending_audits:
         audit_fn(
             action="archive_expired",
             actor="lifecycle",
@@ -402,22 +399,14 @@ def archive_expired_topics(
             old_value="; ".join(expired_lines),
             new_value=archive_rel,
         )
-    if archived_counts and ensure_index_fn is not None:
+    if ensure_index_fn is not None:
         ensure_index_fn(ARCHIVE_INDEX_PATH, ARCHIVE_INDEX_LINE)
     return archived_counts
 
 
-# 提取文本的中英文核心检索单元（英文词与中文二元组），用于判断裸原话是否已被规范化沉淀
+# 复用双语分词器提取文本核心词元集合，用于判断裸原话是否已被规范化沉淀吸收
 def _overlap_tokens(text: str) -> set[str]:
-    lowered = text.lower()
-    tokens: set[str] = set(re.findall(r"[a-z0-9_+-]{2,}", lowered))
-    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
-        if len(run) == 1:
-            tokens.add(run)
-        else:
-            for idx in range(len(run) - 1):
-                tokens.add(run[idx : idx + 2])
-    return tokens
+    return set(tokenize_text(text, for_query=False))
 
 
 # 清理 facts.md 中已被本次沉淀规范化的原始 (msg#...) 裸原话，防止临时事实留存永不过期的幽灵副本

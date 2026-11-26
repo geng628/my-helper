@@ -14,9 +14,14 @@ from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
-from personal_assistant.assistant.cli import build_demo_tools
 from personal_assistant.assistant.common import load_dotenv
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT
+
+
+# 从插件目录加载单句提问演示所需的时间工具注册表
+def build_demo_tools() -> ToolRegistry:
+    plugin_tools = PluginManager.from_entries(["plugins/tools"], ROOT).build_tools()
+    return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
 # 离线脚本化模拟模型：按预设顺序返回回复，用于零成本演示 ReAct 循环
@@ -46,7 +51,7 @@ def _print_event(event: AgentEvent) -> None:
 # 运行两个离线演示场景：多轮链式工具调用 + 工具参数出错自愈
 def run_offline_demo(show_messages: bool = False) -> None:
     tools = ToolRegistry(
-        *PluginManager.from_entries(["plugins/tools"], ROOT).tools(),
+        *PluginManager.from_entries(["plugins/tools"], ROOT).build_tools(),
         allowed_names=["get_current_time", "add_numbers"],
     )
 
@@ -134,7 +139,7 @@ def run_offline_demo(show_messages: bool = False) -> None:
 
 # 读取 .env 并向真实模型发起单句提问，用于快速验证真实工具调用链路
 def run_live_ask(question: str, show_messages: bool = False) -> int:
-    load_dotenv(ROOT / ".env")
+    load_dotenv()
     client = from_env()
     tools = build_demo_tools()
     messages: list[dict[str, object]] = [

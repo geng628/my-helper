@@ -1,13 +1,12 @@
-"""Unit tests for the user-editable Python tool plugin system."""
+"""Unit tests for the Plugin(ABC) motherboard and purified PluginContext."""
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.ai import LLMClient
 from personal_assistant.agent.plugins import (
     ConfigCompilerProtocol,
     LLMProviderProtocol,
@@ -16,6 +15,8 @@ from personal_assistant.agent.plugins import (
     PluginManager,
 )
 from personal_assistant.agent.react import run_react
+from personal_assistant.ai import LLMClient, ModelProfile
+from personal_assistant.assistant.commands import ToolsConfig
 
 
 # 测试用脚本化模拟模型
@@ -33,22 +34,49 @@ class ScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
-# 测试 @tool 装饰器插件、显式 Plugin 子类与白名单拦截机制
+# 测试显式 Plugin 子类挂载 @tool 函数与裸 Tool 实例，且无 Plugin 子类的孤儿脚本不再被静默包装
 def test_load_plugins_supports_decorator_and_plugin_class_and_allowlist(tmp_path: Path) -> None:
+    import personal_assistant.agent.plugins as plugins_mod
+
+    assert not hasattr(plugins_mod, "_AutoScriptPlugin")
+
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "_helper.py").write_text("raise RuntimeError('should be ignored')\n", encoding="utf-8")
-    (plugins_dir / "my_tools.py").write_text(
+    (plugins_dir / "orphan_no_plugin.py").write_text(
         """
 from personal_assistant.agent.tools import tool
 
+# 未声明 Plugin 子类的孤儿函数不应被幽灵自动包装注册
+@tool(description="孤儿工具")
+def ghost_tool() -> str:
+    return "ghost"
+""",
+        encoding="utf-8",
+    )
+    (plugins_dir / "my_tools.py").write_text(
+        """
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import tool
+
+# 反转输入字符串
 @tool(description="反转字符串", parameters={"text": "输入文本"})
 def reverse_text(text: str) -> str:
     return text[::-1]
 
+# 未列入白名单的工具
 @tool(description="未加入白名单的工具")
 def disabled_plugin() -> str:
     return "should not run"
+
+# 显式注册当前模块工具的插件类
+class MyToolsPlugin(Plugin):
+    plugin_id = "my_tools"
+
+    # 向主板插槽登记两个 @tool 函数
+    def initialize(self) -> None:
+        self.context.register_tool(reverse_text)
+        self.context.register_tool(disabled_plugin)
 """,
         encoding="utf-8",
     )
@@ -70,7 +98,6 @@ class ShoutPlugin(Plugin):
                 parameters={"text": "文本"},
                 handler=lambda text: text.upper(),
             ),
-            source_name="a_shout_plugin",
         )
 """,
         encoding="utf-8",
@@ -81,7 +108,7 @@ class ShoutPlugin(Plugin):
     cfg_path.write_text(
         json.dumps(
             {
-                "enabled_tools": ["reverse_text", "shout"],
+                "enabled_tools": ["reverse_text", "shout", "ghost_tool"],
                 "plugins": ["plugins"],
                 "commands": [],
             }
@@ -93,6 +120,7 @@ class ShoutPlugin(Plugin):
     registry = cfg.build_registry()
 
     assert registry.names == ["shout", "reverse_text"]
+    assert "未知工具" in registry.execute("ghost_tool", "{}")
     assert registry.execute("reverse_text", '{"text": "abc"}') == "cba"
     assert registry.execute("shout", '{"text": "hello"}') == "HELLO"
     assert "不在白名单中" in registry.execute("disabled_plugin", "{}")
@@ -108,11 +136,21 @@ def test_plugin_security_rejects_outside_paths_and_duplicates(tmp_path: Path) ->
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     code = """
+from personal_assistant.agent.plugins import Plugin
 from personal_assistant.agent.tools import tool
 
+# 重名工具探针
 @tool(description="重复名称")
 def dup_tool() -> str:
     return "x"
+
+# 注册重名工具的测试插件
+class DupPlugin(Plugin):
+    plugin_id = "dup"
+
+    # 向主板登记工具以触发重名校验
+    def initialize(self) -> None:
+        self.context.register_tool(dup_tool)
 """
     (plugins_dir / "a.py").write_text(code, encoding="utf-8")
     (plugins_dir / "b.py").write_text(code, encoding="utf-8")
@@ -126,11 +164,21 @@ def test_plugin_tool_runs_inside_react_loop(tmp_path: Path) -> None:
     plugins_dir.mkdir()
     (plugins_dir / "math_plugin.py").write_text(
         """
+from personal_assistant.agent.plugins import Plugin
 from personal_assistant.agent.tools import tool
 
+# 计算两数乘积
 @tool(description="计算两数乘积", parameters={"x": "乘数1", "y": "乘数2"})
 def multiply(x: str, y: str) -> str:
     return str(int(x) * int(y))
+
+# 显式数学工具插件
+class MathPlugin(Plugin):
+    plugin_id = "math_plugin"
+
+    # 向主板登记乘法工具
+    def initialize(self) -> None:
+        self.context.register_tool(multiply)
 """,
         encoding="utf-8",
     )
@@ -167,21 +215,17 @@ def multiply(x: str, y: str) -> str:
 # 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽
 def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
-        ConfigCompilerProtocol,
-        LLMProviderProtocol,
         ObserverProtocol,
-        Plugin,
-        PluginManager,
         RetrieverProtocol,
     )
     from personal_assistant.agent.tools import Tool
-    from personal_assistant.ai import LLMClient
     from personal_assistant.assistant.common import REPO_ROOT
     from plugins.models_dsl import ModelsDSLCompiler
     from plugins.reasoning_provider import OpenAIReasoningProvider
-    from plugins.tools import ToolsPlugin
 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
+    assert not hasattr(manager, "modules")
+    assert not hasattr(manager, "default_tools")
 
     # 1. 外层：主板加载 5 个同级 Plugin(ABC) 实例（tools 文件夹插件 + 4 个单文件插件）
     assert len(manager.plugins) == 5
@@ -203,10 +247,11 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     }
     assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
 
-    # 2. 内层子协议 1：plugins/tools/ 下的全部 @tool 模块由唯一的 ToolsPlugin 统一装配为 Tool 子类实例
-    assert all(isinstance(t, Tool) for t in manager.default_tools)
+    # 2. 内层子协议 1：plugins/tools/ 下的全部 @tool 模块由 ToolsPlugin 通过 register_tools_from_module 装配为纯净 Tool
+    built_tools = manager.build_tools()
+    assert all(type(t) is Tool for t in built_tools)
     assert {"get_current_time", "run_command", "web_search", "fetch_webpage"}.issubset(
-        {t.name for t in manager.default_tools}
+        {t.name for t in built_tools}
     )
 
     # 3. 内层子协议 2：RetrieverProtocol（MemoryStore 只认 search_hits）
@@ -222,12 +267,20 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
-    # 5. 内层子协议 4：LLMProviderProtocol（from_model_profile / from_env 只认已注册 Provider 工厂）
+    # 5. 内层子协议 4：LLMProviderProtocol（单轨直通实化 ModelProfile）
     reasoning_provider = OpenAIReasoningProvider()
     assert isinstance(reasoning_provider, LLMProviderProtocol)
     assert not callable(reasoning_provider)
     assert "openai_reasoning" in manager.providers
-    reasoning_client = manager.providers["openai_reasoning"]({"LLM_API_KEY": "sk-slot4-test"})
+    reasoning_client = manager.providers["openai_reasoning"](
+        ModelProfile(
+            name="r1",
+            provider="openai_reasoning",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+            api_key="sk-slot4-test",
+        )
+    )
     assert isinstance(reasoning_client, LLMClient)
     assert type(reasoning_client).__name__ == "OpenAIReasoningLLM"
 
@@ -240,7 +293,7 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     manager.terminate_all()
 
 
-# 测试所有已移除的历史兼容胶水与旧版全局变量写法均彻底失效
+# 测试所有已移除的历史兼容胶水、旧版全局变量写法与非法插槽对象均严格拒绝（统一 TypeError）
 def test_legacy_compat_shims_removed_and_rejected(tmp_path: Path) -> None:
     import personal_assistant.agent as agent_pkg
     import personal_assistant.agent.plugins as plugins_mod
@@ -252,7 +305,7 @@ def test_legacy_compat_shims_removed_and_rejected(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
 
     # 1. 不再把 plugins/<x>.py 静默兜底解析为 plugins/tools/<x>.py
-    assert PluginManager.from_entries(["plugins/custom_tools.py"], repo_root).tools() == []
+    assert PluginManager.from_entries(["plugins/custom_tools.py"], repo_root).build_tools() == []
 
     # 2. 旧式魔法全局变量与 TOOLS = [...] 列表不再被静默扫描加载
     legacy_plugin = tmp_path / "legacy_plugin.py"
@@ -274,7 +327,7 @@ compile_config = lambda text, source="": {}
         encoding="utf-8",
     )
     legacy_mgr = PluginManager.from_entries([legacy_plugin.name], tmp_path)
-    assert legacy_mgr.tools() == []
+    assert legacy_mgr.build_tools() == []
     assert legacy_mgr.retrievers == {}
     assert legacy_mgr.providers == {}
     assert legacy_mgr.compilers == {}
@@ -287,10 +340,13 @@ compile_config = lambda text, source="": {}
         "load_plugin_providers",
         "load_plugin_compilers",
         "ConfigCompiler",
+        "_AutoScriptPlugin",
     ):
         assert not hasattr(agent_pkg, sym), f"agent_pkg 仍残留 {sym}"
         assert not hasattr(plugins_mod, sym), f"plugins_mod 仍残留 {sym}"
 
+    assert not hasattr(agent_pkg, "ToolDocument")
+    assert not hasattr(tools_mod, "ToolDocument")
     assert not hasattr(agent_pkg, "build_dynamic_plugin_tool")
     assert not hasattr(tools_mod, "build_dynamic_plugin_tool")
 
@@ -301,12 +357,16 @@ compile_config = lambda text, source="": {}
     for attr in ("command_tools", "plugin_tools", "plugin_retrievers", "plugin_compilers"):
         assert not hasattr(ToolsConfig, attr), f"ToolsConfig 仍残留 {attr}"
 
-    # 4. PluginContext 仅接受强类型 ConfigCompilerProtocol / LLMProviderProtocol，拒绝裸函数
+    # 4. 全部主板插槽注册非法对象统一抛出 TypeError
     ctx = PluginContext(project_root=tmp_path)
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises(TypeError):
         ctx.register_compiler(lambda text, source="": {})  # type: ignore[arg-type]
-    with pytest.raises((TypeError, ValueError)):
-        ctx.register_provider(lambda env: None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ctx.register_provider(lambda profile: None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ctx.register_retriever("bad_ret", 123)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ctx.register_observer("bad_obs", 123)  # type: ignore[arg-type]
 
 
 # 测试第 5 插槽 ObserverProtocol 的实例/工厂注册、重名校验与 ToolsConfig.build_observers 装配
@@ -379,7 +439,7 @@ class MemObserverPlugin(Plugin):
     ctx.register_observer("obs1", obs_list_a[0])
     with pytest.raises(ValueError, match="重复"):
         ctx.register_observer("obs1", obs_list_b[0])
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises(TypeError):
         ctx.register_observer("bad", 123)  # type: ignore[arg-type]
 
 
@@ -394,7 +454,7 @@ def test_plugin_initialize_runs_once_while_tools_rebind_dynamic_context(tmp_path
         """
 from pathlib import Path
 from personal_assistant.agent.plugins import Plugin
-from personal_assistant.agent.tools import Tool, ToolDocument, ToolMetadata, tool
+from personal_assistant.agent.tools import Tool, ToolMetadata, tool
 
 TOOL_INIT_CALLS = 0
 OBSERVER_INIT_CALLS = 0
@@ -419,7 +479,7 @@ class CounterToolPlugin(Plugin):
     def initialize(self) -> None:
         global TOOL_INIT_CALLS
         TOOL_INIT_CALLS += 1
-        self.context.register_tool(peek_turn_ctx, source_name="counter_plugins")
+        self.context.register_tool(peek_turn_ctx)
         self.context.register_tool(
             Tool(
                 name="peek_explicit_tool",
@@ -427,9 +487,7 @@ class CounterToolPlugin(Plugin):
                 parameters={},
                 handler=lambda before_msg_id=None: f"explicit:{before_msg_id}",
             ),
-            source_name="counter_plugins",
             metadata=ToolMetadata(risk="read", always_on=True),
-            document=ToolDocument(source_type="plugin", source_name="custom_doc"),
         )
 
 
@@ -473,7 +531,7 @@ class CounterObserverPlugin(Plugin):
     )
 
     cfg = ToolsConfig.load(cfg_path, project_root=tmp_path)
-    mod = cfg.plugin_manager.modules[0][1]
+    mod = sys.modules[type(cfg.plugin_manager.plugins[0]).__module__]
     assert mod.TOOL_INIT_CALLS == 1
     assert mod.OBSERVER_INIT_CALLS == 1
 
@@ -486,10 +544,10 @@ class CounterObserverPlugin(Plugin):
     assert reg2.execute("peek_turn_ctx", '{"tag": "t2"}') == "t2:25:none"
     assert reg1.execute("peek_explicit_tool", "{}") == "explicit:10"
     assert reg2.execute("peek_explicit_tool", "{}") == "explicit:25"
-    assert reg2.document("peek_explicit_tool").source_name == "custom_doc"  # type: ignore[union-attr]
-    assert reg2.metadata("peek_explicit_tool").always_on is True  # type: ignore[union-attr]
+    meta = reg2.metadata("peek_explicit_tool")
+    assert meta is not None and meta.always_on is True
 
-    # 2. 跨多轮 AssistantApp.chat() 与 status()：initialize() 仍严格保持 1 次，before_msg_id 逐轮递增
+    # 2. 跨多轮 AssistantApp.chat() 与 status()：initialize() 仍严格保持单次加载语义，before_msg_id 逐轮递增
     llm = ScriptedLLM(
         [
             {
@@ -520,8 +578,7 @@ class CounterObserverPlugin(Plugin):
     )
     app = AssistantApp(data_root=tmp_path / "app_data", config_path=cfg_path, project_root=tmp_path, llm=llm)
     try:
-        app_mod = app.tools_config.plugin_manager.modules[0][1]  # type: ignore[union-attr]
-        # 新建 AssistantApp 时再次执行 ToolsConfig.load 初始化 1 次（累计 2 次），后续每轮对话不得再递增
+        app_mod = sys.modules[type(app.tools_config.plugin_manager.plugins[0]).__module__]
         assert app_mod.TOOL_INIT_CALLS == 2
         assert app_mod.OBSERVER_INIT_CALLS == 2
 
@@ -545,30 +602,28 @@ class CounterObserverPlugin(Plugin):
         assert "search_chat_history" in reg.names
 
 
-# 测试自定义 Tool 子类保留子类类型/重写 run/always_on 且不污染 **values，以及省略 source_name 的函数工具重绑与 base_context 合并
-def test_custom_tool_subclass_preserved_and_base_context_merged(tmp_path: Path) -> None:
-    from personal_assistant.agent.tools import Tool, ToolMetadata, ToolRegistry
+# 测试纯值对象 Tool 的 accept_context=False 上下文隔离与 PluginManager 初始 bindings 合并重绑
+def test_accept_context_false_isolation_and_base_bindings_merged(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import Tool, ToolRegistry
 
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
-    (plugins_dir / "subclass_and_fn_plugin.py").write_text(
+    (plugins_dir / "fn_and_isolated_plugin.py").write_text(
         """
 from collections.abc import Mapping
 from pathlib import Path
 from personal_assistant.agent.plugins import Plugin
-from personal_assistant.agent.tools import Tool, ToolMetadata, build_tool
+from personal_assistant.agent.tools import ToolMetadata, build_tool
 
 
-# 真正的自定义 Tool 子类（重写 run 且含 **values），绝不能被 build_tool 洗壳或注入上下文参数
-class StrictSubclassTool(Tool):
-    # 直接校验只收到模型声明的 text 参数，绝无 project_root/data_root 混入
-    def run(self, **values: str) -> str:
-        assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
-        return f"subclass:{self.name}:{values['text']}"
+# 隔离上下文的 **values 工具：绝不能被混入 project_root / data_root 等上下文键
+def strict_values(**values: str) -> str:
+    assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
+    return f"isolated:{values['text']}"
 
 
-# 测试用函数型工具：省略 source_name 注册时也必须能动态绑定 data_root / config_path / web_config
-def probe_omitted_source(
+# 声明动态绑定键的函数工具
+def probe_bindings(
     tag: str,
     *,
     data_root: Path | None = None,
@@ -582,37 +637,29 @@ def probe_omitted_source(
     return f"{tag}:{data_name}:{cfg_name}:{timeout_val}:{before_msg_id}"
 
 
-FN_BUILT_TOOL = build_tool(
-    probe_omitted_source,
-    description="省略 source_name 的 build_tool 产物",
-    parameters={"tag": "标签"},
-)
+# 注册上下文隔离工具与动态绑定工具的插件
+class MixedToolPlugin(Plugin):
+    plugin_id = "mixed_tool"
 
-
-# 同时注册自定义 Tool 子类（带/不带 source_name）与省略 source_name 的函数型工具
-class MixedCustomPlugin(Plugin):
-    plugin_id = "mixed_custom"
-
-    # 注册三类工具
+    # 向主板插槽注册两个纯净 Tool 值对象
     def initialize(self) -> None:
         self.context.register_tool(
-            StrictSubclassTool(
-                name="sub_with_src",
-                description="带 source_name 的自定义子类",
+            build_tool(
+                strict_values,
+                name="isolated_tool",
+                description="隔离上下文工具",
                 parameters={"text": "文本"},
+                accept_context=False,
             ),
-            source_name="subclass_src",
             metadata=ToolMetadata(risk="read", always_on=True),
         )
         self.context.register_tool(
-            StrictSubclassTool(
-                name="sub_no_src",
-                description="省略 source_name 的自定义子类",
-                parameters={"text": "文本"},
-            ),
-            metadata=ToolMetadata(risk="exec", always_on=True),
+            build_tool(
+                probe_bindings,
+                description="动态绑定探针",
+                parameters={"tag": "标签"},
+            )
         )
-        self.context.register_tool(FN_BUILT_TOOL)
 """,
         encoding="utf-8",
     )
@@ -620,88 +667,73 @@ class MixedCustomPlugin(Plugin):
     cfg_path = tmp_path / "tools.json"
     cfg_path.write_text("{}", encoding="utf-8")
     manager = PluginManager.from_entries(
-        ["plugins/subclass_and_fn_plugin.py"],
+        ["plugins/fn_and_isolated_plugin.py"],
         tmp_path,
-        context={
-            "project_root": tmp_path,
+        config={"web": {"timeout": 9}},
+        bindings={
             "config_path": cfg_path,
-            "raw_config": {"web": {"timeout": 9}},
+            "web_config": {"timeout": 9},
         },
     )
-    mod = manager.modules[0][1]
 
-    # 局部上下文仅传 data_root 与 extra_bindings，必须保留 base_context 中的 config_path 与 web_config
-    reg = ToolRegistry(allowed_names=["probe_omitted_source"])
+    reg = ToolRegistry(allowed_names=["probe_bindings"])
     manager.register_into(
         reg,
         context={
             "data_root": tmp_path / "data_turn_a",
-            "extra_bindings": {"before_msg_id": 31},
+            "before_msg_id": 31,
         },
     )
 
-    # 自定义子类保持原子类类型、always_on=True 常驻激活，且 **values 不被上下文参数污染
-    assert set(reg.names) == {"probe_omitted_source", "sub_with_src", "sub_no_src"}
-    sub_a = reg._tools["sub_with_src"]
-    sub_b = reg._tools["sub_no_src"]
-    assert type(sub_a) is mod.StrictSubclassTool
-    assert type(sub_b) is mod.StrictSubclassTool
-    assert reg.metadata("sub_with_src").always_on is True  # type: ignore[union-attr]
-    assert reg.metadata("sub_no_src").risk == "exec"  # type: ignore[union-attr]
-    assert reg.document("sub_with_src").source_name == "subclass_src"  # type: ignore[union-attr]
-    assert reg.document("sub_no_src").source_name == "mixed_custom"  # type: ignore[union-attr]
-    assert reg.execute("sub_with_src", '{"text": "ok"}') == "subclass:sub_with_src:ok"
-    assert reg.execute("sub_no_src", '{"text": "ok"}') == "subclass:sub_no_src:ok"
+    assert set(reg.names) == {"probe_bindings", "isolated_tool"}
+    iso_a = reg._tools["isolated_tool"]
+    assert type(iso_a) is Tool
+    meta = reg.metadata("isolated_tool")
+    assert meta is not None and meta.always_on is True
+    assert reg.execute("isolated_tool", '{"text": "ok"}') == "isolated:ok"
+    assert reg.execute("probe_bindings", '{"tag": "t1"}') == "t1:data_turn_a:tools.json:9:31"
 
-    # 省略 source_name 的函数型工具同样在 build_tools(ctx) 中拿到动态覆盖 + 初始 base_context
-    assert reg.execute("probe_omitted_source", '{"tag": "t1"}') == "t1:data_turn_a:tools.json:9:31"
-
-    reg2 = ToolRegistry(allowed_names=["probe_omitted_source"])
+    reg2 = ToolRegistry(allowed_names=["probe_bindings"])
     manager.register_into(
         reg2,
         context={
             "data_root": tmp_path / "data_turn_b",
-            "extra_bindings": {"before_msg_id": 45},
+            "before_msg_id": 45,
         },
     )
-    assert reg2.execute("probe_omitted_source", '{"tag": "t2"}') == "t2:data_turn_b:tools.json:9:45"
-    assert reg2._tools["sub_with_src"] is not sub_a
+    assert reg2.execute("probe_bindings", '{"tag": "t2"}') == "t2:data_turn_b:tools.json:9:45"
 
 
-# 测试 PluginContext.tool_bindings 通用顶层配置映射与裸 Tool 实例零猴子补丁签名解析
-def test_plugin_context_generic_section_config_mapping_and_bare_tool_rebind(tmp_path: Path) -> None:
-    from personal_assistant.agent.tools import Tool, ToolRegistry
+# 测试 register_tools_from_module 公开方法与裸 Tool 实例零猴子补丁签名推断及重绑
+def test_register_tools_from_module_and_bare_tool_rebind(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import ToolRegistry
 
-    # 验证任意顶层 Mapping 配置自动按 <section>_config 注入，且不覆盖显式 extra_bindings
-    ctx = PluginContext(
-        project_root=tmp_path,
-        raw_config={
-            "custom_search": {"top_k": 8},
-            "web": {"timeout": 12},
-            "enabled_tools": ["demo"],
-        },
-        extra_bindings={"custom_search_config": {"top_k": 3}},
-    )
-    bindings = ctx.tool_bindings()
-    assert bindings["web_config"] == {"timeout": 12}
-    assert bindings["custom_search_config"] == {"top_k": 3}
-    assert "enabled_tools_config" not in bindings
-
-    # 验证插件注册裸 Tool(handler=...) 时自动解析 accepted_context_keys 与 optional required，且后续 build_tools 轻量化重绑
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
+    (plugins_dir / "_sub_tools.py").write_text(
+        """
+from personal_assistant.agent.tools import tool
+
+# 子模块装饰器工具（供 register_tools_from_module 扫描）
+@tool(description="拼接前缀", parameters={"word": "词"})
+def prefix_word(word: str, *, prefix: str = "def") -> str:
+    return f"{prefix}:{word}"
+""",
+        encoding="utf-8",
+    )
     (plugins_dir / "bare_tool_plugin.py").write_text(
         """
 from collections.abc import Mapping
+from pathlib import Path
 from personal_assistant.agent.plugins import Plugin
 from personal_assistant.agent.tools import Tool
 
 
-# 测试裸 Tool 实例通过主板按通用配置键注入
+# 测试裸 Tool 实例签名解析与 register_tools_from_module 扫描
 class BareToolPlugin(Plugin):
     plugin_id = "bare_tool"
 
-    # 注册带可选参数与配置键的裸 Tool 实例
+    # 注册裸 Tool 实例并从附属模块扫描 @tool
     def initialize(self) -> None:
         # 接收模型参数与自动映射的 custom_mod_config 上下文
         def _run(query: str, mode: str = "fast", *, custom_mod_config: Mapping[str, object] | None = None) -> str:
@@ -716,18 +748,21 @@ class BareToolPlugin(Plugin):
                 handler=_run,
             )
         )
+        self.context.register_tools_from_module(Path(__file__).with_name("_sub_tools.py"))
 """,
         encoding="utf-8",
     )
     manager = PluginManager.from_entries(
         ["plugins/bare_tool_plugin.py"],
         tmp_path,
-        context={"raw_config": {"custom_mod": {"limit": 7}}},
+        bindings={"custom_mod_config": {"limit": 7}, "prefix": "init"},
     )
-    reg = ToolRegistry(allowed_names=["bare_probe"])
+    reg = ToolRegistry(allowed_names=["bare_probe", "prefix_word"])
     manager.register_into(reg)
     assert reg.execute("bare_probe", '{"query": "hello"}') == "hello:fast:7"
+    assert reg.execute("prefix_word", '{"word": "ok"}') == "init:ok"
 
-    reg_override = ToolRegistry(allowed_names=["bare_probe"])
-    manager.register_into(reg_override, context={"raw_config": {"custom_mod": {"limit": 15}}})
+    reg_override = ToolRegistry(allowed_names=["bare_probe", "prefix_word"])
+    manager.register_into(reg_override, context={"custom_mod_config": {"limit": 15}, "prefix": "override"})
     assert reg_override.execute("bare_probe", '{"query": "hi", "mode": "deep"}') == "hi:deep:15"
+    assert reg_override.execute("prefix_word", '{"word": "ok"}') == "override:ok"

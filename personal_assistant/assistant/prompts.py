@@ -1,11 +1,10 @@
 """Layer 3 个人助手业务系统提示词定义与组装（从通用 ReAct 引擎中剥离）。"""
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import TYPE_CHECKING
-from zoneinfo import ZoneInfo
 
-from personal_assistant.assistant.common import format_date_with_weekday
+from personal_assistant.assistant.common import format_date_with_weekday, today_shanghai
 
 if TYPE_CHECKING:
     from personal_assistant.assistant.memory import MemoryStore
@@ -40,6 +39,6 @@ def format_system_prompt(
     index = memory.read_memory_index()
     if index:
         parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-    ref_day = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    ref_day = today or today_shanghai()
     parts.append(f"今天是 {format_date_with_weekday(ref_day)}。")
     return "\n\n".join(parts)

@@ -13,7 +13,6 @@ from personal_assistant.ai import (
     ModelProfile,
     ModelsConfig,
     OpenAICompatibleLLM,
-    from_models_dict,
 )
 from personal_assistant.assistant.app import build_app
 from personal_assistant.assistant.commands import ToolsConfig
@@ -353,12 +352,12 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
     """
     compiled = compiler.compile(dsl, "dual.dsl")
     assert compiled["default"] == "deepseek_reasoner"
-    assert compiled["consolidator"] == "deepseek"
+    assert compiled["roles"] == {"consolidator": "deepseek"}
 
     cfg = ModelsConfig.from_dict(compiled)
-    assert cfg.consolidator == "deepseek"
+    assert cfg.roles == {"consolidator": "deepseek"}
     redacted = cfg.redacted_dict()
-    assert redacted["consolidator"] == "deepseek"
+    assert redacted["roles"] == {"consolidator": "deepseek"}
     assert "sk-r1-secret" not in json.dumps(redacted, ensure_ascii=False)
     assert "sk-ds-secret" not in json.dumps(redacted, ensure_ascii=False)
 
@@ -368,19 +367,19 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
         "alias.dsl",
     )
     assert compiled_alias_def["default"] == "deepseek_reasoner"
-    assert compiled_alias_def["consolidator"] == "deepseek"
+    assert compiled_alias_def["roles"] == {"consolidator": "deepseek"}
 
-    # 未配置 consolidator 时 ModelsConfig.consolidator 为 None 且不破坏既有脱敏结构
+    # 未配置命名角色时 ModelsConfig.roles 为空字典
     single_cfg = ModelsConfig.from_dict(compiler.compile("use deepseek sk-only", "single.dsl"))
-    assert single_cfg.consolidator is None
-    assert "consolidator" not in single_cfg.redacted_dict()
+    assert single_cfg.roles == {}
+    assert single_cfg.redacted_dict()["roles"] == {}
 
-    # 2. 非法校验：ModelsConfig 悬空 consolidator、DSL 重复声明/悬空 consolidator 报精确错
+    # 2. 非法校验：ModelsConfig 悬空 role、DSL 重复声明/悬空 consolidator 报精确错
     with pytest.raises(ValueError, match="ghost"):
         ModelsConfig.from_dict(
             {
                 "default": "a",
-                "consolidator": "ghost",
+                "roles": {"consolidator": "ghost"},
                 "models": {"a": {"base_url": "https://x.com/v1", "model": "m", "api_key": "sk-1"}},
             }
         )
@@ -392,7 +391,7 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
     # 3. render_models_dsl / compiler.render 支持可选 consolidator 并防注入校验
     rendered = compiler.render(preset="deepseek", api_key="sk-render", consolidator="deepseek")
     assert "consolidator deepseek" in rendered
-    assert compiler.compile(rendered, "rendered.dsl")["consolidator"] == "deepseek"
+    assert compiler.compile(rendered, "rendered.dsl")["roles"] == {"consolidator": "deepseek"}
 
     rendered_custom = compiler.render(
         preset="custom",
@@ -403,7 +402,7 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
         consolidator="r1",
     )
     assert "consolidator r1" in rendered_custom
-    assert compiler.compile(rendered_custom, "rendered_custom.dsl")["consolidator"] == "r1"
+    assert compiler.compile(rendered_custom, "rendered_custom.dsl")["roles"] == {"consolidator": "r1"}
 
     with pytest.raises(ValueError, match="模型名称"):
         compiler.render(preset="deepseek", api_key="sk-1", consolidator="bad\nuse ollama")

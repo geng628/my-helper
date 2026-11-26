@@ -577,7 +577,6 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "models.json").write_text('{"api_key":"MODEL_JSON_SECRET"}\n', encoding="utf-8")
     (tmp_path / "config" / "models.dsl").write_text("api_key MODEL_DSL_SECRET\n", encoding="utf-8")
-    (tmp_path / "config" / ".tmp-models-abc").write_text("TMP_SECRET\n", encoding="utf-8")
     (tmp_path / "data" / "state").mkdir(parents=True)
     (tmp_path / "data" / "state" / "db.txt").write_text("STATE_DB_SECRET\n", encoding="utf-8")
     (tmp_path / "data" / "workspace").mkdir(parents=True)
@@ -628,7 +627,6 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         "ls data/ſtate",
         "cat config/modelſ.json",
         "cat config/modelſ.dsl",
-        "cat config/.tmp-models-abc",
         "cat .e\u200bnv",
         "cat .ENV.EXAMPLE",
         "cat data/workspace/hardlink_models.txt",

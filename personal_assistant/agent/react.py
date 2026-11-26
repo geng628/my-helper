@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from time import perf_counter
 
 from personal_assistant.agent.tools import ToolRegistry
@@ -11,7 +11,6 @@ from personal_assistant.ai.types import (
     StreamDone,
     TextDelta,
     ThinkingDelta,
-    TokenUsage,
     ToolCall,
     extract_tool_calls,
 )
@@ -44,36 +43,19 @@ class TurnEnd:
     total_ms: float = 0.0
 
 
-# 通用后台任务完成事件：供业务层广播异步任务耗时与 Token 开销，不侵入微内核具体业务
-@dataclass(frozen=True)
-class TaskEvent:
-    kind: str
-    duration_ms: float = 0.0
-    usage: TokenUsage | None = None
-    details: dict[str, object] = field(default_factory=dict)
-    error: str | None = None
-
-
 AgentEvent = TextDelta | ThinkingDelta | StreamDone | ToolStart | ToolStep | TurnEnd
-RuntimeEvent = AgentEvent | TaskEvent
 
 
-# 准备单轮发往大模型的上下文消息切片，确保两阶段管道变换绝不原地污染主消息列表及字典键
+# 准备单轮发往大模型的上下文消息切片，确保上下文边界转换绝不原地污染主消息列表及字典键
 def _prepare_llm_messages(
     messages: list[dict[str, object]],
-    transform_context: ContextTransformer | None,
     convert_to_llm: ContextTransformer | None,
 ) -> list[dict[str, object]]:
-    if transform_context is None and convert_to_llm is None:
+    if convert_to_llm is None:
         return messages
     ctx_msgs: list[dict[str, object]] = [dict(msg) for msg in messages]
-    if transform_context is not None:
-        transformed = transform_context(ctx_msgs)
-        ctx_msgs = transformed if isinstance(transformed, list) else list(transformed)
-    if convert_to_llm is not None:
-        converted = convert_to_llm(ctx_msgs)
-        ctx_msgs = converted if isinstance(converted, list) else list(converted)
-    return ctx_msgs
+    converted = convert_to_llm(ctx_msgs)
+    return converted if isinstance(converted, list) else list(converted)
 
 
 # 规范化写入历史的消息字典：保留扩展字段、补齐 role，并统一将 tool_calls 归一化或剥离
@@ -107,13 +89,12 @@ def _stream_llm_round(
     return done.message if done is not None else {"role": "assistant", "content": ""}
 
 
-# 执行流式通用 ReAct 主循环：单层 while True 内核，支持两阶段上下文转换并仅在无 ToolCall 时自然终止
+# 执行流式通用 ReAct 主循环：单层 while True 内核，支持可选 convert_to_llm 边界转换并仅在无 ToolCall 时自然终止
 def iter_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
     *,
-    transform_context: ContextTransformer | None = None,
     convert_to_llm: ContextTransformer | None = None,
     tool_context: Mapping[str, object] | None = None,
 ) -> Iterator[AgentEvent]:
@@ -121,8 +102,8 @@ def iter_react(
     tool_defs = tools.definitions() if tools.names else None
 
     while True:
-        # 1. Reason：按需经 transform_context -> convert_to_llm 转换上下文副本后流式调用模型
-        llm_msgs = _prepare_llm_messages(messages, transform_context, convert_to_llm)
+        # 1. Reason：按需经 convert_to_llm 转换上下文副本后流式调用模型
+        llm_msgs = _prepare_llm_messages(messages, convert_to_llm)
         assistant_msg = yield from _stream_llm_round(llm, llm_msgs, tool_defs)
         tool_calls = extract_tool_calls(assistant_msg)
         if not tool_calls:
@@ -154,14 +135,13 @@ def iter_react(
             )
 
 
-# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent 与两阶段上下文管道，并在模型停止调用工具时返回最终回答
+# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent 与上下文转换，并在模型停止调用工具时返回最终回答
 def run_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
     *,
     on_event: Callable[[AgentEvent], None] | None = None,
-    transform_context: ContextTransformer | None = None,
     convert_to_llm: ContextTransformer | None = None,
     tool_context: Mapping[str, object] | None = None,
 ) -> str:
@@ -170,7 +150,6 @@ def run_react(
         llm,
         messages,
         tools,
-        transform_context=transform_context,
         convert_to_llm=convert_to_llm,
         tool_context=tool_context,
     ):

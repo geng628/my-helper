@@ -44,17 +44,30 @@ def test_registry_allowlist_filters_schemas_and_blocks_calls() -> None:
 
 # 测试加载项目真实 config/tools.json 与统一工具注册表
 def test_load_real_project_tools_config() -> None:
+    from collections.abc import Mapping
+    from personal_assistant.agent.tools import ToolsetProvider
+
     repo_root = Path(__file__).resolve().parent.parent
     cfg = ToolsConfig.load(repo_root / "config" / "tools.json", project_root=repo_root)
 
     assert "search_markdown" in cfg.enabled_tools
     assert [cmd.tool_name for cmd in cfg.commands] == ["cmd_git_status", "cmd_disk_usage"]
 
-    builtin = [
-        Tool("search_markdown", "搜笔记", {"query": "词"}, lambda query: f"hit:{query}"),
-        Tool("unlisted_tool", "未在白名单的工具", {}, lambda: "nope"),
-    ]
-    registry = cfg.build_registry(*builtin)
+    # 模拟内置工具提供方（同时含白名单内外工具）
+    class _BuiltinStubProvider(ToolsetProvider):
+        # 产出内置桩工具列表
+        def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
+            return [
+                Tool("search_markdown", "搜笔记", {"query": "词"}, lambda query: f"hit:{query}"),
+                Tool("unlisted_tool", "未在白名单的工具", {}, lambda: "nope"),
+            ]
+
+    with pytest.raises(TypeError):
+        cfg.build_registry(Tool("x", "x", {}, lambda: "x"))  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        cfg.build_registry(extra_tools=[])  # type: ignore[call-arg]
+
+    registry = cfg.build_registry(providers=[_BuiltinStubProvider()])
     assert registry.names == [
         "search_markdown",
         "get_current_time",
@@ -298,15 +311,22 @@ def test_command_spec_offloads_long_stdout_and_stderr_with_head_tail(
     assert "FINAL_STDERR_LINE" in full_saved
 
 
-# 测试三类异构工具来源（BuiltinTool / 纯净 Tool 插件 / CommandToolWrapper）统一汇聚进同一个 ToolRegistry（_tools + _metadata + _documents）并支持按需激活
+# 测试三类工具来源（内置记忆工具 / 插件 @tool / 固定命令）全部收敛为单一纯值对象 Tool，并消除空壳子类与死归档
 def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
     tmp_path: Path,
 ) -> None:
-    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, tool
+    import personal_assistant.agent.tools as tools_mod
+    import personal_assistant.assistant.builtin_tools as builtin_mod
+    import personal_assistant.assistant.commands as commands_mod
+    from personal_assistant.agent.tools import ToolMetadata, extract_tool, is_tool, tool
     from personal_assistant.assistant.app import AssistantApp
-    from personal_assistant.assistant.builtin_tools import BuiltinTool
-    from personal_assistant.assistant.commands import CommandToolWrapper
     from personal_assistant.assistant.common import REPO_ROOT
+
+    assert not hasattr(tools_mod, "ToolDocument")
+    assert not hasattr(ToolRegistry, "document")
+    assert not hasattr(ToolRegistry, "activate")
+    assert not hasattr(builtin_mod, "BuiltinTool")
+    assert not hasattr(commands_mod, "CommandToolWrapper")
 
     app = AssistantApp(
         data_root=tmp_path / "data",
@@ -316,44 +336,27 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
     try:
         registry = app.tools
 
-        # 1. 内核内置工具 (MemoryToolsetProvider) ──▶ BuiltinTool(Tool) 子类
-        read_tool = registry._tools["read_markdown"]
-        assert isinstance(read_tool, BuiltinTool)
-        assert isinstance(read_tool, Tool)
-        assert registry.metadata("read_markdown") == ToolMetadata(risk="read", always_on=False)
-        assert registry.document("read_markdown") == ToolDocument(
-            source_type="builtin",
-            source_name="memory",
-        )
-        assert registry.metadata("write_file") == ToolMetadata(risk="write", always_on=False)
+        # 1. 内核内置工具、插件工具与固定命令全部收敛为纯净 Tool 值对象（type(t) is Tool）
+        for tool_name, expected_risk in (
+            ("read_markdown", "read"),
+            ("write_file", "write"),
+            ("run_command", "exec"),
+            ("cmd_git_status", "exec"),
+        ):
+            item = registry._tools[tool_name]
+            assert type(item) is Tool
+            assert registry.metadata(tool_name) == ToolMetadata(risk=expected_risk, always_on=False)
 
-        # 2. 插件 @tool (PluginManager) ──▶ 纯净 Tool 实例（不再生成动态子类）
-        run_cmd_tool = registry._tools["run_command"]
-        assert type(run_cmd_tool) is Tool
-        assert registry.metadata("run_command") == ToolMetadata(risk="exec", always_on=False)
-        assert registry.document("run_command") == ToolDocument(
-            source_type="plugin",
-            source_name="shell_tools",
-        )
-
-        # 3. 固定命令包装器 ──▶ CommandToolWrapper(Tool) 子类
-        git_tool = registry._tools["cmd_git_status"]
-        assert isinstance(git_tool, CommandToolWrapper)
-        assert isinstance(git_tool, Tool)
-        assert registry.metadata("cmd_git_status") == ToolMetadata(risk="exec", always_on=False)
-        assert registry.document("cmd_git_status") == ToolDocument(
-            source_type="command",
-            source_name="tools.json",
-        )
-
-        # 4. 按需加载与 always_on 常驻激活
+        # 2. @tool 装饰函数可直接传给 ToolRegistry.__init__ / register，always_on=True 在注册时立即激活
         @tool(description="常驻心跳", always_on=True)
         def always_ping() -> str:
             return "pong"
 
-        registry.register(always_ping.__agent_tool__)
-        registry.activate(["read_markdown"])
-        assert set(registry.names) == {"read_markdown", "always_ping"}
+        assert is_tool(always_ping) is True
+        assert type(extract_tool(always_ping)) is Tool
+        registry.register(always_ping)
+        assert "always_ping" in registry.names
+        assert registry.execute("always_ping", "{}") == "pong"
     finally:
         app.close()
 
@@ -396,7 +399,7 @@ def test_tool_schema_required_export_and_positional_compat() -> None:
 
 # 测试 build_tool 自动识别带默认值可选参数、CommandSpec 全必填与零动态造类/猴子补丁
 def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) -> None:
-    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, build_tool
+    from personal_assistant.agent.tools import ToolMetadata, build_tool
     from personal_assistant.assistant.commands import CommandSpec, ParamSpec
 
     # 同时含必选参数、POSITIONAL_OR_KEYWORD 默认值、KEYWORD_ONLY 默认值与上下文参数
@@ -415,15 +418,12 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
         parameters={"query": "查询", "root": "目录", "limit": "条数"},
         risk="read",
         always_on=True,
-        source_type="plugin",
-        source_name="demo_mod",
     )
     assert type(built) is Tool
     assert not hasattr(built, "_raw_fn")
     assert not hasattr(built, "__tool_metadata__")
-    assert not hasattr(built, "__tool_document__")
+    assert not hasattr(built, "document")
     assert built.metadata == ToolMetadata(risk="read", always_on=True)
-    assert built.document == ToolDocument(source_type="plugin", source_name="demo_mod")
     assert built.required == ("query",)
     assert built.accepted_context_keys == frozenset({"turn_id"})
     assert built.to_openai_schema()["function"]["parameters"]["required"] == ["query"]
@@ -446,7 +446,7 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
     assert flex_tool.required == ("query",)
     assert flex_tool.accepted_context_keys is None
 
-    # CommandSpec.run(self, **values) 的签名参数为 **values，params 仍全为必填
+    # CommandSpec.run(self, **values) 通过 accept_context=False 隔离上下文且 params 全为必填
     spec = CommandSpec(
         name="demo_cmd",
         description="示例命令",
@@ -455,6 +455,7 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
         cwd=tmp_path,
     )
     cmd_tool = spec.to_tool()
+    assert type(cmd_tool) is Tool
     assert cmd_tool.required == ("mode",)
     assert cmd_tool.accepted_context_keys == frozenset()
     assert cmd_tool.to_openai_schema()["function"]["parameters"]["required"] == ["mode"]
@@ -507,9 +508,9 @@ def test_tool_registry_execute_optional_params_and_validation() -> None:
     assert "不接受参数" in registry.execute("ping", '{"x": "1"}')
 
 
-# 测试执行期 context 动态注入、bind_tool_context 纯函数重绑与自定义 Tool 子类隔离保护
+# 测试执行期 context 动态注入、bind_tool_context 纯函数重绑与 accept_context=False 上下文隔离保护
 def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
-    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, bind_tool_context, build_tool
+    from personal_assistant.agent.tools import ToolMetadata, bind_tool_context, build_tool
 
     # 声明静态/动态上下文键的函数工具
     def ctx_fn(query: str, *, env: str = "unset", turn_id: int | None = None) -> str:
@@ -519,12 +520,10 @@ def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
     def kwargs_fn(query: str, **ctx: object) -> str:
         return f"q={query}|keys={sorted(ctx)}|turn={ctx.get('turn_id')}"
 
-    # 自定义重写 run() 的 Tool 子类：绝不能把 bound_kwargs 或执行期 context 混入 **values
-    class StrictSubTool(Tool):
-        # 校验只收到模型声明的参数
-        def run(self, **values: str) -> str:
-            assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
-            return f"sub:{values['text']}"
+    # 关闭 accept_context=False 的 **values 工具：绝不能把 bound_kwargs 或执行期 context 混入 **values
+    def strict_values_fn(**values: str) -> str:
+        assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
+        return f"sub:{values['text']}"
 
     t_ctx = build_tool(
         ctx_fn,
@@ -535,7 +534,13 @@ def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
     assert t_ctx.bound_kwargs == {"env": "prod", "turn_id": 0}
 
     t_kw = build_tool(kwargs_fn, description="kwargs探针", parameters={"query": "词"})
-    t_sub = StrictSubTool(name="strict_sub", description="子类", parameters={"text": "文本"})
+    t_sub = build_tool(
+        strict_values_fn,
+        name="strict_sub",
+        description="隔离工具",
+        parameters={"text": "文本"},
+        accept_context=False,
+    )
 
     reg = ToolRegistry(t_ctx, t_kw, t_sub)
     # 1. 执行期 context 覆盖 turn_id、保留 env、忽略未声明键，且绝不覆盖模型声明参数 query
@@ -555,7 +560,7 @@ def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
         == "q=ok|keys=['turn_id']|turn=7"
     )
 
-    # 4. 自定义子类绝不混入 context
+    # 4. accept_context=False 工具绝不混入 context
     assert reg.execute("strict_sub", '{"text": "safe"}', context={"turn_id": 9, "extra": "bad"}) == "sub:safe"
 
     # 5. bind_tool_context 纯函数返回新实例且不篡改原实例
@@ -563,17 +568,15 @@ def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
         t_ctx,
         {"turn_id": 88, "ignored": "nope"},
         metadata=ToolMetadata(risk="write", always_on=True),
-        document=ToolDocument(source_type="plugin", source_name="rebound_src"),
     )
     assert rebound is not t_ctx
     assert t_ctx.bound_kwargs["turn_id"] == 0
     assert rebound.bound_kwargs == {"env": "prod", "turn_id": 88}
     assert rebound.metadata == ToolMetadata(risk="write", always_on=True)
-    assert rebound.document == ToolDocument(source_type="plugin", source_name="rebound_src")
 
-    # 6. bind_tool_context 对重写 run() 的子类仍返回新实例且不注入 bound_kwargs
+    # 6. bind_tool_context 对 accept_context=False 工具同样不混入 bound_kwargs
     rebound_sub = bind_tool_context(t_sub, {"turn_id": 5}, metadata=ToolMetadata(risk="exec", always_on=True))
     assert rebound_sub is not t_sub
-    assert type(rebound_sub) is StrictSubTool
+    assert type(rebound_sub) is Tool
     assert rebound_sub.bound_kwargs == {}
     assert rebound_sub.run_with_context({"text": "clean"}, {"turn_id": 99}) == "sub:clean"

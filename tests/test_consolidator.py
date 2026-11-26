@@ -230,15 +230,15 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
         assert "data/memory/preferences.md" in app.memory.read_memory_index()
         assert app.status()["consolidation"]["last_result"]["compacted_messages"] == 4
 
-        # 第 4 轮验证上下文已缩减：system 更新了索引 + 前情摘要承接对 + 仅保留第3轮 2 条原话 + 本轮提问
+        # 第 4 轮验证上下文已缩减：单条 system 更新了索引并拼入前情摘要 + 仅保留第3轮 2 条原话 + 本轮提问
         r4 = app.chat("第4轮：现在还记得吗？", chat_id="auto-1")
         assert r4["reply"] == "答4"
         turn4_msgs = chat_llm.requests[3]
+        assert turn4_msgs[0]["role"] == "system"
         assert "data/memory/preferences.md" in str(turn4_msgs[0]["content"])
-        assert "【本会话已压缩前情摘要" in str(turn4_msgs[1]["content"])
-        assert turn4_msgs[2]["role"] == "assistant"
-        # 仅保留最近 2 条（第3轮一问一答）+ 本轮提问，第1/2轮原话已缩减掉
-        contents = [str(m["content"]) for m in turn4_msgs[3:]]
+        assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in str(turn4_msgs[0]["content"])
+        # 仅保留最近 2 条（第3轮一问一答）+ 本轮提问，零伪造承接对，第1/2轮原话已缩减掉
+        contents = [str(m["content"]) for m in turn4_msgs[1:]]
         assert contents == ["第3轮：继续推进", "答3", "第4轮：现在还记得吗？"]
         # 原始 SQLite 历史仍然完整保留全部 8 条消息
         assert app.state.count_messages("auto-1") == 8

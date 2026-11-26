@@ -23,7 +23,6 @@ from personal_assistant.ai.client import (
     extract_usage,
     from_env,
     from_model_profile,
-    from_models_dict,
     register_provider,
 )
 from personal_assistant.ai.types import (
@@ -69,7 +68,6 @@ __all__ = [
     "format_cache_summary",
     "from_env",
     "from_model_profile",
-    "from_models_dict",
     "register_provider",
     "serialize_request",
     "summarize_records",

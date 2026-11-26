@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from personal_assistant.assistant.cli import build_demo_tools
 from personal_assistant.ai import (
     LLMClient,
     LLMNotConfigured,
@@ -17,6 +16,18 @@ from personal_assistant.ai import (
 )
 from personal_assistant.agent.react import ToolStart, ToolStep, TurnEnd, iter_react, run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
+
+
+# 构造纯内存演示工具注册表，确保 Layer 1/2 单元测试与 Layer 3 cli.py 零反向耦合
+def _demo_tools() -> ToolRegistry:
+    return ToolRegistry(
+        Tool(
+            name="get_current_time",
+            description="获取当前时间",
+            parameters={},
+            handler=lambda: "2026-11-26 12:00:00 (Asia/Shanghai)",
+        )
+    )
 
 
 # 测试用确定性脚本模拟模型
@@ -55,9 +66,9 @@ def test_direct_answer_without_tool_calls() -> None:
     messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "你好"}]
 
     with pytest.raises(TypeError):
-        run_react(llm, messages, build_demo_tools(), on_step=lambda *_: None)  # type: ignore[call-arg]
+        run_react(llm, messages, _demo_tools(), on_step=lambda *_: None)  # type: ignore[call-arg]
 
-    reply = run_react(llm, messages, build_demo_tools())
+    reply = run_react(llm, messages, _demo_tools())
 
     assert reply == "你好，有什么可以帮你？"
     assert len(llm.requests) == 1
@@ -287,7 +298,7 @@ def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     msg = real_client.respond(
         [{"role": "user", "content": "hi"}],
-        tools=build_demo_tools().definitions(),
+        tools=_demo_tools().definitions(),
     )
     assert msg == {"role": "assistant", "content": "ok"}
     assert captured["url"] == "https://example.com/v1/chat/completions"
@@ -351,7 +362,7 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
     assert bad_attempts["count"] == 1
 
 
-# 测试 ToolCall 双向契约与 extract_tool_calls 对字典和实例的兼容提取
+# 测试 ToolCall 单轨标准 OpenAI wire 契约与 extract_tool_calls 严格校验
 def test_tool_call_contract_and_extract_tool_calls() -> None:
     tc = ToolCall(id="call_a", name="ping", arguments='{"host": "127.0.0.1"}')
     wire = tc.to_openai_dict()
@@ -361,7 +372,6 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
         "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'},
     }
     assert ToolCall.from_raw(wire) == tc
-    assert ToolCall.from_raw(tc) is tc
     assert ToolCall.from_raw({"id": "c_empty", "type": "function", "function": {"name": "noop", "arguments": ""}}) == ToolCall(
         id="c_empty",
         name="noop",
@@ -372,20 +382,21 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
         name="noop",
         arguments="{}",
     )
-    assert ToolCall.from_raw({"id": "c_flat", "name": "echo", "arguments": {"text": "hi"}}) == ToolCall(
-        id="c_flat",
-        name="echo",
-        arguments='{"text": "hi"}',
-    )
-    with pytest.raises(TypeError):
-        ToolCall.from_raw("invalid-tool-call")
+    for bad_raw in (
+        "invalid-tool-call",
+        tc,
+        {"id": "c_flat", "name": "echo", "arguments": '{"text": "hi"}'},
+        {"id": "c_map", "type": "function", "function": {"name": "echo", "arguments": {"text": "hi"}}},
+    ):
+        with pytest.raises(TypeError):
+            ToolCall.from_raw(bad_raw)
 
-    extracted = extract_tool_calls({"role": "assistant", "tool_calls": [tc, wire]})
-    assert extracted == [tc, tc]
+    extracted = extract_tool_calls({"role": "assistant", "tool_calls": [wire]})
+    assert extracted == [tc]
     assert extract_tool_calls({"role": "assistant", "content": "hi"}) == []
     assert extract_tool_calls({"role": "assistant", "tool_calls": None}) == []
 
-    # 验证 iter_react 可直接消费 ToolCall 实例，并先产出 ToolStart 再执行工具后产出 ToolStep
+    # 验证 iter_react 按标准 wire 字典先产出 ToolStart 再执行工具后产出 ToolStep
     exec_order: list[str] = []
     tools = ToolRegistry(
         Tool(
@@ -397,7 +408,7 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
     )
     llm = ScriptedLLM(
         [
-            {"role": "assistant", "content": None, "tool_calls": [tc]},
+            {"role": "assistant", "content": None, "tool_calls": [wire]},
             {"role": "assistant", "content": "完成探测"},
         ]
     )
@@ -413,7 +424,7 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
     assert ToolStart(tool="ping", arguments='{"host": "127.0.0.1"}', call_id="call_a") in events
     assert any(isinstance(ev, ToolStep) and ev.call_id == "call_a" for ev in events)
 
-    # 验证扁平字典 / arguments=None 的 tool_calls 写回 messages 与发往下一轮 LLM 时均已统一归一化为标准 OpenAI wire 字典
+    # 验证 arguments=None / 空串的 wire tool_calls 写回 messages 与发往下一轮 LLM 时均已归一化为 "{}"
     noop_tools = ToolRegistry(Tool(name="ping", description="探测", parameters={}, handler=lambda: "pong"))
     norm_llm = ScriptedLLM(
         [
@@ -422,7 +433,7 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
                 "content": None,
                 "reasoning_content": "先探测",
                 "tool_calls": [
-                    {"id": "flat_1", "name": "ping", "arguments": {"host": "127.0.0.1"}},
+                    {"id": "wire_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
                     {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": None}},
                 ],
             },
@@ -432,7 +443,7 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
     norm_msgs: list[dict[str, object]] = [{"role": "user", "content": "探测"}]
     assert run_react(norm_llm, norm_msgs, noop_tools) == "归一化完成"
     expected_wire_calls = [
-        {"id": "flat_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
+        {"id": "wire_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
         {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
     ]
     assert norm_msgs[1] == {
@@ -487,7 +498,7 @@ def test_exit_message_purified_and_preserves_extension_fields() -> None:
     }
 
 
-# 测试双阶段上下文管道（transform_context -> convert_to_llm）不污染原列表且每轮过滤应用自定义消息
+# 测试单阶段 convert_to_llm 边界转换不污染原消息列表，且已彻底移除冗余 transform_context 参数
 def test_transform_context_and_convert_to_llm_pipeline() -> None:
     seen_stages: list[str] = []
     tools = ToolRegistry(
@@ -506,16 +517,15 @@ def test_transform_context_and_convert_to_llm_pipeline() -> None:
     ]
     snapshot_before = [dict(m) for m in messages]
 
-    # 第一阶段：克隆后追加临时提示并原地改写首条消息字段（验证不污染外部主历史及原字典键）
-    def transform_context(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
-        seen_stages.append("transform")
-        ctx[0]["injected"] = "dirty"
-        ctx.append({"role": "transient_hint", "content": "临时提醒"})
-        return ctx
+    with pytest.raises(TypeError):
+        run_react(llm, messages, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        iter_react(llm, messages, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
 
-    # 第二阶段：原地 pop 自定义消息键并过滤掉应用层自定义角色，仅保留标准 LLM 消息
+    # 单一边界转换：即使在回调内原地修改字典或 pop 键，也绝不污染外部主历史列表
     def convert_to_llm(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
         seen_stages.append("convert")
+        ctx[0]["injected"] = "dirty"
         for msg in ctx:
             if msg.get("role") == "artifact":
                 msg.pop("content", None)
@@ -525,37 +535,18 @@ def test_transform_context_and_convert_to_llm_pipeline() -> None:
         llm,
         messages,
         tools,
-        transform_context=transform_context,
         convert_to_llm=convert_to_llm,
     )
 
     assert reply == "管道执行完毕"
-    assert seen_stages == ["transform", "convert", "transform", "convert"]
-    # 原始自定义消息及首条消息字典键均完整保留，未被原地篡改或注入 transient_hint
+    assert seen_stages == ["convert", "convert"]
     assert messages[:3] == snapshot_before
     assert "injected" not in messages[0]
     assert messages[1] == {"role": "artifact", "content": "仅前端渲染的卡片对象"}
-    assert not any(m.get("role") == "transient_hint" for m in messages)
-    # 发往模型的请求已彻底剥离 artifact 与 transient_hint
     for req_msgs, _ in llm.requests:
         assert all(m.get("role") in {"system", "user", "assistant", "tool"} for m in req_msgs)
     assert [m["role"] for m in llm.requests[0][0]] == ["system", "user"]
     assert [m["role"] for m in llm.requests[1][0]] == ["system", "user", "assistant", "tool"]
-
-    # 剥离全部钩子（默认 None）且仅传 convert_to_llm 时同样不污染原 messages
-    filtered_msgs: list[dict[str, object]] = [
-        {"role": "artifact", "content": "ui"},
-        {"role": "user", "content": "hi"},
-    ]
-    clean_llm = ScriptedLLM([{"role": "assistant", "content": "ok"}])
-
-    # 仅提供 convert_to_llm，并在回调中 pop 测试是否隔离原列表
-    def mutating_convert(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
-        return [m for m in ctx if m.get("role") != "artifact"] + [{"role": "user", "content": "extra"}]
-
-    assert run_react(clean_llm, filtered_msgs, ToolRegistry(), convert_to_llm=mutating_convert) == "ok"
-    assert [m["role"] for m in filtered_msgs] == ["artifact", "user", "assistant"]
-    assert [m["role"] for m in clean_llm.requests[0][0]] == ["user", "user"]
 
 
 # 测试 default_post_json 读取响应体中途发生 IncompleteRead/SSLError/ConnectionError 等瞬时异常时退避重试，且对损坏 JSON 不重试；同步 respond 校验 error 帧与空 choices
@@ -689,12 +680,10 @@ def test_react_forwards_runtime_tool_context_across_turns() -> None:
     ) -> str:
         return f"q={query}|limit={limit}|turn={turn_id}|label={label}"
 
-    # 重写 run() 的自定义 Tool 子类：绝不能被注入 tool_context
-    class PureSubclassTool(Tool):
-        # 仅接受模型声明参数并断言未混入上下文键
-        def run(self, **values: str) -> str:
-            assert set(values) == {"msg"}, f"unexpected keys: {values!r}"
-            return f"pure:{values['msg']}"
+    # 显式关闭 accept_context=False 的 **values 工具：绝不能被混入执行期 tool_context
+    def isolated_fn(**values: str) -> str:
+        assert set(values) == {"msg"}, f"unexpected keys: {values!r}"
+        return f"pure:{values['msg']}"
 
     probe_tool = build_tool(
         probe_ctx,
@@ -702,10 +691,12 @@ def test_react_forwards_runtime_tool_context_across_turns() -> None:
         parameters={"query": "关键词", "limit": "条数"},
         context={"label": "pinned"},
     )
-    sub_tool = PureSubclassTool(
+    sub_tool = build_tool(
+        isolated_fn,
         name="pure_sub",
-        description="纯子类工具",
+        description="上下文隔离工具",
         parameters={"msg": "消息"},
+        accept_context=False,
     )
     registry = ToolRegistry(probe_tool, sub_tool)
 

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from personal_assistant.agent.plugins import Plugin, PluginManager
-from personal_assistant.agent.tools import ToolDocument, ToolMetadata
+from personal_assistant.agent.tools import ToolMetadata
 from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
@@ -45,7 +45,7 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
     assert len(manager.plugins) == 5
     assert all(isinstance(p, Plugin) for p in manager.plugins)
     assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "openai_reasoning", "telemetry"}
-    assert "search_chat_history" in {t.name for t in manager.default_tools}
+    assert "search_chat_history" in {t.name for t in manager.build_tools()}
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
     db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
@@ -62,10 +62,6 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
     )
     assert "search_chat_history" in registry.names
     assert registry.metadata("search_chat_history") == ToolMetadata(risk="read", always_on=False)
-    assert registry.document("search_chat_history") == ToolDocument(
-        source_type="plugin",
-        source_name="history_tools",
-    )
     tool_obj = next(t for t in registry if t.name == "search_chat_history")
     assert set(tool_obj.parameters) == {"query"}
     assert "原对话语言" in tool_obj.parameters["query"]
@@ -703,9 +699,9 @@ def test_history_plugin_isolated_without_fts5_retriever(
     manager = PluginManager.from_entries(
         ["plugins/tools"],
         tmp_path,
-        context={
+        bindings={
             "data_root": tmp_path / "data",
-            "extra_bindings": {"history_db_path": db_path},
+            "history_db_path": db_path,
         },
     )
     assert [p.plugin_id for p in manager.plugins] == ["tools"]
@@ -715,7 +711,7 @@ def test_history_plugin_isolated_without_fts5_retriever(
         registry,
         context={
             "data_root": tmp_path / "data",
-            "extra_bindings": {"history_db_path": db_path},
+            "history_db_path": db_path,
         },
     )
     obs = registry.execute("search_chat_history", '{"query": "东京机房 Atlas 9092"}')

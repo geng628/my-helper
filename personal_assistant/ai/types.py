@@ -1,7 +1,6 @@
 """Layer 1 原子契约类型（对标 pi-ai）：工具签名 Schema、工具调用、模型配置档案与 Token/缓存统计。"""
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -20,15 +19,6 @@ class TokenUsage:
         if self.prompt_tokens <= 0:
             return None
         return round(self.cached_tokens / self.prompt_tokens, 4)
-
-    # 转换为便于 JSON 序列化的统计字典
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "cached_tokens": self.cached_tokens,
-            "completion_tokens": self.completion_tokens,
-            "cache_hit_rate": self.cache_hit_rate,
-        }
 
 
 # 单次大模型流式响应产生的文本增量片段
@@ -65,6 +55,14 @@ class ToolSchema:
     param_enums: dict[str, tuple[str, ...]] | None = field(default=None, kw_only=True)
     required: tuple[str, ...] | None = field(default=None, kw_only=True)
 
+    # 返回按参数声明顺序对齐的有效必填参数名元组（供 Schema 导出与参数校验单点复用）
+    @property
+    def required_names(self) -> tuple[str, ...]:
+        if self.required is None:
+            return tuple(self.parameters)
+        allowed = set(self.required)
+        return tuple(k for k in self.parameters if k in allowed)
+
     # 导出标准 OpenAI Chat Completions Function Calling JSON Schema
     def to_openai_schema(self) -> dict[str, object]:
         properties: dict[str, dict[str, object]] = {}
@@ -73,11 +71,6 @@ class ToolSchema:
             if self.param_enums and param in self.param_enums:
                 prop["enum"] = list(self.param_enums[param])
             properties[param] = prop
-        required = (
-            list(self.parameters)
-            if self.required is None
-            else [k for k in self.parameters if k in set(self.required)]
-        )
         return {
             "type": "function",
             "function": {
@@ -86,7 +79,7 @@ class ToolSchema:
                 "parameters": {
                     "type": "object",
                     "properties": properties,
-                    "required": required,
+                    "required": list(self.required_names),
                     "additionalProperties": False,
                 },
             },
@@ -100,26 +93,22 @@ class ToolCall:
     name: str
     arguments: str
 
-    # 从 ToolCall 实例、OpenAI wire 字典或扁平工具调用字典解析标准 ToolCall
+    # 从标准 OpenAI wire 字典解析强类型 ToolCall（空参数兜底为 "{}"）
     @classmethod
     def from_raw(cls, raw: object) -> "ToolCall":
-        if isinstance(raw, cls):
-            return raw
-        if not isinstance(raw, Mapping):
+        if not isinstance(raw, Mapping) or raw.get("type") != "function":
             raise TypeError(f"非法的 tool_call 对象：{raw!r}")
         fn = raw.get("function")
-        if isinstance(fn, Mapping):
-            name = str(fn.get("name") or "")
-            raw_args = fn.get("arguments")
-        else:
-            name = str(raw.get("name") or "")
-            raw_args = raw.get("arguments")
-        if isinstance(raw_args, Mapping):
-            arguments = json.dumps(raw_args, ensure_ascii=False)
-        elif raw_args is None or raw_args == "":
+        if not isinstance(fn, Mapping):
+            raise TypeError(f"tool_call 缺少合法的 function 字段：{raw!r}")
+        name = str(fn.get("name") or "")
+        raw_args = fn.get("arguments")
+        if raw_args is None or raw_args == "":
             arguments = "{}"
+        elif isinstance(raw_args, str):
+            arguments = raw_args
         else:
-            arguments = str(raw_args)
+            raise TypeError(f"tool_call.function.arguments 必须是 JSON 字符串：{raw_args!r}")
         return cls(id=str(raw.get("id") or ""), name=name, arguments=arguments)
 
     # 导出标准 OpenAI Chat Completions tool_calls 条目字典
@@ -131,7 +120,7 @@ class ToolCall:
         }
 
 
-# 从 assistant 消息字典中提取规范化的 ToolCall 列表（兼容 ToolCall 实例与 OpenAI wire 字典）
+# 从 assistant 消息字典中提取规范化的 ToolCall 列表（仅接受标准 OpenAI wire 字典）
 def extract_tool_calls(message: Mapping[str, object]) -> list[ToolCall]:
     raw_calls = message.get("tool_calls")
     if not raw_calls or not isinstance(raw_calls, Iterable) or isinstance(raw_calls, (str, bytes, Mapping)):
@@ -160,16 +149,18 @@ class ModelProfile:
         provider = str(raw.get("provider") or "openai_compatible").strip().lower() or "openai_compatible"
         api_key = str(raw.get("api_key") or "").strip()
         key_env = str(raw.get("key_env") or "").strip()
-        raw_temp = raw.get("temperature", raw.get("temp", 0.2))
+        raw_temp = raw.get("temperature", 0.2)
         if not base_url or not base_url.startswith(("http://", "https://")):
             raise ValueError(f"模型 {name!r} 的 base_url 必须以 http:// 或 https:// 开头。")
         if not model:
             raise ValueError(f"模型 {name!r} 缺少非空 model 名称。")
+        if isinstance(raw_temp, bool) or not isinstance(raw_temp, (int, float, str)):
+            raise ValueError(f"模型 {name!r} 的 temperature 必须是数字。")
         try:
             temp = float(raw_temp)
-        except (TypeError, ValueError) as error:
+        except ValueError as error:
             raise ValueError(f"模型 {name!r} 的 temperature 必须是数字。") from error
-        if isinstance(raw_temp, bool) or not (0.0 <= temp <= 2.0):
+        if not (0.0 <= temp <= 2.0):
             raise ValueError(f"模型 {name!r} 的 temperature 必须在 [0, 2] 之间。")
         return cls(
             name=name,
@@ -209,14 +200,14 @@ class ModelProfile:
         }
 
 
-# 多模型注册表配置对象（对应标准 models.json 的顶层结构）
+# 多模型注册表配置对象（对应标准 models.json 的顶层结构，支持通用命名角色映射 roles）
 @dataclass(frozen=True)
 class ModelsConfig:
     default: str
     models: dict[str, ModelProfile]
-    consolidator: str | None = None
+    roles: dict[str, str] = field(default_factory=dict)
 
-    # 从标准 JSON 字典构造 ModelsConfig 并校验默认模型与可选后台沉淀模型存在
+    # 从标准 JSON 字典构造 ModelsConfig 并校验默认模型与全部命名角色目标模型存在
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> "ModelsConfig":
         if not isinstance(raw, dict):
@@ -229,6 +220,8 @@ class ModelsConfig:
             name = str(raw_name).strip()
             if not name:
                 raise ValueError("模型名称不能为空。")
+            if not isinstance(entry, dict):
+                raise ValueError(f"模型 {name!r} 的配置必须是 JSON 对象。")
             parsed[name] = ModelProfile.from_dict(name, entry)
         default_name = str(raw.get("default") or "").strip()
         if not default_name:
@@ -238,13 +231,22 @@ class ModelsConfig:
                 raise ValueError("配置多个模型时必须指定 default 默认模型。")
         if default_name not in parsed:
             raise ValueError(f"default 指向不存在的模型：{default_name!r}")
-        raw_consolidator = raw.get("consolidator")
-        if raw_consolidator is not None and not isinstance(raw_consolidator, str):
-            raise ValueError("consolidator 必须是模型名称字符串。")
-        consolidator_name = (raw_consolidator or "").strip() or None
-        if consolidator_name is not None and consolidator_name not in parsed:
-            raise ValueError(f"consolidator 指向不存在的模型：{consolidator_name!r}")
-        return cls(default=default_name, models=parsed, consolidator=consolidator_name)
+        raw_roles = raw.get("roles")
+        roles: dict[str, str] = {}
+        if raw_roles is not None:
+            if not isinstance(raw_roles, dict):
+                raise ValueError("roles 必须是角色名到模型名的映射对象。")
+            for raw_role, raw_target in raw_roles.items():
+                role_name = str(raw_role).strip()
+                if not role_name:
+                    raise ValueError("roles 中的角色名称不能为空。")
+                if not isinstance(raw_target, str) or not raw_target.strip():
+                    raise ValueError(f"角色 {role_name!r} 必须是模型名称字符串。")
+                target_name = raw_target.strip()
+                if target_name not in parsed:
+                    raise ValueError(f"角色 {role_name!r} 指向不存在的模型：{target_name!r}")
+                roles[role_name] = target_name
+        return cls(default=default_name, models=parsed, roles=roles)
 
     # 按名称读取目标模型档案（缺省返回 default 模型）
     def get_profile(self, name: str | None = None) -> ModelProfile:
@@ -254,12 +256,10 @@ class ModelsConfig:
             raise ValueError(f"未找到模型配置 {target!r}，可用模型：{available}")
         return self.models[target]
 
-    # 导出全部模型配置的脱敏摘要，供终端打印与 /status 展示
+    # 导出全部模型配置的脱敏摘要，供终端打印与状态面板展示
     def redacted_dict(self, env: Mapping[str, str] | None = None) -> dict[str, object]:
-        result: dict[str, object] = {
+        return {
             "default": self.default,
             "models": {name: profile.redacted_dict(env) for name, profile in self.models.items()},
+            "roles": dict(self.roles),
         }
-        if self.consolidator is not None:
-            result["consolidator"] = self.consolidator
-        return result
