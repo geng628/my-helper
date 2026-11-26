@@ -32,6 +32,7 @@ class ModelPreset:
             "default_model": self.default_model,
             "needs_key": self.needs_key,
             "provider": self.provider,
+            "aliases": list(self.aliases),
         }
 
 

@@ -239,3 +239,204 @@ def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
     mem = _prepare_isolated_memory(REPO_ROOT / "evals" / "sample_data", tmp_path, cfg, REPO_ROOT)
     assert getattr(mem.retriever, "name", None) == "fts5_bm25"
+
+
+# 测试 evals CLI 统一复用 ToolsConfig.build_llm：支持外部 --config、models.dsl、预设名/模型 ID 与 --judge-model
+def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    from personal_assistant.ai import OpenAIChatClient, OpenAICompatibleLLM
+    from personal_assistant.ai import client as client_mod
+    from personal_assistant.assistant.commands import ToolsConfig
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    # 隔离宿主 .env 与全局 _PROVIDERS 引用，模拟干净 CLI 进程且退出后零泄漏
+    monkeypatch.setattr("evals.cli.load_dotenv", lambda *_a, **_kw: None)
+    isolated_providers = {k: v for k, v in client_mod._PROVIDERS.items() if k != "openai_reasoning"}
+    monkeypatch.setattr(client_mod, "_PROVIDERS", isolated_providers)
+
+    # 在仓库外临时目录放置独立 tools.json（验证非 repo/config 层级下仍能回退加载仓库 plugins）
+    ext_cfg_dir = tmp_path / "ext_cfg"
+    ext_cfg_dir.mkdir()
+    ext_tools_json = ext_cfg_dir / "tools.json"
+    ext_tools_json.write_text((REPO_ROOT / "config" / "tools.json").read_text(encoding="utf-8"), encoding="utf-8")
+
+    agent_cases = tmp_path / "agent_cases.jsonl"
+    agent_cases.write_text(
+        json.dumps({"id": "a1", "query": "hi", "answerable": True, "expected_sources": []}) + "\n",
+        encoding="utf-8",
+    )
+    mem_cases = tmp_path / "mem_cases.jsonl"
+    mem_cases.write_text(
+        json.dumps({"id": "m1", "steps": [{"action": "ask", "message": "hi"}]}) + "\n",
+        encoding="utf-8",
+    )
+
+    captured_agent: list[LLMClient] = []
+    monkeypatch.setattr(
+        "evals.cli.evaluate_agent",
+        lambda llm, *_a, **_kw: captured_agent.append(llm)
+        or {"mode": "agent", "git_commit": "t", "summary": {}, "failures": [], "cases": []},
+    )
+    captured_mem: list[tuple[LLMClient, LLMClient | None]] = []
+    monkeypatch.setattr(
+        "evals.cli.evaluate_memory",
+        lambda llm, _sc, **kw: captured_mem.append((llm, kw.get("judge_llm")))
+        or {"mode": "memory", "git_commit": "t", "summary": {}, "failures": [], "scenarios": []},
+    )
+
+    # 1. 环境变量模式：外部 --config 自动注册 Slot-4，--model / --judge-model 支持预设别名（reasoner / deepseek）
+    monkeypatch.setenv("LLM_MODE", "on")
+    monkeypatch.setenv("LLM_API_KEY", "sk-eval-cli-test")
+    monkeypatch.setenv("LLM_BASE_URL", "https://proxy.example.com/v1")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-chat")
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+    assert main(["--mode", "agent", "--config", str(ext_tools_json), "--cases", str(agent_cases), "--model", "reasoner"]) == 0
+    assert isinstance(captured_agent[-1], OpenAIChatClient)
+    assert type(captured_agent[-1]).__name__ == "OpenAIReasoningLLM"
+    assert captured_agent[-1].model == "deepseek-reasoner"  # type: ignore[attr-defined]
+    assert captured_agent[-1].base_url == "https://proxy.example.com/v1"  # type: ignore[attr-defined]
+
+    # 2. 即使环境中设了 LLM_PROVIDER=openai_reasoning，--judge-model deepseek 仍按预设自身协议构造 OpenAICompatibleLLM
+    isolated_providers.pop("openai_reasoning", None)
+    monkeypatch.setenv("LLM_PROVIDER", "openai_reasoning")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-reasoner")
+    assert (
+        main(["--mode", "memory", "--config", str(ext_tools_json), "--cases", str(mem_cases), "--judge-model", "deepseek"])
+        == 0
+    )
+    eval_llm, judge_llm = captured_mem[-1]
+    assert type(eval_llm).__name__ == "OpenAIReasoningLLM"
+    assert eval_llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
+    assert isinstance(judge_llm, OpenAICompatibleLLM)
+    assert judge_llm.model == "deepseek-chat"
+    assert judge_llm.api_key == "sk-eval-cli-test"
+    assert judge_llm.base_url == "https://proxy.example.com/v1"
+    assert os.environ["LLM_PROVIDER"] == "openai_reasoning"
+    assert os.environ["LLM_MODEL"] == "deepseek-reasoner"
+
+    # 3. 非预设自定义模型名绝不偷偷篡改当前 LLM_PROVIDER（无暗箱 or "openai_compatible" 劫持）
+    assert (
+        main(
+            [
+                "--mode",
+                "memory",
+                "--config",
+                str(ext_tools_json),
+                "--cases",
+                str(mem_cases),
+                "--model",
+                "custom-r1-v2",
+                "--judge-model",
+                "custom-r1-judge",
+            ]
+        )
+        == 0
+    )
+    assert type(captured_mem[-1][0]).__name__ == "OpenAIReasoningLLM"
+    assert captured_mem[-1][0].model == "custom-r1-v2"  # type: ignore[attr-defined]
+    assert type(captured_mem[-1][1]).__name__ == "OpenAIReasoningLLM"
+    assert captured_mem[-1][1].model == "custom-r1-judge"  # type: ignore[attr-defined]
+
+    # 4. default_model 匹配、缺省 base_url 补全、ollama 免密钥补全与缺失 tools.json 降级路径
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    assert (
+        main(
+            [
+                "--mode",
+                "memory",
+                "--config",
+                str(ext_tools_json),
+                "--cases",
+                str(mem_cases),
+                "--model",
+                "deepseek-reasoner",
+                "--judge-model",
+                "deepseek-chat",
+            ]
+        )
+        == 0
+    )
+    dm_eval, dm_judge = captured_mem[-1]
+    assert type(dm_eval).__name__ == "OpenAIReasoningLLM"
+    assert dm_eval.base_url == "https://api.deepseek.com/v1"  # type: ignore[attr-defined]
+    assert isinstance(dm_judge, OpenAICompatibleLLM)
+    assert dm_judge.base_url == "https://api.deepseek.com/v1"
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    assert main(["--mode", "agent", "--config", str(ext_tools_json), "--cases", str(agent_cases), "--model", "ollama"]) == 0
+    assert isinstance(captured_agent[-1], OpenAICompatibleLLM)
+    assert captured_agent[-1].base_url == "http://127.0.0.1:11434/v1"
+    assert captured_agent[-1].model == "qwen2.5:7b"
+    assert captured_agent[-1].api_key == "ollama"
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-fallback")
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    missing_cfg = tmp_path / "missing_tools.json"
+    assert main(["--mode", "agent", "--config", str(missing_cfg), "--cases", str(agent_cases)]) == 0
+    assert isinstance(captured_agent[-1], OpenAICompatibleLLM)
+    assert main(["--mode", "agent", "--config", str(missing_cfg), "--cases", str(agent_cases), "--model", "m-override"]) == 0
+    assert captured_agent[-1].model == "m-override"  # type: ignore[attr-defined]
+
+    # 5. 空白 --judge-model 视为未传（复用待测模型）；--no-judge 优先关闭 Judge
+    assert main(["--mode", "memory", "--config", str(ext_tools_json), "--cases", str(mem_cases), "--judge-model", "   "]) == 0
+    assert captured_mem[-1][0] is captured_mem[-1][1]
+    assert (
+        main(["--mode", "memory", "--config", str(ext_tools_json), "--cases", str(mem_cases), "--judge-model", "deepseek", "--no-judge"])
+        == 0
+    )
+    assert captured_mem[-1][1] is None
+
+    # 6. 纯 models.dsl 模式：优先读 DSL（未定义档案显式报错不静默回退 .env），并支持预设别名/default_model 映射与 env= 透传
+    (ext_cfg_dir / "models.dsl").write_text(
+        "use deepseek sk-dsl-chat\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="未找到模型配置"):
+        main(["--mode", "agent", "--config", str(ext_tools_json), "--cases", str(agent_cases), "--model", "reasoner"])
+
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    (ext_cfg_dir / "models.dsl").write_text(
+        "use deepseek sk-dsl-chat\n"
+        "add reasoner sk-dsl-r1\n"
+        "model env_backed {\n"
+        "  base_url https://api.deepseek.com/v1\n"
+        "  model    deepseek-chat\n"
+        "  key_env  CUSTOM_DSL_KEY\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                "--mode",
+                "memory",
+                "--config",
+                str(ext_tools_json),
+                "--cases",
+                str(mem_cases),
+                "--model",
+                "reasoner",
+                "--judge-model",
+                "deepseek-chat",
+            ]
+        )
+        == 0
+    )
+    dsl_eval_llm, dsl_judge_llm = captured_mem[-1]
+    assert type(dsl_eval_llm).__name__ == "OpenAIReasoningLLM"
+    assert dsl_eval_llm.api_key == "sk-dsl-r1"  # type: ignore[attr-defined]
+    assert isinstance(dsl_judge_llm, OpenAICompatibleLLM)
+    assert dsl_judge_llm.api_key == "sk-dsl-chat"
+
+    tcfg = ToolsConfig.load(ext_tools_json, project_root=REPO_ROOT)
+    assert tcfg._match_preset("   ") is None
+    env_llm = tcfg.build_llm(ext_cfg_dir, model_name="env_backed", env={"CUSTOM_DSL_KEY": "sk-passed-via-env"})
+    assert isinstance(env_llm, OpenAICompatibleLLM)
+    assert env_llm.api_key == "sk-passed-via-env"

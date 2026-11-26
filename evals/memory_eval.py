@@ -23,7 +23,7 @@ from personal_assistant.assistant.consolidator import (
     MemoryConsolidator,
     _parse_json_object,
 )
-from evals.common import current_git_commit
+from evals.common import current_git_commit, resolve_eval_paths
 
 ProgressCallback = Callable[[int, int, dict[str, object]], None]
 SetupDoneCallback = Callable[[dict[str, object]], None]
@@ -654,8 +654,7 @@ def evaluate_memory(
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers 必须为 >= 1 的整数。")
 
-    cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
-    project_root = cfg_path.parent.parent if cfg_path.is_file() else REPO_ROOT
+    cfg_path, project_root = resolve_eval_paths(config_path)
 
     # 识别本轮所有待构建的共享长记忆组，并保留每个场景剥离前置后的独立执行步骤
     shared_specs: dict[str, dict[str, object]] = {}

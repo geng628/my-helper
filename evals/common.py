@@ -87,6 +87,16 @@ def normalize_expected_sources(
     return normalized
 
 
+# 解析评测用 tools.json 路径与所属项目根目录（外部独立配置文件自动回退仓库根目录以定位内置插件）
+def resolve_eval_paths(config_path: Path | None) -> tuple[Path, Path]:
+    cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
+    if not cfg_path.is_file():
+        return cfg_path, REPO_ROOT
+    candidate_root = cfg_path.parent.parent
+    project_root = candidate_root if (candidate_root / "plugins").is_dir() else REPO_ROOT
+    return cfg_path, project_root
+
+
 # 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染数据目录
 def safe_write_report(output_path: Path, data_dir: Path, report: dict[str, object]) -> None:
     resolved_out = output_path.resolve()

@@ -663,3 +663,27 @@
   - 单元测试 (`uv run pytest -v`)：**133 passed → 134 passed**（含 Node 前端渲染与 XSS 单测、三层架构守卫）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：继续合入 PR `#49`（Issue `#48` 统一 `ToolsConfig.build_llm` 与评测 CLI `--model` / `--judge-model`），并启动安全沙箱加固与 `pi-agent-core` 架构优雅化演进。
+
+
+---
+
+### [2026-11-25] `deepseek-reasoner` 多轮记忆实测对比与 `evals/cli.py` Slot-4 插件 / 独立 Judge 修复（Issue `#48`）
+- **背景与实测发现（基于 `main` `16ebd78`）**：
+  - 合并 PR `#45` 后，在 `main`（`16ebd78`）上以 `deepseek-chat` 为固定 Judge 跑完两套 `deepseek-reasoner` 完整多轮记忆对比（报告保存在本地 `/tmp/reasoner_eval_16ebd78_*.json`，未入库）：
+    - **LongMemEval 35 题（`workers=5`）**：较 `deepseek-chat` 基线（`0a6cf70`）由 **`30/35 (85.71%)` → `34/35 (97.14%)`**（**`+11.43 pp` / `+4` 题，`0` 退步**，6/7 分类达到 `100%`；先前失败的 `lme-gpt4_2312f94c`、`lme-gpt4_194be4b3`、`lme-5a7937c8`、`lme-35a27287` 全部通过，仅剩 `lme-9ea5eabc` 1 题）；代价为 `completion_tokens` `36,730 → 154,655`（约 `4.2×`）、服务端 KV 命中 `55.14% → 43.14%`、墙钟 `319.88s`。
+    - **Memory 16 场景（`workers=4`）**：`16/16 (100%) → 15/16 (93.75%)`（服务端 KV 命中 `66.15% → 69.31%`，`completion_tokens` `13,228 → 37,567` 约 `2.8×`，墙钟 `201.65s`；唯一失败为 `temp-fact-expiry` 第 3 步额外调 `save_rule` 导致第 6 步过期检索残留 1 条，但第 8 步最终回答本身完全正确）。
+    - **架构结论**：该实测印证当前 `MEMORY.md` 目录 + FTS5 + `search_chat_history` 架构的信息召回上限已在 `97%+`，**无需引入向量检索**，路线重心转向核心后端能力与性价比优化（如主对话/后台沉淀双模型分槽、活跃窗口调优等）。
+  - 同步暴露 [evals/cli.py](evals/cli.py) 两处缺陷：① `--mode agent` / `--mode memory` 调用 `from_env()` 前未加载 `config/tools.json`，导致命令行直接跑 `LLM_PROVIDER=openai_reasoning` 报 `未知 LLM_PROVIDER`；② `--mode memory` 将 `judge` 写死为待测模型，无法通过 CLI 固定 `--judge-model deepseek-chat` 做跨模型同 Judge 对照。
+- **改动文件（Issue `#48`，方案 A 统一收口代码提交 `e103e2b` → 覆盖补全 `5a2ba30`）**：
+  - [personal_assistant/assistant/commands.py](personal_assistant/assistant/commands.py) & [plugins/models_dsl.py](plugins/models_dsl.py)：`ModelPreset.to_dict()` 导出 `aliases`；`ToolsConfig.build_llm()` 统一承接“优先 `models.dsl`/`models.json` 档案（支持预设别名映射到已定义档案）→ 其次匹配内置厂商预设自动带出 `provider`/`default_model`/`base_url`/免密钥占位 → 否则作为普通 `LLM_MODEL` 走 `from_env()`”，使主程序与评测 CLI 共享唯一模型装配入口。
+  - [evals/common.py](evals/common.py)、[evals/cli.py](evals/cli.py)、[evals/agent_eval.py](evals/agent_eval.py)、[evals/memory_eval.py](evals/memory_eval.py)：抽离 `resolve_eval_paths()`（用 `.is_dir()` 校验 `plugins/`，外部 `--config` 自动回退 `REPO_ROOT` 加载内置插件）；`evals/cli.py` 彻底删去 `--provider` / `--judge-provider` 与 `or "openai_compatible"` 暗箱补丁，仅保留对称的 `--model` 与 `--judge-model` 两个参数，统一调用 `ToolsConfig.build_llm()`。
+  - [tests/test_eval.py](tests/test_eval.py)：新增 `test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model()`（隔离宿主 `load_dotenv`、全局 `_PROVIDERS` 副本零泄漏与仓库外 `tools.json`，完整覆盖预设别名与 `default_model`、缺省 `base_url`/`ollama` 免密钥补全、非预设模型保留当前 `LLM_PROVIDER`、缺失 `tools.json` 降级、空白参数/`--no-judge` 优先级，以及 `models.dsl` 优先报错边界与 `env=` 透传）。
+- **审查与自检重构 trace**：
+  - 初版（`4d986e4` → `63e3454`）经自审发现 `judge_provider or "openai_compatible"` 暗箱默认、绕开 `ToolsConfig.build_llm()` 与 `tools_cfg_path.parent.parent` 路径假设脆弱 3 处胶水味道；
+  - 按方案 A 重构（`e103e2b`）并经独立只读审查补全 `build_llm` 全部新增分支单测与边界加固（`5a2ba30`）。
+- **同口径验证对比（改前 `main` `16ebd78` → 改后 `5a2ba30`）**：
+  - 单元测试 (`uv run pytest -v`)：**133 passed → 134 passed (`6.62s`)**（+1 条 TDD 单测，含 `tests/test_architecture.py` 三层漏斗守卫与 `_PROVIDERS` `before=False, after=False` 独立隔离验证）；CI AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`mean_mrr=0.9483`, `negative_clean_rate=1.0`），零退步。
+  - **真机 CLI 端到端冒烟（测于等价主路径 `e103e2b`，`uv run python -m evals --mode memory --cases evals/public/longmemeval_scenarios.jsonl --max-cases 1 --model reasoner --judge-model deepseek`）**：**`[1/1] PASS lme-15745da0_abs (104.2s)`**，服务端 KV 命中 `85.54%`、本地前缀复用 `73.34%`。
+- **退步与未验证项**：无退步；因检索算法、提示词与记忆写入逻辑零改动，本次未重跑全量 Memory 16 / LongMemEval 35 / LoCoMo 100。
+- **下一步**：待 Issue `#48` 对应 PR `#49` 经 CI 验收与确认合并后，按需推进「主对话 / 后台沉淀双模型分槽（兼顾 `reasoner` 精度与 `chat` 成本）」、Issue `#13`（活跃窗口与 `MAX_TOOL_ROUNDS` 调优）或克制版 Issue `#32`（显式 `event_date`）；暂不引入向量检索。
