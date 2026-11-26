@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
+import socket
 import sys
 import webbrowser
 from http import HTTPStatus
@@ -20,6 +22,71 @@ from personal_assistant.assistant.common import load_dotenv
 
 UI_HTML_PATH = Path(__file__).resolve().parent / "web_ui.html"
 MAX_REQUEST_BYTES = 256 * 1024
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+ALLOWED_SEC_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
+
+
+# 标记 POST 请求 Content-Type 非 application/json 时的 415 协议错误
+class _UnsupportedMediaTypeError(ValueError):
+    pass
+
+
+# 解析绑定主机名（去括号与大小写规范化）并判断是否为 IPv6 字面量
+def _parse_bind_host(host: str) -> tuple[str, bool]:
+    clean = host.strip().strip("[]").lower()
+    if not clean:
+        return "", False
+    try:
+        ip = ipaddress.ip_address(clean)
+        return clean, ip.version == 6
+    except ValueError:
+        return clean, False
+
+
+# 基于绑定地址与实际监听端口构造允许的 Host 与同源 Origin 白名单
+def _allowed_hosts_and_origins(host: str, port: int) -> tuple[frozenset[str], frozenset[str]]:
+    clean, is_ipv6 = _parse_bind_host(host)
+    is_loopback = clean in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and clean:
+        try:
+            is_loopback = ipaddress.ip_address(clean).is_loopback
+        except ValueError:
+            is_loopback = False
+
+    formatted = f"[{clean}]" if is_ipv6 else clean
+    if is_loopback:
+        base_hosts = set(LOOPBACK_HOSTS)
+        if clean not in {"127.0.0.1", "localhost", "::1"}:
+            base_hosts.add(formatted)
+    elif clean in {"", "0.0.0.0", "::"}:
+        base_hosts = set(LOOPBACK_HOSTS)
+        if formatted:
+            base_hosts.add(formatted)
+    else:
+        base_hosts = {formatted}
+
+    allowed_hosts: set[str] = set()
+    allowed_origins: set[str] = set()
+    for item in base_hosts:
+        host_port = f"{item}:{port}"
+        allowed_hosts.add(host_port)
+        allowed_origins.add(f"http://{host_port}")
+        if port == 80:
+            allowed_hosts.add(item)
+            allowed_origins.add(f"http://{item}")
+    return frozenset(allowed_hosts), frozenset(allowed_origins)
+
+
+# 扩展标准库集合以补充单一地址字面量对应的 Host 与同源 Origin
+def _extend_with_literal_host(
+    allowed_hosts: frozenset[str],
+    allowed_origins: frozenset[str],
+    literal_host: str,
+    port: int,
+) -> tuple[frozenset[str], frozenset[str]]:
+    extra_hosts = {f"{literal_host}:{port}"} | ({literal_host} if port == 80 else set())
+    extra_origins = {f"http://{literal_host}:{port}"} | ({f"http://{literal_host}"} if port == 80 else set())
+    return allowed_hosts | extra_hosts, allowed_origins | extra_origins
 
 
 # 创建绑定了 AssistantApp 的本地多线程 HTTP 服务（不依赖任何第三方 Web 框架）
@@ -29,6 +96,8 @@ def create_web_server(
     port: int = 8765,
 ) -> ThreadingHTTPServer:
     ui_html = UI_HTML_PATH.read_text(encoding="utf-8")
+    clean_bind_host, is_ipv6 = _parse_bind_host(host)
+    is_wildcard_bind = clean_bind_host in {"", "0.0.0.0", "::"}
 
     # 本地网页与 JSON API 请求处理器
     class WebChatHandler(BaseHTTPRequestHandler):
@@ -52,8 +121,63 @@ def create_web_server(
             self.wfile.write(raw)
             self.wfile.flush()
 
-        # 读取并校验 JSON 请求体（限制最大字节数防止异常大包）
+        # 在通配地址绑定模式下获取当前连接落地的本机 IP（用于局域网 Host/Origin 放行）
+        def _socket_local_host(self) -> str | None:
+            try:
+                sock_ip = str(self.connection.getsockname()[0]).split("%", 1)[0]
+                ip = ipaddress.ip_address(sock_ip)
+                if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                    ip = ip.ipv4_mapped
+                return f"[{ip}]" if ip.version == 6 else str(ip)
+            except (AttributeError, OSError, IndexError, ValueError):
+                return None
+
+        # 校验 Host（全路由）及同源 Origin / Sec-Fetch-Site（敏感 API 读写），拦截 DNS Rebinding 与 CSRF
+        def _check_request_boundary(self, *, check_origin: bool) -> bool:
+            listen_port = self.server.server_port
+            allowed_hosts, allowed_origins = _allowed_hosts_and_origins(host, listen_port)
+            if is_wildcard_bind:
+                sock_host = self._socket_local_host()
+                if sock_host:
+                    allowed_hosts, allowed_origins = _extend_with_literal_host(
+                        allowed_hosts, allowed_origins, sock_host, listen_port
+                    )
+
+            host_headers = self.headers.get_all("Host") or []
+            if len(host_headers) != 1 or host_headers[0].strip().lower() not in allowed_hosts:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Host 请求头。"})
+                return False
+
+            if not check_origin:
+                return True
+
+            sec_fetch_sites = [v.strip().lower() for v in (self.headers.get_all("Sec-Fetch-Site") or [])]
+            if len(sec_fetch_sites) > 1 or (sec_fetch_sites and sec_fetch_sites[0] not in ALLOWED_SEC_FETCH_SITES):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "禁止跨站访问本地接口。"})
+                return False
+
+            origin_headers = self.headers.get_all("Origin") or []
+            if len(origin_headers) > 1:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Origin 请求头。"})
+                return False
+            if origin_headers and origin_headers[0].strip().lower() not in allowed_origins:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "禁止跨源访问本地接口。"})
+                return False
+
+            return True
+
+        # 校验 POST 请求是否显式携带 application/json 主媒体类型（忽略 charset 等参数）
+        def _is_json_content_type(self) -> bool:
+            ct_headers = self.headers.get_all("Content-Type") or []
+            if len(ct_headers) != 1:
+                return False
+            media_type = ct_headers[0].split(";", 1)[0].strip().lower()
+            return media_type == "application/json"
+
+        # 读取并校验 JSON 请求体（先校验 Content-Type 再限制最大字节数防止异常大包）
         def _read_json_body(self) -> dict[str, object]:
+            if not self._is_json_content_type():
+                raise _UnsupportedMediaTypeError("Content-Type 必须为 application/json。")
             length_raw = self.headers.get("Content-Length", "0").strip()
             try:
                 length = int(length_raw)
@@ -70,6 +194,9 @@ def create_web_server(
         # 处理页面加载与只读查询接口（/、/api/status、/api/history、/api/memory）
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            is_api = parsed.path == "/api" or parsed.path.startswith("/api/")
+            if not self._check_request_boundary(check_origin=is_api):
+                return
             if parsed.path in {"/", "/index.html"}:
                 data = ui_html.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -105,9 +232,14 @@ def create_web_server(
 
         # 处理对话发送与提示词缓存刷新接口（/api/chat、/api/refresh）
         def do_POST(self) -> None:
+            if not self._check_request_boundary(check_origin=True):
+                return
             parsed = urlparse(self.path)
             try:
                 body = self._read_json_body()
+            except _UnsupportedMediaTypeError as error:
+                self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": str(error)})
+                return
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return
@@ -188,6 +320,13 @@ def create_web_server(
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": f"未知接口：{parsed.path}"})
 
+    if is_ipv6:
+        # 绑定 IPv6 地址的多线程 HTTP 服务子类
+        class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        return _IPv6ThreadingHTTPServer((clean_bind_host, port), WebChatHandler)
+
     return ThreadingHTTPServer((host, port), WebChatHandler)
 
 
@@ -203,7 +342,9 @@ def main(argv: list[str] | None = None) -> None:
 
     app = build_app(model_name=args.model)
     server = create_web_server(app, host=args.host, port=args.port)
-    url = f"http://{args.host}:{server.server_port}"
+    clean_host, is_ipv6 = _parse_bind_host(args.host)
+    url_host = f"[{clean_host}]" if is_ipv6 else (clean_host or args.host)
+    url = f"http://{url_host}:{server.server_port}"
     print(f"My Helper 本地网页对话已启动：{url}")
     print("按 Ctrl+C 停止服务（退出前会自动等待后台记忆沉淀完成）。")
     if args.open:
