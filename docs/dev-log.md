@@ -755,3 +755,25 @@
   - 单元测试 (`uv run pytest -v`)：**全量通过**（+6 组安全对抗单测，含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：验收合入 Issue `#58`（插件单次初始化解耦、`MemoryStore` 写锁与会话断流孤儿消息防护），随后推进学习助手流式思维链与伴读叠加层。
+
+
+---
+
+### [2026-11-26] 消除每轮重跑插件 `initialize()`，落地 `StateStore.append_turn` 成对原子落库与 `MemoryStore` 并发写锁（Issue `#58`）
+- **背景与核心隐患**：
+  1. 此前每轮对话 `AssistantApp.build_tools()` 都会触发 `PluginManager` 重新执行全部 5 个主板插件的 `initialize()`，违背生命周期单次初始化语义；
+  2. `MemoryStore` 多处磁盘写路径与 `audit.jsonl` 缺乏线程锁，前台工具写入与后台 `MemoryConsolidator` 沉淀并发时存在竞态风险；
+  3. 流式对话若在预写 `user` 消息后遇上游断流或客户端关闭连接，不仅会残留未配对的孤儿 `user` 消息导致推理模型报连续同角色 HTTP 400，若采用流后 `DELETE` 回滚还会破坏 `messages` 单调只追不删不变量，导致 `search_chat_history` 内存 FTS5 索引因 `max_id` 与 `total_count` 未降而永久残留幽灵命中，以及后台沉淀切出奇数条活跃消息拆散问答对。
+- **改动文件（初版 `6cf0f02` → 方案 A 正交重构 `932a72c9`）**：
+  - [personal_assistant/agent/plugins.py](personal_assistant/agent/plugins.py)：`PluginManager` 缓存初始 `base_context` 与插件 `initialize()` 阶段登记的原始工具规格，`build_tools(context)` 仅按运行时上下文重绑函数型工具签名参数，不再重跑任何 `Plugin.initialize()`；同时通过 `_clone_custom_tool` 完整保护自定义 `Tool` 子类的重写 `run()`、`ToolMetadata(always_on=...)` 与 `ToolDocument`。
+  - [personal_assistant/assistant/db.py](personal_assistant/assistant/db.py)：`StateStore` 新增单事务成对原子写入 `append_turn(chat_id, user_content, assistant_content)` 与只读快照上界 `max_message_id()`，保持 `messages` 表 100% 只追不删与偶数成对不变量。
+  - [personal_assistant/assistant/memory.py](personal_assistant/assistant/memory.py)：引入可重入写锁 `_write_lock` 保护全量写操作与审计读写；新增 `turn_tag` 轮内暂存与 `finalize_turn_fact(turn_tag, message_id=...)`，兼顾同轮 `remember_fact` 立即检索可见、回合成功升级绑定 `(msg#<id>)` 与异常中断干净回滚。
+  - [personal_assistant/assistant/app.py](personal_assistant/assistant/app.py)：新增有界会话级互斥锁 `_chat_turn_lock`（`acquire()` 纳入 `try` 防中断泄漏引用计数）、`contextlib.closing` 流确定性关闭、`(today_str, prompt)` 跨自然日自动失效与归档后推进游标；接入 Issue `#54` 的 `convert_to_llm` 边界钩子转换前情摘要并合并历史异常连续同角色消息，保持常规多轮请求字节级 KV Cache 100% 一致。
+  - [tests/test_plugins.py](tests/test_plugins.py)、[tests/test_step3_memory.py](tests/test_step3_memory.py)、[tests/test_step4_app.py](tests/test_step4_app.py)：新增插件单次初始化、自定义 `Tool` 子类零污染、并发写锁、断流后 FTS5 零幽灵命中、`remember_fact` 提交/回滚与跨日刷新回归单测。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`6cf0f02`）→ `Request Changes`**（检出 `app.py` 越界访问 `StateStore._lock`、流前预写 + `DELETE` 导致 `history_tools` 内存 FTS5 幽灵命中、自定义 `Tool` 子类被洗壳、`lock.acquire()` 阻塞中断漏 `refs` 共 4 项 Blocker）；
+  - **Round 2（`932a72c9`）→ `Pass`**（`0 Blockers / 2 Nits`）。
+- **同口径验证对比（改前 `main` `61a5ded` → 改后 `932a72c9`）**：
+  - 单元测试 (`uv run pytest -v`)：**147 passed → 156 passed**（含三层依赖守卫与并发压测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：合入学习助手知识卡片与间隔复习插件（Issue `#62` / PR `#64`），并推进流式思维链教学视图与主对话/后台沉淀双模型分槽（Issue `#63`）。
