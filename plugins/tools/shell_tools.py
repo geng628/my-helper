@@ -7,28 +7,48 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import truncate_or_offload
+from personal_assistant.assistant.files_policy import (
+    DEFAULT_REJECT_SEGMENTS,
+    collect_protected_inodes,
+    hits_protected_inode,
+    is_sensitive_segment,
+    normalize_segment,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_ALLOWED_EXECUTABLES = ("ls", "find", "grep", "rg", "wc", "head", "tail", "cat", "pwd", "date", "df", "git", "pytest")
 DEFAULT_GIT_SUBCOMMANDS = ("status", "log", "diff", "show", "branch", "rev-parse")
-DEFAULT_REJECT_SEGMENTS = (".env", ".git", ".ssh", "state", "uploads", "models.dsl", "models.json")
+_MAX_CAPTURE_BYTES = 1024 * 1024
+
 DANGEROUS_FIND_FLAGS = frozenset(
     "-exec -execdir -ok -okdir -delete -fls -fprint -fprint0 -fprintf -files0-from -f".split()
 )
-DANGEROUS_GIT_PREFIXES = (
-    "-c", "-C", "-O", "--no-index", "--config-env", "--git-dir", "--work-tree",
-    "--exec-path", "--upload-pack", "--receive-pack", "--ext-cmd", "--ext-diff", "--textconv", "--output",
+GIT_STATUS_FLAGS = frozenset({"-s", "--short", "-b", "--branch", "--porcelain"})
+GIT_BRANCH_FLAGS = frozenset(
+    {"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current"}
 )
+GIT_LOG_BOOL_FLAGS = frozenset({"--oneline", "--stat", "--name-only", "--name-status", "--graph", "--decorate"})
+GIT_DIFF_FLAGS = frozenset({"--stat", "--name-only", "--name-status", "--cached", "--staged"})
+GIT_SHOW_SUMMARY_FLAGS = frozenset({"--stat", "--name-only", "--name-status", "-s", "--no-patch"})
+GIT_SHOW_FLAGS = GIT_SHOW_SUMMARY_FLAGS | frozenset({"--oneline"})
+GIT_REV_PARSE_FLAGS = frozenset(
+    {"--short", "--abbrev-ref", "--show-toplevel", "--is-inside-work-tree", "--verify", "--symbolic-full-name"}
+)
+GIT_SUPPORTED_SUBCOMMANDS = frozenset({"status", "branch", "log", "diff", "show", "rev-parse"})
+
 PYTEST_SHORT_BOOL, PYTEST_SHORT_VAL = frozenset("vqxsl"), frozenset("km")
 PYTEST_LONG_BOOL = frozenset(
     "--ff --lf --nf --collect-only --no-header --verbose --quiet --exitfirst --co --no-summary --disable-warnings".split()
@@ -136,28 +156,45 @@ def _parse_single_command(command: str) -> list[str]:
     return tokens
 
 
-# 判断单个路径段是否命中受保护敏感名称（全量大小写不敏感，仅精确放行 .env.example）
+# 判断单个路径段是否命中受保护敏感名称（复用 files_policy 的 Unicode 折叠检测，仅放行 .env.example）
 def _is_rejected_segment(part: str, reject_segments: tuple[str, ...]) -> bool:
-    if part == ".env.example":
-        return False
-    lower = part.lower()
-    return lower in {seg.lower() for seg in reject_segments} or lower.startswith(".env.")
+    return is_sensitive_segment(part, reject_segments)
 
 
-# 检查带通配符表达式是否可能大小写不敏感地命中敏感路径段或 .env.* 变体
+# 检查带通配符表达式是否可能经过 Unicode 折叠后命中敏感路径段或 .env.* / .tmp-models-* 变体
 def _matches_sensitive_glob(glob_expr: str, reject_segments: tuple[str, ...]) -> bool:
     if not any(ch in glob_expr for ch in "*?["):
         return False
-    samples = {seg.lower() for seg in reject_segments} | {
-        ".env", ".env.local", ".env.production", ".env.staging", ".env.development",
+    samples = {normalize_segment(seg) for seg in reject_segments} | {
+        ".env", ".env.local", ".env.production", ".env.staging", ".env.development", ".tmp-models-x",
     }
-    norm = glob_expr.replace("\\", "/").lower()
+    norm = normalize_segment(glob_expr.replace("\\", "/"))
     cands = {norm, *(p for p in Path(norm).parts if any(ch in p for ch in "*?["))}
     return any(fnmatch.fnmatchcase(sample, cand) for cand in cands for sample in samples)
 
 
-# 校验单个路径参数：拒绝绝对路径、.. 穿越、敏感目录段以及指向外部或敏感文件的软链接
-def _validate_path_candidate(raw_value: str, policy: ShellPolicy) -> None:
+# 收集当前 ShellPolicy 对应的停止边界目录与受保护内核 Inode 集合
+def _protected_inode_context(policy: ShellPolicy) -> tuple[list[Path], set[tuple[int, int]]]:
+    root_res = policy.project_root.resolve(strict=False)
+    scan_roots: list[Path] = [root_res, root_res / "config", root_res / "data"]
+    stop_roots: list[Path] = [root_res]
+    if policy.offload_dir is not None:
+        off_res = policy.offload_dir.resolve(strict=False)
+        scan_roots.extend([off_res, off_res.parent])
+        stop_roots.append(off_res.parent)
+        if off_res.parent.parent != off_res.parent:
+            scan_roots.append(off_res.parent.parent)
+            stop_roots.append(off_res.parent.parent)
+    return stop_roots, collect_protected_inodes(scan_roots, policy.reject_segments)
+
+
+# 校验单个路径参数：拒绝绝对路径、.. 穿越、Unicode 敏感目录段、内核 Inode 命中及越权软链接
+def _validate_path_candidate(
+    raw_value: str,
+    policy: ShellPolicy,
+    *,
+    protected_ctx: tuple[list[Path], set[tuple[int, int]]] | None = None,
+) -> None:
     if not raw_value:
         return
     if raw_value.startswith("~") or Path(raw_value).is_absolute():
@@ -168,8 +205,27 @@ def _validate_path_candidate(raw_value: str, policy: ShellPolicy) -> None:
     for part in rel.parts:
         if _is_rejected_segment(part, policy.reject_segments):
             raise ValueError(f"禁止访问受保护路径：{part}")
+
+    stop_roots, protected_inodes = protected_ctx or _protected_inode_context(policy)
     root_res = policy.project_root.resolve(strict=False)
     candidate = policy.cwd / rel
+    if hits_protected_inode(candidate, stop_roots, protected_inodes):
+        raise ValueError(f"禁止访问受保护路径：{raw_value}")
+
+    # 逐级排查软链接（即使末端文件不存在，中间目录软链接也不得逃出项目或落入受保护目标）
+    cur = policy.cwd
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            cur_res = cur.resolve(strict=False)
+            if not cur_res.is_relative_to(root_res):
+                raise ValueError(f"目标路径超出项目根目录：{raw_value}")
+            for rpart in cur_res.relative_to(root_res).parts:
+                if _is_rejected_segment(rpart, policy.reject_segments):
+                    raise ValueError(f"禁止访问受保护目标：{rpart}")
+            if hits_protected_inode(cur_res, stop_roots, protected_inodes):
+                raise ValueError(f"禁止访问受保护目标：{raw_value}")
+
     if candidate.exists() or candidate.is_symlink():
         resolved = candidate.resolve(strict=False)
         if not resolved.is_relative_to(root_res):
@@ -177,9 +233,11 @@ def _validate_path_candidate(raw_value: str, policy: ShellPolicy) -> None:
         for part in resolved.relative_to(root_res).parts:
             if _is_rejected_segment(part, policy.reject_segments):
                 raise ValueError(f"禁止访问受保护目标：{part}")
+        if hits_protected_inode(resolved, stop_roots, protected_inodes):
+            raise ValueError(f"禁止访问受保护目标：{raw_value}")
 
 
-# 校验搜索/文件过滤 glob（禁止正向匹配隐藏路径或命中敏感段，放行排除式 !glob）
+# 校验搜索/文件过滤 glob（禁止正向匹配隐藏路径或经 Unicode 折叠命中敏感段，放行排除式 !glob）
 def _validate_safe_glob(raw_glob: str, policy: ShellPolicy) -> None:
     if not raw_glob:
         raise ValueError("glob 参数不能为空。")
@@ -188,12 +246,12 @@ def _validate_safe_glob(raw_glob: str, policy: ShellPolicy) -> None:
     _validate_path_candidate(cleaned, policy)
     if negated:
         return
-    norm = cleaned.replace("\\", "/")
-    if norm != ".env.example" and (
+    norm = normalize_segment(cleaned.replace("\\", "/"))
+    if cleaned != ".env.example" and (
         norm.startswith(".") or "/." in norm or any(p.startswith(".") for p in Path(norm).parts)
     ):
         raise ValueError(f"禁止通过 glob 正向匹配隐藏路径：{raw_glob}")
-    if _matches_sensitive_glob(norm, policy.reject_segments) or (".env" in norm.lower() and norm.lower() != ".env.example"):
+    if _matches_sensitive_glob(cleaned, policy.reject_segments) or (".env" in norm and cleaned != ".env.example"):
         raise ValueError(f"禁止通过 glob 匹配受保护路径：{raw_glob}")
 
 
@@ -261,41 +319,131 @@ def _parse_pytest_args(args: list[str], policy: ShellPolicy) -> bool:
     return has_target
 
 
-# 校验 git 参数：禁止子命令前置选项走私、拦截高危参数/pathspec 魔法语法及通配符/冒号路径绕过
-def _validate_git_args(args: list[str], policy: ShellPolicy) -> None:
+# 校验 git branch --list/-l 的分支名称匹配模式（允许 * 通配符，拦截路径穿越、魔法语法与敏感段）
+def _validate_git_branch_pattern(arg: str, policy: ShellPolicy) -> None:
+    if not arg or arg.startswith("~") or ":(" in arg or ":^" in arg or ":!" in arg:
+        raise ValueError(f"git branch 模式参数非法：{arg}")
+    rel = Path(arg.replace("\\", "/"))
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"git branch 模式不能包含绝对路径或 ..：{arg}")
+    for part in rel.parts:
+        if _is_rejected_segment(part, policy.reject_segments):
+            raise ValueError(f"git branch 模式禁止引用受保护名称：{part}")
+
+
+# 校验 git 位置参数（路径/revision/冒号引用），阻断 pathspec 魔法语法、通配符绕过与敏感路径
+def _validate_git_pathspec(
+    arg: str,
+    policy: ShellPolicy,
+    *,
+    protected_ctx: tuple[list[Path], set[tuple[int, int]]],
+) -> None:
+    if ":(" in arg or ":^" in arg or ":!" in arg:
+        raise ValueError(f"git 禁止使用 pathspec 魔法语法：{arg}")
+    _validate_path_candidate(arg, policy, protected_ctx=protected_ctx)
+    if _matches_sensitive_glob(arg, policy.reject_segments):
+        raise ValueError(f"git 禁止通配符匹配受保护路径：{arg}")
+    if ":" in arg:
+        parts = arg.split(":")
+        if not parts[-1]:
+            raise ValueError(f"git 冒号引用缺少路径目标：{arg}")
+        for i in range(1, len(parts)):
+            for cand in (parts[i], ":".join(parts[i:]), *parts[i].split("..")):
+                if cand:
+                    _validate_path_candidate(cand, policy, protected_ctx=protected_ctx)
+                    if _matches_sensitive_glob(cand, policy.reject_segments):
+                        raise ValueError(f"git 禁止通配符匹配受保护路径：{cand}")
+
+
+# 解析并严格校验单个 git 只读子命令及选项，返回 (子命令名, 子命令后参数列表)
+def _parse_git_command(args: list[str], policy: ShellPolicy) -> tuple[str, list[str]]:
     allowed = ", ".join(policy.allowed_git_subcommands)
     sub_idx = 1 if args[:1] == ["--no-pager"] else 0
-    if sub_idx >= len(args) or args[sub_idx] not in policy.allowed_git_subcommands:
-        raise ValueError(f"git 仅允许直接调用白名单子命令（允许：{allowed}），禁止前置全局选项。")
+    if (
+        sub_idx >= len(args)
+        or args[sub_idx] not in policy.allowed_git_subcommands
+        or args[sub_idx] not in GIT_SUPPORTED_SUBCOMMANDS
+    ):
+        raise ValueError(f"git 仅允许直接调用白名单只读子命令（允许：{allowed}），禁止前置全局选项。")
 
+    sub = args[sub_idx]
+    rest = args[sub_idx + 1 :]
+    protected_ctx = _protected_inode_context(policy)
+
+    idx = 0
     after_dd = False
-    for arg in args[sub_idx + 1 :]:
+    seen_flags: list[str] = []
+    positionals: list[str] = []
+
+    while idx < len(rest):
+        arg = rest[idx]
         if arg == "--" and not after_dd:
             after_dd = True
+            idx += 1
             continue
-        if not after_dd and arg.startswith("-"):
-            for bad in DANGEROUS_GIT_PREFIXES:
-                if (not bad.startswith("--") and arg.startswith(bad)) or arg == bad or arg.startswith(f"{bad}="):
-                    raise ValueError(f"禁止使用高危 git 选项：{arg}")
-            if "=" in arg:
-                _validate_path_candidate(arg.split("=", 1)[1], policy)
-            elif not arg.startswith("--") and not re.fullmatch(r"-[A-Za-z0-9]+", arg):
-                raise ValueError(f"git 禁止使用未知连写短选项：{arg}")
+        if after_dd or not arg.startswith("-") or arg == "-":
+            if sub == "branch":
+                _validate_git_branch_pattern(arg, policy)
+            else:
+                _validate_git_pathspec(arg, policy, protected_ctx=protected_ctx)
+            positionals.append(arg)
+            idx += 1
             continue
 
-        if ":(" in arg or ":^" in arg or ":!" in arg:
-            raise ValueError(f"git 禁止使用 pathspec 魔法语法：{arg}")
-        _validate_path_candidate(arg, policy)
-        if _matches_sensitive_glob(arg, policy.reject_segments):
-            raise ValueError(f"git 禁止通配符匹配受保护路径：{arg}")
-        if ":" in arg:
-            parts = arg.split(":")
-            for i in range(1, len(parts)):
-                for cand in (parts[i], ":".join(parts[i:]), *parts[i].split("..")):
-                    if cand:
-                        _validate_path_candidate(cand, policy)
-                        if _matches_sensitive_glob(cand, policy.reject_segments):
-                            raise ValueError(f"git 禁止通配符匹配受保护路径：{cand}")
+        if sub == "status":
+            if arg not in GIT_STATUS_FLAGS:
+                raise ValueError(f"git status 不允许选项：{arg}")
+            seen_flags.append(arg)
+            idx += 1
+        elif sub == "branch":
+            if arg not in GIT_BRANCH_FLAGS:
+                raise ValueError(f"git branch 仅允许只读列举标志，禁止：{arg}")
+            seen_flags.append(arg)
+            idx += 1
+        elif sub == "diff":
+            if arg not in GIT_DIFF_FLAGS:
+                raise ValueError(f"git diff 不允许选项：{arg}")
+            seen_flags.append(arg)
+            idx += 1
+        elif sub == "show":
+            if arg not in GIT_SHOW_FLAGS:
+                raise ValueError(f"git show 不允许选项：{arg}")
+            seen_flags.append(arg)
+            idx += 1
+        elif sub == "rev-parse":
+            if arg not in GIT_REV_PARSE_FLAGS:
+                raise ValueError(f"git rev-parse 不允许选项：{arg}")
+            seen_flags.append(arg)
+            idx += 1
+        elif sub == "log":
+            if arg in GIT_LOG_BOOL_FLAGS:
+                seen_flags.append(arg)
+                idx += 1
+            elif arg == "-n":
+                val, idx = _consume_opt_value(rest, idx, None, "git log -n")
+                if not re.fullmatch(r"[1-9]\d*", val):
+                    raise ValueError(f"git log -n 需要正整数：{val}")
+                seen_flags.append(arg)
+            elif re.fullmatch(r"-n[1-9]\d*", arg) or re.fullmatch(r"-[1-9]\d*", arg):
+                seen_flags.append(arg)
+                idx += 1
+            elif re.fullmatch(r"--max-count=[1-9]\d*", arg):
+                seen_flags.append(arg)
+                idx += 1
+            else:
+                raise ValueError(f"git log 不允许选项：{arg}")
+
+    if sub == "branch" and positionals:
+        has_list = any(flag in {"--list", "-l"} for flag in seen_flags)
+        if not has_list or "--show-current" in seen_flags:
+            raise ValueError("git branch 仅允许纯列举只读标志，严禁传入位置参数创建分支。")
+
+    return sub, rest
+
+
+# 校验 git 参数的统一入口（供验证与外部测试调用）
+def _validate_git_args(args: list[str], policy: ShellPolicy) -> None:
+    _parse_git_command(args, policy)
 
 
 # 校验 grep / rg 带值选项参数，阻断非法整数、类型与敏感 glob
@@ -315,6 +463,7 @@ def _validate_search_opt_value(exe: str, opt: str, kind: str, val: str, policy: 
 # 解析并校验 grep / rg 参数（全量扫描后再判定路径位置参数，彻底封堵后置 -e/--files 绕过）
 def _parse_search_args(exe: str, args: list[str], policy: ShellPolicy) -> tuple[int, bool, bool]:
     spec = SEARCH_SPECS[exe]
+    protected_ctx = _protected_inode_context(policy)
     idx, dd_idx, is_recursive, explicit_pattern, after_dd = 0, None, exe == "rg", False, False
     positionals: list[str] = []
     while idx < len(args):
@@ -373,7 +522,7 @@ def _parse_search_args(exe: str, args: list[str], policy: ShellPolicy) -> tuple[
         idx = next_idx
     targets = positionals if explicit_pattern else positionals[1:]
     for target in targets:
-        _validate_path_candidate(target, policy)
+        _validate_path_candidate(target, policy, protected_ctx=protected_ctx)
     only_example = bool(targets) and all(
         (t == ".env.example" or t.endswith("/.env.example")) and not (policy.cwd / Path(t.replace("\\", "/"))).is_dir()
         for t in targets
@@ -391,6 +540,7 @@ def _validate_program_rules(argv: list[str], policy: ShellPolicy) -> None:
     elif exe in SEARCH_SPECS:
         _parse_search_args(exe, args, policy)
     else:
+        protected_ctx = _protected_inode_context(policy)
         after_dd = False
         for arg in args:
             if arg == "--" and not after_dd:
@@ -409,12 +559,12 @@ def _validate_program_rules(argv: list[str], policy: ShellPolicy) -> None:
                     if arg == "--files0-from" or arg.startswith("--files0-from="):
                         raise ValueError(f"{exe} 禁止从文件读取路径列表：{arg}")
                     if "=" in arg:
-                        _validate_path_candidate(arg.split("=", 1)[1], policy)
+                        _validate_path_candidate(arg.split("=", 1)[1], policy, protected_ctx=protected_ctx)
                     continue
                 if not re.fullmatch(r"-[A-Za-z0-9]+", arg):
                     raise ValueError(f"{exe} 禁止使用未知连写路径短选项：{arg}")
                 continue
-            _validate_path_candidate(arg, policy)
+            _validate_path_candidate(arg, policy, protected_ctx=protected_ctx)
 
 
 # 将路径转换为相对 cwd 的字符串以简化 --ignore 目标参数
@@ -422,7 +572,7 @@ def _rel_to_cwd(path: Path, cwd: Path) -> str:
     return str(path.relative_to(cwd)) if path.is_relative_to(cwd) else str(path)
 
 
-# 为 grep/rg 在用户选项后注入敏感排除项，为 pytest 注入 --ignore 与 tests 收敛目标
+# 为 grep/rg 注入敏感排除项，为 pytest 注入 --ignore 与 tests 目标，为 git show/diff 补齐安全限制与负向排除
 def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
     exe, args = argv[0], argv[1:]
     if exe in SEARCH_SPECS:
@@ -432,6 +582,7 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             *policy.reject_segments,
             *((".git",) if ".git" not in policy.reject_segments else ()),
             *((".env.*",) if add_env else ()),
+            ".tmp-models-*",
         )
         fmts = ("--exclude={}", "--exclude-dir={}") if exe == "grep" else ("--glob=!{}", "--glob=!**/{}/**")
         excludes = [fmt.format(seg) for seg in pats for fmt in fmts]
@@ -450,6 +601,43 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
         tail = [] if has_target else [_rel_to_cwd((root_res / "tests").resolve(strict=False), cwd_res)]
         return [exe, *ignores, *args, *tail]
 
+    if exe == "git":
+        sub, rest = _parse_git_command(args, policy)
+        if sub == "show":
+            before_dd = rest[: rest.index("--")] if "--" in rest else rest
+            if not any(tok in GIT_SHOW_SUMMARY_FLAGS for tok in before_dd):
+                sub_pos = args.index("show") + 1
+                return [exe, *args[:sub_pos], "--stat", *args[sub_pos:]]
+        if sub == "diff":
+            diff_pats = (*policy.reject_segments, ".env.*", ".tmp-models-*")
+            neg_specs: list[str] = []
+            for seg in diff_pats:
+                if seg == ".git":
+                    continue
+                neg_specs.extend(
+                    (
+                        f":(exclude,glob,icase){seg}",
+                        f":(exclude,glob,icase)**/{seg}",
+                        f":(exclude,glob,icase)**/{seg}/**",
+                    )
+                )
+            if "--" in args:
+                dd_pos = args.index("--")
+                has_pos_path = dd_pos + 1 < len(args)
+                return [exe, *args, *(() if has_pos_path else (".",)), *neg_specs]
+            # 区分无 -- 时的修订号与工作区文件路径，确保不把文件名塞到 -- 左侧报 bad revision
+            sub_pos = args.index("diff") + 1
+            rev_part: list[str] = []
+            path_part: list[str] = []
+            in_paths = False
+            for tok in args[sub_pos:]:
+                if not in_paths and (tok.startswith("-") or not (policy.cwd / tok).exists() or tok == "HEAD"):
+                    rev_part.append(tok)
+                else:
+                    in_paths = True
+                    path_part.append(tok)
+            return [exe, *args[:sub_pos], *rev_part, "--", *(path_part or ["."]), *neg_specs]
+
     return argv
 
 
@@ -467,7 +655,208 @@ def _format_command_output(
     return f"退出码：{returncode}\n{body}"
 
 
-# 在安全策略护栏内执行单条受控命令（shell=False、脱敏环境、超时与 Head+Tail TOAST 卸载）
+# 构建隔离的子进程环境变量：空 HOME + 禁用全局/系统 git config 与交互提示
+def _build_isolated_env(safe_path: str, isolated_home: str) -> dict[str, str]:
+    return {
+        "PATH": safe_path,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "HOME": isolated_home,
+        "TMPDIR": tempfile.gettempdir(),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "GIT_EDITOR": "true",
+    }
+
+
+# 在守护线程中流式读取管道字节，超过硬上限即停止缓冲并通知终止整个进程组
+def _read_pipe_limited(
+    pipe: IO[bytes] | None,
+    limit: int,
+    chunks: list[bytes],
+    overflow: threading.Event,
+    wake: threading.Event,
+) -> None:
+    if pipe is None:
+        return
+    total = 0
+    try:
+        while True:
+            block = pipe.read(16384)
+            if not block:
+                break
+            remaining = limit - total
+            if remaining > 0:
+                kept = block[:remaining]
+                chunks.append(kept)
+                total += len(kept)
+            if len(block) > remaining:
+                overflow.set()
+                wake.set()
+                break
+    except OSError:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+# 强制向子进程所属整个进程组发送 SIGKILL 并回收进程，杜绝超时或超限后孙进程残留
+def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+# 以独立进程组、限长流式管道读取和超时强杀机制执行单个子进程命令
+def _run_subprocess_limited(
+    cmd_argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
+    max_capture_bytes: int,
+) -> tuple[int, str, str, str | None]:
+    proc = subprocess.Popen(
+        cmd_argv,
+        shell=False,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(env),
+        start_new_session=True,
+    )
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    overflow = threading.Event()
+    wake = threading.Event()
+
+    # 等待子进程结束并立即唤醒主线程
+    def _wait_proc() -> None:
+        try:
+            proc.wait()
+        finally:
+            wake.set()
+
+    t_out = threading.Thread(
+        target=_read_pipe_limited,
+        args=(proc.stdout, max_capture_bytes, out_chunks, overflow, wake),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_read_pipe_limited,
+        args=(proc.stderr, max_capture_bytes, err_chunks, overflow, wake),
+        daemon=True,
+    )
+    t_wait = threading.Thread(target=_wait_proc, daemon=True)
+    t_out.start()
+    t_err.start()
+    t_wait.start()
+
+    finished = wake.wait(timeout=timeout)
+    if not finished:
+        _kill_process_group(proc)
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+        t_wait.join(timeout=1.0)
+        return -1, "", "", f"错误：命令执行超时（>{timeout:g}s）。"
+
+    t_wait.join(timeout=0.5)
+    t_out.join(timeout=0.5)
+    t_err.join(timeout=0.5)
+    if t_out.is_alive() or t_err.is_alive() or proc.poll() is None:
+        _kill_process_group(proc)
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+        t_wait.join(timeout=1.0)
+
+    if overflow.is_set():
+        return -1, "", "", f"错误：命令输出超过单流硬上限（>{max_capture_bytes} 字节），已强制终止。"
+
+    stdout_text = b"".join(out_chunks).decode("utf-8", errors="replace")
+    stderr_text = b"".join(err_chunks).decode("utf-8", errors="replace")
+    return proc.returncode if proc.returncode is not None else 0, stdout_text, stderr_text, None
+
+
+# 核验单个 git 修订引用（及其解引用 ^{}）是否指向裸 blob 或 tree 对象
+def _check_git_rev_not_blob_or_tree(
+    executable: str,
+    rev: str,
+    *,
+    sub: str,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
+) -> str | None:
+    for probe in (rev, f"{rev}^{{}}"):
+        code, obj_type, _, err_msg = _run_subprocess_limited(
+            (executable, "cat-file", "-t", probe),
+            cwd=cwd,
+            timeout=min(timeout, 3.0),
+            env=env,
+            max_capture_bytes=4096,
+        )
+        if err_msg is not None:
+            return err_msg
+        kind = obj_type.strip()
+        if code == 0 and kind in {"blob", "tree"}:
+            return f"错误：git {sub} 禁止直接读取 {kind} 对象（{rev}），仅允许基于 commit 摘要或安全路径查看。"
+    return None
+
+
+# 在执行 git show / diff 前核验范围端点与冒号左侧引用，严禁利用裸 blob 或 tree SHA 绕过敏感路径过滤
+def _reject_bare_git_blob_or_tree(
+    executable: str,
+    sub: str,
+    git_args: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
+) -> str | None:
+    sub_idx = 1 if git_args[:1] == ["--no-pager"] else 0
+    rest = git_args[sub_idx + 1 :]
+    before_dd = rest[: rest.index("--")] if "--" in rest else rest
+    for tok in before_dd:
+        if tok.startswith("-"):
+            continue
+        for ep in re.split(r"\.{2,3}", tok):
+            clean_ep = re.sub(r"\^[!@]$", "", ep.strip())
+            if not clean_ep:
+                continue
+            if ":" in clean_ep:
+                lhs, _ = clean_ep.split(":", 1)
+                if not lhs or lhs in {"0", "1", "2", "3"}:
+                    continue
+                err = _check_git_rev_not_blob_or_tree(
+                    executable, lhs, sub=sub, cwd=cwd, timeout=timeout, env=env
+                )
+                if err is not None:
+                    return err
+                continue
+            err = _check_git_rev_not_blob_or_tree(
+                executable, clean_ep, sub=sub, cwd=cwd, timeout=timeout, env=env
+            )
+            if err is not None:
+                return err
+    return None
+
+
+# 在安全策略护栏内执行单条受控命令（shell=False、隔离 HOME、进程组限长与 Head+Tail TOAST 卸载）
 def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     try:
         argv = _parse_single_command(command)
@@ -480,6 +869,7 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     except ValueError as error:
         return f"错误：{error}"
 
+    orig_git_sub = _parse_git_command(argv[1:], policy)[0] if argv[0] == "git" else ""
     final_argv = _augment_safe_argv(argv, policy)
     # 使用 absolute() 而非 resolve()，保留 .venv/bin/python 软链所在目录以便定位 .venv/bin/pytest
     venv_bin = str(Path(sys.executable).absolute().parent)
@@ -488,21 +878,41 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     if not executable:
         return f"错误：找不到可执行程序 {final_argv[0]}。"
 
-    env = {"PATH": safe_path, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": str(policy.cwd), "TMPDIR": tempfile.gettempdir()}
-    try:
-        done = subprocess.run(
-            (executable, *final_argv[1:]),
-            shell=False, cwd=policy.cwd, timeout=policy.timeout,
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return f"错误：命令执行超时（>{policy.timeout:g}s）。"
-    except OSError as error:
-        return f"错误：命令启动失败（{error}）。"
+    with tempfile.TemporaryDirectory(prefix="my_helper_home_") as isolated_home:
+        env = _build_isolated_env(safe_path, isolated_home)
+        try:
+            if orig_git_sub in {"show", "diff"}:
+                err_msg = _reject_bare_git_blob_or_tree(
+                    executable,
+                    orig_git_sub,
+                    argv[1:],
+                    cwd=policy.cwd,
+                    timeout=policy.timeout,
+                    env=env,
+                )
+                if err_msg is not None:
+                    return err_msg
+
+            returncode, stdout_text, stderr_text, run_err = _run_subprocess_limited(
+                (executable, *final_argv[1:]),
+                cwd=policy.cwd,
+                timeout=policy.timeout,
+                env=env,
+                max_capture_bytes=_MAX_CAPTURE_BYTES,
+            )
+        except OSError as error:
+            return f"错误：命令启动失败（{error}）。"
+
+    if run_err is not None:
+        return run_err
 
     return _format_command_output(
-        done.returncode, done.stdout or "", done.stderr or "",
-        max_output_bytes=policy.max_output_bytes, tag=f"shell-{final_argv[0]}", offload_dir=policy.offload_dir,
+        returncode,
+        stdout_text,
+        stderr_text,
+        max_output_bytes=policy.max_output_bytes,
+        tag=f"shell-{final_argv[0]}",
+        offload_dir=policy.offload_dir,
     )
 
 

@@ -849,3 +849,210 @@ def test_web_ui_fetch_headers_and_allowed_targets_rules() -> None:
             server.server_close()
             thread.join(timeout=3.0)
             app.close()
+
+
+# 测试响应安全头、socket 超时配置、SSE 断连立即释放锁回滚、非回环绑定警告与 Bearer Token 鉴权
+def test_web_chat_security_headers_sse_closing_non_loopback_warn_and_bearer_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import time
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    from personal_assistant.ai import StreamDone, TextDelta
+    from scripts.web_chat import _is_loopback_host, _warn_if_non_loopback, main as web_main
+
+    # 1. 验证安全响应头（HTML 与 JSON）与 WebChatHandler.timeout == 30
+    llm = WebTestLLM(
+        [
+            ({"role": "assistant", "content": "ok"}, None),
+        ]
+    )
+    app, _cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
+    try:
+        assert getattr(server.RequestHandlerClass, "timeout", None) == 30
+        parsed = urlparse(base_url)
+        conn = http.client.HTTPConnection(str(parsed.hostname), int(parsed.port or 80), timeout=5)
+        try:
+            conn.request("GET", "/", headers={"Host": f"127.0.0.1:{parsed.port}"})
+            html_resp = conn.getresponse()
+            _ = html_resp.read()
+            assert html_resp.status == 200
+            assert html_resp.headers.get("X-Content-Type-Options") == "nosniff"
+            assert html_resp.headers.get("X-Frame-Options") == "DENY"
+            assert html_resp.headers.get("Content-Security-Policy") == "frame-ancestors 'none'"
+
+            conn.request("GET", "/api/status", headers={"Host": f"127.0.0.1:{parsed.port}"})
+            api_resp = conn.getresponse()
+            _ = api_resp.read()
+            assert api_resp.status == 200
+            assert api_resp.headers.get("X-Content-Type-Options") == "nosniff"
+            assert api_resp.headers.get("X-Frame-Options") == "DENY"
+            assert api_resp.headers.get("Content-Security-Policy") == "frame-ancestors 'none'"
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        app.close()
+
+    # 2. 验证 /api/chat/stream 客户端断连后 contextlib.closing 确定性触发生成器 finally 回滚与锁释放
+    first_chunk_sent = threading.Event()
+    second_chunk_gate = threading.Event()
+
+    # 控制流式吐帧节奏：首帧后调用 remember_fact 暂存并在第二帧前等待门栓，随后恢复正常对话
+    class SlowDisconnectLLM(LLMClient):
+        # 初始化脚本步数
+        def __init__(self) -> None:
+            self._step = 0
+
+        # 同步响应入口（用于断连恢复后的下一轮对话）
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            return {"role": "assistant", "content": "恢复后正常"}
+
+        # 流式响应：第 1 步调 remember_fact，第 2 步先吐 1 帧后卡住等待客户端断开
+        def stream(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None):
+            self._step += 1
+            if self._step == 1:
+                msg = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "c_rem", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}],
+                }
+                yield StreamDone(message=msg)
+                return
+            if self._step == 2:
+                yield TextDelta(text="第一段")
+                first_chunk_sent.set()
+                second_chunk_gate.wait(timeout=3.0)
+                yield TextDelta(text="第二段")
+                time.sleep(0.05)
+                yield TextDelta(text="第三段")
+                yield StreamDone(message={"role": "assistant", "content": "第一段第二段第三段"})
+                return
+            yield TextDelta(text="恢复后正常")
+            yield StreamDone(message={"role": "assistant", "content": "恢复后正常"})
+
+    sse_app = AssistantApp(data_root=tmp_path / "sse_data", llm=SlowDisconnectLLM())
+    sse_srv = create_web_server(sse_app, host="127.0.0.1", port=0)
+    sse_thread = threading.Thread(target=sse_srv.serve_forever, daemon=True)
+    sse_thread.start()
+    try:
+        sse_url = f"http://127.0.0.1:{sse_srv.server_port}"
+        sock = socket.create_connection(("127.0.0.1", sse_srv.server_port), timeout=5)
+        body = json.dumps({"message": "记住，断连测试不应保留", "chat_id": "sse-drop"}).encode("utf-8")
+        req_raw = (
+            f"POST /api/chat/stream HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{sse_srv.server_port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        sock.sendall(req_raw)
+        assert first_chunk_sent.wait(timeout=3.0)
+        # 读到前几帧后立即暴力关闭客户端 socket，再放行第二帧触发服务端 BrokenPipeError
+        _ = sock.recv(4096)
+        sock.close()
+        second_chunk_gate.set()
+
+        # 等待服务端关闭生成器后验证 facts.md 已回滚、同 chat_id 可立即再次对话且锁引用计数归零
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if "(turn#" not in sse_app.memory.read_recent_facts():
+                break
+            time.sleep(0.02)
+        res_next = sse_app.chat("断开后恢复对话", chat_id="sse-drop")
+        assert res_next["reply"] == "恢复后正常"
+        assert "断连测试不应保留" not in sse_app.memory.read_recent_facts()
+        assert sse_app._chat_locks["sse-drop"][1] == 0
+    finally:
+        second_chunk_gate.set()
+        sse_srv.shutdown()
+        sse_srv.server_close()
+        sse_thread.join(timeout=3.0)
+        sse_app.close()
+
+    # 3. 非回环绑定检测与 stderr 安全警告
+    assert _is_loopback_host("127.0.0.1") is True
+    assert _is_loopback_host("localhost") is True
+    assert _is_loopback_host("::1") is True
+    assert _is_loopback_host("0.0.0.0") is False
+    assert _is_loopback_host("::") is False
+    assert _is_loopback_host("192.168.1.50") is False
+
+    _warn_if_non_loopback("127.0.0.1")
+    assert capsys.readouterr().err == ""
+    _warn_if_non_loopback("0.0.0.0")
+    warn_err = capsys.readouterr().err
+    assert "警告" in warn_err and "0.0.0.0" in warn_err
+
+    # 4. Bearer Token 鉴权（环境变量 MY_HELPER_WEB_TOKEN 与显式 auth_token / CLI --auth-token）
+    monkeypatch.setenv("MY_HELPER_WEB_TOKEN", "env-secret-token")
+    auth_app = AssistantApp(data_root=tmp_path / "auth_data", llm=WebTestLLM([]))
+    auth_srv = create_web_server(auth_app, host="127.0.0.1", port=0)
+    auth_thread = threading.Thread(target=auth_srv.serve_forever, daemon=True)
+    auth_thread.start()
+    try:
+        auth_base = f"http://127.0.0.1:{auth_srv.server_port}"
+        for path in ("/", "/api/status"):
+            with pytest.raises(HTTPError) as no_tok_err:
+                urlopen(Request(f"{auth_base}{path}"), timeout=5)
+            assert no_tok_err.value.code == 401
+            with pytest.raises(HTTPError) as bad_tok_err:
+                urlopen(Request(f"{auth_base}{path}", headers={"Authorization": "Bearer wrong"}), timeout=5)
+            assert bad_tok_err.value.code == 401
+            # 含非 ASCII 字节（0x80..0xFF）的 Authorization 头必须优雅返回 401 JSON 而绝不抛 TypeError 断连
+            non_ascii_status, non_ascii_body = _raw_http_request(
+                auth_base,
+                path,
+                method="GET",
+                headers={"Authorization": "Bearer \x80\xff"},
+            )
+            assert non_ascii_status == 401
+            assert "error" in json.loads(non_ascii_body)
+            with urlopen(
+                Request(f"{auth_base}{path}", headers={"Authorization": "Bearer env-secret-token"}),
+                timeout=5,
+            ) as ok_resp:
+                assert ok_resp.status == 200
+    finally:
+        auth_srv.shutdown()
+        auth_srv.server_close()
+        auth_thread.join(timeout=3.0)
+        auth_app.close()
+
+    # 验证 main() 支持 --auth-token 并在非回环绑定时输出警告
+    monkeypatch.delenv("MY_HELPER_WEB_TOKEN", raising=False)
+    captured_srv: dict[str, object] = {}
+
+    # 拦截真实 HTTP 服务启动以在单测内验证 CLI 参数解析与告警逻辑
+    class _FakeServer:
+        server_port = 8765
+
+        # 立即返回而不阻塞事件循环
+        def serve_forever(self) -> None:
+            return None
+
+        # 空关闭方法
+        def server_close(self) -> None:
+            return None
+
+    # 记录 create_web_server 入参
+    def _fake_create_server(app_obj, host: str = "127.0.0.1", port: int = 8765, *, auth_token: str | None = None):
+        captured_srv["host"] = host
+        captured_srv["auth_token"] = auth_token
+        return _FakeServer()
+
+    monkeypatch.setattr("scripts.web_chat.build_app", lambda **kw: auth_app)
+    monkeypatch.setattr("scripts.web_chat.create_web_server", _fake_create_server)
+    monkeypatch.setattr(auth_app, "close", lambda: None)
+    web_main(["--host", "0.0.0.0", "--port", "0", "--auth-token", "cli-secret-999"])
+    cli_err = capsys.readouterr().err
+    assert "警告" in cli_err and "0.0.0.0" in cli_err
+    assert captured_srv == {"host": "0.0.0.0", "auth_token": "cli-secret-999"}
+

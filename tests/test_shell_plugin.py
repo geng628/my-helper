@@ -563,3 +563,177 @@ def test_shell_plugin_blocks_attached_short_flags_git_colon_refs_and_env_variant
     assert "退出码：0" in no_pager_out
     safe_glob_out = execute_safe_command("git diff HEAD -- '*.py'", repo_policy)
     assert "退出码：0" in safe_glob_out
+
+
+# 测试 APFS Unicode 折叠（ſ/零宽字符）与内核 Inode 防护、Git 严格只读白名单、HOME 隔离以及进程组限长清理
+def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    import plugins.tools.shell_tools as shell_mod
+
+    (tmp_path / ".env").write_text("ROOT_SECRET=1\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("EXAMPLE=ok\n", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "models.json").write_text('{"api_key":"MODEL_JSON_SECRET"}\n', encoding="utf-8")
+    (tmp_path / "config" / "models.dsl").write_text("api_key MODEL_DSL_SECRET\n", encoding="utf-8")
+    (tmp_path / "config" / ".tmp-models-abc").write_text("TMP_SECRET\n", encoding="utf-8")
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    (tmp_path / "data" / "state" / "db.txt").write_text("STATE_DB_SECRET\n", encoding="utf-8")
+    (tmp_path / "data" / "workspace").mkdir(parents=True)
+    (tmp_path / "README.md").write_text("hello world\n", encoding="utf-8")
+    (tmp_path / "binary.dat").write_bytes(b"\xff\xfe\x80ok\n")
+    os.link(tmp_path / "config" / "models.json", tmp_path / "data" / "workspace" / "hardlink_models.txt")
+
+    # 在 tmp_path 初始化真实 Git 仓库（含提交与历史敏感文件 blob）以验证 git branch / show / log 白名单
+    git_bin = shutil.which("git")
+    assert git_bin is not None
+    for git_cmd in (
+        [git_bin, "init"],
+        [git_bin, "config", "user.email", "test@example.com"],
+        [git_bin, "config", "user.name", "Test User"],
+        [git_bin, "add", "README.md", "config/models.json"],
+        [git_bin, "commit", "-m", "init commit"],
+    ):
+        subprocess.run(git_cmd, cwd=tmp_path, check=True, capture_output=True)
+    blob_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD:config/models.json"], cwd=tmp_path, text=True
+    ).strip()
+    readme_blob_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD:README.md"], cwd=tmp_path, text=True
+    ).strip()
+    config_tree_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD:config"], cwd=tmp_path, text=True
+    ).strip()
+
+    # 在 cwd 放置恶意 .gitconfig，验证隔离 HOME + GIT_CONFIG_GLOBAL 彻底免疫
+    poison_marker = tmp_path / "pwned_gitconfig.txt"
+    (tmp_path / ".gitconfig").write_text(
+        f"[alias]\n\tst = !touch {poison_marker}\n[core]\n\tpager = touch {poison_marker}\n",
+        encoding="utf-8",
+    )
+
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("cat", "ls", "git", "env", "rg", "sh", "yes"),
+        timeout=1.5,
+        offload_dir=tmp_path / "data" / "workspace" / "tool_outputs",
+    )
+
+    # 1. APFS Unicode 折叠（data/ſtate、config/modelſ.json）、零宽字符与硬链接 Inode 绕过全部拦截
+    unicode_and_inode_blocked = [
+        "cat data/ſtate/db.txt",
+        "cat data/ſtate/nonexistent.txt",
+        "ls data/ſtate",
+        "cat config/modelſ.json",
+        "cat config/modelſ.dsl",
+        "cat config/.tmp-models-abc",
+        "cat .e\u200bnv",
+        "cat .ENV.EXAMPLE",
+        "cat data/workspace/hardlink_models.txt",
+        "git diff HEAD -- 'config/modelſ.*'",
+        "rg -g '*modelſ*' .",
+    ]
+    for cmd in unicode_and_inode_blocked:
+        out = execute_safe_command(cmd, policy)
+        assert out.startswith("错误："), f"应被拦截但放行：{cmd!r} -> {out!r}"
+        assert "MODEL_JSON_SECRET" not in out
+        assert "STATE_DB_SECRET" not in out
+
+    # 2. Git 严格逐子命令白名单：全面封堵 branch 写操作/改名/删分支、log 导出补丁与裸 show <blob>
+    git_blocked = [
+        "git branch -D master",
+        "git branch -d main",
+        "git branch -m old new",
+        "git branch -M old new",
+        "git branch -c main copy_b",
+        "git branch -C main copy_b",
+        "git branch -f evil_branch",
+        "git branch --delete main",
+        "git branch --del main",
+        "git branch --move a b",
+        "git branch --copy a b",
+        "git branch --force evil_branch",
+        "git branch --set-upstream-to=origin/main",
+        "git branch --unset-upstream",
+        "git branch --edit-description",
+        "git branch create_new_branch",
+        "git branch -- create_new_branch",
+        "git branch --show-current extra",
+        "git log -p",
+        "git log --patch",
+        "git log -u",
+        "git log --raw",
+        "git log --all",
+        "git log -n 0",
+        "git log --format=%H",
+        "git diff --ext-diff",
+        "git diff --no-index README.md .env",
+        "git status --ignored",
+        f"git show {blob_sha}",
+        f"git show --stat {blob_sha}",
+        f"git show -s {blob_sha}",
+        f"git show {config_tree_sha}:models.json",
+        f"git diff {readme_blob_sha} {blob_sha}",
+        f"git diff {readme_blob_sha}..{blob_sha}",
+        "git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD",
+        "git show HEAD:config/models.json",
+        "git rev-parse --git-dir",
+    ]
+    for cmd in git_blocked:
+        out = execute_safe_command(cmd, policy)
+        assert out.startswith("错误："), f"高危 git 命令应拦截：{cmd!r} -> {out!r}"
+        assert "MODEL_JSON_SECRET" not in out
+
+    # 合法只读 git 命令放行；裸 git show HEAD 自动补 --stat 不泄露敏感正文
+    for ok_cmd in (
+        "git status -s -b --porcelain",
+        "git branch",
+        "git branch -a -v --show-current",
+        "git branch --list",
+        "git branch -l '*'",
+        "git log -n 3 --oneline",
+        "git log -2 --stat --name-only --graph --decorate",
+        "git log --max-count=1 --name-status",
+        "git diff --stat --name-only --cached",
+        "git show --oneline -s HEAD",
+        "git rev-parse --short HEAD",
+    ):
+        out = execute_safe_command(ok_cmd, policy)
+        assert "退出码：0" in out, f"合法只读 git 命令应放行：{ok_cmd!r} -> {out!r}"
+
+    show_head_out = execute_safe_command("git show HEAD", policy)
+    assert "退出码：0" in show_head_out
+    assert "MODEL_JSON_SECRET" not in show_head_out
+
+    # 3. 隔离 HOME 与 Git 环境变量：不指向 cwd、不触发 .gitconfig 恶意配置
+    env_out = execute_safe_command("env", policy)
+    assert "退出码：0" in env_out
+    assert f"HOME={tmp_path}\n" not in env_out
+    assert "GIT_CONFIG_NOSYSTEM=1" in env_out
+    assert f"GIT_CONFIG_GLOBAL={os.devnull}" in env_out
+    assert "GIT_ATTR_NOSYSTEM=1" in env_out
+    assert "GIT_TERMINAL_PROMPT=0" in env_out
+    assert not poison_marker.exists()
+
+    # 4. 非 UTF-8 二进制输出使用 errors='replace' 安全解码不崩溃
+    bin_out = execute_safe_command("cat binary.dat", policy)
+    assert "退出码：0" in bin_out
+    assert "ok" in bin_out
+
+    # 5. 流式字节上限与 os.killpg 快速清理（含主进程秒退但孙进程仍持有管道、以及快速超限退出竞态）
+    yes_out = execute_safe_command("yes", policy)
+    assert yes_out.startswith("错误：") and ("上限" in yes_out or "超时" in yes_out)
+    assert hasattr(shell_mod, "_MAX_CAPTURE_BYTES")
+
+    import time
+
+    t_spawn = time.monotonic()
+    orphan_out = execute_safe_command("sh -c 'sleep 10 >/dev/stdout 2>&1 & echo parent_done'", policy)
+    assert time.monotonic() - t_spawn < 1.3
+    assert "parent_done" in orphan_out
+
+    fast_overflow = execute_safe_command("sh -c 'head -c 1100000 /dev/zero'", policy)
+    assert fast_overflow.startswith("错误：") and "上限" in fast_overflow
+

@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hmac
 import ipaddress
 import json
+import os
 import socket
 import sys
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +45,32 @@ def _parse_bind_host(host: str) -> tuple[str, bool]:
         return str(ip), ip.version == 6
     except ValueError:
         return clean, False
+
+
+# 判断绑定主机名是否仅限本机回环地址（127.0.0.0/8、localhost、::1）
+def _is_loopback_host(host: str) -> bool:
+    clean, _ = _parse_bind_host(host)
+    if clean in {"127.0.0.1", "localhost", "::1"}:
+        return True
+    if not clean:
+        return False
+    try:
+        return ipaddress.ip_address(clean).is_loopback
+    except ValueError:
+        return False
+
+
+# 当绑定非回环地址时向 stderr 打印醒目安全警告，提示开启令牌鉴权
+def _warn_if_non_loopback(host: str, stream: TextIO | None = None) -> bool:
+    if _is_loopback_host(host):
+        return False
+    target = stream if stream is not None else sys.stderr
+    print(
+        f"[安全警告] 本地网页服务正在监听非回环地址 {host!r}，可能暴露到局域网或外部网络；"
+        "请设置环境变量 MY_HELPER_WEB_TOKEN 或传入 --auth-token 开启 Bearer 鉴权。",
+        file=target,
+    )
+    return True
 
 
 # 基于绑定地址与实际监听端口构造允许的 Host 与同源 Origin 白名单（支持补充通配绑定下的落地地址）
@@ -90,25 +120,47 @@ def create_web_server(
     app: AssistantApp,
     host: str = "127.0.0.1",
     port: int = 8765,
+    *,
+    auth_token: str | None = None,
 ) -> ThreadingHTTPServer:
     ui_html = UI_HTML_PATH.read_text(encoding="utf-8")
     clean_bind_host, is_ipv6 = _parse_bind_host(host)
     is_wildcard_bind = clean_bind_host in {"", "0.0.0.0", "::"}
+    effective_token = (
+        auth_token if auth_token is not None else os.getenv("MY_HELPER_WEB_TOKEN", "")
+    ).strip()
 
     # 本地网页与 JSON API 请求处理器
     class WebChatHandler(BaseHTTPRequestHandler):
+        timeout = 30
+
         # 屏蔽默认每条请求的嘈杂 stderr 访问日志
         def log_message(self, format: str, *args: object) -> None:
             return
 
+        # 统一写入防点击劫持与防 MIME 嗅探安全响应头
+        def _send_security_headers(self) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+
         # 发送统一 UTF-8 JSON 响应
-        def _send_json(self, status: int, payload: dict[str, object]) -> None:
+        def _send_json(
+            self,
+            status: int,
+            payload: dict[str, object],
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self._send_security_headers()
+            if extra_headers:
+                for hdr_name, hdr_val in extra_headers.items():
+                    self.send_header(hdr_name, hdr_val)
             self.end_headers()
             self.wfile.write(raw)
 
@@ -137,7 +189,31 @@ def create_web_server(
             except (AttributeError, OSError, IndexError, ValueError):
                 return None
 
-        # 校验 Host（全路由）及同源 Origin / Sec-Fetch-Site（敏感 API 读写），拦截 DNS Rebinding 与 CSRF
+        # 当开启访问令牌时校验唯一 Authorization: Bearer <token> 请求头（恒定时间比对）
+        def _check_bearer_auth(self) -> bool:
+            if not effective_token:
+                return True
+            auth_headers = self._get_header_values("Authorization")
+            if len(auth_headers) != 1:
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "未授权访问，请提供有效的 Bearer Token。"},
+                    extra_headers={"WWW-Authenticate": "Bearer"},
+                )
+                return False
+            scheme, _, token_val = auth_headers[0].strip().partition(" ")
+            provided_bytes = token_val.strip().encode("utf-8", errors="surrogateescape")
+            expected_bytes = effective_token.encode("utf-8", errors="surrogateescape")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(provided_bytes, expected_bytes):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "无效的 Bearer Token。"},
+                    extra_headers={"WWW-Authenticate": "Bearer"},
+                )
+                return False
+            return True
+
+        # 校验 Host、可选 Bearer 令牌及同源 Origin / Sec-Fetch-Site，拦截 DNS Rebinding、未授权访问与 CSRF
         def _check_request_boundary(self, *, check_origin: bool) -> bool:
             sock_host = self._socket_local_host() if is_wildcard_bind else None
             allowed_hosts, allowed_origins = _allowed_hosts_and_origins(
@@ -147,6 +223,9 @@ def create_web_server(
             host_headers = self._get_header_values("Host")
             if len(host_headers) != 1 or host_headers[0].strip().lower() not in allowed_hosts:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Host 请求头。"})
+                return False
+
+            if not self._check_bearer_auth():
                 return False
 
             if not check_origin:
@@ -203,6 +282,7 @@ def create_web_server(
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
+                self._send_security_headers()
                 self.end_headers()
                 self.wfile.write(data)
                 return
@@ -280,10 +360,12 @@ def create_web_server(
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
+                self._send_security_headers()
                 self.end_headers()
                 try:
-                    for frame in frames:
-                        self._send_sse_frame(frame)
+                    with contextlib.closing(frames):  # type: ignore[arg-type]
+                        for frame in frames:
+                            self._send_sse_frame(frame)
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 except Exception as error:  # noqa: BLE001
@@ -339,11 +421,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     parser.add_argument("--model", default=None, help="指定 config/models.dsl 或 models.json 中的模型名称")
     parser.add_argument("--consolidator-model", default=None, help="指定后台记忆沉淀专用模型名称")
+    parser.add_argument("--auth-token", default=None, help="设置 Bearer 访问令牌（默认读取 MY_HELPER_WEB_TOKEN）")
     parser.add_argument("--open", action="store_true", help="启动后自动打开系统默认浏览器")
     args = parser.parse_args(argv)
 
+    _warn_if_non_loopback(args.host)
     app = build_app(model_name=args.model, consolidator_model=args.consolidator_model)
-    server = create_web_server(app, host=args.host, port=args.port)
+    server = (
+        create_web_server(app, host=args.host, port=args.port, auth_token=args.auth_token)
+        if args.auth_token is not None
+        else create_web_server(app, host=args.host, port=args.port)
+    )
     clean_host, is_ipv6 = _parse_bind_host(args.host)
     url_host = f"[{clean_host}]" if is_ipv6 else (clean_host or args.host)
     url = f"http://{url_host}:{server.server_port}"

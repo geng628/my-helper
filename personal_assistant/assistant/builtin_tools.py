@@ -8,6 +8,13 @@ from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
 
+RULE_INTENT_KEYWORDS = (
+    "记住", "规则", "以后", "每次", "必须", "不要", "禁止", "默认", "优先",
+    "一律", "习惯", "偏好", "请用", "始终", "以后回复", "以后回答", "回复风格", "回答风格", "风格",
+    "always", "never", "rule", "prefer", "must", "default",
+)
+MAX_RULE_STATEMENT_CHARS = 300
+
 
 # 将可选日期参数（date / datetime / ISO 字符串）安全归一化为标准 date 对象
 def _coerce_date(raw: date | str | None) -> date | None:
@@ -112,8 +119,30 @@ class MemoryToolsetProvider(ToolsetProvider):
                 effective_cb()
             return f"已记录用户原话到 {target}"
 
-        # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
-        def save_rule(statement: str) -> str:
+        # 适配 save_rule 工具：先阻断外部不可信工具污染轮并校验用户规则意图，再落盘到 data/memory/rules/
+        def save_rule(
+            statement: str,
+            *,
+            user_text: str = "",
+            untrusted_tool_seen: Callable[[], bool] | bool = False,
+        ) -> str:
+            seen_untrusted = (
+                bool(untrusted_tool_seen())
+                if callable(untrusted_tool_seen)
+                else bool(untrusted_tool_seen)
+            )
+            if seen_untrusted:
+                raise PermissionError("安全拦截：本轮已读取外部网页或搜索结果，禁止自动写入全局行为规则。")
+            raw_user = user_text.strip() if isinstance(user_text, str) and user_text.strip() else ""
+            if not raw_user and get_user_message is not None:
+                ctor_text, _ = get_user_message()
+                if isinstance(ctor_text, str):
+                    raw_user = ctor_text.strip()
+            if raw_user:
+                lower_user = raw_user.lower()
+                has_intent = any(kw in lower_user for kw in RULE_INTENT_KEYWORDS)
+                if not has_intent or len(statement.strip()) > MAX_RULE_STATEMENT_CHARS:
+                    raise PermissionError("安全拦截：当前用户消息未表达设定长期规则的意图，已拒绝写入 rules/。")
             path = memory.save_rule(statement, source="agent")
             return f"已保存行为规则：data/memory/rules/{path.name}"
 
