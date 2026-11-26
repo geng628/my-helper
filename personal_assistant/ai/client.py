@@ -17,7 +17,9 @@ from personal_assistant.ai.types import (
     ModelsConfig,
     StreamDone,
     TextDelta,
+    ThinkingDelta,
     TokenUsage,
+    ToolCall,
 )
 
 
@@ -121,15 +123,18 @@ def default_post_stream(
             yield raw_line.decode("utf-8")
 
 
-# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 TextDelta、拼接分片 tool_calls 并按需聚合扩展文本增量字段
+# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 ThinkingDelta/TextDelta、拼接分片 tool_calls 并按需聚合扩展文本增量字段
 def _consume_openai_sse(
     lines: Iterable[str],
     t0: float,
     *,
     extra_delta_fields: Iterable[str] = (),
+    thinking_delta_fields: Iterable[str] = (),
 ) -> Iterator[LLMStreamEvent]:
-    extra_fields = tuple(extra_delta_fields)
-    extra_parts: dict[str, list[str]] = {name: [] for name in extra_fields}
+    thinking_fields = tuple(dict.fromkeys(thinking_delta_fields))
+    thinking_set = set(thinking_fields)
+    all_extra_fields = tuple(dict.fromkeys((*extra_delta_fields, *thinking_fields)))
+    extra_parts: dict[str, list[str]] = {name: [] for name in all_extra_fields}
     role, parts, tool_acc = "assistant", [], {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
@@ -155,11 +160,13 @@ def _consume_openai_sse(
             continue
         if isinstance(delta.get("role"), str) and delta["role"]:
             role = str(delta["role"])
-        for field_name in extra_fields:
+        for field_name in all_extra_fields:
             extra_piece = delta.get(field_name)
             if isinstance(extra_piece, str) and extra_piece:
                 ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
                 extra_parts[field_name].append(extra_piece)
+                if field_name in thinking_set:
+                    yield ThinkingDelta(text=extra_piece)
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
@@ -171,11 +178,9 @@ def _consume_openai_sse(
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
             raw_idx = tc.get("index")
             idx = raw_idx if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) else 0
-            acc = tool_acc.setdefault(idx, {"id": "", "type": "function", "name": "", "args": []})
+            acc = tool_acc.setdefault(idx, {"id": "", "name": "", "args": []})
             if isinstance(tc.get("id"), str) and tc["id"]:
                 acc["id"] = tc["id"]
-            if isinstance(tc.get("type"), str) and tc["type"]:
-                acc["type"] = tc["type"]
             fn = tc.get("function") or {}
             if isinstance(fn, dict):
                 if isinstance(fn.get("name"), str) and fn["name"]:
@@ -185,7 +190,11 @@ def _consume_openai_sse(
 
     full_text = "".join(parts)
     calls = [
-        {"id": a["id"], "type": a["type"], "function": {"name": a["name"], "arguments": "".join(a["args"])}}
+        ToolCall(
+            id=str(a["id"]),
+            name=str(a["name"]),
+            arguments="".join(a["args"]),  # type: ignore[arg-type]
+        ).to_openai_dict()
         for _, a in sorted(tool_acc.items())
     ]
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
@@ -228,7 +237,7 @@ class LLMClient(ABC):
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]: ...
 
-    # 流式发送对话历史与工具定义并吐出 TextDelta / StreamDone 事件；未重写时自动包装同步 respond()
+    # 流式发送对话历史与工具定义并吐出 ThinkingDelta / TextDelta / StreamDone 事件；未重写时自动包装同步 respond()
     def stream(
         self,
         messages: list[dict[str, object]],
@@ -239,9 +248,13 @@ class LLMClient(ABC):
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
         raw_usage = getattr(self, "last_usage", None)
         usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
+        reasoning = msg.get("reasoning_content")
         content = msg.get("content")
         tool_calls = msg.get("tool_calls") or []
         ttft_ms: float | None = None
+        if isinstance(reasoning, str) and reasoning:
+            ttft_ms = elapsed_ms
+            yield ThinkingDelta(text=reasoning)
         if isinstance(content, str) and content and not tool_calls:
             ttft_ms = elapsed_ms
             yield TextDelta(text=content)
@@ -293,6 +306,10 @@ class OpenAIChatClient(LLMClient):
 
     # 返回流式解析时需按字符串聚合的扩展增量字段名（默认为空）
     def _stream_delta_fields(self) -> tuple[str, ...]:
+        return ()
+
+    # 返回流式解析时需实时吐出 ThinkingDelta 并按字符串聚合的思维链字段名（默认为空）
+    def _thinking_delta_fields(self) -> tuple[str, ...]:
         return ()
 
     # 规范化同步与流式响应产出的 assistant 消息字典（子类可重写）
@@ -347,7 +364,12 @@ class OpenAIChatClient(LLMClient):
         self.last_usage = None
         t0 = time.perf_counter()
         lines = _open_openai_stream(self.post_stream, url, payload, headers)
-        for event in _consume_openai_sse(lines, t0, extra_delta_fields=self._stream_delta_fields()):
+        for event in _consume_openai_sse(
+            lines,
+            t0,
+            extra_delta_fields=self._stream_delta_fields(),
+            thinking_delta_fields=self._thinking_delta_fields(),
+        ):
             if isinstance(event, StreamDone):
                 event = StreamDone(
                     message=self._normalize_response_message(event.message),

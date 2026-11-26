@@ -1,22 +1,40 @@
-"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：复用 ai 层流式事件并产出 ToolStep / TurnEnd，不含业务与统计逻辑。"""
+"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：复用 ai 层流式事件并产出 ToolStart / ToolStep / TurnEnd，不含业务与统计逻辑。"""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
 
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.client import LLMClient
-from personal_assistant.ai.types import StreamDone, TextDelta, TokenUsage
+from personal_assistant.ai.types import (
+    StreamDone,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    ToolCall,
+    extract_tool_calls,
+)
+
+ContextTransformer = Callable[[list[dict[str, object]]], list[dict[str, object]]]
 
 
-# 单步工具执行完成事件：携带工具名、参数、观察结果与执行耗时
+# 单步工具开始执行事件：在工具运行前向外部观察者与界面通知工具名、参数与调用标识
+@dataclass(frozen=True)
+class ToolStart:
+    tool: str
+    arguments: str
+    call_id: str = ""
+
+
+# 单步工具执行完成事件：携带工具名、参数、观察结果、执行耗时与调用标识
 @dataclass(frozen=True)
 class ToolStep:
     tool: str
     arguments: str
     observation: str
     duration_ms: float = 0.0
+    call_id: str = ""
 
 
 # 回合结束事件：标识一次 ReAct 推理全部完成并返回最终回复与总耗时
@@ -36,14 +54,44 @@ class TaskEvent:
     error: str | None = None
 
 
-AgentEvent = TextDelta | StreamDone | ToolStep | TurnEnd
+AgentEvent = TextDelta | ThinkingDelta | StreamDone | ToolStart | ToolStep | TurnEnd
 RuntimeEvent = AgentEvent | TaskEvent
 
 
-# 从模型返回的消息字典中提取纯文本回复，为空时使用默认提示文案
-def _extract_reply(message: dict[str, object]) -> str:
-    content = str(message.get("content") or "").strip()
-    return content or "模型没有返回回复，请重试。"
+# 准备单轮发往大模型的上下文消息切片，确保两阶段管道变换绝不原地污染主消息列表
+def _prepare_llm_messages(
+    messages: list[dict[str, object]],
+    transform_context: ContextTransformer | None,
+    convert_to_llm: ContextTransformer | None,
+) -> list[dict[str, object]]:
+    if transform_context is None and convert_to_llm is None:
+        return messages
+    ctx_msgs = transform_context(list(messages)) if transform_context is not None else list(messages)
+    if convert_to_llm is None:
+        return ctx_msgs if isinstance(ctx_msgs, list) else list(ctx_msgs)
+    safe_ctx = list(ctx_msgs) if ctx_msgs is messages else ctx_msgs
+    llm_msgs = convert_to_llm(safe_ctx)
+    return llm_msgs if isinstance(llm_msgs, list) else list(llm_msgs)
+
+
+# 规范化写入历史的消息字典：保留扩展字段、补齐 role，并确保退出文本或 ToolCall 符合协议格式
+def _normalize_stored_assistant(
+    assistant_msg: Mapping[str, object],
+    *,
+    reply: str | None = None,
+    tool_calls: list[ToolCall] | None = None,
+) -> dict[str, object]:
+    stored = dict(assistant_msg)
+    stored["role"] = str(stored.get("role") or "assistant")
+    if reply is not None:
+        stored["content"] = reply
+        if "tool_calls" in stored and not stored["tool_calls"]:
+            stored.pop("tool_calls", None)
+    elif tool_calls:
+        raw_calls = stored.get("tool_calls")
+        if isinstance(raw_calls, Sequence) and any(isinstance(item, ToolCall) for item in raw_calls):
+            stored["tool_calls"] = [call.to_openai_dict() for call in tool_calls]
+    return stored
 
 
 # 透传单轮 LLM 流式事件并返回本轮完整 assistant 消息
@@ -60,54 +108,70 @@ def _stream_llm_round(
     return done.message if done is not None else {"role": "assistant", "content": ""}
 
 
-# 执行流式通用 ReAct 主循环：透传模型流式增量与 StreamDone，产出 ToolStep / TurnEnd 并仅在无 tool_calls 时自然终止
+# 执行流式通用 ReAct 主循环：单层 while True 内核，支持两阶段上下文转换并仅在无 ToolCall 时自然终止
 def iter_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
+    *,
+    transform_context: ContextTransformer | None = None,
+    convert_to_llm: ContextTransformer | None = None,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
     tool_defs = tools.definitions() if tools.names else None
 
     while True:
-        # 1. Reason：流式调用模型，实时吐字或请求工具调用
-        assistant_msg = yield from _stream_llm_round(llm, messages, tool_defs)
-        tool_calls = assistant_msg.get("tool_calls") or []
+        # 1. Reason：按需经 transform_context -> convert_to_llm 转换上下文副本后流式调用模型
+        llm_msgs = _prepare_llm_messages(messages, transform_context, convert_to_llm)
+        assistant_msg = yield from _stream_llm_round(llm, llm_msgs, tool_defs)
+        tool_calls = extract_tool_calls(assistant_msg)
         if not tool_calls:
-            reply = _extract_reply(assistant_msg)
-            messages.append({"role": "assistant", "content": reply})
+            reply = str(assistant_msg.get("content") or "").strip()
+            messages.append(_normalize_stored_assistant(assistant_msg, reply=reply))
             yield TurnEnd(reply=reply, total_ms=round((perf_counter() - t_turn) * 1000, 3))
             return
 
-        # 2. Act & Observe：依次执行模型请求的工具并计时，结果写回上下文
-        messages.append(assistant_msg)
+        # 2. Act & Observe：先发出 ToolStart，再执行强类型 ToolCall 并产出 ToolStep，结果写回上下文
+        messages.append(_normalize_stored_assistant(assistant_msg, tool_calls=tool_calls))
         for call in tool_calls:
-            fn = call.get("function") or {}
-            name = str(fn.get("name") or "")
-            args = str(fn.get("arguments") or "{}")
+            yield ToolStart(tool=call.name, arguments=call.arguments, call_id=call.id)
             t_tool = perf_counter()
-            observation = tools.execute(name, args)
+            observation = tools.execute(call.name, call.arguments)
             duration_ms = round((perf_counter() - t_tool) * 1000, 3)
-            yield ToolStep(tool=name, arguments=args, observation=observation, duration_ms=duration_ms)
+            yield ToolStep(
+                tool=call.name,
+                arguments=call.arguments,
+                observation=observation,
+                duration_ms=duration_ms,
+                call_id=call.id,
+            )
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": str(call.get("id") or ""),
+                    "tool_call_id": call.id,
                     "content": observation,
                 }
             )
 
 
-# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent，并在模型停止调用工具时返回最终自然语言回答
+# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent 与两阶段上下文管道，并在模型停止调用工具时返回最终回答
 def run_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
     *,
     on_event: Callable[[AgentEvent], None] | None = None,
+    transform_context: ContextTransformer | None = None,
+    convert_to_llm: ContextTransformer | None = None,
 ) -> str:
     reply = ""
-    for event in iter_react(llm, messages, tools):
+    for event in iter_react(
+        llm,
+        messages,
+        tools,
+        transform_context=transform_context,
+        convert_to_llm=convert_to_llm,
+    ):
         if on_event is not None:
             on_event(event)
         if isinstance(event, TurnEnd):

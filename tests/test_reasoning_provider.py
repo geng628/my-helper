@@ -8,7 +8,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from personal_assistant.agent import PluginManager, ToolStep, TurnEnd
+from personal_assistant.agent import PluginManager, ThinkingDelta, ToolStart, ToolStep, TurnEnd
 from personal_assistant.ai import (
     LLMClient,
     OpenAIChatClient,
@@ -145,7 +145,15 @@ def test_openai_reasoning_llm_wire_protocol_and_sse_parsing() -> None:
     # 2. 当前轮次（最后一个 user 之后）的轮内工具调用思维链保持透传
     assert wire_msgs[4]["reasoning_content"] == "轮内工具调用思维链必须保留"
 
-    # 3. TextDelta 仅吐出 delta.content（绝不泄漏 reasoning_content），StreamDone 携带完整 reasoning_content 与 usage
+    # 3. 实时产出 ThinkingDelta 与 TextDelta 且互不混入，StreamDone 携带完整 reasoning_content 与 usage
+    assert [type(e) for e in events] == [
+        ThinkingDelta,
+        ThinkingDelta,
+        TextDelta,
+        TextDelta,
+        StreamDone,
+    ]
+    assert [e.text for e in events if isinstance(e, ThinkingDelta)] == ["先梳理步骤", "，再作答"]
     text_deltas = [e.text for e in events if isinstance(e, TextDelta)]
     assert text_deltas == ["最终", "结论"]
     done = next(e for e in events if isinstance(e, StreamDone))
@@ -243,6 +251,8 @@ def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path
         turn1_events: list[object] = []
         frames1 = list(app.stream_chat("现在几点了？", chat_id="r1-sess", on_event=turn1_events.append))
         assert [f["text"] for f in frames1 if f["type"] == "text_delta"] == ["现在时间已确认。"]
+        assert [e.text for e in turn1_events if isinstance(e, ThinkingDelta)] == ["先查当前时间", "核对完毕"]
+        assert any(isinstance(e, ToolStart) and e.tool == "get_current_time" for e in turn1_events)
         assert any(isinstance(e, ToolStep) and e.tool == "get_current_time" for e in turn1_events)
         assert any(isinstance(e, TurnEnd) and e.reply == "现在时间已确认。" for e in turn1_events)
         done1 = next(f for f in frames1 if f["type"] == "done")
@@ -320,7 +330,9 @@ def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
             ]
         ),
     )
-    frag_done = next(e for e in frag_llm.stream([{"role": "user", "content": "x"}]) if isinstance(e, StreamDone))
+    frag_events = list(frag_llm.stream([{"role": "user", "content": "x"}]))
+    assert not any(isinstance(e, ThinkingDelta) for e in frag_events)
+    frag_done = next(e for e in frag_events if isinstance(e, StreamDone))
     assert frag_done.message["reasoning_content"] == ""
     assert frag_done.message["tool_calls"] == [
         {"id": "c_frag", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}

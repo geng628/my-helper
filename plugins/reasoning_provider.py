@@ -25,11 +25,11 @@ def _prepare_wire_messages(messages: list[dict[str, object]]) -> list[dict[str, 
     ]
 
 
-# 原生推理模型客户端：复用微内核 OpenAIChatClient 底座，仅声明 reasoning_content 流式采集与消息边界差异
+# 原生推理模型客户端：复用微内核 OpenAIChatClient 底座，仅声明 reasoning_content 流式思考增量与消息边界差异
 @dataclass
 class OpenAIReasoningLLM(OpenAIChatClient):
-    # 声明流式增量中需聚合的思维链字段（计入 ttft_ms，不吐出主文本）
-    def _stream_delta_fields(self) -> tuple[str, ...]:
+    # 声明流式增量中需实时吐出 ThinkingDelta 并聚合的思维链字段（计入 ttft_ms，不混入主文本）
+    def _thinking_delta_fields(self) -> tuple[str, ...]:
         return ("reasoning_content",)
 
     # 发往接口前跨轮剥离历史 reasoning_content，轮内工具调用思维链保持透传
