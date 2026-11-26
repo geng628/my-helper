@@ -3,10 +3,158 @@ from __future__ import annotations
 
 import os
 import tempfile
+import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_REJECT_SEGMENTS = (".env", ".git", "state", ".ssh", "uploads", "models.dsl", "models.json")
+
+
+# 剥离零宽等 Unicode 格式控制字符后执行 NFKC 规范化与 casefold，防御 APFS 字符折叠绕过
+def normalize_segment(part: str) -> str:
+    cleaned = "".join(ch for ch in part if unicodedata.category(ch) != "Cf")
+    return unicodedata.normalize("NFKC", cleaned).casefold()
+
+
+# 判断单个路径段是否命中受保护敏感名称（Unicode 折叠等价类拦截，仅精确放行 .env.example）
+def is_sensitive_segment(
+    part: str,
+    reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS,
+) -> bool:
+    if part == ".env.example":
+        return False
+    folded = normalize_segment(part)
+    if not folded:
+        return True
+    rejected = {normalize_segment(seg) for seg in reject_segments}
+    return (
+        folded in rejected
+        or folded.startswith(".env.")
+        or folded.startswith(".tmp-models-")
+    )
+
+
+# 安全记录路径自身（lstat）与可选解引用目标（stat）的内核设备号与 Inode 元组
+def _record_path_inodes(
+    path: Path,
+    inodes: set[tuple[int, int]],
+    *,
+    follow_symlinks: bool = True,
+) -> None:
+    try:
+        lst = os.lstat(path)
+        inodes.add((lst.st_dev, lst.st_ino))
+    except OSError:
+        pass
+    if follow_symlinks:
+        try:
+            st = os.stat(path)
+            inodes.add((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+
+
+# 扫描给定基础目录第一层及已知受保护子项，收集所有受保护文件的 (st_dev, st_ino) 集合
+def collect_protected_inodes(
+    roots: Iterable[Path],
+    reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS,
+) -> set[tuple[int, int]]:
+    inodes: set[tuple[int, int]] = set()
+    visited_dirs: set[Path] = set()
+    for raw_root in roots:
+        root = Path(raw_root)
+        if is_sensitive_segment(root.name, reject_segments):
+            _record_path_inodes(root, inodes)
+        try:
+            key = root.resolve(strict=False)
+        except OSError:
+            key = root
+        if key in visited_dirs:
+            continue
+        visited_dirs.add(key)
+
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    if not is_sensitive_segment(entry.name, reject_segments):
+                        continue
+                    entry_path = Path(entry.path)
+                    _record_path_inodes(entry_path, inodes)
+                    # 对敏感目录（如 state/.ssh/.git/uploads）补充一层常规子项 inode，阻断硬链接绕过
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            with os.scandir(entry_path) as sub_it:
+                                for sub in sub_it:
+                                    if not sub.is_symlink():
+                                        _record_path_inodes(Path(sub.path), inodes, follow_symlinks=False)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        for seg in reject_segments:
+            _record_path_inodes(root / seg, inodes)
+    return inodes
+
+
+# 沿候选路径及其逐级父目录（直至 stop_roots）比对 stat/lstat 是否落入受保护 Inode 集合
+def hits_protected_inode(
+    candidate: Path,
+    stop_roots: Iterable[Path],
+    protected_inodes: set[tuple[int, int]],
+) -> bool:
+    if not protected_inodes:
+        return False
+
+    stop_paths: set[Path] = set()
+    stop_inodes: set[tuple[int, int]] = set()
+    for raw_stop in stop_roots:
+        stop_paths.add(Path(os.path.abspath(raw_stop)))
+        try:
+            stop_paths.add(Path(raw_stop).resolve(strict=False))
+        except OSError:
+            pass
+        try:
+            st = os.stat(raw_stop)
+            inode = (st.st_dev, st.st_ino)
+            if inode not in protected_inodes:
+                stop_inodes.add(inode)
+        except OSError:
+            pass
+
+    start_chains: list[Path] = [Path(os.path.abspath(candidate))]
+    try:
+        resolved_cand = Path(candidate).resolve(strict=False)
+        if resolved_cand != start_chains[0]:
+            start_chains.append(resolved_cand)
+    except OSError:
+        pass
+
+    for start in start_chains:
+        cur = start
+        while True:
+            if cur in stop_paths:
+                break
+            try:
+                lst = os.lstat(cur)
+                if (lst.st_dev, lst.st_ino) in protected_inodes:
+                    return True
+            except OSError:
+                pass
+            try:
+                st = os.stat(cur)
+                inode = (st.st_dev, st.st_ino)
+                if inode in protected_inodes:
+                    return True
+                if inode in stop_inodes:
+                    break
+            except OSError:
+                pass
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    return False
 
 
 # 校验配置中的整数项必须为正整数，缺省时返回默认值
@@ -128,13 +276,73 @@ class FilesPolicy:
             return ("data" / resolved.relative_to(data_resolved)).as_posix()
         return resolved.name
 
-    # 检查路径中是否包含受保护的敏感目录段（如 .env、.git、state）
+    # 检查路径中是否包含受保护的敏感目录段（全量 Unicode 折叠等价类防护，如 .ENV、ſtate、modelſ.json）
     def check_segments(self, parts: tuple[str, ...]) -> None:
         for part in parts:
-            if part in self.reject_segments:
+            if is_sensitive_segment(part, self.reject_segments):
                 raise ValueError(f"禁止访问受保护路径：{part}")
 
-    # 安全解析相对路径：校验读写白名单、拒绝 .. 穿越、敏感目录与越权软链接
+    # 收集当前策略与数据目录下的受保护内核 Inode 集合及停止边界
+    def _protected_context(self, data_root: Path) -> tuple[list[Path], set[tuple[int, int]]]:
+        proj_resolved = self.project_root.resolve(strict=False)
+        data_resolved = data_root.resolve(strict=False)
+        write_resolved = self.write_root.resolve(strict=False)
+        scan_roots: list[Path] = [
+            proj_resolved,
+            proj_resolved / "config",
+            proj_resolved / "data",
+            data_resolved,
+            *(raw.resolve(strict=False) for raw in self.read_roots),
+            write_resolved,
+            write_resolved.parent,
+        ]
+        stop_roots: list[Path] = [
+            proj_resolved,
+            data_resolved,
+            *(raw.resolve(strict=False).parent for raw in (*self.read_roots, self.write_root)),
+        ]
+        return stop_roots, collect_protected_inodes(scan_roots, self.reject_segments)
+
+    # 逐级检验只读候选路径的符号链接与 Inode，拦截中途逃逸允许目录或指向受保护目标
+    def _validate_read_candidate(
+        self,
+        candidate: Path,
+        data_root: Path,
+        stop_roots: list[Path],
+        protected_inodes: set[tuple[int, int]],
+    ) -> None:
+        if hits_protected_inode(candidate, stop_roots, protected_inodes):
+            raise ValueError("禁止访问受保护路径。")
+
+        resolved_read_roots = tuple(r.resolve() for r in self.read_roots)
+        base_candidates = (*self.read_roots, data_root.resolve(), self.project_root.resolve())
+        base_root: Path | None = None
+        rel_parts: tuple[str, ...] = ()
+        for base in base_candidates:
+            try:
+                rel_parts = candidate.relative_to(base).parts
+                base_root = base
+                break
+            except ValueError:
+                continue
+
+        if base_root is None:
+            return
+        current = base_root
+        for part in rel_parts:
+            current = current / part
+            if is_sensitive_segment(part, self.reject_segments):
+                raise ValueError(f"禁止访问受保护路径：{part}")
+            if current.is_symlink():
+                target = current.resolve(strict=False)
+                if hits_protected_inode(target, stop_roots, protected_inodes):
+                    raise ValueError(f"读取路径符号链接指向受保护目标：{part}")
+                matched_root = next((rr for rr in resolved_read_roots if target.is_relative_to(rr)), None)
+                if matched_root is None:
+                    raise ValueError(f"读取路径符号链接超出允许目录范围：{part}")
+                self.check_segments(target.relative_to(matched_root).parts)
+
+    # 安全解析相对路径：校验读写白名单、拒绝 .. 穿越、敏感目录（含 Unicode/Inode）与越权软链接
     def resolve_path(
         self,
         rel_path: str,
@@ -149,11 +357,17 @@ class FilesPolicy:
         if rel.is_absolute() or ".." in rel.parts:
             raise ValueError("路径必须是项目内相对路径，且不能包含 ..。")
         self.check_segments(rel.parts)
+        stop_roots, protected_inodes = self._protected_context(data_root)
         if write:
-            return self._resolve_write_path(rel, data_root)
+            return self._resolve_write_path(rel, data_root, stop_roots, protected_inodes)
 
         active_roots = roots if roots is not None else self.build_roots(data_root)
-        resolved = self._map_read_candidate(rel, data_root, active_roots).resolve(strict=False)
+        candidate = self._map_read_candidate(rel, data_root, active_roots)
+        self._validate_read_candidate(candidate, data_root, stop_roots, protected_inodes)
+
+        resolved = candidate.resolve(strict=False)
+        if hits_protected_inode(resolved, stop_roots, protected_inodes):
+            raise ValueError("禁止访问受保护路径。")
         for raw_root in self.read_roots:
             root_resolved = raw_root.resolve()
             if resolved.is_relative_to(root_resolved):
@@ -162,8 +376,14 @@ class FilesPolicy:
         allowed = "、".join(self.root_labels(r, data_root)[0] for r in self.read_roots)
         raise ValueError(f"路径不在允许读取的目录内；允许范围：{allowed}")
 
-    # 解析并校验写入路径：限制在 write_root（data/workspace）内且禁止任何软链接组件
-    def _resolve_write_path(self, rel: Path, data_root: Path) -> Path:
+    # 解析并校验写入路径：限制在 write_root（data/workspace）内且禁止任何软链接组件及受保护 Inode
+    def _resolve_write_path(
+        self,
+        rel: Path,
+        data_root: Path,
+        stop_roots: list[Path],
+        protected_inodes: set[tuple[int, int]],
+    ) -> Path:
         parts = rel.parts
         write_root = self.write_root
         write_resolved = write_root.resolve()
@@ -179,12 +399,17 @@ class FilesPolicy:
         else:
             unresolved = write_root / rel
 
+        if hits_protected_inode(unresolved, stop_roots, protected_inodes):
+            raise ValueError("禁止写入受保护路径。")
+
         current = write_root
         for part in unresolved.relative_to(write_root).parts:
             current = current / part
             if current.is_symlink():
                 raise ValueError("写入路径不能包含符号链接。")
         resolved = unresolved.resolve(strict=False)
+        if hits_protected_inode(resolved, stop_roots, protected_inodes):
+            raise ValueError("禁止写入受保护路径。")
         if not resolved.is_relative_to(write_resolved):
             raise ValueError(f"只能写入 {write_display} 目录。")
         self.check_segments(resolved.relative_to(write_resolved).parts)

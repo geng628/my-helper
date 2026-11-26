@@ -83,12 +83,25 @@ def test_validate_public_url_blocks_ssrf_and_non_http_schemes() -> None:
     assert validate_public_url("https://example.com/docs", resolve_dns=make_resolver("93.184.216.34")) == (
         "https://example.com/docs"
     )
-    # 兼容 macOS TUN 代理 Fake-IP 网段（仅允许公开域名 DNS 解析到 198.18.0.0/15，严禁字面 IP 直连）
-    assert validate_public_url("https://docs.python.org/", resolve_dns=make_resolver("198.18.1.170")) == (
-        "https://docs.python.org/"
+    # 默认严格拦截 198.18.0.0/15 Fake-IP；仅显式 allow_fake_ip=True 时才允许域名解析到 Fake-IP（仍禁字面 IP）
+    with pytest.raises(ValueError, match="公网"):
+        validate_public_url("https://docs.python.org/", resolve_dns=make_resolver("198.18.0.1"))
+    with pytest.raises(ValueError, match="公网"):
+        validate_public_url("https://docs.python.org/", resolve_dns=make_resolver("198.18.1.170"))
+    assert (
+        validate_public_url(
+            "https://docs.python.org/",
+            resolve_dns=make_resolver("198.18.1.170"),
+            allow_fake_ip=True,
+        )
+        == "https://docs.python.org/"
     )
     with pytest.raises(ValueError, match="公网"):
-        validate_public_url("http://198.18.1.170/", resolve_dns=make_resolver("198.18.1.170"))
+        validate_public_url(
+            "http://198.18.1.170/",
+            resolve_dns=make_resolver("198.18.1.170"),
+            allow_fake_ip=True,
+        )
 
 
 # 测试 HTML 正文提取：保留标题和正文段落，剔除 script/style/nav/footer 噪声
@@ -346,3 +359,231 @@ def test_web_search_supports_duckduckgo_bing_tavily_and_brave(monkeypatch) -> No
 
     # 空查询报错
     assert execute_web_search("   ", policy).startswith("错误：")
+
+
+# 测试 SSRF 纵深防护：IPv6 内嵌私网拦截、DNS Pinning 防 Rebinding、禁系统代理、跨域重定向剥离鉴权头、墙钟超时与编码校验
+def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import http.server
+    import socket
+    import threading
+    import time
+
+    from plugins.tools import web_tools as wt
+
+    # 1. WebPolicy 默认 allow_fake_ip=False，支持从配置读取 allow_fake_ip
+    assert WebPolicy().allow_fake_ip is False
+    assert WebPolicy.from_dict({}).allow_fake_ip is False
+    assert WebPolicy.from_dict({"allow_fake_ip": True}).allow_fake_ip is True
+
+    # 构造固定 IP 的假 DNS 解析器
+    def make_resolver(ip: str):
+        # 返回兼容 getaddrinfo 结构的单 IP 记录
+        def _resolve(host: str, port: object, *args: object):
+            return [(0, 0, 0, "", (ip, 0))]
+
+        return _resolve
+
+    # 2. 拦截 NAT64、ipv4_mapped、sixtofour、Teredo、deprecated IPv4-compatible 及多播地址
+    for sneaky_ip in (
+        "64:ff9b::127.0.0.1",
+        "64:ff9b::169.254.169.254",
+        "64:ff9b:1::127.0.0.1",
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        "2002:7f00:0001::1",
+        "2001:0000:4136:e378:8000:63bf:80ff:ffff",
+        "::127.0.0.1",
+        "::10.0.0.1",
+        "224.0.0.1",
+        "ff0e::1",
+    ):
+        with pytest.raises(ValueError, match="公网"):
+            validate_public_url("https://ipv6-ssrf.example/", resolve_dns=make_resolver(sneaky_ip))
+
+    # resolve_and_validate_public_url 返回规范化 (clean_url, hostname, port, pinned_ip)
+    assert wt.resolve_and_validate_public_url(
+        " https://Example.COM:8443/path ",
+        resolve_dns=make_resolver("93.184.216.34"),
+    ) == ("https://Example.COM:8443/path", "example.com", 8443, "93.184.216.34")
+
+    # 3. 验证 DNS Pinning：校验后连接直接使用 pinned_ip，不触发二次 DNS 解析，且屏蔽系统 HTTP_PROXY
+    captured_targets: list[tuple[tuple[str, int], str]] = []
+    dns_calls = {"count": 0}
+
+    # 第 1 次返回公网 IP，若后续误触发二次解析则故意返回 127.0.0.1（模拟 DNS Rebinding）
+    def rebinding_dns(host: str, port: object, *args: object):
+        dns_calls["count"] += 1
+        ip = "93.184.216.34" if dns_calls["count"] == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (ip, int(port) if isinstance(port, int) else 80))]
+
+    # 启动本地真实 HTTP 服务模拟远端目标（通过拦截 create_connection 把 93.184.216.34 导向本地端口）
+    received_headers: list[dict[str, str]] = []
+    received_paths: list[str] = []
+
+    # 模拟公网站点与跨域跳转端点的轻量请求处理器
+    class _PinHandler(http.server.BaseHTTPRequestHandler):
+        # 屏蔽默认访问日志
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        # 根据路径返回 302 跳转（同源或跨域）或正文
+        def do_GET(self) -> None:
+            received_paths.append(self.path)
+            received_headers.append({k.lower(): v for k, v in self.headers.items()})
+            if self.path == "/redirect-cross":
+                self.send_response(302)
+                self.send_header("Location", f"http://other.example:{self.server.server_port}/target")
+                self.end_headers()
+                return
+            if self.path == "/redirect-rebind":
+                self.send_response(302)
+                self.send_header("Location", f"http://rebind.example:{self.server.server_port}/secret")
+                self.end_headers()
+                return
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        # 处理 POST JSON 请求并回显路径与载荷字段
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or "0")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            resp_body = json.dumps({"echo": payload.get("q"), "host": self.headers.get("Host")}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _PinHandler)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+
+    real_create_conn = socket.create_connection
+    real_getaddrinfo = socket.getaddrinfo
+
+    # 记录连接器实际尝试直连的目标 IP（应为 pinned_ip 而非域名），并将测试公网 IP 转发到本机临时端口
+    def spy_create_connection(address: tuple[str, int], timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        host_arg, port_arg = address
+        captured_targets.append(((host_arg, port_arg), host_arg))
+        if host_arg == "93.184.216.34":
+            return real_create_conn(("127.0.0.1", port_arg), timeout=timeout, source_address=source_address)
+        return real_create_conn(address, timeout=timeout, source_address=source_address)
+
+    # 禁止 connect 阶段对任何域名触发系统 DNS 查询，仅放行本地字面回环地址
+    def guard_getaddrinfo(host, port, *args, **kwargs):
+        if host not in {"127.0.0.1", "::1"}:
+            raise AssertionError(f"connect 阶段不应再解析域名：{host}")
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    try:
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setattr(socket, "create_connection", spy_create_connection)
+        monkeypatch.setattr(socket, "getaddrinfo", guard_getaddrinfo)
+
+        # 3a. 单跳请求仅解析 1 次 DNS、TCP 直连 93.184.216.34、忽略 HTTP_PROXY、Host 保留原域名
+        final_url, ctype, raw_data = wt._default_http_get(
+            f"http://rebind.example:{srv.server_port}/ok",
+            {"Authorization": "Bearer top-secret"},
+            5.0,
+            4096,
+            resolve_dns=rebinding_dns,
+        )
+        assert final_url.endswith("/ok")
+        assert json.loads(raw_data.decode("utf-8")) == {"ok": True}
+        assert dns_calls["count"] == 1
+        assert captured_targets[0][0] == ("93.184.216.34", srv.server_port)
+        assert received_headers[0]["host"] == f"rebind.example:{srv.server_port}"
+
+        # 3b. 跨域重定向时剥离 Authorization 与 X-Subscription-Token
+        received_headers.clear()
+        received_paths.clear()
+        wt._default_http_get(
+            f"http://origin.example:{srv.server_port}/redirect-cross",
+            {"Authorization": "Bearer secret-auth", "X-Subscription-Token": "brave-secret"},
+            5.0,
+            4096,
+            resolve_dns=make_resolver("93.184.216.34"),
+        )
+        assert received_paths == ["/redirect-cross", "/target"]
+        assert "authorization" in received_headers[0]
+        assert "x-subscription-token" in received_headers[0]
+        assert "authorization" not in received_headers[1]
+        assert "x-subscription-token" not in received_headers[1]
+
+        # 3c. 重定向跳发生 DNS Rebinding（第 2 次解析落入 127.0.0.1）必须立即拦截
+        dns_calls["count"] = 0
+        with pytest.raises(ValueError, match="公网"):
+            wt._default_http_get(
+                f"http://rebind.example:{srv.server_port}/redirect-rebind",
+                {},
+                5.0,
+                4096,
+                resolve_dns=rebinding_dns,
+            )
+
+        # 3d. _default_http_post_json 同样走 DNS Pinning（直连 pinned_ip 且不触发系统 DNS）
+        dns_calls["count"] = 0
+        post_res = wt._default_http_post_json(
+            f"http://rebind.example:{srv.server_port}/search",
+            {"q": "pinned-post"},
+            {},
+            5.0,
+            resolve_dns=rebinding_dns,
+        )
+        assert post_res == {"echo": "pinned-post", "host": f"rebind.example:{srv.server_port}"}
+        assert dns_calls["count"] == 1
+
+        # 验证 _PinnedHTTPSConnection 保留原始域名用于 TLS SNI / 证书校验
+        fake_sni: list[str] = []
+
+        # 仅记录 wrap_socket 传入的 server_hostname 而不真正执行 TLS 握手
+        class _FakeSSLContext:
+            # 记录 server_hostname 并原样返回套接字
+            def wrap_socket(self, sock, *, server_hostname: str):
+                fake_sni.append(server_hostname)
+                return sock
+
+        https_conn = wt._PinnedHTTPSConnection(
+            "tls.example",
+            port=srv.server_port,
+            pinned_ip="93.184.216.34",
+            context=_FakeSSLContext(),
+            timeout=3.0,
+        )
+        https_conn.connect()
+        https_conn.close()
+        assert fake_sni == ["tls.example"]
+        assert captured_targets[-1][0] == ("93.184.216.34", srv.server_port)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        srv_thread.join(timeout=3.0)
+
+    # 4. 慢速滴水响应必须在总时长 Deadline 内中止（防止无限挂起）
+    # 返回固定分块字节并模拟慢速滴水的假响应对象
+    class _SlowDripResp:
+        # 每次 read1 休眠后仅吐出 1 字节
+        def read1(self, n: int) -> bytes:
+            time.sleep(0.06)
+            return b"x"
+
+        # 兼容回退 read 接口
+        def read(self, n: int) -> bytes:
+            return self.read1(n)
+
+    with pytest.raises(TimeoutError):
+        wt._read_body_with_deadline(_SlowDripResp(), max_bytes=1024 * 1024, deadline=time.monotonic() + 0.12)
+
+    # 5. _extract_charset 通过 codecs.lookup 校验合法文本编码，未知或伪编码回退 utf-8
+    assert wt._extract_charset("text/html; charset=gbk") == "gbk"
+    assert wt._extract_charset("text/html; charset=rot13") == "utf-8"
+    assert wt._extract_charset("text/html; charset=base64") == "utf-8"
+    assert wt._extract_charset("text/html; charset=nonexistent-enc-99") == "utf-8"
+
