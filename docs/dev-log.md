@@ -737,3 +737,21 @@
   - 单元测试 (`uv run pytest -v`)：**143 passed → 145 passed**（含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：继续验收合入 Issue `#58`（插件单次初始化解耦与会话并发防护）与 Issue `#52`（`shell_tools.py` 沙箱收尾），随后进入学习助手体验叠加阶段。
+
+
+---
+
+### [2026-11-26] 加固 `shell_tools.py` 沙箱：封堵两步 `pytest` RCE、子命令走私、后置选项绕过与大小写变体（Issue `#52`）
+- **背景与高危链路**：默认白名单同时开启 `write_file`（允许写入 `data/workspace/`）与 `run_command`（允许 `pytest`、`git`、`grep`、`rg`），此前存在多条沙箱逃逸与泄密链：① `write_file("data/workspace/test_poc.py")` + `run_command("pytest data/workspace/test_poc.py")`（或无参/`--fixtures` 收集工作区）直接触发两步 RCE；② `git --namespace status config ...` 全局选项错位走私与 `:(glob).env` / `<rev>:<path>` 冒号引用绕过；③ `grep <path> -e <pat>` 后置参数顺序绕过、`grep -r --include=...` 覆盖前置排除项与 `-R` 软链穿透；④ macOS APFS 大小写不敏感变体（`.GIT`、`MODELS.JSON`、`STATE`）与 `.env.*` 变体未拦截。
+- **改动文件（代码提交 `201af53` → 消肿重构 `b4958c5` → 终审收口 `119cd07`）**：
+  - [plugins/tools/shell_tools.py](plugins/tools/shell_tools.py)（精简收敛至 532 行单一真源配置表）：`pytest` 除纯 `--version`/`-V` 外强制校验真实 `tests/` 目录与只读标志白名单，无条件注入 `--ignore=data`（及自定义 `offload_dir` 顶层目录）并默认限定 `tests/`；`git` 禁止子命令前出现任意未知全局选项（仅允许可选 `--no-pager`），拦截 pathspec 魔法与中间目录段敏感通配符；`grep`/`rg` 全量扫描后再识别目标路径并将 `--exclude*` / `--glob=!*` 置于 `--` 前最高优先级位置，禁止 `-R` / `-f` / 正向隐藏 glob；`_is_rejected_segment` 对全量敏感段与 `.env.*` 统一做大小写不敏感匹配（精确放行 `.env.example`）。
+  - [config/tools.json](config/tools.json)：`shell.reject_segments` 补齐 `".git"`。
+  - [tests/test_shell_plugin.py](tests/test_shell_plugin.py)：补齐覆盖全部 38 条红队绕过向量与日常只读命令无误伤的回归单测（附带防缺命令假绿断言）。
+- **Layer 2 独立只读红队审查 trace**：
+  - **Round 1（`201af53`）→ `Request Changes`**（检出 `pytest --fixtures`、`git --namespace`、`grep --include`、大小写变体、`rg` 隐藏 glob 共 5 项 Blocker 及 963 行臃肿问题）；
+  - **Round 2（`b4958c5`）→ `Request Changes`**（检出后置 `-e` 位置参数绕过与中间目录段通配符 2 项边界）；
+  - **Round 3（`119cd07`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径验证对比（改前 `main` → 改后 `119cd07`）**：
+  - 单元测试 (`uv run pytest -v`)：**全量通过**（+6 组安全对抗单测，含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：验收合入 Issue `#58`（插件单次初始化解耦、`MemoryStore` 写锁与会话断流孤儿消息防护），随后推进学习助手流式思维链与伴读叠加层。
