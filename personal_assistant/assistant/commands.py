@@ -11,7 +11,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from personal_assistant.agent.plugins import ObserverProtocol, PluginManager
+from personal_assistant.agent.plugins import (
+    ObserverProtocol,
+    PluginManager,
+    RetrieverProtocol,
+)
 from personal_assistant.agent.tools import (
     Tool,
     ToolRegistry,
@@ -22,10 +26,14 @@ from personal_assistant.ai.client import (
     LLMClient,
     from_env,
     from_model_profile,
-    register_provider,
 )
 from personal_assistant.ai.types import ModelsConfig
-from personal_assistant.assistant.common import REPO_ROOT, truncate_or_offload
+from personal_assistant.assistant.common import (
+    REPO_ROOT,
+    atomic_write_text,
+    require_positive_int,
+    truncate_or_offload,
+)
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
@@ -131,8 +139,8 @@ class CommandSpec:
         )
         return f"退出码：{done.returncode}\n{body}"
 
-    # 统一通过 build_tool 将当前命令规格包装成 CommandToolWrapper(Tool) 子类实例（支持注入实例专属 offload_dir）
-    def to_tool(self, *, offload_dir: Path | None = None) -> "CommandToolWrapper":
+    # 统一通过 build_tool 将当前命令规格包装成纯净 Tool 值对象（隔离执行期上下文，支持绑定专属 offload_dir）
+    def to_tool(self, *, offload_dir: Path | None = None) -> Tool:
         bound_spec = (
             replace(self, offload_dir=offload_dir)
             if offload_dir is not None and self.offload_dir is None
@@ -141,46 +149,23 @@ class CommandSpec:
         param_desc = {name: spec.description for name, spec in bound_spec.params.items()}
         param_enums = {name: spec.enum for name, spec in bound_spec.params.items() if spec.enum}
         cmd_preview = " ".join(bound_spec.argv)
-        built = build_tool(
+        return build_tool(
             bound_spec.run,
             name=bound_spec.tool_name,
             description=f"执行固定白名单命令 `{cmd_preview}`。{bound_spec.description}",
             parameters=param_desc,
             param_enums=param_enums or None,
             risk="exec",
-            source_type="command",
-            source_name="tools.json",
-            base_cls=CommandToolWrapper,
-            extra_fields={"spec": bound_spec},
+            accept_context=False,
         )
-        assert isinstance(built, CommandToolWrapper)
-        return built
 
 
-# 固定白名单命令的 Tool 子类包装器（对标 McpToolWrapper / CommandToolWrapper）
-@dataclass(frozen=True)
-class CommandToolWrapper(Tool):
-    spec: CommandSpec | None = field(default=None, kw_only=True)
-
-    # 委派给绑定的 CommandSpec.run 执行固定命令
-    def run(self, **values: str) -> str:
-        if self.spec is not None:
-            return self.spec.run(**values)
-        return super().run(**values)
-
-
-# 固定命令工具集提供方（继承 ToolsetProvider）：按统一上下文将 commands 适配为 CommandToolWrapper(Tool) 子类列表
+# 固定命令工具集提供方（继承 ToolsetProvider）：按统一上下文将 commands 适配为纯净 Tool 列表
 @dataclass(frozen=True)
 class CommandToolsetProvider(ToolsetProvider):
     commands: tuple[CommandSpec, ...]
-    source_type: str = "command"
-    source_name: str = "tools.json"
 
-    # 返回默认无上下文时的 CommandToolWrapper 列表
-    def tools(self) -> list[Tool]:
-        return [spec.to_tool() for spec in self.commands]
-
-    # 按运行时上下文（如 offload_dir）通过 build_tool 构建全部 CommandToolWrapper 实例
+    # 按运行时上下文（如 offload_dir）通过 build_tool 构建全部命令 Tool 实例
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         raw_offload = context.get("offload_dir") if context is not None else None
         offload_dir = Path(str(raw_offload)).resolve() if isinstance(raw_offload, (str, Path)) else None
@@ -242,9 +227,7 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     timeout = raw.get("timeout", 10)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (0 < timeout <= 120):
         raise ValueError(f"{name}: timeout 必须在 (0, 120] 秒之间。")
-    max_output = raw.get("max_output_bytes", 8192)
-    if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output <= 0:
-        raise ValueError(f"{name}: max_output_bytes 必须是正整数。")
+    max_output = require_positive_int(raw.get("max_output_bytes", 8192), f"{name}: max_output_bytes")
 
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
@@ -262,26 +245,34 @@ def _parse_command_spec(raw: object, project_root: Path) -> tuple[CommandSpec, b
     return spec, enabled
 
 
-# 以 0600 仅属主可读权限原子落盘私密文本文件（如 models.dsl / models.json），防误泄露
-def _atomic_write_private_text(target: Path, content: str) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-models-", dir=str(target.parent))
-    tmp_path = Path(tmp_name)
-    try:
-        os.chmod(tmp_path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, target)
-        os.chmod(target, 0o600)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
-# 以 0600 仅属主可读权限原子落盘私密 JSON 配置（如编译后的 config/models.json），防误泄露
+# 以 0600 仅属主可读权限原子落盘私密 JSON 配置（如编译后的 config/models.json）
 def _atomic_write_private_json(target: Path, data: dict[str, object]) -> None:
-    _atomic_write_private_text(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+
+
+# 将业务路径与 tools.json 各字典配置段组装为传给 PluginContext / build_tools 的命名绑定表
+def _build_plugin_bindings(
+    *,
+    project_root: Path,
+    config_path: Path | None,
+    raw_config: Mapping[str, object],
+    data_root: Path | None = None,
+    tool_context: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_data = data_root.resolve() if data_root is not None else None
+    offload_dir = (resolved_data / "workspace" / "tool_outputs") if resolved_data is not None else None
+    bindings: dict[str, object] = {
+        "project_root": project_root,
+        "config_path": config_path,
+        "data_root": resolved_data,
+        "offload_dir": offload_dir,
+    }
+    for sec_name, sec_val in raw_config.items():
+        if isinstance(sec_val, Mapping):
+            bindings[f"{sec_name}_config"] = dict(sec_val)
+    if tool_context:
+        bindings.update(tool_context)
+    return bindings
 
 
 # config/tools.json 的完整配置对象（管理白名单、插件管理器、检索/配置编译/观测插件、文件策略与固定命令）
@@ -297,6 +288,20 @@ class ToolsConfig:
     project_root: Path = REPO_ROOT
     config_path: Path | None = None
     raw_config: dict[str, object] = field(default_factory=dict)
+    restrict_tools: bool = True
+
+    # 构造未加载 tools.json 时的缺省空配置（放行内置工具集，避免上层散落 None 分支）
+    @classmethod
+    def empty(cls, project_root: Path = REPO_ROOT) -> "ToolsConfig":
+        root = project_root.resolve()
+        return cls(
+            enabled_tools=(),
+            files={},
+            commands=(),
+            plugin_manager=PluginManager(project_root=root),
+            project_root=root,
+            restrict_tools=False,
+        )
 
     # 从 tools.json 读取并校验白名单配置，同时通过 PluginManager 扫描加载 plugins 目录中的全部插件
     @classmethod
@@ -341,13 +346,17 @@ class ToolsConfig:
             if enabled:
                 commands.append(spec)
 
+        init_bindings = _build_plugin_bindings(
+            project_root=root,
+            config_path=resolved_cfg,
+            raw_config=raw,
+        )
         manager = PluginManager.from_entries(
             plugins_raw,
             root,
-            context={"project_root": root, "config_path": resolved_cfg, "raw_config": dict(raw)},
+            config=dict(raw),
+            bindings=init_bindings,
         )
-        for prov_name, prov_factory in manager.providers.items():
-            register_provider(prov_name, prov_factory)
 
         return cls(
             enabled_tools=tuple(enabled_raw),
@@ -378,11 +387,16 @@ class ToolsConfig:
     # 加载模型配置：优先通过 models_dsl 插件编译 models.dsl（可选原子落盘为 0600 权限的 models.json），否则直接读 models.json
     def load_models_config(
         self,
-        config_dir: Path,
+        config_dir: Path | None = None,
         *,
         write_json: bool = False,
     ) -> ModelsConfig | None:
-        cfg_dir = config_dir.resolve()
+        if config_dir is None:
+            if self.config_path is None:
+                return None
+            cfg_dir = self.config_path.parent.resolve()
+        else:
+            cfg_dir = config_dir.resolve()
         dsl_path = cfg_dir / "models.dsl"
         json_path = cfg_dir / "models.json"
         if dsl_path.is_file():
@@ -431,7 +445,7 @@ class ToolsConfig:
         compiled = compiler.compile(dsl_text, "models.dsl")
         models_cfg = ModelsConfig.from_dict(compiled)
         cfg_dir = config_dir.resolve()
-        _atomic_write_private_text(cfg_dir / "models.dsl", dsl_text)
+        atomic_write_text(cfg_dir / "models.dsl", dsl_text, mode=0o600)
         _atomic_write_private_json(cfg_dir / "models.json", compiled)
         return models_cfg
 
@@ -453,27 +467,33 @@ class ToolsConfig:
                 return preset
         return None
 
-    # 基于 models.dsl / models.json、内置预设或环境变量统一构造 LLMClient
+    # 基于预编译或即时读取的 ModelsConfig、内置预设或环境变量统一构造 LLMClient
     def build_llm(
         self,
-        config_dir: Path,
+        config_dir: Path | None = None,
         *,
         model_name: str | None = None,
         env: Mapping[str, str] | None = None,
+        models_cfg: ModelsConfig | None = None,
     ) -> LLMClient:
         clean_name = (model_name or "").strip() or None
         source_env = os.environ if env is None else env
-        models_cfg = self.load_models_config(config_dir)
-        if models_cfg is not None:
+        providers = self.plugin_manager.providers
+        resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
+        if resolved_cfg is not None:
             target = clean_name
-            if target is not None and target not in models_cfg.models:
+            if target is not None and target not in resolved_cfg.models:
                 preset = self._match_preset(target)
                 preset_id = str(preset.get("id") or "").strip() if preset is not None else ""
-                if preset_id and preset_id in models_cfg.models:
+                if preset_id and preset_id in resolved_cfg.models:
                     target = preset_id
-            return from_model_profile(models_cfg.get_profile(target), env=source_env)
+            return from_model_profile(
+                resolved_cfg.get_profile(target),
+                env=source_env,
+                providers=providers,
+            )
         if clean_name is None:
-            return from_env(source_env)
+            return from_env(source_env, providers=providers)
         merged = dict(source_env)
         preset = self._match_preset(clean_name)
         if preset is not None:
@@ -485,33 +505,49 @@ class ToolsConfig:
                 merged["LLM_API_KEY"] = str(preset.get("id") or "local")
         else:
             merged["LLM_MODEL"] = clean_name
-        return from_env(merged)
+        return from_env(merged, providers=providers)
 
-    # 按「显式参数 > models.dsl/json 的 consolidator 槽位 > 纯环境变量模式下 LLM_CONSOLIDATOR_MODEL > 复用 fallback_llm」构造后台沉淀模型
+    # 按「显式参数 > ModelsConfig.roles['consolidator'] > 纯环境变量 LLM_CONSOLIDATOR_MODEL > 复用 fallback_llm」构造后台沉淀模型
     def build_consolidator_llm(
         self,
-        config_dir: Path,
+        config_dir: Path | None = None,
         *,
         fallback_llm: LLMClient,
         model_name: str | None = None,
         env: Mapping[str, str] | None = None,
+        models_cfg: ModelsConfig | None = None,
     ) -> LLMClient:
         clean_name = (model_name or "").strip() or None
         source_env = os.environ if env is None else env
+        resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
         if clean_name is not None:
-            return self.build_llm(config_dir, model_name=clean_name, env=source_env)
-        models_cfg = self.load_models_config(config_dir)
-        if models_cfg is not None:
-            if models_cfg.consolidator:
-                return from_model_profile(models_cfg.get_profile(models_cfg.consolidator), env=source_env)
+            return self.build_llm(
+                config_dir,
+                model_name=clean_name,
+                env=source_env,
+                models_cfg=resolved_cfg,
+            )
+        if resolved_cfg is not None:
+            role_target = resolved_cfg.roles.get("consolidator")
+            if role_target:
+                return from_model_profile(
+                    resolved_cfg.get_profile(role_target),
+                    env=source_env,
+                    providers=self.plugin_manager.providers,
+                )
             return fallback_llm
         env_val = str(source_env.get("LLM_CONSOLIDATOR_MODEL") or "").strip()
         if env_val:
-            return self.build_llm(config_dir, model_name=env_val, env=source_env)
+            return self.build_llm(
+                config_dir,
+                model_name=env_val,
+                env=source_env,
+                models_cfg=None,
+            )
         return fallback_llm
 
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
-    def build_retriever(self, override_name: str | None = None) -> object | None:
+    def build_retriever(self, override_name: str | None = None) -> RetrieverProtocol | None:
         raw_name = override_name if override_name is not None else self.retrieval.get("plugin")
         plugin_name = str(raw_name or "").strip()
         if not plugin_name or plugin_name == "linear":
@@ -522,41 +558,32 @@ class ToolsConfig:
             raise ValueError(f"未找到检索插件 {plugin_name!r}，当前已加载：{available}")
         return registry[plugin_name](dict(self.retrieval))
 
-    # 统一将所有 ToolsetProvider（内置 / 插件 / 命令）按同一套 build_ctx 汇入单个 ToolRegistry 并按需激活
+    # 统一将所有 ToolsetProvider（内置 / 插件 / 命令）按同一套绑定汇入单个 ToolRegistry 并按需激活
     def build_registry(
         self,
-        *builtin_tools: Tool,
-        extra_tools: Iterable[Tool] = (),
+        *,
         providers: Iterable[ToolsetProvider] = (),
         data_root: Path | None = None,
         tool_context: Mapping[str, object] | None = None,
     ) -> ToolRegistry:
-        extras = list(extra_tools)
-        allowed = [
-            *self.enabled_tools,
-            *(spec.tool_name for spec in self.commands),
-            *(item.name for item in extras),
-        ]
+        allowed = (
+            [
+                *self.enabled_tools,
+                *(spec.tool_name for spec in self.commands),
+            ]
+            if self.restrict_tools
+            else None
+        )
         registry = ToolRegistry(allowed_names=allowed)
-        resolved_data = data_root.resolve() if data_root is not None else None
-        offload_dir = (resolved_data / "workspace" / "tool_outputs") if resolved_data is not None else None
-        build_ctx: dict[str, object] = {
-            "project_root": self.project_root,
-            "config_path": self.config_path,
-            "data_root": resolved_data,
-            "offload_dir": offload_dir,
-            "raw_config": self.raw_config,
-        }
-        if tool_context:
-            build_ctx["extra_bindings"] = dict(tool_context)
-
+        build_ctx = _build_plugin_bindings(
+            project_root=self.project_root,
+            config_path=self.config_path,
+            raw_config=self.raw_config,
+            data_root=data_root,
+            tool_context=tool_context,
+        )
         for provider in providers:
             registry.register_provider(provider, context=build_ctx)
-        for item in builtin_tools:
-            registry.register(item)
         registry.register_provider(self.plugin_manager, context=build_ctx)
         registry.register_provider(CommandToolsetProvider(self.commands), context=build_ctx)
-        for item in extras:
-            registry.register(item)
-
         return registry

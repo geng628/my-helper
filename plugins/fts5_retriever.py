@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from personal_assistant.agent.plugins import Plugin
+from personal_assistant.assistant.common import today_shanghai
 from personal_assistant.assistant.memory import SearchHit
-from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN, today_shanghai
+from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN
 from personal_assistant.assistant.text_search import (
     EN_IRREGULAR_LEMMAS,
     EN_STOPWORDS,

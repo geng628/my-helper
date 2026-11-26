@@ -152,12 +152,12 @@ def _parse_single_command(command: str) -> list[str]:
     return tokens
 
 
-# 检查通配符表达式是否可能经 Unicode 折叠后命中敏感路径段或 .env.* 变体
+# 检查通配符表达式是否可能经 Unicode 折叠后命中敏感路径段、.env.* 或 .tmp-* 暂存文件
 def _matches_sensitive_glob(glob_expr: str, reject_segments: tuple[str, ...]) -> bool:
     if not any(ch in glob_expr for ch in "*?["):
         return False
     samples = {normalize_segment(seg) for seg in reject_segments} | {
-        ".env", ".env.local", ".env.production", ".env.staging", ".env.development", ".tmp-models-x",
+        ".env", ".env.local", ".env.production", ".env.staging", ".env.development", ".tmp-x",
     }
     norm = normalize_segment(glob_expr.replace("\\", "/"))
     cands = {norm, *(p for p in Path(norm).parts if any(ch in p for ch in "*?["))}
@@ -495,9 +495,9 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
         add_env = (not only_example) if exe == "rg" else (is_recursive or not only_example)
         pats = (
             *policy.reject_segments,
+            ".tmp-*",
             *((".git",) if ".git" not in policy.reject_segments else ()),
             *((".env.*",) if add_env else ()),
-            ".tmp-models-*",
         )
         fmts = ("--exclude={}", "--exclude-dir={}") if exe == "grep" else ("--glob=!{}", "--glob=!**/{}/**")
         return [exe, *args[:insert_at], *(fmt.format(seg) for seg in pats for fmt in fmts), *args[insert_at:]]
@@ -529,7 +529,7 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             if not explicit_files or any((policy.cwd / p).is_dir() for p in explicit_files):
                 return [exe, *args[:insert_pos], "--stat", *args[insert_pos:]]
             if any(not (policy.cwd / p).is_file() for p in explicit_files):
-                pats = (s for s in (*policy.reject_segments, ".env.*", ".tmp-models-*") if s != ".git")
+                pats = (s for s in (*policy.reject_segments, ".env.*", ".tmp-*") if s != ".git")
                 neg = [f":(exclude,glob,icase){p}" for s in pats for p in (s, f"**/{s}", f"**/{s}/**")]
                 return [*argv, *neg]
         return argv

@@ -121,7 +121,12 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
                 assert allowed, f"Layer 2 越权依赖业务层：{mod} -> {dep}"
 
         # Layer 3 约束：底座模块零内部依赖；memory 不横向依赖 commands；非入口模块绝不反向依赖 cli
-        elif mod == "personal_assistant.assistant.common" or mod == "personal_assistant.assistant.db":
+        elif mod in {
+            "personal_assistant.assistant.common",
+            "personal_assistant.assistant.db",
+            "personal_assistant.assistant.files_policy",
+            "personal_assistant.assistant.text_search",
+        }:
             assert not deps, f"底座模块 {mod} 不应有任何内部依赖，实际：{deps}"
         elif mod == "personal_assistant.assistant.memory":
             for dep in deps:
@@ -310,7 +315,7 @@ print(json.dumps({"has_main": callable(evals.main), "leaked": leaked}))
     assert "Eval mode=search  retriever=fts5_bm25" in res_cli.stdout
 
 
-# 测试 Provider 插件化注册与按 LLM_PROVIDER 环境变量分发（换厂商不改 react.py）
+# 测试 Provider 插件化注册与 ModelProfile 单轨直通分发（支持局部 providers 与显式 register_provider）
 def test_llm_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from personal_assistant.agent.plugins import PluginManager
     from personal_assistant.ai.client import LLMClient, from_env, register_provider
@@ -319,17 +324,24 @@ def test_llm_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: p
     plugin_file.write_text(
         "from personal_assistant.agent.plugins import Plugin\n"
         "from personal_assistant.ai.client import LLMClient\n"
+        "# 测试用假模型客户端\n"
         "class DummyProviderLLM(LLMClient):\n"
+        "    # 记录模型名\n"
         "    def __init__(self, model):\n"
         "        self.model = model\n"
+        "    # 返回带模型名的固定回复\n"
         "    def respond(self, messages, tools=None):\n"
         "        return {'role': 'assistant', 'content': f'dummy:{self.model}'}\n"
+        "# 测试用 Provider 实现\n"
         "class DummyProvider:\n"
         "    name = 'dummy_test_provider'\n"
-        "    def build(self, env):\n"
-        "        return DummyProviderLLM(env.get('LLM_MODEL', 'demo'))\n"
+        "    # 直接读取实化 ModelProfile 字段\n"
+        "    def build(self, profile):\n"
+        "        return DummyProviderLLM(profile.model or 'demo')\n"
+        "# 测试用主板插件子类\n"
         "class DummyProviderPlugin(Plugin):\n"
         "    plugin_id = 'dummy_test_provider'\n"
+        "    # 注册测试 Provider\n"
         "    def initialize(self):\n"
         "        self.context.register_provider(DummyProvider())\n",
         encoding="utf-8",
@@ -337,12 +349,19 @@ def test_llm_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: p
 
     providers = PluginManager.from_entries([plugin_file.name], tmp_path).providers
     assert "dummy_test_provider" in providers
-    register_provider("dummy_test_provider", providers["dummy_test_provider"])
 
     monkeypatch.setenv("LLM_MODE", "on")
     monkeypatch.setenv("LLM_PROVIDER", "dummy_test_provider")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "claude-test")
+
+    # 1. 不污染全局 _PROVIDERS 时可直接传入局部 providers 构建
+    local_client = from_env(providers=providers)
+    assert isinstance(local_client, LLMClient)
+    assert local_client.respond([{"role": "user", "content": "hi"}])["content"] == "dummy:claude-test"
+
+    # 2. 显式调用 register_provider 后全局亦可分发
+    register_provider("dummy_test_provider", providers["dummy_test_provider"])
     client = from_env()
     assert isinstance(client, LLMClient)
     assert client.respond([{"role": "user", "content": "hi"}])["content"] == "dummy:claude-test"
@@ -409,3 +428,65 @@ def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None
                 raise AssertionError(
                     f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止动态 type() 造类"
                 )
+
+
+# 方法 5：Issue #83 硬红线守卫——personal_assistant/ 全目录零 type: ignore，且 PluginContext 零业务字段泄漏
+def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
+    from dataclasses import fields
+    from personal_assistant.agent.plugins import PluginContext
+
+    all_pkg_files = sorted(PKG_ROOT.rglob("*.py"))
+    assert all_pkg_files
+    for py_file in all_pkg_files:
+        for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
+            assert "type: ignore" not in line, (
+                f"{py_file.relative_to(REPO_ROOT)}:{lineno} 禁止出现 # type: ignore：{line.strip()!r}"
+            )
+
+    plugins_py = PKG_ROOT / "agent" / "plugins.py"
+    plugins_src = plugins_py.read_text(encoding="utf-8")
+    for forbidden_field in (
+        "data_root",
+        "offload_dir",
+        "config_path",
+        "raw_config",
+        "extra_bindings",
+        "active_plugin_id",
+        "tool_registry",
+    ):
+        assert forbidden_field not in plugins_src, (
+            f"agent/plugins.py 严禁泄漏业务字段 {forbidden_field!r}"
+        )
+
+    ctx_fields = {f.name for f in fields(PluginContext)}
+    assert ctx_fields == {
+        "project_root",
+        "config",
+        "bindings",
+        "tool_specs",
+        "retrievers",
+        "compilers",
+        "providers",
+        "observers",
+    }
+
+    # 验证 assistant/__init__.py 按需延迟导出：导入 text_search 时绝不急切拖入 app / db / consolidator
+    lazy_code = (
+        "import json, sys\n"
+        "import personal_assistant.assistant.text_search\n"
+        "eager = [m for m in sys.modules if m in {"
+        "'personal_assistant.assistant.app', "
+        "'personal_assistant.assistant.db', "
+        "'personal_assistant.assistant.consolidator'}]\n"
+        "print(json.dumps(eager))\n"
+    )
+    res_lazy = subprocess.run(
+        [sys.executable, "-c", lazy_code],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    assert json.loads(res_lazy.stdout.strip()) == []
+

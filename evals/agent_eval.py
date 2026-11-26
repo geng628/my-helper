@@ -103,7 +103,7 @@ def evaluate_agent(
                 messages,
                 registry,
                 on_event=on_event,
-                tool_context={"user_text": query, "message_id": idx, "before_msg_id": idx},
+                tool_context={"user_text": query, "turn_tag": f"eval-{idx}", "before_msg_id": idx},
             )
             elapsed_ms = round((perf_counter() - t0) * 1000, 3)
 

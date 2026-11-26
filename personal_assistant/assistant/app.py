@@ -7,16 +7,14 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.plugins import ObserverProtocol
+from personal_assistant.agent.plugins import ObserverProtocol, RuntimeEvent
 from personal_assistant.agent.react import (
     AgentEvent,
-    RuntimeEvent,
     ToolStart,
     ToolStep,
     TurnEnd,
@@ -24,9 +22,10 @@ from personal_assistant.agent.react import (
 )
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
-from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient
 from personal_assistant.ai.types import (
     LLMStreamEvent,
+    ModelsConfig,
     StreamDone,
     TextDelta,
     ThinkingDelta,
@@ -35,6 +34,7 @@ from personal_assistant.ai.types import (
 )
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.common import require_positive_int, today_shanghai
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
     ConsolidationPolicy,
@@ -60,13 +60,6 @@ class TurnBudgetExceeded(RuntimeError):
         self.kind = kind
         self.reason = reason
         super().__init__(reason)
-
-
-# 校验运行期整数预算配置为正整数（严格拒绝布尔值）
-def _validate_positive_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} 必须是正整数。")
-    return value
 
 
 # 校验运行期浮点秒数预算配置为非负有限数（严格拒绝布尔值、NaN 与 Inf）
@@ -210,7 +203,7 @@ class _GuardedTurnLLM(LLMClient):
         self.steps += 1
         self.last_usage = None
         msg = self._inner.respond(messages, tools)
-        self._record_usage(getattr(self._inner, "last_usage", None))
+        self._record_usage(self._inner.last_usage)
         return msg
 
     # 流式调用前执行预算核查，触发熔断时吐出降级文本与无 tool_calls 的 StreamDone 使循环自然退出
@@ -232,11 +225,7 @@ class _GuardedTurnLLM(LLMClient):
         self.last_usage = None
         for event in self._inner.stream(messages, tools):
             if isinstance(event, StreamDone):
-                usage = (
-                    event.usage
-                    if isinstance(event.usage, TokenUsage)
-                    else getattr(self._inner, "last_usage", None)
-                )
+                usage = event.usage if isinstance(event.usage, TokenUsage) else self._inner.last_usage
                 self._record_usage(usage)
                 if event.finish_reason == "length" and _has_truncated_tool_call_json(event.message):
                     self.truncated_tool_call = True
@@ -284,6 +273,7 @@ class AssistantApp:
         state: StateStore | None = None,
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: LLMClient | None = None,
+        auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
         consolidator_model: str | None = None,
@@ -294,13 +284,14 @@ class AssistantApp:
         max_repeated_tool_calls: int = 3,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        self.max_turn_steps = _validate_positive_int(max_turn_steps, "max_turn_steps")
-        self.max_turn_tokens = _validate_positive_int(max_turn_tokens, "max_turn_tokens")
+        self.max_turn_steps = require_positive_int(max_turn_steps, "max_turn_steps")
+        self.max_turn_tokens = require_positive_int(max_turn_tokens, "max_turn_tokens")
         self.max_turn_seconds = _validate_non_negative_float(max_turn_seconds, "max_turn_seconds")
-        self.max_repeated_tool_calls = _validate_positive_int(
+        self.max_repeated_tool_calls = require_positive_int(
             max_repeated_tool_calls, "max_repeated_tool_calls"
         )
         self._clock: Callable[[], float] = clock or time.monotonic
+        self.auto_consolidate = bool(auto_consolidate)
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
         self._today_fn = today_fn
@@ -311,15 +302,15 @@ class AssistantApp:
             if project_root is not None
             else (self.config_path.parent.parent if self.config_path else self.data_root.parent)
         )
-        self.tools_config = (
+        self.tools_config: ToolsConfig = (
             ToolsConfig.load(self.config_path, project_root=self.project_root)
             if (self.config_path is not None and self.config_path.is_file())
-            else None
+            else ToolsConfig.empty(self.project_root)
         )
 
         if memory is not None:
             self.memory = memory
-        elif self.tools_config is not None:
+        else:
             policy = FilesPolicy.from_dict(
                 self.tools_config.files,
                 project_root=self.project_root,
@@ -327,16 +318,20 @@ class AssistantApp:
             )
             retriever = self.tools_config.build_retriever()
             self.memory = MemoryStore(self.data_root, policy=policy, retriever=retriever)
-        else:
-            self.memory = MemoryStore(self.data_root)
 
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
-        if llm is not None:
-            self.llm = llm
-        elif self.tools_config is not None and self.config_path is not None:
-            self.llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
-        else:
-            self.llm = from_env()
+        cfg_dir = self.config_path.parent if self.config_path is not None else None
+        clean_cons_model = (consolidator_model or "").strip() or None
+        need_models_cfg = cfg_dir is not None and (
+            llm is None or (consolidator_llm is None and clean_cons_model is not None)
+        )
+        models_cfg = self.tools_config.load_models_config(cfg_dir) if need_models_cfg else None
+
+        self.llm = (
+            llm
+            if llm is not None
+            else self.tools_config.build_llm(cfg_dir, model_name=model_name, models_cfg=models_cfg)
+        )
         self._llm_lock = threading.RLock()
         self._prompt_lock = threading.Lock()
         self._session_prompts: dict[str, tuple[str, str]] = {}
@@ -344,13 +339,9 @@ class AssistantApp:
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: dict[str, tuple[threading.Lock, int]] = {}
         self.cache_monitor = CacheMonitor()
-        if observers is not None:
-            self.observers: tuple[ObserverProtocol, ...] = tuple(observers)
-        elif self.tools_config is not None:
-            self.observers = tuple(self.tools_config.build_observers())
-        else:
-            self.observers = ()
-        clean_cons_model = (consolidator_model or "").strip() or None
+        self.observers: tuple[ObserverProtocol, ...] = (
+            tuple(observers) if observers is not None else tuple(self.tools_config.build_observers())
+        )
         self._consolidator_model = clean_cons_model
         self._custom_consolidator_llm = consolidator_llm is not None
         if consolidator_llm is not None:
@@ -358,9 +349,11 @@ class AssistantApp:
         elif llm is not None and clean_cons_model is None:
             resolved_consolidator_llm = self.llm
         else:
-            resolved_consolidator_llm = self._resolve_consolidator_llm(
-                self.llm,
-                consolidator_model=clean_cons_model,
+            resolved_consolidator_llm = self.tools_config.build_consolidator_llm(
+                cfg_dir,
+                fallback_llm=self.llm,
+                model_name=clean_cons_model,
+                models_cfg=models_cfg,
             )
         self.consolidator = MemoryConsolidator(
             self.state,
@@ -395,50 +388,24 @@ class AssistantApp:
 
     # 返回内置模型厂商预设目录，供零代码向导与网页设置表单展示
     def model_presets(self) -> list[dict[str, object]]:
-        if self.tools_config is None:
-            return []
         return self.tools_config.model_presets()
 
     # 返回当前模型预设与已配置模型的脱敏视图（绝不包含明文 api_key）
     def models_overview(self) -> dict[str, object]:
-        configured: dict[str, object] | None = None
-        if self.tools_config is not None and self.config_path is not None:
-            cfg = self.tools_config.load_models_config(self.config_path.parent)
-            if cfg is not None:
-                configured = cfg.redacted_dict()
+        cfg = self.tools_config.load_models_config()
         return {
             "presets": self.model_presets(),
-            "configured": configured,
+            "configured": cfg.redacted_dict() if cfg is not None else None,
             "llm_configured": not isinstance(self.llm, NoopLLMClient),
         }
 
-    # 按配置槽位、显式参数或 LLM_CONSOLIDATOR_MODEL 解析后台沉淀 LLM；未配置时原样返回 fallback_llm
-    def _resolve_consolidator_llm(
-        self,
-        fallback_llm: LLMClient,
-        *,
-        consolidator_model: str | None = None,
-    ) -> LLMClient:
-        clean_target = (consolidator_model or "").strip() or None
-        if self.tools_config is not None and self.config_path is not None:
-            return self.tools_config.build_consolidator_llm(
-                self.config_path.parent,
-                fallback_llm=fallback_llm,
-                model_name=clean_target,
-            )
-        env_model = (clean_target or os.getenv("LLM_CONSOLIDATOR_MODEL", "")).strip()
-        if env_model:
-            merged = dict(os.environ)
-            merged["LLM_MODEL"] = env_model
-            return from_env(merged)
-        return fallback_llm
-
-    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 LLMClient（失败时保持原实例零污染）
+    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 LLMClient（单次编译，失败零污染）
     def reload_llm(
         self,
         model_name: str | None = None,
         *,
         consolidator_model: str | None = None,
+        models_cfg: ModelsConfig | None = None,
     ) -> None:
         with self._llm_lock:
             next_cons_model = (
@@ -446,14 +413,26 @@ class AssistantApp:
                 if consolidator_model is None
                 else (consolidator_model.strip() or None)
             )
-            if self.tools_config is not None and self.config_path is not None:
-                new_llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
-            else:
-                new_llm = from_env()
+            cfg_dir = self.config_path.parent if self.config_path is not None else None
+            resolved_cfg = (
+                models_cfg
+                if models_cfg is not None
+                else self.tools_config.load_models_config(cfg_dir)
+            )
+            new_llm = self.tools_config.build_llm(
+                cfg_dir,
+                model_name=model_name,
+                models_cfg=resolved_cfg,
+            )
             new_cons_llm = (
                 self.consolidator.llm
                 if self._custom_consolidator_llm
-                else self._resolve_consolidator_llm(new_llm, consolidator_model=next_cons_model)
+                else self.tools_config.build_consolidator_llm(
+                    cfg_dir,
+                    fallback_llm=new_llm,
+                    model_name=next_cons_model,
+                    models_cfg=resolved_cfg,
+                )
             )
             self._consolidator_model = next_cons_model
             self.llm = new_llm
@@ -471,7 +450,7 @@ class AssistantApp:
         name: str = "",
         temperature: float = 0.2,
     ) -> dict[str, object]:
-        if self.tools_config is None or self.config_path is None:
+        if self.config_path is None:
             raise ValueError("当前实例未加载 config/tools.json，无法写入模型配置。")
         models_cfg = self.tools_config.save_model_setup(
             self.config_path.parent,
@@ -482,7 +461,11 @@ class AssistantApp:
             name=name,
             temperature=temperature,
         )
-        self.reload_llm(model_name=models_cfg.default, consolidator_model="")
+        self.reload_llm(
+            model_name=models_cfg.default,
+            consolidator_model="",
+            models_cfg=models_cfg,
+        )
         return models_cfg.redacted_dict()
 
     # 等待所有在途后台沉淀任务完成（供退出收尾或测试调用）
@@ -493,8 +476,7 @@ class AssistantApp:
     def close(self) -> None:
         try:
             self.background_consolidator.wait(timeout=15.0)
-            if self.tools_config is not None:
-                self.tools_config.plugin_manager.terminate_all()
+            self.tools_config.plugin_manager.terminate_all()
         finally:
             self.state.close()
 
@@ -502,20 +484,15 @@ class AssistantApp:
     def _today(self) -> date:
         if self._today_fn is not None:
             return self._today_fn()
-        return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return today_shanghai()
 
     # 在应用启动时一次性构建受白名单管控的常驻工具注册表（跨轮复用，动态上下文走执行期 tool_context）
     def _build_base_registry(self) -> ToolRegistry:
-        provider = MemoryToolsetProvider(self.memory)
-        if self.tools_config is not None:
-            return self.tools_config.build_registry(
-                providers=[provider],
-                data_root=self.data_root,
-                tool_context={"history_db_path": self.state.db_path},
-            )
-        registry = ToolRegistry()
-        registry.register_provider(provider)
-        return registry
+        return self.tools_config.build_registry(
+            providers=[MemoryToolsetProvider(self.memory)],
+            data_root=self.data_root,
+            tool_context={"history_db_path": self.state.db_path},
+        )
 
     # 返回应用常驻白名单工具注册表
     @property
@@ -590,7 +567,7 @@ class AssistantApp:
             _append_alternating_message(result, {"role": role, "content": content})
         return result
 
-    # 组装应用层上下文消息（系统提示词、前情摘要占位、活跃历史与当前提问），交由 #54 边界转换器净化
+    # 组装单条稳定 system 消息（按需尾部拼入已压缩前情摘要）与严格交替的历史及当前提问
     def _assemble_context_messages(
         self,
         system_prompt: str,
@@ -598,40 +575,15 @@ class AssistantApp:
         history: list[dict[str, object]],
         clean_text: str,
     ) -> list[dict[str, object]]:
-        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}]
-        if summary_text:
-            messages.append({"role": "compaction_summary", "content": summary_text})
+        effective_system = (
+            f"{system_prompt}\n\n【本会话已压缩前情摘要】\n{summary_text}"
+            if summary_text
+            else system_prompt
+        )
+        messages: list[dict[str, object]] = [{"role": "system", "content": effective_system}]
         messages.extend(self._build_history_messages(history))
-        messages.append({"role": "user", "content": clean_text})
+        _append_alternating_message(messages, {"role": "user", "content": clean_text})
         return messages
-
-    # #54 convert_to_llm 边界转换器：将摘要占位转为标准 user/assistant 承接对，并合并任何残留同角色孤儿消息
-    @staticmethod
-    def _convert_context_to_llm(messages: list[dict[str, object]]) -> list[dict[str, object]]:
-        converted: list[dict[str, object]] = []
-        for msg in messages:
-            role = str(msg.get("role") or "")
-            if role == "compaction_summary":
-                summary_text = str(msg.get("content") or "").strip()
-                if summary_text:
-                    # 使用标准 user/assistant 承接对注入前情摘要，保证仅含单条 system 消息且兼容全部模型接口
-                    _append_alternating_message(
-                        converted,
-                        {
-                            "role": "user",
-                            "content": f"【本会话已压缩前情摘要（供承接上下文）】\n{summary_text}",
-                        },
-                    )
-                    _append_alternating_message(
-                        converted,
-                        {"role": "assistant", "content": "已了解前情摘要，请继续。"},
-                    )
-                continue
-            if role in {"user", "assistant"}:
-                _append_alternating_message(converted, msg)
-                continue
-            converted.append(msg)
-        return converted
 
     # 每个自然日首次对话时先执行过期归档，归档成功后再更新日期游标并清理过时会话冻结提示词
     def _maybe_archive_expired(self) -> None:
@@ -659,14 +611,16 @@ class AssistantApp:
         chat_id: str = "default",
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
-    ) -> Iterator[dict[str, object]]:
+    ) -> Generator[dict[str, object], None, None]:
         clean_text = text.strip()
         if not clean_text:
             raise ValueError("消息内容不能为空。")
         with self._llm_lock:
             active_llm = self.llm
         if isinstance(active_llm, NoopLLMClient):
-            active_llm.respond([{"role": "user", "content": clean_text}])
+            raise LLMNotConfigured(
+                "未配置真实大模型（LLM_MODE!=on）。请运行 `uv run python -m personal_assistant setup` 或配置 API Key。"
+            )
         return self._run_stream_turn(
             clean_text,
             chat_id,
@@ -680,7 +634,7 @@ class AssistantApp:
         chat_id: str,
         *,
         on_event: Callable[[AgentEvent], None] | None,
-    ) -> Iterator[dict[str, object]]:
+    ) -> Generator[dict[str, object], None, None]:
         with self._chat_turn_lock(chat_id):
             self._maybe_archive_expired()
             compaction, active_all = self.state.get_context_snapshot(chat_id)
@@ -688,16 +642,6 @@ class AssistantApp:
             before_msg_id = self.state.max_message_id() + 1
             turn_tag = uuid.uuid4().hex[:12]
             fact_used = False
-            untrusted_seen = False
-
-            # 标记本轮曾调用 remember_fact 写入待提交暂存事实
-            def _mark_fact_used() -> None:
-                nonlocal fact_used
-                fact_used = True
-
-            # 返回本轮是否已触发过 network 风险工具（供 #72 等下游护栏读取）
-            def _has_seen_untrusted_tool() -> bool:
-                return untrusted_seen
 
             turn_persisted = False
             try:
@@ -706,8 +650,7 @@ class AssistantApp:
                     "user_text": clean_text,
                     "before_msg_id": before_msg_id,
                     "turn_tag": turn_tag,
-                    "on_remember": _mark_fact_used,
-                    "untrusted_tool_seen": _has_seen_untrusted_tool,
+                    "untrusted_tool_seen": False,
                     "today": self._today(),
                     "history_db_path": self.state.db_path,
                 }
@@ -736,18 +679,16 @@ class AssistantApp:
                     guarded_llm,
                     messages,
                     registry,
-                    convert_to_llm=self._convert_context_to_llm,
+                    convert_to_llm=None,
                     tool_context=turn_ctx,
                 ):
                     if isinstance(event, ToolStart):
                         meta = registry.metadata(event.tool)
                         if meta is not None and meta.risk == "network":
-                            untrusted_seen = True
+                            turn_ctx["untrusted_tool_seen"] = True
+                        if event.tool == "remember_fact":
+                            fact_used = True
                         guarded_llm.observe_tool_call(event.tool, event.arguments)
-                    elif isinstance(event, ToolStep):
-                        meta = registry.metadata(event.tool)
-                        if meta is not None and meta.risk == "network":
-                            untrusted_seen = True
                     self._emit_event(chat_id, event)
                     if on_event is not None:
                         on_event(event)
@@ -784,9 +725,13 @@ class AssistantApp:
                 if not turn_persisted and fact_used:
                     self.memory.finalize_turn_fact(turn_tag, message_id=None)
 
-            scheduled = self.background_consolidator.maybe_schedule(
-                chat_id,
-                on_complete=lambda res: self.reset_session_prompt(res.chat_id),
+            scheduled = (
+                self.background_consolidator.maybe_schedule(
+                    chat_id,
+                    on_complete=lambda res: self.reset_session_prompt(res.chat_id),
+                )
+                if self.auto_consolidate
+                else False
             )
             done_payload: dict[str, object] = {
                 "type": "done",
@@ -843,23 +788,14 @@ class AssistantApp:
 
     # 返回系统运行状态摘要（LLM 配置状态、记忆文件数、消息数、工具、插件与观测快照）
     def status(self) -> dict[str, object]:
-        memory_count = (
-            sum(
-                1
-                for p in self.memory.memory_dir.rglob("*")
-                if p.is_file() and p.suffix.lower() in {".md", ".txt"} and not p.name.startswith(".")
-            )
-            if self.memory.memory_dir.is_dir()
-            else 0
-        )
         return {
             "status": "ok",
             "llm_configured": not isinstance(self.llm, NoopLLMClient),
-            "memory_files": memory_count,
+            "memory_files": self.memory.count_files(),
             "messages": self.state.count_messages(),
             "tools": self._tool_registry.names,
-            "plugins": list(self.tools_config.plugins) if self.tools_config else [],
-            "retriever": str(getattr(self.memory.retriever, "name", "linear")),
+            "plugins": list(self.tools_config.plugins),
+            "retriever": self.memory.retriever.name,
             "observers": [obs.name for obs in self.observers],
             "telemetry": self._collect_telemetry(),
             "cache": self.cache_monitor.summary(),
@@ -876,6 +812,7 @@ def build_app(
     project_root: Path | None = None,
     model_name: str | None = None,
     consolidator_model: str | None = None,
+    auto_consolidate: bool = True,
 ) -> AssistantApp:
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
     cfg_dir = (config_root or Path(os.getenv("MY_HELPER_CONFIG", "config"))).resolve()
@@ -892,4 +829,5 @@ def build_app(
         llm=llm,
         model_name=model_name,
         consolidator_model=consolidator_model,
+        auto_consolidate=auto_consolidate,
     )

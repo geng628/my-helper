@@ -1,44 +1,22 @@
-"""内核内置工具定义与提供方（记忆读写、工作区落盘与行为规则工具集，零反向依赖 memory.py）。"""
+"""内核内置工具提供方（记忆读写、工作区落盘与行为规则工具集，零反向依赖 memory.py）。"""
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import date, datetime
+from collections.abc import Callable, Mapping
+from datetime import date
 from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
+from personal_assistant.assistant.common import parse_iso_date
 
 
-# 将可选日期参数（date / datetime / ISO 字符串）安全归一化为标准 date 对象
-def _coerce_date(raw: date | str | None) -> date | None:
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, date):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        return date.fromisoformat(raw.strip()[:10])
-    return None
-
-
-# 内核内置工具子类：承载记忆与文件操作，由统一 build_tool 构建并注入 ToolRegistry
-@dataclass(frozen=True)
-class BuiltinTool(Tool):
-    pass
-
-
-# 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 向 ToolRegistry 提供 6 个 BuiltinTool 子类实例
+# 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 产出 6 个纯净 Tool 实例
 class MemoryToolsetProvider(ToolsetProvider):
-    source_type = "builtin"
-    source_name = "memory"
-
     # 绑定当前实例的 MemoryStore
     def __init__(self, memory: Any) -> None:
         self.memory = memory
 
-    # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
-    def tools(self) -> list[Tool]:
+    # 按统一契约构建 6 个记忆与文件操作 Tool 值对象（带 risk 元数据与执行期上下文签名）
+    def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         memory = self.memory
 
         # 适配 search_markdown 工具：将执行期可选注入的 today 参数归一化为标准 date 对象
@@ -48,7 +26,7 @@ class MemoryToolsetProvider(ToolsetProvider):
             *,
             today: date | str | None = None,
         ) -> str:
-            return memory.search_markdown(query, root=root, today=_coerce_date(today))
+            return memory.search_markdown(query, root=root, today=parse_iso_date(today))
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:
@@ -65,38 +43,24 @@ class MemoryToolsetProvider(ToolsetProvider):
             saved = memory.write_workspace_file(path, content, mode=mode)
             return f"已写入：{saved}"
 
-        # 适配 remember_fact 工具：严格通过执行期 tool_context 读取当前用户原话与消息/回合标识
+        # 适配 remember_fact 工具：严格通过执行期 tool_context 读取当前用户原话与回合暂存标识
         def remember_fact(
             *,
             user_text: str = "",
-            message_id: int | None = None,
             turn_tag: str | None = None,
-            on_remember: Callable[[], None] | None = None,
         ) -> str:
             if not isinstance(user_text, str) or not user_text.strip():
                 raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
-            effective_tag = None if message_id is not None else turn_tag
-            target = memory.remember_user_statement(
-                user_text,
-                message_id=message_id,
-                turn_tag=effective_tag,
-            )
-            if on_remember is not None:
-                on_remember()
+            target = memory.remember_user_statement(user_text, turn_tag=turn_tag)
             return f"已记录用户原话到 {target}"
 
         # 适配 save_rule 工具：阻断已接触外部不可信网络工具的污染轮，其余直接落盘到 data/memory/rules/
         def save_rule(
             statement: str,
             *,
-            untrusted_tool_seen: Callable[[], bool] | bool = False,
+            untrusted_tool_seen: bool = False,
         ) -> str:
-            seen_untrusted = (
-                bool(untrusted_tool_seen())
-                if callable(untrusted_tool_seen)
-                else bool(untrusted_tool_seen)
-            )
-            if seen_untrusted:
+            if untrusted_tool_seen:
                 raise PermissionError("安全拦截：本轮已读取外部网页或搜索结果，禁止自动写入全局行为规则。")
             path = memory.save_rule(statement, source="agent")
             return f"已保存行为规则：data/memory/rules/{path.name}"
@@ -159,9 +123,6 @@ class MemoryToolsetProvider(ToolsetProvider):
                 parameters=params,
                 param_enums=enums,
                 risk=risk,
-                source_type=self.source_type,
-                source_name=self.source_name,
-                base_cls=BuiltinTool,
             )
             for name, desc, params, fn, risk, enums in specs
         ]

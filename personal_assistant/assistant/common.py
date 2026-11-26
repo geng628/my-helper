@@ -1,4 +1,4 @@
-"""Layer 3 无内部依赖基础工具：仓库根目录、.env 加载、UTF-8 截断与极简 TOAST 输出卸载。"""
+"""Layer 3 无内部依赖基础原语：仓库根目录、时间/日期、正整数校验、原子写盘、.env 加载与 TOAST 输出卸载。"""
 from __future__ import annotations
 
 import hashlib
@@ -8,8 +8,10 @@ import tempfile
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 _CN_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 OFFLOAD_SUBDIR = "tool_outputs"
 DEFAULT_MAX_OFFLOAD_BYTES = 1024 * 1024
@@ -19,16 +21,70 @@ DEFAULT_OFFLOAD_TTL_SECONDS = 24 * 3600
 _OFFLOAD_CAP_NOTICE = "…（原始输出超过落盘上限，后续字节未保存）"
 
 
+# 获取当前北京时间（Asia/Shanghai 带时区 datetime）
+def now_shanghai() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
+
+
+# 获取当前北京时间自然日日期
+def today_shanghai() -> date:
+    return datetime.now(SHANGHAI_TZ).date()
+
+
+# 安全解析可选日期对象或 YYYY-MM-DD 字符串，非法或空值返回 None
+def parse_iso_date(raw: object) -> date | None:
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    candidate = text[:10] if len(text) > 10 and text[10] in {"T", " "} else text
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        return None
+
+
+# 严格校验参数为正整数（>= 1 且拒绝布尔值）
+def require_positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数。")
+    return value
+
+
+# 通过同目录 .tmp- 临时文件与 os.replace 原子落盘 UTF-8 文本（可选在写内容前通过 fchmod 设置权限如 0o600）
+def atomic_write_text(target: Path, content: str, *, mode: int | None = None) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
+            handle.write(content)
+        if mode is not None and not hasattr(os, "fchmod"):
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, target)
+        if mode is not None:
+            os.chmod(target, mode)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 # 将日期格式化为带中文星期与时区的统一展示文本（如 2026-11-16（星期一，北京时间））
 def format_date_with_weekday(day: date) -> str:
     return f"{day.isoformat()}（{_CN_WEEKDAYS[day.weekday()]}，北京时间）"
 
 
-# 读取本地 .env 文件并将未设置的 KEY=VALUE 注入当前进程环境变量
-def load_dotenv(path: Path = Path(".env")) -> None:
-    if not path.is_file():
+# 读取本地 .env 文件（默认仓库根目录 .env）并将未设置的 KEY=VALUE 注入当前进程环境变量
+def load_dotenv(dotenv_path: Path | None = None) -> None:
+    target = dotenv_path if dotenv_path is not None else (REPO_ROOT / ".env")
+    if not target.is_file():
         return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in target.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -151,18 +207,7 @@ def _write_offload_file(
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     digest = hashlib.sha256(payload).hexdigest()[:8]
     filename = f"{stamp}-{_sanitize_tag(tag)}-{digest}.txt"
-    target_path = target_dir / filename
-
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target_dir))
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-        os.replace(tmp_path, target_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
+    atomic_write_text(target_dir / filename, content)
     _cleanup_offload_dir(
         target_dir,
         keep_name=filename,
@@ -213,6 +258,24 @@ def _take_tail_lines(lines: list[str], budget: int, min_index: int = 0) -> int:
     return count
 
 
+# 统一拼装 TOAST 输出截断说明与分页续读/全文检索调用提示
+def _format_offload_notice(
+    *,
+    summary: str,
+    total: int,
+    display_path: str,
+    display_root: str,
+    start_line: int,
+    end_line: int,
+    action: str = "分页读取",
+) -> str:
+    return (
+        f"…（输出已截断：{summary}完整共 {total} 行，已保存至 {display_path}；"
+        f'可用 read_markdown(path="{display_path}", start_line={start_line}, end_line={end_line}) {action}，'
+        f'或用 search_markdown(query="关键词", root="{display_root}") 检索）'
+    )
+
+
 # 渲染 head 模式整行预览与 TOAST 续读指针（适合网页正文与长文章）
 def _render_head_preview(
     lines: list[str],
@@ -224,21 +287,25 @@ def _render_head_preview(
     head_count = _take_head_lines(lines, max_bytes)
     if head_count == 0:
         preview = _slice_utf8_prefix(lines[0], max_bytes)
-        end_hint = min(total, 200)
-        notice = (
-            f"…（输出已截断：以上仅含第 1 行前缀，完整共 {total} 行，已保存至 {display_path}；"
-            f'可用 read_markdown(path="{display_path}", start_line=1, end_line={end_hint}) 分页读取，'
-            f'或用 search_markdown(query="关键词", root="{display_root}") 检索）'
+        notice = _format_offload_notice(
+            summary="以上仅含第 1 行前缀，",
+            total=total,
+            display_path=display_path,
+            display_root=display_root,
+            start_line=1,
+            end_line=min(total, 200),
         )
         return f"{preview}\n{notice}"
 
     preview = "\n".join(lines[:head_count])
-    next_line = min(total, head_count + 1)
-    end_hint = min(total, head_count + 200)
-    notice = (
-        f"…（输出已截断：以上为第 1-{head_count} 行预览，完整共 {total} 行，已保存至 {display_path}；"
-        f'可用 read_markdown(path="{display_path}", start_line={next_line}, end_line={end_hint}) 续读，'
-        f'或用 search_markdown(query="关键词", root="{display_root}") 检索）'
+    notice = _format_offload_notice(
+        summary=f"以上为第 1-{head_count} 行预览，",
+        total=total,
+        display_path=display_path,
+        display_root=display_root,
+        start_line=min(total, head_count + 1),
+        end_line=min(total, head_count + 200),
+        action="续读",
     )
     return f"{preview}\n{notice}"
 
@@ -269,14 +336,16 @@ def _render_head_tail_preview(
         omit_start = head_count + 1
         omit_end = total - tail_count
         omitted = omit_end - omit_start + 1
-        end_hint = min(omit_end, omit_start + 199)
         head_block = "\n".join(lines[:head_count])
         tail_block = "\n".join(lines[total - tail_count :])
-        notice = (
-            f"…（输出已截断：中间省略第 {omit_start}-{omit_end} 行，共省略 {omitted} 行；"
-            f"完整共 {total} 行，已保存至 {display_path}；"
-            f'可用 read_markdown(path="{display_path}", start_line={omit_start}, end_line={end_hint}) 查看中间内容，'
-            f'或用 search_markdown(query="关键词", root="{display_root}") 检索）'
+        notice = _format_offload_notice(
+            summary=f"中间省略第 {omit_start}-{omit_end} 行，共省略 {omitted} 行；",
+            total=total,
+            display_path=display_path,
+            display_root=display_root,
+            start_line=omit_start,
+            end_line=min(omit_end, omit_start + 199),
+            action="查看中间内容",
         )
         return f"{head_block}\n\n{notice}\n\n{tail_block}"
 
@@ -287,11 +356,13 @@ def _render_head_tail_preview(
         else _slice_utf8_suffix(lines[-1], tail_budget)
     )
     start_hint = max(1, head_count + 1)
-    end_hint = min(total, start_hint + 199)
-    notice = (
-        f"…（输出已截断：完整共 {total} 行，已保存至 {display_path}；"
-        f'可用 read_markdown(path="{display_path}", start_line={start_hint}, end_line={end_hint}) 分页读取，'
-        f'或用 search_markdown(query="关键词", root="{display_root}") 检索）'
+    notice = _format_offload_notice(
+        summary="",
+        total=total,
+        display_path=display_path,
+        display_root=display_root,
+        start_line=start_hint,
+        end_line=min(total, start_hint + 199),
     )
     return f"{head_block}\n\n{notice}\n\n{tail_block}"
 
@@ -310,8 +381,7 @@ def truncate_or_offload(
     max_files: int = DEFAULT_OFFLOAD_MAX_FILES,
     ttl_seconds: float = DEFAULT_OFFLOAD_TTL_SECONDS,
 ) -> str:
-    if max_bytes <= 0:
-        raise ValueError("max_bytes 必须是正整数。")
+    max_bytes = require_positive_int(max_bytes, "max_bytes")
     if mode not in {"head", "head_tail"}:
         raise ValueError("mode 只能是 head 或 head_tail。")
     if len(text.encode("utf-8")) <= max_bytes:

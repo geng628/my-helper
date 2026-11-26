@@ -104,7 +104,13 @@ def test_openai_sse_tool_calls_400_fallback_and_midstream_error(monkeypatch: pyt
         body = json.loads((request.data or b"{}").decode("utf-8"))
         call_payloads.append(body)
         if "stream_options" in body:
-            raise HTTPError(request.full_url, 400, "Unsupported", {}, io.BytesIO(b"bad"))
+            raise HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(b'{"error":"stream_options unsupported"}'),
+            )
         raw_sse = (
             'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":['
             '{"index":0,"id":"c_1","type":"function","function":{"name":"add_","arguments":"{\\"a\\":"}},'
@@ -231,29 +237,36 @@ def test_iter_react_emits_slim_typed_events() -> None:
     end = streamed_events[-1]
     assert isinstance(end, TurnEnd) and end.reply == "结果是 42" and end.total_ms >= 0.0
 
-    # 验证同步基类 LLMClient.stream() 对 reasoning_content 的 ThinkingDelta 兼容（且 tool_calls 时不误发 TextDelta）
+    # 验证同步基类 LLMClient.stream() 保持纯净（不跨层嗅探 reasoning_content），思考增量由流式实现直接产出
     sync_llm = ScriptedStreamLLM(
         [
             {
                 "role": "assistant",
-                "content": "忽略占位",
-                "reasoning_content": "同步思考",
+                "content": None,
+                "reasoning_content": "跨层字段不应由基类嗅探",
                 "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "double", "arguments": '{"n":"1"}'}}],
             },
             {
                 "role": "assistant",
                 "content": "同步回答",
-                "reasoning_content": "同步总结",
+                "reasoning_content": "跨层字段不应由基类嗅探",
             },
+            [
+                ThinkingDelta(text="流式思考"),
+                TextDelta(text="流式回答"),
+                StreamDone(message={"role": "assistant", "content": "流式回答", "reasoning_content": "流式思考"}),
+            ],
         ]
     )
     sync_ev1 = list(sync_llm.stream([{"role": "user", "content": "a"}]))
-    assert [type(ev) for ev in sync_ev1] == [ThinkingDelta, StreamDone]
-    assert sync_ev1[0] == ThinkingDelta(text="同步思考")
+    assert [type(ev) for ev in sync_ev1] == [StreamDone]
     sync_ev2 = list(sync_llm.stream([{"role": "user", "content": "b"}]))
-    assert [type(ev) for ev in sync_ev2] == [ThinkingDelta, TextDelta, StreamDone]
-    assert sync_ev2[0] == ThinkingDelta(text="同步总结")
-    assert sync_ev2[1] == TextDelta(text="同步回答")
+    assert [type(ev) for ev in sync_ev2] == [TextDelta, StreamDone]
+    assert sync_ev2[0] == TextDelta(text="同步回答")
+    stream_ev3 = list(sync_llm.stream([{"role": "user", "content": "c"}]))
+    assert [type(ev) for ev in stream_ev3] == [ThinkingDelta, TextDelta, StreamDone]
+    assert stream_ev3[0] == ThinkingDelta(text="流式思考")
+    assert stream_ev3[1] == TextDelta(text="流式回答")
 
 
 # 测试 TelemetryObserver 与 AssistantApp 忽略 ThinkingDelta / ToolStart 等新事件不崩且统计精确
@@ -647,6 +660,7 @@ def test_assistant_app_tools_injects_logical_today_into_plugins(tmp_path: Path) 
     (plugins_dir / "clock_probe.py").write_text(
         """
 from datetime import date
+from personal_assistant.agent.plugins import Plugin
 from personal_assistant.agent.tools import tool
 
 
@@ -660,6 +674,16 @@ def peek_logical_today(topic: str, *, today: date | None = None) -> str:
 @tool(description="原样回显文本", parameters={"text": "文本"})
 def plain_echo(text: str) -> str:
     return text
+
+
+# 显式注册两个时钟探测工具的测试插件
+class ClockProbePlugin(Plugin):
+    plugin_id = "clock_probe"
+
+    # 向主板插槽注册探测工具
+    def initialize(self) -> None:
+        self.context.register_tool(peek_logical_today)
+        self.context.register_tool(plain_echo)
 """,
         encoding="utf-8",
     )

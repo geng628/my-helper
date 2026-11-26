@@ -11,7 +11,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -19,7 +19,6 @@ from urllib.request import Request, urlopen
 from personal_assistant.ai.types import (
     LLMStreamEvent,
     ModelProfile,
-    ModelsConfig,
     StreamDone,
     TextDelta,
     ThinkingDelta,
@@ -35,7 +34,7 @@ class LLMNotConfigured(RuntimeError):
 
 PostJson = Callable[[str, dict[str, object], dict[str, str]], dict[str, object]]
 PostStream = Callable[[str, dict[str, object], dict[str, str]], Iterator[str]]
-ProviderFactory = Callable[[Mapping[str, str]], "LLMClient"]
+ProviderFactory = Callable[[ModelProfile], "LLMClient"]
 
 
 # 安全将接口返回的数字字段解析为非负整数
@@ -83,16 +82,8 @@ _TRANSIENT_HTTP_ERRORS = (
 _BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]+")
 _MAX_HTTP_ERROR_BODY_BYTES = 1024
-_STREAM_OPTIONS_INCOMPAT_MARKERS = (
-    "stream_options",
-    "include_usage",
-    "unknown",
-    "unrecognized",
-    "extra",
-    "unsupported",
-)
+_STREAM_OPTIONS_MARKERS = ("stream_options", "include_usage")
 _CONTEXT_LIMIT_MARKERS = ("context_length", "maximum context", "tokens")
-_GENERIC_400_REASONS = frozenset({"", "bad request", "http error 400", "400", "client error"})
 
 
 # 脱敏 HTTP 错误文本中的疑似 Bearer 或 sk- 令牌，防止错误透出泄漏密钥
@@ -101,13 +92,9 @@ def _redact_error_tokens(text: str) -> str:
     return _SK_SECRET_RE.sub("sk-***", masked)
 
 
-# 安全读取最多 1024 字节的 HTTPError 响应体并脱敏缓存，同时拼入异常 reason 便于上层观测真实错误
-def _attach_http_error_body(error: HTTPError) -> str:
-    cached = getattr(error, "_cached_error_body", None)
-    if isinstance(cached, str):
-        return cached
-    orig_reason = str(getattr(error, "reason", "") or "").strip()
-    error._orig_reason = orig_reason  # type: ignore[attr-defined]
+# 纯函数读取最多 1024 字节 HTTPError 响应体并脱敏，构造零猴子补丁的新 HTTPError 与组合诊断文本
+def _format_http_error(error: HTTPError) -> tuple[HTTPError, str]:
+    orig_reason = _redact_error_tokens(str(error.reason or "").strip())
     body = ""
     try:
         raw = error.read(_MAX_HTTP_ERROR_BODY_BYTES)
@@ -118,10 +105,11 @@ def _attach_http_error_body(error: HTTPError) -> str:
     elif isinstance(raw, str):
         body = raw.strip()
     clean_body = _redact_error_tokens(body)
-    error._cached_error_body = clean_body  # type: ignore[attr-defined]
     if clean_body and clean_body not in orig_reason:
-        error.msg = f"{orig_reason} | {clean_body}" if orig_reason else clean_body
-    return clean_body
+        msg = f"{orig_reason} | {clean_body}" if orig_reason else clean_body
+    else:
+        msg = orig_reason
+    return HTTPError(error.url, error.code, msg, error.headers, None), f"{orig_reason} {clean_body}".strip()
 
 
 # 从 HTTP 429 响应头解析合法数字 Retry-After，并夹紧在 [0.1, 10.0] 秒内
@@ -145,16 +133,12 @@ def _parse_retry_after_seconds(headers: Any) -> float | None:
     return max(0.1, min(10.0, parsed))
 
 
-# 判断 HTTP 400 是否属于 stream_options 参数不兼容（明确排除上下文或 Token 超长错误）
-def _should_fallback_without_stream_options(error: HTTPError) -> bool:
-    body = _attach_http_error_body(error)
-    orig_reason = str(getattr(error, "_orig_reason", getattr(error, "reason", "")) or "").strip()
-    combined = f"{orig_reason} {body}".lower()
-    if any(marker in combined for marker in _CONTEXT_LIMIT_MARKERS):
+# 判断 HTTP 400 错误文本是否明确包含 stream_options / include_usage 不兼容标记（排除上下文超长错误）
+def _is_stream_options_incompat(error_text: str) -> bool:
+    lowered = error_text.lower()
+    if any(marker in lowered for marker in _CONTEXT_LIMIT_MARKERS):
         return False
-    if not body and orig_reason.lower() in _GENERIC_400_REASONS:
-        return True
-    return any(marker in combined for marker in _STREAM_OPTIONS_INCOMPAT_MARKERS)
+    return any(marker in lowered for marker in _STREAM_OPTIONS_MARKERS)
 
 
 # 构造 JSON POST 请求，并在连接或指定读取阶段遇到瞬时网络/TLS/5xx/429 异常时按指数退避或 Retry-After 重试
@@ -178,12 +162,11 @@ def _post_with_retry(
         try:
             return operation(urlopen(request, timeout=60))
         except HTTPError as error:
-            # 4xx 客户端错误（429 限流除外）不重试，附带脱敏错误体直接抛出
             if (error.code < 500 and error.code != 429) or attempt >= max_retries:
-                _attach_http_error_body(error)
-                raise
+                formatted_error, _ = _format_http_error(error)
+                raise formatted_error from error
             if error.code == 429:
-                retry_after = _parse_retry_after_seconds(getattr(error, "headers", None))
+                retry_after = _parse_retry_after_seconds(error.headers)
                 if retry_after is not None:
                     delay = retry_after
         except _TRANSIENT_HTTP_ERRORS:
@@ -236,6 +219,14 @@ def default_post_stream(
             yield raw_line.decode("utf-8")
 
 
+# 流式 SSE 增量工具调用分片累加器
+@dataclass
+class _ToolCallAcc:
+    id: str = ""
+    name: str = ""
+    args: list[str] = field(default_factory=list)
+
+
 # 逐行解析 OpenAI 兼容 SSE 流：实时吐出 ThinkingDelta/TextDelta、拼接分片 tool_calls 并聚合思维链字段
 def _consume_openai_sse(
     lines: Iterable[str],
@@ -245,7 +236,9 @@ def _consume_openai_sse(
 ) -> Iterator[LLMStreamEvent]:
     thinking_fields = tuple(dict.fromkeys(thinking_delta_fields))
     thinking_parts: dict[str, list[str]] = {name: [] for name in thinking_fields}
-    role, parts, tool_acc = "assistant", [], {}
+    role = "assistant"
+    parts: list[str] = []
+    tool_acc: dict[int, _ToolCallAcc] = {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
     finish_reason: str | None = None
@@ -310,22 +303,22 @@ def _consume_openai_sse(
                     if isinstance(fn, dict) and isinstance(fn.get("arguments"), str) and fn["arguments"]
                     else ""
                 )
-                acc = tool_acc.setdefault(idx, {"id": "", "name": "", "args": []})
+                acc = tool_acc.setdefault(idx, _ToolCallAcc())
                 if tc_id:
-                    acc["id"] = tc_id
+                    acc.id = tc_id
                 if fn_name:
-                    acc["name"] = f"{acc['name']}{fn_name}"
+                    acc.name = f"{acc.name}{fn_name}"
                 if fn_args:
-                    acc["args"].append(fn_args)  # type: ignore[attr-defined]
+                    acc.args.append(fn_args)
 
     full_text = "".join(parts)
     calls = [
         ToolCall(
-            id=str(a["id"]) or f"call_{slot_idx}",
-            name=str(a["name"]),
-            arguments="".join(a["args"]) or "{}",  # type: ignore[arg-type]
+            id=acc.id or f"call_{slot_idx}",
+            name=acc.name,
+            arguments="".join(acc.args) or "{}",
         ).to_openai_dict()
-        for slot_idx, a in sorted(tool_acc.items())
+        for slot_idx, acc in sorted(tool_acc.items())
     ]
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
     if calls:
@@ -342,12 +335,14 @@ def _consume_openai_sse(
     )
 
 
-# 打开 OpenAI 兼容 SSE 流；若首包前因 stream_options 不兼容返回 HTTP 400 则自动去掉该参数重试一次
+# 打开 OpenAI 兼容 SSE 流；首包前若明确因 stream_options/include_usage 返回 400 则记录不支持并去参数重试一次
 def _open_openai_stream(
     post_stream: PostStream,
     url: str,
     payload: dict[str, object],
     headers: dict[str, str],
+    *,
+    on_stream_options_unsupported: Callable[[], None] | None = None,
 ) -> Iterator[str]:
     yielded_any = False
     try:
@@ -355,17 +350,17 @@ def _open_openai_stream(
             yielded_any = True
             yield line
     except HTTPError as error:
-        if error.code != 400 or yielded_any or "stream_options" not in payload:
-            _attach_http_error_body(error)
-            raise
-        if not _should_fallback_without_stream_options(error):
-            raise
+        formatted_error, error_text = _format_http_error(error)
+        if error.code != 400 or yielded_any or "stream_options" not in payload or not _is_stream_options_incompat(error_text):
+            raise formatted_error from error
+        if on_stream_options_unsupported is not None:
+            on_stream_options_unsupported()
         fallback_payload = {k: v for k, v in payload.items() if k != "stream_options"}
         try:
             yield from post_stream(url, fallback_payload, headers)
         except HTTPError as retry_error:
-            _attach_http_error_body(retry_error)
-            raise
+            formatted_retry, _ = _format_http_error(retry_error)
+            raise formatted_retry from retry_error
 
 
 # 大模型客户端抽象基类，供上层 Agent 循环或独立脚本调用
@@ -380,7 +375,7 @@ class LLMClient(ABC):
         tools: list[dict[str, object]] | None = None,
     ) -> dict[str, object]: ...
 
-    # 流式发送对话历史与工具定义并吐出 ThinkingDelta / TextDelta / StreamDone 事件；未重写时自动包装同步 respond()
+    # 流式发送对话历史与工具定义并吐出 TextDelta / StreamDone 事件；未重写时自动包装同步 respond()
     def stream(
         self,
         messages: list[dict[str, object]],
@@ -389,16 +384,11 @@ class LLMClient(ABC):
         t0 = time.perf_counter()
         msg = self.respond(messages, tools)
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
-        raw_usage = getattr(self, "last_usage", None)
-        usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
-        reasoning = msg.get("reasoning_content")
+        usage = self.last_usage if isinstance(self.last_usage, TokenUsage) else None
         content = msg.get("content")
         tool_calls = msg.get("tool_calls") or []
         ttft_ms: float | None = None
-        if isinstance(reasoning, str) and reasoning:
-            ttft_ms = elapsed_ms
-            yield ThinkingDelta(text=reasoning)
-        if isinstance(content, str) and content and not tool_calls:
+        if isinstance(content, str) and content:
             ttft_ms = elapsed_ms
             yield TextDelta(text=content)
         elif tool_calls:
@@ -428,6 +418,7 @@ class OpenAIChatClient(LLMClient):
     post_json: PostJson = field(default=default_post_json, kw_only=True)
     post_stream: PostStream = field(default=default_post_stream, kw_only=True)
     _usage_local: threading.local = field(default_factory=threading.local, init=False, repr=False)
+    _stream_usage_supported: bool = field(default=True, init=False, repr=False)
 
     # 读取当前线程最近一次调用记录的 Token 统计（避免多线程共享客户端串台）
     @property
@@ -438,6 +429,10 @@ class OpenAIChatClient(LLMClient):
     @last_usage.setter
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
+
+    # 记录当前端点不支持 stream_options，后续流式调用直接跳过该字段
+    def _disable_stream_usage(self) -> None:
+        self._stream_usage_supported = False
 
     # 预处理发往接口的消息列表（默认返回浅拷贝列表，子类可按协议边界重写）
     def _prepare_messages(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -469,7 +464,7 @@ class OpenAIChatClient(LLMClient):
             **self._extra_payload(),
             "stream": stream,
         }
-        if stream:
+        if stream and self._stream_usage_supported:
             payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = tools
@@ -513,7 +508,13 @@ class OpenAIChatClient(LLMClient):
         url, payload, headers = self._build_request(messages, tools, stream=True)
         self.last_usage = None
         t0 = time.perf_counter()
-        lines = _open_openai_stream(self.post_stream, url, payload, headers)
+        lines = _open_openai_stream(
+            self.post_stream,
+            url,
+            payload,
+            headers,
+            on_stream_options_unsupported=self._disable_stream_usage,
+        )
         for event in _consume_openai_sse(lines, t0, thinking_delta_fields=self._thinking_delta_fields()):
             if isinstance(event, StreamDone):
                 event = StreamDone(
@@ -537,15 +538,13 @@ class OpenAICompatibleLLM(OpenAIChatClient):
         return {"temperature": self.temperature}
 
 
-# 默认内建 OpenAI 兼容 Provider 构造器
-def _build_openai_compatible(env: Mapping[str, str]) -> LLMClient:
-    raw_temp = env.get("LLM_TEMPERATURE", "").strip()
-    temp = float(raw_temp) if raw_temp else 0.2
+# 默认内建 OpenAI 兼容 Provider 构造器：直接读取已实化的 ModelProfile 字段
+def _build_openai_compatible(profile: ModelProfile) -> LLMClient:
     return OpenAICompatibleLLM(
-        api_key=env.get("LLM_API_KEY", "").strip(),
-        base_url=env.get("LLM_BASE_URL", "").strip() or "https://api.deepseek.com/v1",
-        model=env.get("LLM_MODEL", "").strip() or "deepseek-chat",
-        temperature=temp,
+        api_key=profile.api_key,
+        base_url=profile.base_url,
+        model=profile.model,
+        temperature=profile.temperature,
     )
 
 
@@ -555,7 +554,7 @@ _PROVIDERS: dict[str, ProviderFactory] = {
 }
 
 
-# 注册自定义大模型厂商 Provider 工厂（支持外部插件扩展非 OpenAI 原生协议，不改动核心循环）
+# 注册自定义大模型厂商 Provider 工厂（支持外部插件显式扩展非 OpenAI 原生协议）
 def register_provider(name: str, factory: ProviderFactory) -> None:
     key = name.strip().lower()
     if not key or not callable(factory):
@@ -563,61 +562,53 @@ def register_provider(name: str, factory: ProviderFactory) -> None:
     _PROVIDERS[key] = factory
 
 
-# 返回当前所有已注册的 Provider 名称列表
+# 返回当前所有全局已注册的 Provider 名称列表
 def available_providers() -> list[str]:
     return sorted(_PROVIDERS)
 
 
-# 从环境变量读取配置并按 LLM_PROVIDER 分发构造 LLMClient（未开启则返回 NoopLLMClient）
-def from_env(env: Mapping[str, str] | None = None) -> LLMClient:
-    source = os.environ if env is None else env
-    mode = source.get("LLM_MODE", "off").strip().lower() or "off"
-    api_key = source.get("LLM_API_KEY", "").strip()
-    if mode != "on" or not api_key:
-        return NoopLLMClient()
-    provider = source.get("LLM_PROVIDER", "openai_compatible").strip().lower() or "openai_compatible"
-    factory = _PROVIDERS.get(provider)
-    if factory is None:
-        raise ValueError(
-            f"未知 LLM_PROVIDER={provider!r}，可用 Provider：{', '.join(available_providers())}"
-        )
-    return factory(source)
-
-
-# 根据单个 ModelProfile 构造对应的 LLMClient（统一复用已注册 Provider，支持直写密钥免配环境变量）
+# 根据单个 ModelProfile 直通构造对应的 LLMClient（优先查局部 providers，再查全局 _PROVIDERS）
 def from_model_profile(
     profile: ModelProfile,
     *,
     env: Mapping[str, str] | None = None,
+    providers: Mapping[str, ProviderFactory] | None = None,
 ) -> LLMClient:
     api_key = profile.resolve_api_key(env)
     if not api_key:
         return NoopLLMClient()
-    factory = _PROVIDERS.get(profile.provider)
-    if factory is None:
-        raise ValueError(
-            f"模型 {profile.name!r} 使用了未知 provider={profile.provider!r}，可用：{', '.join(available_providers())}"
-        )
-    merged: dict[str, str] = dict(os.environ if env is None else env)
-    merged.update(
-        {
-            "LLM_MODE": "on",
-            "LLM_PROVIDER": profile.provider,
-            "LLM_API_KEY": api_key,
-            "LLM_BASE_URL": profile.base_url,
-            "LLM_MODEL": profile.model,
-            "LLM_TEMPERATURE": str(profile.temperature),
-        }
+    provider_key = profile.provider.strip().lower() or "openai_compatible"
+    local_providers = (
+        {name.strip().lower(): factory for name, factory in providers.items()} if providers is not None else {}
     )
-    return factory(merged)
+    factory = local_providers.get(provider_key) or _PROVIDERS.get(provider_key)
+    if factory is None:
+        all_names = sorted(set(_PROVIDERS) | set(local_providers))
+        raise ValueError(
+            f"模型 {profile.name!r} 使用了未知 provider={provider_key!r}，可用：{', '.join(all_names)}"
+        )
+    resolved_profile = replace(profile, provider=provider_key, api_key=api_key)
+    return factory(resolved_profile)
 
 
-# 从标准 models.json 字典与可选模型名直接构造 LLMClient
-def from_models_dict(
-    raw: dict[str, object],
-    *,
-    profile_name: str | None = None,
+# 从环境变量提取字段构造 ModelProfile 后直接委派给 from_model_profile（未开启则返回 NoopLLMClient）
+def from_env(
     env: Mapping[str, str] | None = None,
+    *,
+    providers: Mapping[str, ProviderFactory] | None = None,
 ) -> LLMClient:
-    cfg = ModelsConfig.from_dict(raw)
-    return from_model_profile(cfg.get_profile(profile_name), env=env)
+    source = os.environ if env is None else env
+    mode = source.get("LLM_MODE", "off").strip().lower() or "off"
+    if mode != "on":
+        return NoopLLMClient()
+    raw_temp = source.get("LLM_TEMPERATURE", "").strip()
+    temp = float(raw_temp) if raw_temp else 0.2
+    profile = ModelProfile(
+        name="env",
+        provider=source.get("LLM_PROVIDER", "openai_compatible").strip().lower() or "openai_compatible",
+        base_url=source.get("LLM_BASE_URL", "").strip() or "https://api.deepseek.com/v1",
+        model=source.get("LLM_MODEL", "").strip() or "deepseek-chat",
+        api_key=source.get("LLM_API_KEY", "").strip(),
+        temperature=temp,
+    )
+    return from_model_profile(profile, env=source, providers=providers)

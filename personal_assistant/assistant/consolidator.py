@@ -7,14 +7,13 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from time import perf_counter
-from zoneinfo import ZoneInfo
 
-from personal_assistant.agent.react import TaskEvent
+from personal_assistant.agent.plugins import TaskEvent
 from personal_assistant.ai.client import LLMClient, NoopLLMClient
 from personal_assistant.ai.types import TokenUsage
-from personal_assistant.assistant.common import format_date_with_weekday
+from personal_assistant.assistant.common import format_date_with_weekday, today_shanghai
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
 
@@ -183,11 +182,7 @@ class MemoryConsolidator:
         ref_day = (
             today
             if today is not None
-            else (
-                self._today_fn()
-                if self._today_fn is not None
-                else datetime.now(ZoneInfo("Asia/Shanghai")).date()
-            )
+            else (self._today_fn() if self._today_fn is not None else today_shanghai())
         )
 
         # 沉淀前先零成本归档已过期的临时记忆，避免把过期条目再喂给模型
@@ -235,32 +230,32 @@ class MemoryConsolidator:
                 if not ops:
                     continue
                 try:
-                    with self.memory._write_lock:
-                        saved = self.memory.apply_memory_operations(
-                            topic,
-                            title,
-                            index_summary,
-                            ops,
-                            today=ref_day,
-                            applied_texts=applied_texts,
-                        )
+                    saved = self.memory.apply_memory_operations(
+                        topic,
+                        title,
+                        index_summary,
+                        ops,
+                        today=ref_day,
+                        applied_texts=applied_texts,
+                    )
                 except ValueError:
                     continue
                 if saved and saved not in saved_files:
                     saved_files.append(saved)
 
         # 兜底清理 facts.md 中已被本次沉淀实际落盘吸收的原始 (msg#...) 幽灵行，避免临时事实漏过期
-        batch_ids = {int(msg["id"]) for msg in batch if msg.get("id") is not None}
+        batch_ids = {int(msg["id"]) for msg in batch if isinstance(msg.get("id"), int)}
         if applied_texts:
             self.memory.prune_consolidated_raw_facts(batch_ids, applied_texts)
 
         # 只有长期记忆文件落盘与摘要解析均成功后，才推进 SQLite 压缩游标
-        cutoff_id = int(batch[-1]["id"])
-        self.state.save_compaction(chat_id, summary, cutoff_id)
+        last_id = batch[-1].get("id")
+        assert isinstance(last_id, int)
+        self.state.save_compaction(chat_id, summary, last_id)
         return ConsolidationResult(
             chat_id=chat_id,
             compacted_messages=len(batch),
-            compacted_until_id=cutoff_id,
+            compacted_until_id=last_id,
             saved_files=tuple(saved_files),
             summary=summary,
         )
@@ -358,7 +353,7 @@ class BackgroundConsolidator:
         finally:
             try:
                 if self.on_event is not None and (result is not None or err_text is not None):
-                    raw_usage = getattr(self.consolidator.llm, "last_usage", None)
+                    raw_usage = self.consolidator.llm.last_usage
                     details = (
                         {
                             "compacted_messages": result.compacted_messages,

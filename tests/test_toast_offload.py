@@ -23,6 +23,8 @@ def test_truncate_or_offload_passthrough_and_validation(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="max_bytes"):
         truncate_or_offload("abc", max_bytes=0, offload_dir=offload_dir)
+    with pytest.raises(ValueError, match="max_bytes"):
+        truncate_or_offload("abc", max_bytes=True, offload_dir=offload_dir)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="mode"):
         truncate_or_offload("abc" * 100, max_bytes=10, mode="invalid", offload_dir=offload_dir)
 

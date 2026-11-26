@@ -40,16 +40,6 @@ class CallCacheRecord:
     prefix_reuse_rate: float | None
     usage: TokenUsage | None = None
 
-    # 转换为便于日志与评测报告输出的字典
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "session_key": self.session_key,
-            "prefix_chars": self.prefix_chars,
-            "total_chars": self.total_chars,
-            "prefix_reuse_rate": self.prefix_reuse_rate,
-            "usage": self.usage.to_dict() if self.usage is not None else None,
-        }
-
 
 # 校验有界容量参数为正整数（排除布尔值）
 def _validate_positive_int(value: int, name: str) -> int:
@@ -182,7 +172,7 @@ class CacheMonitor:
                 self._total_prefix_rate_sum += Fraction(reuse_rate)
             return entry
 
-    # 汇总从 since 位置起的调用统计（支持按 session_key 切片隔离；since=0 且未指定会话时走 O(1) 全局累计）
+    # 汇总从非负游标 since 位置起的调用统计（支持按 session_key 切片隔离；since=0 且未指定会话时走 O(1) 全局累计）
     def summary(
         self,
         since: int = 0,
@@ -199,10 +189,8 @@ class CacheMonitor:
                     warm_calls=self._total_warm_calls,
                     prefix_rate_sum=self._total_prefix_rate_sum,
                 )
-            if since == 0:
+            if since <= 0:
                 snapshot = list(self._records)
-            elif since < 0:
-                snapshot = list(self._records)[since:]
             else:
                 window_start = self._total_recorded - len(self._records)
                 offset = max(0, since - window_start)
@@ -216,7 +204,7 @@ class CacheMonitor:
         return TrackingLLMClient(llm, self, session_key=session_key)
 
 
-# 透明代理客户端：在每次 respond 前后采样请求前缀与服务端 usage
+# 透明代理客户端：在每次 respond/stream 前后采样请求前缀与服务端 usage
 class TrackingLLMClient(LLMClient):
     # 绑定底层模型客户端、监控器与所属会话标识
     def __init__(
@@ -250,7 +238,7 @@ class TrackingLLMClient(LLMClient):
         serialized = serialize_request(messages, tools)
         self.last_usage = None
         reply = self.inner.respond(messages, tools)
-        raw_usage = getattr(self.inner, "last_usage", None)
+        raw_usage = self.inner.last_usage
         usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
         self.last_usage = usage
         self.monitor.record(self.session_key, serialized, usage)
@@ -267,11 +255,7 @@ class TrackingLLMClient(LLMClient):
         recorded = False
         for event in self.inner.stream(messages, tools):
             if isinstance(event, StreamDone) and not recorded:
-                raw_usage = (
-                    event.usage
-                    if isinstance(event.usage, TokenUsage)
-                    else getattr(self.inner, "last_usage", None)
-                )
+                raw_usage = event.usage if isinstance(event.usage, TokenUsage) else self.inner.last_usage
                 usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
                 self.last_usage = usage
                 self.monitor.record(self.session_key, serialized, usage)

@@ -873,9 +873,10 @@
         const optionsHtml = presets
           .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}（默认：${escapeHtml(p.default_model)}）</option>`)
           .join("") + `<option value="custom">自定义 OpenAI 兼容接口</option>`;
+        const consRole = data.configured && data.configured.roles && data.configured.roles.consolidator;
         const configuredText = data.configured
           ? `当前已生效默认模型：${escapeHtml(data.configured.default)}${
-              data.configured.consolidator ? `（后台沉淀：${escapeHtml(data.configured.consolidator)}）` : ""
+              consRole ? `（后台沉淀：${escapeHtml(consRole)}）` : ""
             }`
           : "尚未配置模型，填好下面两项即可直接使用。";
 

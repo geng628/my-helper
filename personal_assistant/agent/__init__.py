@@ -9,11 +9,11 @@ from personal_assistant.agent.plugins import (
     PluginManager,
     RetrieverFactory,
     RetrieverProtocol,
+    RuntimeEvent,
+    TaskEvent,
 )
 from personal_assistant.agent.react import (
     AgentEvent,
-    RuntimeEvent,
-    TaskEvent,
     ToolStart,
     ToolStep,
     TurnEnd,
@@ -22,12 +22,13 @@ from personal_assistant.agent.react import (
 )
 from personal_assistant.agent.tools import (
     Tool,
-    ToolDocument,
     ToolMetadata,
     ToolRegistry,
     ToolsetProvider,
     bind_tool_context,
     build_tool,
+    extract_tool,
+    is_tool,
     tool,
 )
 
@@ -45,7 +46,6 @@ __all__ = [
     "RuntimeEvent",
     "TaskEvent",
     "Tool",
-    "ToolDocument",
     "ToolMetadata",
     "ToolRegistry",
     "ToolStart",
@@ -54,6 +54,8 @@ __all__ = [
     "TurnEnd",
     "bind_tool_context",
     "build_tool",
+    "extract_tool",
+    "is_tool",
     "iter_react",
     "run_react",
     "tool",

@@ -147,7 +147,7 @@ def evaluate_search(
     }
     return {
         "mode": "search",
-        "retriever": str(getattr(memory.retriever, "name", "linear")),
+        "retriever": memory.retriever.name,
         "git_commit": git_commit or current_git_commit(),
         "timestamp": datetime.now(UTC).isoformat(),
         "root": root,

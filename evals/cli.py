@@ -68,7 +68,7 @@ def _build_eval_llm(
 
 # 解析命令行参数、执行对应模式评测或公开数据集下载，输出汇总并按需保存 JSON 报告
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv(REPO_ROOT / ".env")
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="My Helper 评测运行器（search 离线检索 / agent 单轮 / memory 多轮记忆 / download 下载公开基准）"
     )

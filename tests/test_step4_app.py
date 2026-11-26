@@ -35,7 +35,8 @@ def test_state_store_persistence_and_isolation(tmp_path: Path) -> None:
             store.append_message("chat-a", role, f"msg-{idx}")
         store.append_message("chat-b", "user", "hello-b")
 
-        recent_a = store.recent_messages("chat-a", limit=12)
+        assert not hasattr(store, "recent_messages")
+        recent_a = store.active_messages("chat-a", limit=12)
         assert [m["content"] for m in recent_a] == [f"msg-{i}" for i in range(3, 15)]
         assert store.count_messages("chat-a") == 15
         assert store.count_messages("chat-b") == 1
@@ -47,7 +48,7 @@ def test_state_store_persistence_and_isolation(tmp_path: Path) -> None:
     reopened = StateStore(db_path)
     try:
         assert reopened.count_messages("chat-a") == 15
-        assert reopened.recent_messages("chat-b", limit=5)[0]["content"] == "hello-b"
+        assert reopened.active_messages("chat-b", limit=5)[0]["content"] == "hello-b"
     finally:
         reopened.close()
 
@@ -964,12 +965,11 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
     finally:
         app_trunc.close()
 
-    # 3. 验证 turn_ctx 注入 untrusted_tool_seen 回调（network 工具触发后翻 True、新轮次重置、未声明工具无感），且 close() 触发 plugin_manager.terminate_all()
+    # 3. 验证 turn_ctx 注入纯布尔 untrusted_tool_seen（network 工具触发后翻 True、新轮次重置、未声明工具无感），且 close() 触发 plugin_manager.terminate_all()
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "guard_probe.py").write_text(
         """
-from collections.abc import Callable
 from personal_assistant.agent.plugins import Plugin
 from personal_assistant.agent.tools import tool
 
@@ -980,11 +980,10 @@ TERMINATED = False
 def mock_net_fetch(url: str) -> str:
     return f"fetched:{url}"
 
-# 声明接收 untrusted_tool_seen 回调的本地执行探针
+# 声明接收 untrusted_tool_seen 布尔标记的本地执行探针
 @tool(description="读取当前回合是否出现过 network 工具", parameters={"tag": "标签"}, risk="exec")
-def probe_untrusted(tag: str, *, untrusted_tool_seen: Callable[[], bool] | None = None) -> str:
-    seen = untrusted_tool_seen() if untrusted_tool_seen is not None else "missing"
-    return f"{tag}:{seen}"
+def probe_untrusted(tag: str, *, untrusted_tool_seen: bool = False) -> str:
+    return f"{tag}:{untrusted_tool_seen}"
 
 # 记录 terminate 钩子调用的插件类
 class ProbeLifecyclePlugin(Plugin):
@@ -992,8 +991,8 @@ class ProbeLifecyclePlugin(Plugin):
 
     # 注册两个测试工具
     def initialize(self) -> None:
-        self.context.register_tool(mock_net_fetch, source_name="guard_probe")
-        self.context.register_tool(probe_untrusted, source_name="guard_probe")
+        self.context.register_tool(mock_net_fetch)
+        self.context.register_tool(probe_untrusted)
 
     # 标记 terminate 已被 AssistantApp.close() 调用
     def terminate(self) -> None:
@@ -1039,7 +1038,9 @@ class ProbeLifecyclePlugin(Plugin):
         llm=untrusted_llm,
         today_fn=lambda: logical_today,
     )
-    plugin_mod = app_plug.tools_config.plugin_manager.modules[0][1]  # type: ignore[union-attr]
+    import sys
+
+    plugin_mod = sys.modules[type(app_plug.tools_config.plugin_manager.plugins[0]).__module__]
     try:
         # 确认 MemoryConsolidator 绑定了 app._today
         assert app_plug.consolidator._today_fn is not None
@@ -1146,9 +1147,10 @@ class ProbeLifecyclePlugin(Plugin):
             r_errs: list[BaseException] = []
 
             # 模拟耗时构建主从模型对，并检测是否发生并发重入
-            def fake_from_env(env=None) -> LLMClient:
+            def fake_from_env(env=None, *, providers=None) -> LLMClient:
                 nonlocal active_reloads, max_concurrent_reloads, seq
-                if env is None:
+                is_cons = isinstance(env, dict) and env.get("LLM_MODEL") == "cons-m"
+                if not is_cons:
                     with probe_lock:
                         active_reloads += 1
                         max_concurrent_reloads = max(max_concurrent_reloads, active_reloads)
@@ -1164,7 +1166,7 @@ class ProbeLifecyclePlugin(Plugin):
                     active_reloads -= 1
                 return cons_obj
 
-            monkeypatch.setattr("personal_assistant.assistant.app.from_env", fake_from_env)
+            monkeypatch.setattr("personal_assistant.assistant.commands.from_env", fake_from_env)
             monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "cons-m")
 
             # 并发触发 reload_llm 并验证主模型与沉淀模型序号始终一致
@@ -1185,5 +1187,18 @@ class ProbeLifecyclePlugin(Plugin):
             assert app_reload.llm._reload_seq == app_reload.consolidator.llm._reload_seq  # type: ignore[attr-defined]
         finally:
             app_reload.close()
+
+        # 7. 验证 auto_consolidate=False 时即使超过活跃消息阈值也不会调度后台沉淀线程
+        no_bg_app = AssistantApp(
+            data_root=tmp_path / "no_bg_data",
+            llm=RecordingLLM([{"role": "assistant", "content": "ok1"}, {"role": "assistant", "content": "ok2"}]),
+            consolidation_policy=ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2),
+            auto_consolidate=False,
+        )
+        try:
+            assert no_bg_app.chat("第一句", chat_id="s-nobg")["consolidation_scheduled"] is False
+            assert no_bg_app.chat("第二句", chat_id="s-nobg")["consolidation_scheduled"] is False
+        finally:
+            no_bg_app.close()
     finally:
         app_conc.close()

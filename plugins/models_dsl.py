@@ -626,12 +626,14 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
         "models": emitted_models,
     }
     if program.consolidator_model is not None:
-        compiled["consolidator"] = _resolve_target_model(
-            program.consolidator_model,
-            emitted_models,
-            directive="consolidator",
-            source=source,
-        )
+        compiled["roles"] = {
+            "consolidator": _resolve_target_model(
+                program.consolidator_model,
+                emitted_models,
+                directive="consolidator",
+                source=source,
+            )
+        }
     return compiled
 
 
@@ -649,6 +651,8 @@ class ModelsDSLCompiler:
 
     # 按表单参数自动生成极简一行或块状 DSL 文本
     def render(self, **kwargs: object) -> str:
+        raw_temp = kwargs.get("temperature", 0.2)
+        temperature = float(raw_temp) if (not isinstance(raw_temp, bool) and isinstance(raw_temp, (int, float, str))) else 0.2
         return render_models_dsl(
             preset=str(kwargs.get("preset") or ""),
             api_key=str(kwargs.get("api_key") or ""),
@@ -656,7 +660,7 @@ class ModelsDSLCompiler:
             base_url=str(kwargs.get("base_url") or ""),
             name=str(kwargs.get("name") or ""),
             provider=str(kwargs.get("provider") or ""),
-            temperature=float(kwargs.get("temperature", 0.2)),  # type: ignore[arg-type]
+            temperature=temperature,
             consolidator=str(kwargs.get("consolidator") or ""),
         )
 

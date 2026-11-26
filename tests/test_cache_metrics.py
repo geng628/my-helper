@@ -312,7 +312,6 @@ def test_cache_monitor_bounded_eviction_and_exact_summaries() -> None:
     assert bounded.summary(since=turn_idx) == unbounded.summary(since=turn_idx)
     assert bounded.summary(since=turn_idx)["llm_calls"] == 3
     assert bounded.summary(since=bounded.snapshot_index())["llm_calls"] == 0
-    assert bounded.summary(since=-2) == unbounded.summary(since=-2)
 
     # 已被淘汰出 _last_serialized 的旧会话 s2 再次出现时，按冷启动处理且窗口上限不突破
     revisited = bounded.record("s2", "sys\nu2\na2\n", TokenUsage(prompt_tokens=130, cached_tokens=0, completion_tokens=13))

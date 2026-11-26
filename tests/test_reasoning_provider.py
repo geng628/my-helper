@@ -11,13 +11,13 @@ import pytest
 from personal_assistant.agent import PluginManager, ToolStart, ToolStep, TurnEnd
 from personal_assistant.ai import (
     LLMClient,
+    ModelProfile,
     OpenAIChatClient,
     OpenAICompatibleLLM,
     StreamDone,
     TextDelta,
     ThinkingDelta,
     TokenUsage,
-    available_providers,
 )
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
@@ -50,7 +50,7 @@ def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
     )
 
     tcfg = ToolsConfig.load(cfg_dir / "tools.json", project_root=REPO_ROOT)
-    assert "openai_reasoning" in available_providers()
+    assert "openai_reasoning" in tcfg.plugin_manager.providers
     assert any(p["id"] == "deepseek_reasoner" for p in tcfg.model_presets())
 
     app = build_app(data_root=tmp_path / "data", config_root=cfg_dir, project_root=REPO_ROOT)
@@ -75,7 +75,15 @@ def test_openai_reasoning_llm_wire_protocol_and_sse_parsing() -> None:
 
     provider = OpenAIReasoningProvider()
     assert provider.name == PROVIDER_NAME
-    built = provider.build({"LLM_API_KEY": "sk-env-r1", "LLM_BASE_URL": "https://api.deepseek.com/v1"})
+    built = provider.build(
+        ModelProfile(
+            name="r1",
+            provider="openai_reasoning",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+            api_key="sk-env-r1",
+        )
+    )
     assert isinstance(built, OpenAIReasoningLLM)
     assert built.model == "deepseek-reasoner"
 
@@ -91,7 +99,7 @@ def test_openai_reasoning_llm_wire_protocol_and_sse_parsing() -> None:
         captured_requests.append(payload)
         if stream_attempts == 1:
             assert "stream_options" in payload
-            raise HTTPError(url, 400, "stream_options unsupported", None, io.BytesIO(b""))  # type: ignore[arg-type]
+            raise HTTPError(url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"stream_options unsupported"}'))
         assert "stream_options" not in payload
         lines = [
             'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"先梳理步骤"}}]}\n',
@@ -288,8 +296,24 @@ def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path
 def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
     from plugins.reasoning_provider import OpenAIReasoningLLM, OpenAIReasoningProvider
 
-    # 1. env 中传入空字符串时必须回退默认 base_url 与 model，且 OpenAIReasoningLLM 与底座构造签名对称
-    built = OpenAIReasoningProvider().build({"LLM_API_KEY": " sk-k ", "LLM_BASE_URL": "  ", "LLM_MODEL": ""})
+    # 1. ModelProfile.from_dict + from_model_profile 归一化字段后直通 OpenAIReasoningProvider.build，且构造签名对称
+    from personal_assistant.ai import from_model_profile
+
+    profile = ModelProfile.from_dict(
+        "r1",
+        {
+            "provider": "openai_reasoning",
+            "base_url": " https://api.deepseek.com/v1 ",
+            "model": " deepseek-reasoner ",
+            "api_key": " sk-k ",
+        },
+    )
+    built = from_model_profile(
+        profile,
+        providers={
+            "openai_reasoning": OpenAIReasoningProvider().build,
+        },
+    )
     assert isinstance(built, OpenAIReasoningLLM)
     assert built.api_key == "sk-k"
     assert built.base_url == "https://api.deepseek.com/v1"

@@ -1,11 +1,10 @@
 """推理模型协议插件（Slot 4 LLMProviderProtocol）：支持 DeepSeek Reasoner / R1 等 reasoning_content 协议模型。"""
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 from personal_assistant.agent.plugins import Plugin
-from personal_assistant.ai import LLMClient, OpenAIChatClient
+from personal_assistant.ai import LLMClient, ModelProfile, OpenAIChatClient
 
 PROVIDER_NAME = "openai_reasoning"
 
@@ -51,12 +50,12 @@ class OpenAIReasoningLLM(OpenAIChatClient):
 class OpenAIReasoningProvider:
     name = PROVIDER_NAME
 
-    # 按统一环境变量/Profile 映射构建 OpenAIReasoningLLM 实例
-    def build(self, env: Mapping[str, str]) -> LLMClient:
+    # 直接读取已实化 ModelProfile 的 api_key / base_url / model 字段构造 OpenAIReasoningLLM
+    def build(self, profile: ModelProfile) -> LLMClient:
         return OpenAIReasoningLLM(
-            api_key=env.get("LLM_API_KEY", "").strip(),
-            base_url=env.get("LLM_BASE_URL", "").strip() or "https://api.deepseek.com/v1",
-            model=env.get("LLM_MODEL", "").strip() or "deepseek-reasoner",
+            api_key=profile.api_key,
+            base_url=profile.base_url,
+            model=profile.model,
         )
 
 

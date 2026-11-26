@@ -50,8 +50,12 @@ class HistorySearchConfig:
         raw_bm25 = cfg.get("min_bm25_score", 0.1)
         if isinstance(raw_cov, bool) or isinstance(raw_bm25, bool):
             raise ValueError("retrieval 阈值参数不能为布尔值。")
-        coverage = 0.22 if raw_cov is None else float(raw_cov)  # type: ignore[arg-type]
-        min_bm25 = 0.1 if raw_bm25 is None else float(raw_bm25)  # type: ignore[arg-type]
+        if raw_cov is not None and not isinstance(raw_cov, (int, float, str)):
+            raise TypeError("retrieval.min_term_coverage 必须是数字。")
+        if raw_bm25 is not None and not isinstance(raw_bm25, (int, float, str)):
+            raise TypeError("retrieval.min_bm25_score 必须是数字。")
+        coverage = 0.22 if raw_cov is None else float(raw_cov)
+        min_bm25 = 0.1 if raw_bm25 is None else float(raw_bm25)
         return cls(min_term_coverage=coverage, min_bm25_score=min_bm25)
 
 

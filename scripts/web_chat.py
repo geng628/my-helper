@@ -363,7 +363,7 @@ def create_web_server(
                 self._send_security_headers()
                 self.end_headers()
                 try:
-                    with contextlib.closing(frames):  # type: ignore[arg-type]
+                    with contextlib.closing(frames):
                         for frame in frames:
                             self._send_sse_frame(frame)
                 except (BrokenPipeError, ConnectionResetError):
@@ -415,7 +415,7 @@ def create_web_server(
 
 # 命令行启动入口：加载 .env、启动本地网页服务并在 Ctrl+C 时优雅收尾后台沉淀任务
 def main(argv: list[str] | None = None) -> None:
-    load_dotenv(REPO_ROOT / ".env")
+    load_dotenv()
     parser = argparse.ArgumentParser(description="启动 My Helper 本地网页对话界面（纯标准库，无需额外插件）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")

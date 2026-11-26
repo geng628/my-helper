@@ -1,8 +1,7 @@
-"""文件访问白名单策略与原子写入原语（零内部依赖）。"""
+"""文件访问白名单策略与受保护 Inode 校验底座（零内部依赖）。"""
 from __future__ import annotations
 
 import os
-import tempfile
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -17,7 +16,7 @@ def normalize_segment(part: str) -> str:
     return unicodedata.normalize("NFKC", cleaned).casefold()
 
 
-# 判断单个路径段是否命中受保护敏感名称（仅精确放行 .env.example）
+# 判断单个路径段是否命中受保护敏感名称（仅精确放行 .env.example，并屏蔽 .env.* 与原子写盘 .tmp-* 暂存文件）
 def is_sensitive_segment(part: str, reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS) -> bool:
     if part == ".env.example":
         return False
@@ -25,7 +24,7 @@ def is_sensitive_segment(part: str, reject_segments: tuple[str, ...] = DEFAULT_R
     if not folded:
         return True
     rejected = {normalize_segment(seg) for seg in reject_segments}
-    return folded in rejected or folded.startswith(".env.") or folded.startswith(".tmp-models-")
+    return folded in rejected or folded.startswith((".env.", ".tmp-"))
 
 
 # 安全记录路径自身（lstat）与解引用目标（stat）的设备号与 Inode 元组
@@ -103,7 +102,7 @@ def _positive_int(value: object, default: int, name: str) -> int:
     return value
 
 
-# 将配置相对目录安全解析为绝对路径，data/* 前缀自动映射到自定义 data_root
+# 将配置相对目录安全解析为绝对路径（纯计算无 mkdir 副作用，data/* 自动映射到自定义 data_root）
 def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | None) -> Path:
     if not isinstance(entry, str) or not entry.strip():
         raise ValueError("目录配置必须是非空字符串。")
@@ -115,7 +114,6 @@ def _resolve_config_dir(entry: object, project_root: Path, data_root: Path | Non
         target = resolved_data / (Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path("."))
         if not target.resolve().is_relative_to(resolved_data):
             raise ValueError(f"目录配置超出 data_root 范围：{entry}")
-        target.mkdir(parents=True, exist_ok=True)
         return target
     target = project_root / rel
     if not target.resolve().is_relative_to(project_root.resolve()):
@@ -161,33 +159,32 @@ class FilesPolicy:
             reject_segments=tuple(raw_rejects),
         )
 
-    # 整理允许根目录的（逻辑路径、真实路径、展示前缀、短别名）映射表
-    def build_roots(self, data_root: Path) -> list[tuple[Path, Path, str, str]]:
+    # 整理允许根目录的（逻辑路径、真实路径、规范展示前缀）映射表
+    def build_roots(self, data_root: Path) -> list[tuple[Path, Path, str]]:
         seen: set[Path] = set()
-        entries: list[tuple[Path, Path, str, str]] = []
+        entries: list[tuple[Path, Path, str]] = []
         for raw in (*self.read_roots, self.write_root):
             resolved = raw.resolve()
             if resolved not in seen:
                 seen.add(resolved)
-                entries.append((raw, resolved, *self.root_labels(raw, data_root)))
+                entries.append((raw, resolved, self.root_label(raw, data_root)))
         return entries
 
-    # 计算单个允许根目录的标准展示路径（如 data/memory）与简写别名（如 memory）
-    def root_labels(self, raw_root: Path, data_root: Path) -> tuple[str, str]:
+    # 计算单个允许根目录的规范相对展示路径（如 data/memory、data/workspace、docs）
+    def root_label(self, raw_root: Path, data_root: Path) -> str:
         for base, prefix in ((data_root.resolve(), "data"), (self.project_root.resolve(), "")):
             if raw_root.is_relative_to(base):
                 rel = raw_root.relative_to(base)
                 if prefix:
-                    return (("data" / rel).as_posix() if rel.parts else "data"), (rel.as_posix() if rel.parts else "")
-                display = rel.as_posix() if rel.parts else "."
-                return display, display
-        return raw_root.name, raw_root.name
+                    return ("data" / rel).as_posix() if rel.parts else "data"
+                return rel.as_posix() if rel.parts else "."
+        return raw_root.name
 
-    # 按允许根目录把磁盘绝对路径格式化为统一的相对展示路径
+    # 按允许根目录把磁盘绝对路径格式化为统一的规范相对展示路径
     def to_display_path(
-        self, resolved: Path, data_root: Path, *, roots: list[tuple[Path, Path, str, str]] | None = None
+        self, resolved: Path, data_root: Path, *, roots: list[tuple[Path, Path, str]] | None = None
     ) -> str:
-        for _, root_resolved, display_prefix, _ in roots or self.build_roots(data_root):
+        for _, root_resolved, display_prefix in roots or self.build_roots(data_root):
             if resolved.is_relative_to(root_resolved):
                 rel = resolved.relative_to(root_resolved)
                 return f"{display_prefix}/{rel.as_posix()}" if rel.parts else display_prefix
@@ -217,7 +214,7 @@ class FilesPolicy:
         data_root: Path,
         *,
         write: bool = False,
-        roots: list[tuple[Path, Path, str, str]] | None = None,
+        roots: list[tuple[Path, Path, str]] | None = None,
     ) -> Path:
         if not isinstance(rel_path, str) or not rel_path.strip() or "\x00" in rel_path:
             raise ValueError("路径必须是非空字符串。")
@@ -235,7 +232,7 @@ class FilesPolicy:
         self,
         rel: Path,
         data_root: Path,
-        roots: list[tuple[Path, Path, str, str]],
+        roots: list[tuple[Path, Path, str]],
         stop_roots: list[Path],
         protected_inodes: set[tuple[int, int]],
     ) -> Path:
@@ -264,31 +261,22 @@ class FilesPolicy:
             raise ValueError("禁止访问受保护路径。")
         owner = next((rr for rr in read_roots if resolved.is_relative_to(rr)), None)
         if owner is None:
-            allowed = "、".join(self.root_labels(r, data_root)[0] for r in self.read_roots)
+            allowed = "、".join(self.root_label(r, data_root) for r in self.read_roots)
             raise ValueError(f"路径不在允许读取的目录内；允许范围：{allowed}")
         self.check_segments(resolved.relative_to(owner).parts)
         return resolved
 
-    # 解析并校验写入路径：限制在 write_root 内且禁止符号链接组件与受保护 Inode
+    # 解析并校验写入路径：支持 data/workspace/<subpath> 或工作区内相对路径，拦截 data/<非workspace> 与符号链接
     def _resolve_write_path(
         self, rel: Path, data_root: Path, stop_roots: list[Path], protected_inodes: set[tuple[int, int]]
     ) -> Path:
         parts = rel.parts
         write_resolved = self.write_root.resolve()
-        write_display, write_alias = self.root_labels(self.write_root, data_root)
+        write_display = self.root_label(self.write_root, data_root)
         d_parts = Path(write_display).parts
-        a_parts = Path(write_alias).parts if write_alias else ()
-        if parts[: len(d_parts)] == d_parts:
+        if d_parts and parts[: len(d_parts)] == d_parts:
             sub = Path(*parts[len(d_parts) :])
-        elif a_parts and parts[: len(a_parts)] == a_parts:
-            sub = Path(*parts[len(a_parts) :])
-        elif parts and (
-            parts[0] == "data"
-            or any(
-                parts[: len(Path(disp).parts)] == Path(disp).parts or (al and parts[0] == Path(al).parts[0])
-                for disp, al in (self.root_labels(r, data_root) for r in self.read_roots)
-            )
-        ):
+        elif parts and parts[0] == "data":
             raise ValueError(f"只能写入 {write_display} 目录。")
         else:
             sub = rel
@@ -311,27 +299,15 @@ class FilesPolicy:
         self.check_segments(resolved.relative_to(write_resolved).parts)
         return resolved
 
-    # 将用户传入的读取相对路径（支持简写别名）映射到候选磁盘路径
-    def _map_read_candidate(self, rel: Path, data_root: Path, roots: list[tuple[Path, Path, str, str]]) -> Path:
+    # 将用户传入的规范相对读取路径映射到候选磁盘路径
+    def _map_read_candidate(
+        self, rel: Path, data_root: Path, roots: list[tuple[Path, Path, str]]
+    ) -> Path:
         parts = rel.parts
-        for raw_root, _, display_prefix, short_alias in roots:
-            for prefix in (display_prefix, short_alias):
-                if prefix and parts[: len(Path(prefix).parts)] == Path(prefix).parts:
-                    return raw_root / Path(*parts[len(Path(prefix).parts) :])
+        for raw_root, _, display_prefix in roots:
+            p_parts = Path(display_prefix).parts
+            if p_parts and parts[: len(p_parts)] == p_parts:
+                return raw_root / Path(*parts[len(p_parts) :])
         if parts and parts[0] == "data":
             return data_root.resolve() / Path(*parts[1:])
         return self.project_root.resolve() / rel
-
-
-# 通过同目录临时文件与 os.replace 实现原子写入，防止半写损坏目标文件
-def _atomic_write(target: Path, content: str) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_path, target)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise

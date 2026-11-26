@@ -7,31 +7,22 @@ import re
 import shutil
 import threading
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from personal_assistant.assistant.common import truncate_utf8
-from personal_assistant.assistant.files_policy import (
-    FilesPolicy,
-    _atomic_write,
-)
+from personal_assistant.agent.plugins import RetrieverProtocol
+from personal_assistant.assistant.common import atomic_write_text, now_shanghai, today_shanghai, truncate_utf8
+from personal_assistant.assistant.files_policy import FilesPolicy, is_sensitive_segment
 from personal_assistant.assistant.memory_lifecycle import (
-    apply_topic_operations,
-    archive_expired_topics,
-    is_line_expired as _is_line_expired,
-    prune_raw_facts_for_batch,
-    read_topic_snapshots as _read_topic_snapshots,
-    today_shanghai as _today_shanghai,
+    apply_topic_operations, archive_expired_topics, is_line_expired as _is_line_expired,
+    prune_raw_facts_for_batch, read_topic_snapshots as _read_topic_snapshots,
 )
 
+_atomic_write = atomic_write_text
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
-__all__ = [
-    "MAX_SEARCH_FILE_BYTES",
-    "MemoryStore",
-    "SearchHit",
-]
+__all__ = ["LinearRetriever", "MAX_SEARCH_FILE_BYTES", "MemoryStore", "SearchHit"]
 
 
 # 从中英文查询语句提取主检索词（primary）与中文二元组兜底词（secondary）
@@ -65,19 +56,48 @@ class SearchHit:
     score: float
 
 
+# 内置零索引线性扫描检索器（实现 RetrieverProtocol，作为默认无外挂索引时的基准实现）
+class LinearRetriever:
+    name = "linear"
+
+    # 扫描允许目录下的 Markdown/文本文件并按文件名、标题与正文命中权重排序返回 SearchHit
+    def search_hits(
+        self, memory: "MemoryStore", query: str, root: str = "data/memory", limit: int = 10, today: date | None = None
+    ) -> list[SearchHit]:
+        primary, secondary = _extract_terms(query)
+        if not primary and not secondary:
+            raise ValueError("搜索关键词不能为空。")
+        ref_day = today or today_shanghai()
+        searchable, _ = memory.iter_searchable_files(root)
+        candidates: list[tuple[float, str, int, str, str]] = []
+        for resolved, display_path, is_memory in searchable:
+            try:
+                text = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            candidates.extend(
+                memory._score_file(display_path, text, primary, secondary, skip_expired_today=ref_day if is_memory else None)
+            )
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [
+            SearchHit(path=path, line=line_no, section=section, snippet=snippet, score=score)
+            for score, path, line_no, section, snippet in candidates[:limit]
+        ]
+
+
 # 纯 Markdown 记忆与本地文件管理类：直接读写磁盘 .md/.txt 文件
 class MemoryStore:
-    # 初始化数据目录、安全策略与可选外挂检索插件；create_dirs=False 时以只读方式打开（供 eval 使用）
+    # 初始化数据目录、安全策略与检索协议实例；create_dirs=False 时以只读方式打开（供 eval 使用）
     def __init__(
         self,
         data_root: Path | str,
         policy: FilesPolicy | None = None,
         *,
         create_dirs: bool = True,
-        retriever: object | None = None,
+        retriever: RetrieverProtocol | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
-        self.retriever = retriever
+        self.retriever: RetrieverProtocol = retriever if retriever is not None else LinearRetriever()
         self._write_lock = threading.RLock()
         if policy is None:
             proj = self.data_root.parent
@@ -102,7 +122,6 @@ class MemoryStore:
                 self.rules_dir,
                 self.workspace_dir,
                 self.workspace_dir / ".backups",
-                self.workspace_dir / ".tmp",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
         self._roots = self.policy.build_roots(self.data_root)
@@ -115,7 +134,21 @@ class MemoryStore:
     def resolve_path(self, rel_path: str, *, write: bool = False) -> Path:
         return self.policy.resolve_path(rel_path, self.data_root, write=write, roots=self._roots)
 
-    # ---- 常驻提示词直读：MEMORY.md 目录索引与 rules/*.md ----
+    # 判断目录遍历路径段是否为隐藏文件/目录或受保护敏感段（含 Unicode 折叠检测）
+    def _is_ignored_part(self, part: str) -> bool:
+        return part.startswith(".") or is_sensitive_segment(part, self.policy.reject_segments)
+
+    # 统计 data/memory 下非隐藏、非敏感段的 Markdown 与纯文本记忆文件数量
+    def count_files(self) -> int:
+        if not self.memory_dir.is_dir():
+            return 0
+        return sum(
+            1
+            for p in self.memory_dir.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in {".md", ".txt"}
+            and not any(self._is_ignored_part(part) for part in p.relative_to(self.memory_dir).parts)
+        )
 
     # 读取 data/memory/MEMORY.md 记忆索引（严格限制前 max_lines 行与 max_chars 字符，防止提示词膨胀）
     def read_memory_index(self, max_lines: int = 100, max_chars: int = 4000) -> str:
@@ -175,10 +208,8 @@ class MemoryStore:
     def read_topic_snapshots(self, max_total_chars: int = 6000) -> str:
         return _read_topic_snapshots(self.memory_dir, max_total_chars=max_total_chars)
 
-    # ---- 按需浏览与搜索 Markdown 文件 ----
-
     # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段及越界软链接
-    def _safe_files(self, target: Path, iterator) -> list[Path]:
+    def _safe_files(self, target: Path, iterator: Iterable[Path]) -> list[Path]:
         files: list[Path] = []
         for item in sorted(iterator):
             if not item.is_file():
@@ -190,7 +221,7 @@ class MemoryStore:
             if not resolved.is_relative_to(target):
                 continue
             parts = resolved.relative_to(target).parts
-            if not any(p in self.policy.reject_segments or p.startswith(".") for p in parts):
+            if not any(self._is_ignored_part(p) for p in parts):
                 files.append(resolved)
         return files
 
@@ -217,14 +248,13 @@ class MemoryStore:
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
         return "\n".join(found) + suffix
 
-    # 安全枚举允许检索的 Markdown/文本文件列表（os.scandir 快速遍历，同时严格守住白名单、敏感段、软链接与归档隔离）
+    # 安全枚举允许检索的 Markdown/文本文件列表（os.scandir 快速遍历，严格守住白名单、敏感段、软链接与归档隔离）
     def iter_searchable_files(self, root: str = "data/memory") -> tuple[list[tuple[Path, str, bool]], bool]:
         target = self.resolve_path(root, write=False)
         if not target.is_dir():
             raise ValueError(f"目录不存在：{root}")
         archive_resolved, memory_resolved = self.archive_dir.resolve(), self.memory_dir.resolve()
         searching_archive = target.is_relative_to(archive_resolved)
-        reject = set(self.policy.reject_segments)
 
         files: list[tuple[Path, str, bool]] = []
         stack: list[Path] = [target]
@@ -236,7 +266,7 @@ class MemoryStore:
             except OSError:
                 continue
             for entry in entries:
-                if entry.name.startswith(".") or entry.name in reject:
+                if self._is_ignored_part(entry.name):
                     continue
                 is_link = entry.is_symlink()
                 entry_path = Path(entry.path)
@@ -246,7 +276,7 @@ class MemoryStore:
                     except OSError:
                         continue
                     if not resolved.is_relative_to(target) or any(
-                        p in reject or p.startswith(".") for p in resolved.relative_to(target).parts
+                        self._is_ignored_part(p) for p in resolved.relative_to(target).parts
                     ):
                         continue
                 else:
@@ -272,38 +302,14 @@ class MemoryStore:
         files.sort(key=lambda item: item[1])
         return files, searching_archive
 
-    # 在允许目录下扫描 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（优先委派已启用的检索插件）
+    # 在允许目录下检索 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（统一委派 self.retriever）
     def search_hits(
         self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
     ) -> list[SearchHit]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("搜索关键词不能为空。")
-        ref_day = today or _today_shanghai()
-        if self.retriever is not None and hasattr(self.retriever, "search_hits"):
-            return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day))
-
-        primary, secondary = _extract_terms(query)
-        if not primary and not secondary:
-            raise ValueError("搜索关键词不能为空。")
-        searchable, _ = self.iter_searchable_files(root)
-
-        candidates: list[tuple[float, str, int, str, str]] = []
-        for resolved, display_path, is_memory in searchable:
-            try:
-                text = resolved.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            candidates.extend(
-                self._score_file(
-                    display_path, text, primary, secondary,
-                    skip_expired_today=ref_day if is_memory else None,
-                )
-            )
-        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-        return [
-            SearchHit(path=path, line=line_no, section=section, snippet=snippet, score=score)
-            for score, path, line_no, section, snippet in candidates[:limit]
-        ]
+        ref_day = today or today_shanghai()
+        return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day))
 
     # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
     def search_markdown(
@@ -396,8 +402,6 @@ class MemoryStore:
             self.policy.max_read_bytes,
         )
 
-    # ---- 白名单受控写入（workspace / MEMORY.md / rules） ----
-
     # 在 data/workspace 中创建或覆盖文本文件，覆盖已有文件前自动备份至 .backups/
     def write_workspace_file(self, path: str, content: str, mode: str = "create") -> str:
         if mode not in {"create", "overwrite"}:
@@ -460,7 +464,7 @@ class MemoryStore:
                 return "data/memory/facts.md"
             if message_id is None and turn_tag and f"(turn#{turn_tag})" in existing:
                 return "data/memory/facts.md"
-            stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+            stamp = now_shanghai().strftime("%Y-%m-%d %H:%M")
             tag = f" (msg#{message_id})" if message_id is not None else (f" (turn#{turn_tag})" if turn_tag else "")
             sep = "" if not existing or existing.endswith("\n") else "\n"
             _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")

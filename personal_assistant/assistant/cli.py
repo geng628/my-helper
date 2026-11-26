@@ -8,9 +8,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep
-from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai import TextDelta, ThinkingDelta
 from personal_assistant.ai.cache import format_cache_summary
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient
@@ -18,12 +16,6 @@ from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
-
-
-# 从可编辑插件目录加载演示用时间工具（不硬编码工具实现）
-def build_demo_tools() -> ToolRegistry:
-    plugin_tools = PluginManager.from_entries(["plugins/tools"], REPO_ROOT).tools()
-    return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
 # 打印单步工具执行日志与耗时
