@@ -1,11 +1,14 @@
 """只读增量 FTS5 历史对话检索插件（plugins/tools/history_tools.py）单元测试（TDD）。"""
 from __future__ import annotations
 
+import ast
 import json
+import shutil
 import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -617,3 +620,123 @@ def test_history_prev_tokens_evidence_not_clipped_at_600(tmp_path: Path) -> None
 
     rendered = execute_search_chat_history(db_path, query, limit=5)
     assert "NostalgiaStoreMarker is an online store based in India." in rendered
+
+
+# 提取插件 Python 文件中所有针对 plugins.* 的静态导入目标（含相对导入解析）
+def _plugin_imports(py_file: Path, plugins_root: Path) -> set[str]:
+    tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    deps: set[str] = set()
+    repo_root = plugins_root.parent
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "plugins" or alias.name.startswith("plugins."):
+                    deps.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                base = node.module or ""
+            else:
+                pkg_dir = py_file.parent
+                for _ in range(node.level - 1):
+                    pkg_dir = pkg_dir.parent
+                try:
+                    rel_parts = pkg_dir.relative_to(repo_root).parts
+                except ValueError:
+                    continue
+                base = ".".join(rel_parts + ((node.module,) if node.module else ()))
+            if base == "plugins" or base.startswith("plugins."):
+                deps.add(base)
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    candidate = f"{base}.{alias.name}"
+                    candidate_path = repo_root.joinpath(*candidate.split("."))
+                    if candidate_path.with_suffix(".py").is_file() or candidate_path.is_dir():
+                        deps.add(candidate)
+    return deps
+
+
+# AST 正交守卫：plugins/ 下所有模块不得导入兄弟插件（仅允许 plugins/tools/__init__.py 导入 plugins.tools.plugin）
+def test_plugins_ast_orthogonal_no_cross_plugin_imports() -> None:
+    plugins_root = REPO_ROOT / "plugins"
+    violations: list[str] = []
+    for py_file in sorted(plugins_root.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
+        rel = py_file.relative_to(REPO_ROOT).as_posix()
+        deps = _plugin_imports(py_file, plugins_root)
+        if rel == "plugins/tools/__init__.py":
+            deps.discard("plugins.tools.plugin")
+            deps.discard("plugins.tools")
+        if deps:
+            violations.append(f"{rel} -> {sorted(deps)}")
+    assert not violations, f"检测到跨插件耦合导入：{violations}"
+
+
+# 物理删除 fts5_retriever.py 的隔离测试：仅保留 plugins/tools/ 仍可正常加载并检索历史对话，且 HistorySearchConfig 校验生效
+def test_history_plugin_isolated_without_fts5_retriever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from personal_assistant.agent.tools import ToolRegistry
+
+    # 1. 构造物理隔离目录：只复制 plugins/tools/，确保不存在 fts5_retriever.py
+    isolated_plugins = tmp_path / "plugins"
+    isolated_plugins.mkdir()
+    shutil.copytree(
+        REPO_ROOT / "plugins" / "tools",
+        isolated_plugins / "tools",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    assert not (isolated_plugins / "fts5_retriever.py").exists()
+
+    # 即使 sys.path 包含仓库根目录，也禁止加载 plugins.fts5_retriever
+    monkeypatch.setitem(sys.modules, "plugins.fts5_retriever", None)
+
+    db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
+    state = StateStore(db_path)
+    try:
+        state.append_message("iso-s1", "user", "东京机房 Atlas 服务端口是多少？")
+        state.append_message("iso-s1", "assistant", "东京机房 Atlas 监听端口是 9092。")
+    finally:
+        state.close()
+
+    manager = PluginManager.from_entries(
+        ["plugins/tools"],
+        tmp_path,
+        context={
+            "data_root": tmp_path / "data",
+            "extra_bindings": {"history_db_path": db_path},
+        },
+    )
+    assert [p.plugin_id for p in manager.plugins] == ["tools"]
+
+    registry = ToolRegistry(allowed_names=["search_chat_history"])
+    manager.register_into(
+        registry,
+        context={
+            "data_root": tmp_path / "data",
+            "extra_bindings": {"history_db_path": db_path},
+        },
+    )
+    obs = registry.execute("search_chat_history", '{"query": "东京机房 Atlas 9092"}')
+    assert "9092" in obs
+    assert "东京机房 Atlas 监听端口是 9092" in obs
+
+    # 2. 验证 HistorySearchConfig 范围校验与鸭子类型 config 对象兼容
+    from plugins.tools.history_tools import HistorySearchConfig, execute_search_chat_history
+
+    default_cfg = HistorySearchConfig.from_dict(None)
+    assert default_cfg.min_term_coverage == 0.22
+    assert default_cfg.min_bm25_score == 0.1
+    with pytest.raises(ValueError):
+        HistorySearchConfig.from_dict({"min_term_coverage": -0.01})
+    with pytest.raises(ValueError):
+        HistorySearchConfig.from_dict({"min_term_coverage": 1.01})
+    with pytest.raises(ValueError):
+        HistorySearchConfig.from_dict({"min_bm25_score": -0.1})
+
+    duck_cfg = SimpleNamespace(min_term_coverage=0.99, min_bm25_score=0.0)
+    assert (
+        execute_search_chat_history(db_path, "Atlas NonExistentKeyword", config=duck_cfg)
+        == "未找到匹配的历史对话记录。"
+    )

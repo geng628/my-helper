@@ -1,7 +1,9 @@
 """Step 3 单元测试：纯 Markdown 记忆、规则、工作区写入与路径安全边界。"""
 from __future__ import annotations
 
+import ast
 import os
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -385,3 +387,188 @@ def test_turn_tag_fact_staging_finalize_and_rollback(tmp_path: Path) -> None:
     # 不存在的 turn_tag 调用 finalize_turn_fact 应安全幂等返回
     memory.finalize_turn_fact("non-existent", message_id=None)
     memory.finalize_turn_fact("non-existent", message_id=99)
+
+
+# 提取模块内部对 personal_assistant / evals / plugins 的静态导入依赖（含 from pkg import submod 展开）
+def _collect_repo_deps(py_file: Path, repo_root: Path) -> set[str]:
+    tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    deps: set[str] = set()
+    prefixes = ("personal_assistant", "evals", "plugins")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if any(alias.name == p or alias.name.startswith(f"{p}.") for p in prefixes):
+                    deps.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                base = node.module or ""
+            else:
+                pkg_dir = py_file.parent
+                for _ in range(node.level - 1):
+                    pkg_dir = pkg_dir.parent
+                rel_parts = pkg_dir.relative_to(repo_root).parts
+                base = ".".join(rel_parts + ((node.module,) if node.module else ()))
+            if any(base == p or base.startswith(f"{p}.") for p in prefixes):
+                deps.add(base)
+                for alias in node.names:
+                    deps.add(f"{base}.*" if alias.name == "*" else f"{base}.{alias.name}")
+    return deps
+
+
+# 架构拆分守卫：files_policy.py 与 text_search.py 零仓库内部依赖，builtin_tools.py 不反向依赖 memory，memory.py <= 600 行
+def test_memory_split_modules_zero_deps_and_line_budget(tmp_path: Path) -> None:
+    import personal_assistant.assistant as assistant_pkg
+    import personal_assistant.assistant.memory as memory_mod
+    from personal_assistant.assistant import (
+        BuiltinTool,
+        FilesPolicy as ExportedFilesPolicy,
+        MemoryStore as ExportedMemoryStore,
+        MemoryToolsetProvider as ExportedProvider,
+        SearchHit,
+        tokenize_text,
+    )
+    from personal_assistant.assistant.builtin_tools import (
+        BuiltinTool as DirectBuiltinTool,
+        MemoryToolsetProvider as DirectProvider,
+    )
+    from personal_assistant.assistant.files_policy import FilesPolicy as DirectFilesPolicy
+    from personal_assistant.assistant.text_search import tokenize_text as direct_tokenize
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assistant_dir = repo_root / "personal_assistant" / "assistant"
+
+    files_policy_path = assistant_dir / "files_policy.py"
+    text_search_path = assistant_dir / "text_search.py"
+    builtin_tools_path = assistant_dir / "builtin_tools.py"
+    memory_path = assistant_dir / "memory.py"
+
+    assert files_policy_path.is_file()
+    assert text_search_path.is_file()
+    assert builtin_tools_path.is_file()
+
+    assert _collect_repo_deps(files_policy_path, repo_root) == set()
+    assert _collect_repo_deps(text_search_path, repo_root) == set()
+
+    builtin_deps = _collect_repo_deps(builtin_tools_path, repo_root)
+    assert all("memory" not in dep for dep in builtin_deps), f"builtin_tools 不得反向依赖 memory：{builtin_deps}"
+
+    # 验证 _collect_repo_deps 能抓出 `from personal_assistant.assistant import memory` 与相对 `from . import memory`
+    fake_pkg = tmp_path / "personal_assistant" / "assistant"
+    fake_pkg.mkdir(parents=True)
+    probe_file = fake_pkg / "probe.py"
+    probe_file.write_text(
+        "from personal_assistant.assistant import memory\nfrom . import memory as rel_mem\n",
+        encoding="utf-8",
+    )
+    probe_deps = _collect_repo_deps(probe_file, tmp_path)
+    assert "personal_assistant.assistant.memory" in probe_deps
+
+    memory_lines = memory_path.read_text(encoding="utf-8").splitlines()
+    assert len(memory_lines) <= 600, f"memory.py 必须瘦身至 600 行以内，当前：{len(memory_lines)}"
+
+    assert ExportedFilesPolicy is DirectFilesPolicy
+    assert ExportedProvider is DirectProvider
+    assert BuiltinTool is DirectBuiltinTool
+    assert tokenize_text is direct_tokenize
+    assert ExportedMemoryStore is memory_mod.MemoryStore
+    assert SearchHit is memory_mod.SearchHit
+    assert not hasattr(assistant_pkg, "memory_tools")
+    assert not hasattr(memory_mod, "memory_tools")
+
+
+# 测试 BuiltinTool / MemoryToolsetProvider 的 read_markdown 默认行号 1..120 与 search_markdown/remember_fact 执行期关键字覆盖
+def test_builtin_tools_defaults_and_runtime_keyword_overrides(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    memory = MemoryStore(tmp_path / "data")
+    long_content = "\n".join(f"第 {i} 行内容" for i in range(1, 151)) + "\n"
+    (memory.memory_dir / "long.md").write_text(long_content, encoding="utf-8")
+    (memory.memory_dir / "schedule.md").write_text(
+        "# 日程\n- [2026-11-15] 冬季压测演练。 (until: 2026-11-20)\n",
+        encoding="utf-8",
+    )
+
+    ctor_calls: list[str] = []
+    rt_calls: list[str] = []
+
+    # 构造期回调记录
+    def _ctor_cb() -> None:
+        ctor_calls.append("ctor")
+
+    # 执行期覆盖回调记录
+    def _rt_cb() -> None:
+        rt_calls.append("runtime")
+
+    # 1. 无构造期用户上下文的提供方：默认 read_markdown 1..120，today 覆盖，remember_fact 执行期关键字覆盖
+    bare_provider = MemoryToolsetProvider(
+        memory,
+        get_today=lambda: date(2026, 11, 25),
+    )
+    bare_tools = {t.name: t for t in bare_provider.tools()}
+
+    read_tool = bare_tools["read_markdown"]
+    assert read_tool.parameters == {
+        "path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md",
+        "start_line": "起始行号（从1开始，默认 1）",
+        "end_line": "结束行号（默认 120）",
+    }
+    default_slice = read_tool.run(path="data/memory/long.md")
+    assert "显示第 1-120 行" in default_slice
+    assert "1: 第 1 行内容" in default_slice
+    assert "120: 第 120 行内容" in default_slice
+    assert "121: 第 121 行内容" not in default_slice
+    with pytest.raises(ValueError, match="必须是整数"):
+        read_tool.run(path="data/memory/long.md", start_line=True, end_line=False)  # type: ignore[arg-type]
+
+    search_tool = bare_tools["search_markdown"]
+    assert "未在 data/memory 下找到" in search_tool.run(query="冬季压测演练")
+    found = search_tool.run(query="冬季压测演练", today=date(2026, 11, 20))
+    assert "冬季压测演练" in found
+    found_dt = search_tool.run(query="冬季压测演练", today=datetime(2026, 11, 20, 18, 30))
+    assert "冬季压测演练" in found_dt
+    found_iso = search_tool.run(query="冬季压测演练", today="2026-11-20")
+    assert "冬季压测演练" in found_iso
+
+    remember_bare = bare_tools["remember_fact"]
+    with pytest.raises(RuntimeError, match="缺少当前用户消息上下文"):
+        remember_bare.run()
+    with pytest.raises(RuntimeError, match="缺少当前用户消息上下文"):
+        remember_bare.run(user_text="   ")
+
+    res_msg = remember_bare.run(
+        user_text="执行期直传原话带消息号",
+        message_id=77,
+        turn_tag="ignored-turn",
+        on_remember=_rt_cb,
+    )
+    assert "data/memory/facts.md" in res_msg
+    assert "(msg#77) 执行期直传原话带消息号" in memory.read_recent_facts()
+    assert rt_calls == ["runtime"]
+
+    # 2. 有构造期上下文的提供方：关键字参数可局部覆盖，空白 user_text 回退构造期，显式 message_id 不被 turn_tag 吞掉
+    ctx_provider = MemoryToolsetProvider(
+        memory,
+        get_user_message=lambda: ("构造期用户原话", None),
+        turn_tag="ctor-tag",
+        on_remember=_ctor_cb,
+    )
+    remember_ctx = {t.name: t for t in ctx_provider.tools()}["remember_fact"]
+
+    remember_ctx.run(user_text="执行期覆盖原话", turn_tag="rt-tag", on_remember=_rt_cb)
+    facts_after_override = memory.read_recent_facts()
+    assert "(turn#rt-tag) 执行期覆盖原话" in facts_after_override
+    assert rt_calls == ["runtime", "runtime"]
+    assert ctor_calls == []
+
+    # 仅空白 user_text 时平滑回退到构造期回调
+    remember_ctx.run(user_text="   ")
+    facts_after_fallback = memory.read_recent_facts()
+    assert "(turn#ctor-tag) 构造期用户原话" in facts_after_fallback
+    assert ctor_calls == ["ctor"]
+
+    # 即使 facts.md 已存在 (turn#ctor-tag)，仅显式传 message_id=999 或同时传 user_text + message_id=888 均正常落盘不丢写
+    remember_ctx.run(message_id=999)
+    remember_ctx.run(user_text="第二条显式消息号原话", message_id=888, turn_tag="ctor-tag")
+    facts_final = memory.read_recent_facts()
+    assert "(msg#999) 构造期用户原话" in facts_final
+    assert "(msg#888) 第二条显式消息号原话" in facts_final
