@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import mean
 from time import perf_counter
 
-from personal_assistant.agent.react import MAX_TOOL_ROUNDS, AgentEvent, ToolStep, run_react
+from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient
@@ -49,7 +49,6 @@ def evaluate_agent(
     cases: list[dict[str, object]],
     *,
     config_path: Path | None = None,
-    max_rounds: int = MAX_TOOL_ROUNDS,
     git_commit: str | None = None,
 ) -> dict[str, object]:
     cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
@@ -101,7 +100,7 @@ def evaluate_agent(
 
             start_idx = monitor.snapshot_index()
             t0 = perf_counter()
-            reply = run_react(tracked_llm, messages, registry, max_rounds=max_rounds, on_event=on_event)
+            reply = run_react(tracked_llm, messages, registry, on_event=on_event)
             elapsed_ms = round((perf_counter() - t0) * 1000, 3)
             latencies.append(elapsed_ms)
 
