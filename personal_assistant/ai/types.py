@@ -62,6 +62,7 @@ class ToolSchema:
     description: str
     parameters: dict[str, str]
     param_enums: dict[str, tuple[str, ...]] | None = field(default=None, kw_only=True)
+    required: tuple[str, ...] | None = field(default=None, kw_only=True)
 
     # 导出标准 OpenAI Chat Completions Function Calling JSON Schema
     def to_openai_schema(self) -> dict[str, object]:
@@ -71,6 +72,11 @@ class ToolSchema:
             if self.param_enums and param in self.param_enums:
                 prop["enum"] = list(self.param_enums[param])
             properties[param] = prop
+        required = (
+            list(self.parameters)
+            if self.required is None
+            else [k for k in self.parameters if k in set(self.required)]
+        )
         return {
             "type": "function",
             "function": {
@@ -79,7 +85,7 @@ class ToolSchema:
                 "parameters": {
                     "type": "object",
                     "properties": properties,
-                    "required": list(self.parameters),
+                    "required": required,
                     "additionalProperties": False,
                 },
             },

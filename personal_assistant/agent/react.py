@@ -115,6 +115,7 @@ def iter_react(
     *,
     transform_context: ContextTransformer | None = None,
     convert_to_llm: ContextTransformer | None = None,
+    tool_context: Mapping[str, object] | None = None,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
     tool_defs = tools.definitions() if tools.names else None
@@ -135,7 +136,7 @@ def iter_react(
         for call in tool_calls:
             yield ToolStart(tool=call.name, arguments=call.arguments, call_id=call.id)
             t_tool = perf_counter()
-            observation = tools.execute(call.name, call.arguments)
+            observation = tools.execute(call.name, call.arguments, context=tool_context)
             duration_ms = round((perf_counter() - t_tool) * 1000, 3)
             yield ToolStep(
                 tool=call.name,
@@ -162,6 +163,7 @@ def run_react(
     on_event: Callable[[AgentEvent], None] | None = None,
     transform_context: ContextTransformer | None = None,
     convert_to_llm: ContextTransformer | None = None,
+    tool_context: Mapping[str, object] | None = None,
 ) -> str:
     reply = ""
     for event in iter_react(
@@ -170,6 +172,7 @@ def run_react(
         tools,
         transform_context=transform_context,
         convert_to_llm=convert_to_llm,
+        tool_context=tool_context,
     ):
         if on_event is not None:
             on_event(event)

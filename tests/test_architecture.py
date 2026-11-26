@@ -370,3 +370,47 @@ def test_architecture_import_extractor_catches_evals_and_cli_backedges(tmp_path:
     )
     eval_deps = _internal_imports(bad_eval)
     assert "personal_assistant.assistant.cli" in eval_deps
+
+
+# 方法 4：微内核纯净守卫——Layer 1/2 不含业务层路径/配置字面量，且彻底消除 object.__setattr__ 与动态 type() 造类
+def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None:
+    forbidden_literals = {
+        "data/memory",
+        "data/workspace",
+        "MEMORY.md",
+        "facts.md",
+        "shell_config",
+        "web_config",
+        "retrieval_config",
+        "tool_outputs",
+    }
+    lower_files = sorted(
+        list((PKG_ROOT / "ai").rglob("*.py")) + list((PKG_ROOT / "agent").rglob("*.py"))
+    )
+    assert lower_files
+    for py_file in lower_files:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for bad in forbidden_literals:
+                    assert bad not in node.value, (
+                        f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 泄漏业务字面量 {bad!r}：{node.value!r}"
+                    )
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setattr__"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "object"
+                ):
+                    raise AssertionError(
+                        f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止调用 object.__setattr__"
+                    )
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "type"
+                    and len(node.args) == 3
+                ):
+                    raise AssertionError(
+                        f"底层 {py_file.relative_to(REPO_ROOT)}:{node.lineno} 禁止动态 type() 造类"
+                    )

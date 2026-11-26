@@ -13,10 +13,13 @@ from personal_assistant.agent.react import run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
+# 测试用脚本化模拟模型
 class ScriptedLLM(LLMClient):
+    # 初始化预设回复序列
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = list(responses)
 
+    # 弹出并返回下一条预设回复
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -25,6 +28,7 @@ class ScriptedLLM(LLMClient):
         return self._responses.pop(0)
 
 
+# 测试白名单过滤导出 Schema 并拦截未启用工具调用
 def test_registry_allowlist_filters_schemas_and_blocks_calls() -> None:
     read_tool = Tool("read_note", "读取笔记", {"path": "路径"}, lambda path: f"content:{path}")
     secret_tool = Tool("delete_all", "危险工具", {}, lambda: "deleted!")
@@ -38,6 +42,7 @@ def test_registry_allowlist_filters_schemas_and_blocks_calls() -> None:
     assert "不在白名单中" in blocked
 
 
+# 测试加载项目真实 config/tools.json 与统一工具注册表
 def test_load_real_project_tools_config() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     cfg = ToolsConfig.load(repo_root / "config" / "tools.json", project_root=repo_root)
@@ -67,6 +72,7 @@ def test_load_real_project_tools_config() -> None:
     assert "不在白名单中" in registry.execute("add_numbers", '{"a": "1", "b": "2"}')
 
 
+# 测试固定命令配置非法占位符、越界路径与超时校验
 def test_command_spec_validation_errors(tmp_path: Path) -> None:
     bad_cases = [
         # Placeholder in argv[0]
@@ -85,6 +91,7 @@ def test_command_spec_validation_errors(tmp_path: Path) -> None:
             ToolsConfig.load(cfg_file, project_root=tmp_path)
 
 
+# 测试固定命令执行器剥离敏感环境变量、参数枚举校验与超长截断
 def test_command_runner_sanitizes_env_validates_params_and_truncates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -163,6 +170,7 @@ def test_command_runner_sanitizes_env_validates_params_and_truncates(
     assert "super-secret-key" not in ok
 
 
+# 测试固定命令超时处理与 ReAct 循环集成执行
 def test_command_runner_handles_timeout_and_react_integration(tmp_path: Path) -> None:
     cfg_file = tmp_path / "tools.json"
     cfg_file.write_text(
@@ -290,7 +298,7 @@ def test_command_spec_offloads_long_stdout_and_stderr_with_head_tail(
     assert "FINAL_STDERR_LINE" in full_saved
 
 
-# 测试三类异构工具来源（BuiltinTool / 动态 type() PluginTool / CommandToolWrapper）统一汇聚进同一个 ToolRegistry（_tools + _metadata + _documents）并支持按需激活
+# 测试三类异构工具来源（BuiltinTool / 纯净 Tool 插件 / CommandToolWrapper）统一汇聚进同一个 ToolRegistry（_tools + _metadata + _documents）并支持按需激活
 def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
     tmp_path: Path,
 ) -> None:
@@ -319,11 +327,9 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
         )
         assert registry.metadata("write_file") == ToolMetadata(risk="write", always_on=False)
 
-        # 2. 插件 @tool (PluginManager) ──▶ 动态 type() Tool 子类
+        # 2. 插件 @tool (PluginManager) ──▶ 纯净 Tool 实例（不再生成动态子类）
         run_cmd_tool = registry._tools["run_command"]
-        assert isinstance(run_cmd_tool, Tool)
-        assert type(run_cmd_tool) is not Tool
-        assert issubclass(type(run_cmd_tool), Tool)
+        assert type(run_cmd_tool) is Tool
         assert registry.metadata("run_command") == ToolMetadata(risk="exec", always_on=False)
         assert registry.document("run_command") == ToolDocument(
             source_type="plugin",
@@ -350,3 +356,224 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
         assert set(registry.names) == {"read_markdown", "always_ping"}
     finally:
         app.close()
+
+
+# 测试 ToolSchema.required 精确导出与 4 位置参数构造兼容
+def test_tool_schema_required_export_and_positional_compat() -> None:
+    from personal_assistant.ai.types import ToolSchema
+
+    # 1. required=None 时保持导出全部参数列表
+    schema_all = ToolSchema(
+        name="search",
+        description="搜索",
+        parameters={"query": "词", "root": "目录"},
+    )
+    assert schema_all.to_openai_schema()["function"]["parameters"]["required"] == ["query", "root"]
+
+    # 2. 显式 required 按 parameters 声明顺序裁剪导出
+    schema_sub = ToolSchema(
+        name="search",
+        description="搜索",
+        parameters={"query": "词", "root": "目录", "mode": "模式"},
+        required=("mode", "query"),
+    )
+    assert schema_sub.to_openai_schema()["function"]["parameters"]["required"] == ["query", "mode"]
+
+    # 3. 全部参数可选时 required=() 导出空列表
+    schema_opt = ToolSchema(
+        name="list_items",
+        description="列举",
+        parameters={"root": "目录"},
+        required=(),
+    )
+    assert schema_opt.to_openai_schema()["function"]["parameters"]["required"] == []
+
+    # 4. 4 位置参数构造 Tool("name", "desc", {"p": "d"}, fn) 保持完全兼容
+    pos_tool = Tool("echo", "回显", {"p": "参数"}, lambda p: f"ok:{p}")
+    assert pos_tool.run(p="hi") == "ok:hi"
+    assert pos_tool.to_openai_schema()["function"]["parameters"]["required"] == ["p"]
+
+
+# 测试 build_tool 自动识别带默认值可选参数、CommandSpec 全必填与零动态造类/猴子补丁
+def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, build_tool
+    from personal_assistant.assistant.commands import CommandSpec, ParamSpec
+
+    # 同时含必选参数、POSITIONAL_OR_KEYWORD 默认值、KEYWORD_ONLY 默认值与上下文参数
+    def search_fn(
+        query: str,
+        root: str = "default_root",
+        *,
+        limit: str = "10",
+        turn_id: int | None = None,
+    ) -> str:
+        return f"{query}|{root}|{limit}|{turn_id}"
+
+    built = build_tool(
+        search_fn,
+        description="搜索",
+        parameters={"query": "查询", "root": "目录", "limit": "条数"},
+        risk="read",
+        always_on=True,
+        source_type="plugin",
+        source_name="demo_mod",
+    )
+    assert type(built) is Tool
+    assert not hasattr(built, "_raw_fn")
+    assert not hasattr(built, "__tool_metadata__")
+    assert not hasattr(built, "__tool_document__")
+    assert built.metadata == ToolMetadata(risk="read", always_on=True)
+    assert built.document == ToolDocument(source_type="plugin", source_name="demo_mod")
+    assert built.required == ("query",)
+    assert built.accepted_context_keys == frozenset({"turn_id"})
+    assert built.to_openai_schema()["function"]["parameters"]["required"] == ["query"]
+
+    # 显式传入 required 覆盖自动推断（按 parameters 声明顺序保留）
+    explicit = build_tool(
+        search_fn,
+        description="搜索",
+        parameters={"query": "查询", "root": "目录", "limit": "条数"},
+        required=("limit", "query"),
+    )
+    assert explicit.required == ("query", "limit")
+    assert explicit.to_openai_schema()["function"]["parameters"]["required"] == ["query", "limit"]
+
+    # 含 **kwargs 的函数接受任意上下文键（accepted_context_keys=None）
+    def flex_fn(query: str, **extra: object) -> str:
+        return f"{query}:{sorted(extra)}"
+
+    flex_tool = build_tool(flex_fn, description="灵活", parameters={"query": "查询"})
+    assert flex_tool.required == ("query",)
+    assert flex_tool.accepted_context_keys is None
+
+    # CommandSpec.run(self, **values) 的签名参数为 **values，params 仍全为必填
+    spec = CommandSpec(
+        name="demo_cmd",
+        description="示例命令",
+        argv=("echo", "{mode}"),
+        params={"mode": ParamSpec(description="模式", enum=("fast", "safe"))},
+        cwd=tmp_path,
+    )
+    cmd_tool = spec.to_tool()
+    assert cmd_tool.required == ("mode",)
+    assert cmd_tool.accepted_context_keys == frozenset()
+    assert cmd_tool.to_openai_schema()["function"]["parameters"]["required"] == ["mode"]
+
+
+# 测试 ToolRegistry.execute 对可选参数省略/null 生效默认值，并严厉拦截非法参数
+def test_tool_registry_execute_optional_params_and_validation() -> None:
+    from personal_assistant.agent.tools import build_tool
+
+    # 含必选参数、默认值参数与枚举默认值参数
+    def query_items(
+        query: str,
+        root: str = "default_dir",
+        *,
+        mode: str = "fast",
+        limit: str = "5",
+    ) -> str:
+        return f"q={query}|root={root}|mode={mode}|limit={limit}"
+
+    registry = ToolRegistry(
+        build_tool(
+            query_items,
+            description="检索",
+            parameters={"query": "词", "root": "目录", "mode": "模式", "limit": "条数"},
+            param_enums={"mode": ("fast", "deep")},
+        ),
+        Tool("ping", "心跳", {}, lambda: "pong"),
+    )
+
+    # 省略可选参数与传 null 均自动使用 Python 默认值
+    assert registry.execute("query_items", '{"query": "rust"}') == "q=rust|root=default_dir|mode=fast|limit=5"
+    assert (
+        registry.execute("query_items", '{"query": "rust", "root": null, "mode": null}')
+        == "q=rust|root=default_dir|mode=fast|limit=5"
+    )
+    # 传入可选参数（含数字自动转字符串）可正常覆盖默认值
+    assert (
+        registry.execute("query_items", '{"query": "rust", "root": "docs", "mode": "deep", "limit": 20}')
+        == "q=rust|root=docs|mode=deep|limit=20"
+    )
+
+    # 未知参数、缺必填参数、必填传 null、可选传空白/布尔/非法枚举、非 JSON 对象及无参传值仍准确报错
+    assert "需要参数" in registry.execute("query_items", '{"query": "rust", "unknown": "x"}')
+    assert "需要参数" in registry.execute("query_items", '{"root": "docs"}')
+    assert "必须是非空字符串" in registry.execute("query_items", '{"query": null}')
+    assert "必须是非空字符串" in registry.execute("query_items", '{"query": "rust", "root": "  "}')
+    assert "必须是非空字符串" in registry.execute("query_items", '{"query": "rust", "limit": true}')
+    assert "只能取：fast, deep" in registry.execute("query_items", '{"query": "rust", "mode": "bad"}')
+    assert "必须是 JSON 对象" in registry.execute("query_items", '["rust"]')
+    assert "不接受参数" in registry.execute("ping", '{"x": "1"}')
+
+
+# 测试执行期 context 动态注入、bind_tool_context 纯函数重绑与自定义 Tool 子类隔离保护
+def test_tool_registry_execute_runtime_context_and_subclass_isolation() -> None:
+    from personal_assistant.agent.tools import ToolDocument, ToolMetadata, bind_tool_context, build_tool
+
+    # 声明静态/动态上下文键的函数工具
+    def ctx_fn(query: str, *, env: str = "unset", turn_id: int | None = None) -> str:
+        return f"q={query}|env={env}|turn={turn_id}"
+
+    # 接受任意 **kwargs 上下文的灵活工具
+    def kwargs_fn(query: str, **ctx: object) -> str:
+        return f"q={query}|keys={sorted(ctx)}|turn={ctx.get('turn_id')}"
+
+    # 自定义重写 run() 的 Tool 子类：绝不能把 bound_kwargs 或执行期 context 混入 **values
+    class StrictSubTool(Tool):
+        # 校验只收到模型声明的参数
+        def run(self, **values: str) -> str:
+            assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
+            return f"sub:{values['text']}"
+
+    t_ctx = build_tool(
+        ctx_fn,
+        description="上下文探针",
+        parameters={"query": "词"},
+        context={"env": "prod", "turn_id": 0, "ignored": "x", "query": "BLOCKED"},
+    )
+    assert t_ctx.bound_kwargs == {"env": "prod", "turn_id": 0}
+
+    t_kw = build_tool(kwargs_fn, description="kwargs探针", parameters={"query": "词"})
+    t_sub = StrictSubTool(name="strict_sub", description="子类", parameters={"text": "文本"})
+
+    reg = ToolRegistry(t_ctx, t_kw, t_sub)
+    # 1. 执行期 context 覆盖 turn_id、保留 env、忽略未声明键，且绝不覆盖模型声明参数 query
+    res1 = reg.execute(
+        "ctx_fn",
+        '{"query": "hello"}',
+        context={"turn_id": 42, "ignored": "bad", "query": "HIJACK", "env": None},
+    )
+    assert res1 == "q=hello|env=prod|turn=42"
+
+    # 2. 不传 context 时回落初始 bound_kwargs（前次执行未污染工具状态）
+    assert reg.execute("ctx_fn", '{"query": "again"}') == "q=again|env=prod|turn=0"
+
+    # 3. **kwargs 工具接收除 parameters 外所有非 None 上下文键，绝不覆盖 query
+    assert (
+        reg.execute("kwargs_fn", '{"query": "ok"}', context={"turn_id": 7, "query": "HIJACK", "skip": None})
+        == "q=ok|keys=['turn_id']|turn=7"
+    )
+
+    # 4. 自定义子类绝不混入 context
+    assert reg.execute("strict_sub", '{"text": "safe"}', context={"turn_id": 9, "extra": "bad"}) == "sub:safe"
+
+    # 5. bind_tool_context 纯函数返回新实例且不篡改原实例
+    rebound = bind_tool_context(
+        t_ctx,
+        {"turn_id": 88, "ignored": "nope"},
+        metadata=ToolMetadata(risk="write", always_on=True),
+        document=ToolDocument(source_type="plugin", source_name="rebound_src"),
+    )
+    assert rebound is not t_ctx
+    assert t_ctx.bound_kwargs["turn_id"] == 0
+    assert rebound.bound_kwargs == {"env": "prod", "turn_id": 88}
+    assert rebound.metadata == ToolMetadata(risk="write", always_on=True)
+    assert rebound.document == ToolDocument(source_type="plugin", source_name="rebound_src")
+
+    # 6. bind_tool_context 对重写 run() 的子类仍返回新实例且不注入 bound_kwargs
+    rebound_sub = bind_tool_context(t_sub, {"turn_id": 5}, metadata=ToolMetadata(risk="exec", always_on=True))
+    assert rebound_sub is not t_sub
+    assert type(rebound_sub) is StrictSubTool
+    assert rebound_sub.bound_kwargs == {}
+    assert rebound_sub.run_with_context({"text": "clean"}, {"turn_id": 99}) == "sub:clean"
