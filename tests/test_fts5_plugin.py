@@ -17,6 +17,23 @@ from personal_assistant.agent.plugins import PluginManager
 
 # 测试插件加载器能从 plugins/ 自动发现 fts5_bm25 检索插件，并受 tools.json 的 retrieval 段开关控制
 def test_fts5_plugin_discovery_and_tools_config_toggle(tmp_path: Path) -> None:
+    import plugins.fts5_retriever as fts5_mod
+    from plugins.fts5_retriever import FTS5Config
+
+    # 确认不再残留未使用的分词重导出，且 FTS5Config 共享数值范围与布尔值校验
+    for unused_sym in ("EN_STOPWORDS", "EN_IRREGULAR_LEMMAS", "_normalize_en_word"):
+        assert not hasattr(fts5_mod, unused_sym)
+    with pytest.raises(ValueError):
+        FTS5Config.from_dict({"min_term_coverage": True})
+    with pytest.raises(ValueError):
+        FTS5Config.from_dict({"min_term_coverage": 1.5})
+    with pytest.raises(ValueError):
+        FTS5Config.from_dict({"min_bm25_score": -0.1})
+    with pytest.raises(ValueError):
+        FTS5Config.from_dict({"max_hits_per_file": 0})
+    with pytest.raises(ValueError):
+        FTS5Config(max_hits_per_file=False)
+
     repo_root = Path(__file__).resolve().parent.parent
     retrievers = PluginManager.from_entries(["plugins"], repo_root).retrievers
     assert "fts5_bm25" in retrievers

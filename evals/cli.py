@@ -9,7 +9,7 @@ from pathlib import Path
 
 from personal_assistant.ai.client import LLMClient, from_env
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
+from personal_assistant.assistant.common import load_dotenv
 from personal_assistant.assistant.memory import MemoryStore
 from evals.agent_eval import evaluate_agent
 from evals.common import load_cases, resolve_eval_paths, safe_write_report
@@ -86,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
     parser.add_argument("--model", default=None, help="agent/memory 模式指定待测模型（models.dsl 档案名、预设名如 reasoner 或模型 ID）")
+    parser.add_argument("--consolidator-model", default=None, help="memory 模式指定后台沉淀专用模型（缺省按 models.dsl 的 consolidator 或复用待测模型）")
     parser.add_argument("--judge-model", default=None, help="memory 模式指定独立 Judge 模型（同上；未指定时默认复用待测模型）")
     parser.add_argument("--workers", type=int, default=1, help="memory 模式并发场景数（默认 1 串行；>1 并发执行各独立场景）")
     parser.add_argument("--config", default=None, help="tools.json 路径（默认 config/tools.json）")
@@ -127,57 +128,81 @@ def main(argv: list[str] | None = None) -> int:
     cases_path = Path(args.cases or default_cases).resolve()
     cfg_path = Path(args.config) if args.config else None
 
-    if args.mode == "search":
-        cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
-        retriever = None
-        if args.retriever != "linear":
+    loaded_cfg: ToolsConfig | None = None
+    try:
+        if args.mode == "search":
+            cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
+            retriever = None
+            if args.retriever != "linear":
+                tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
+                if loaded_cfg is not None:
+                    override = None if args.retriever == "auto" else args.retriever
+                    retriever = loaded_cfg.build_retriever(override_name=override)
+                elif args.retriever != "auto":
+                    raise ValueError(f"无法加载检索插件 {args.retriever!r}：未找到配置文件 {tools_cfg_path}")
+            memory = MemoryStore(data_dir, create_dirs=False, retriever=retriever)
+            report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
+        elif args.mode == "agent":
+            cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
             tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
-            if loaded_cfg is not None:
-                override = None if args.retriever == "auto" else args.retriever
-                retriever = loaded_cfg.build_retriever(override_name=override)
-            elif args.retriever != "auto":
-                raise ValueError(f"无法加载检索插件 {args.retriever!r}：未找到配置文件 {tools_cfg_path}")
-        memory = MemoryStore(data_dir, create_dirs=False, retriever=retriever)
-        report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
-    elif args.mode == "agent":
-        cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
-        tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
-        llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
-        report = evaluate_agent(llm, data_dir, cases, config_path=cfg_path)
-    else:
-        scenarios = _filter_items(load_scenarios(cases_path), category=args.category, max_cases=args.max_cases)
-        tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
-        llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
-        judge_name = (args.judge_model or "").strip() or None
-        if args.no_judge:
-            judge: LLMClient | None = None
-        elif judge_name is not None:
-            judge = _build_eval_llm(loaded_cfg, tools_cfg_path, judge_name)
+            llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
+            report = evaluate_agent(
+                llm,
+                data_dir,
+                cases,
+                config_path=cfg_path,
+                tools_config=loaded_cfg,
+            )
         else:
-            judge = llm
+            scenarios = _filter_items(load_scenarios(cases_path), category=args.category, max_cases=args.max_cases)
+            tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
+            llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
+            cons_name = (args.consolidator_model or "").strip() or None
+            if loaded_cfg is not None:
+                consolidator_llm: LLMClient | None = loaded_cfg.build_consolidator_llm(
+                    tools_cfg_path.parent,
+                    fallback_llm=llm,
+                    model_name=cons_name,
+                )
+            elif cons_name is not None:
+                consolidator_llm = _build_eval_llm(None, tools_cfg_path, cons_name)
+            else:
+                consolidator_llm = None
+            judge_name = (args.judge_model or "").strip() or None
+            if args.no_judge:
+                judge: LLMClient | None = None
+            elif judge_name is not None:
+                judge = _build_eval_llm(loaded_cfg, tools_cfg_path, judge_name)
+            else:
+                judge = llm
 
-        # 向 stderr 输出共享长对话沉淀完成进度
-        def _report_setup_done(setup_rep: dict[str, object]) -> None:
-            sec = float(setup_rep.get("latency_ms") or 0.0) / 1000.0
-            gid = setup_rep.get("shared_group")
-            steps_n = setup_rep.get("steps_executed")
-            print(f"[setup] {gid} ready ({steps_n} steps, {sec:.1f}s)", file=sys.stderr, flush=True)
+            # 向 stderr 输出共享长对话沉淀完成进度
+            def _report_setup_done(setup_rep: dict[str, object]) -> None:
+                sec = float(setup_rep.get("latency_ms") or 0.0) / 1000.0
+                gid = setup_rep.get("shared_group")
+                steps_n = setup_rep.get("steps_executed")
+                print(f"[setup] {gid} ready ({steps_n} steps, {sec:.1f}s)", file=sys.stderr, flush=True)
 
-        # 向 stderr 输出单题完成进度，避免长跑大样本评测时终端无反馈且不污染 stdout 汇总
-        def _report_progress(done: int, total: int, rec: dict[str, object]) -> None:
-            status = "PASS" if rec.get("passed") else "FAIL"
-            sec = float(rec.get("latency_ms") or 0.0) / 1000.0
-            print(f"[{done}/{total}] {status} {rec.get('id')} ({sec:.1f}s)", file=sys.stderr, flush=True)
+            # 向 stderr 输出单题完成进度，避免长跑大样本评测时终端无反馈且不污染 stdout 汇总
+            def _report_progress(done: int, total: int, rec: dict[str, object]) -> None:
+                status = "PASS" if rec.get("passed") else "FAIL"
+                sec = float(rec.get("latency_ms") or 0.0) / 1000.0
+                print(f"[{done}/{total}] {status} {rec.get('id')} ({sec:.1f}s)", file=sys.stderr, flush=True)
 
-        report = evaluate_memory(
-            llm,
-            scenarios,
-            config_path=cfg_path,
-            judge_llm=judge,
-            workers=args.workers,
-            on_progress=_report_progress,
-            on_setup_done=_report_setup_done,
-        )
+            report = evaluate_memory(
+                llm,
+                scenarios,
+                config_path=cfg_path,
+                tools_config=loaded_cfg,
+                consolidator_llm=consolidator_llm,
+                judge_llm=judge,
+                workers=args.workers,
+                on_progress=_report_progress,
+                on_setup_done=_report_setup_done,
+            )
+    finally:
+        if loaded_cfg is not None:
+            loaded_cfg.plugin_manager.terminate_all()
 
     if args.output:
         safe_write_report(Path(args.output), data_dir, report)

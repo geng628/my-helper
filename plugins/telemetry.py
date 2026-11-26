@@ -1,8 +1,7 @@
-"""运行期可观测插件（零第三方依赖）：实现 ObserverProtocol，提供有界窗口、单调游标、分阶段耗时拆解与后台沉淀统计。"""
+"""运行期可观测插件（零第三方依赖）：实现 ObserverProtocol，提供有界会话账本、单调游标、分阶段耗时拆解与后台沉淀统计。"""
 from __future__ import annotations
 
 import threading
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import TypeVar
@@ -37,25 +36,20 @@ def _rate(num: int, den: int) -> float | None:
     return round(num / den, 4) if den > 0 else None
 
 
-# 运行期遥测配置：控制环形历史窗口大小与会话状态上限
+# 运行期遥测配置：控制有界 MRU 会话账本容量上限
 @dataclass(frozen=True)
 class TelemetryConfig:
-    window_size: int = 200
     max_sessions: int = 256
 
     # 校验正整数边界，防止外部直接构造 0 或负数配置引发运行时异常
     def __post_init__(self) -> None:
-        if isinstance(self.window_size, bool) or self.window_size < 1:
-            raise ValueError("window_size 必须是正整数。")
         if isinstance(self.max_sessions, bool) or self.max_sessions < 1:
             raise ValueError("max_sessions 必须是正整数。")
 
     # 从 config/tools.json 的 telemetry 字段解析配置并保障安全上下限
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "TelemetryConfig":
-        ws = _pos_int(raw.get("window_size"), 200)
-        max_sessions = max(ws, _pos_int(raw.get("max_sessions"), 256))
-        return cls(window_size=ws, max_sessions=max_sessions)
+        return cls(max_sessions=_pos_int(raw.get("max_sessions"), 256))
 
 
 # 单轮完整对话遥测记录（含首字、模型推理、工具耗时与调度开销拆解）
@@ -109,11 +103,12 @@ class _TurnMetrics:
     cached_tokens: int = 0
     completion_tokens: int = 0
 
-    # 将单次 TokenUsage 累加到指标计数器
+    # 将单次 TokenUsage 显式累加到指标计数器
     def add_usage(self, usage: object) -> None:
         if isinstance(usage, TokenUsage):
-            for attr in ("prompt_tokens", "cached_tokens", "completion_tokens"):
-                setattr(self, attr, getattr(self, attr) + getattr(usage, attr))
+            self.prompt_tokens += usage.prompt_tokens
+            self.cached_tokens += usage.cached_tokens
+            self.completion_tokens += usage.completion_tokens
 
 
 # 单会话进行中的前台回合暂存累加器（不与后台 TaskEvent 混用）
@@ -130,13 +125,17 @@ class _CumulativeStats(_TurnMetrics):
     total_ms: float = 0.0
     last_turn: TurnRecord | None = field(default=None, repr=False)
 
-    # 累加已完结的单轮遥测记录并更新最近回合引用
+    # 显式累加已完结的单轮遥测记录并更新最近回合引用
     def add_turn(self, rec: TurnRecord) -> None:
         self.turns += 1
-        for attr in ("total_ms", "llm_ms", "tool_ms"):
-            setattr(self, attr, round(getattr(self, attr) + getattr(rec, attr), 3))
-        for attr in ("llm_calls", "tool_calls", "prompt_tokens", "cached_tokens", "completion_tokens"):
-            setattr(self, attr, getattr(self, attr) + getattr(rec, attr))
+        self.total_ms = round(self.total_ms + rec.total_ms, 3)
+        self.llm_ms = round(self.llm_ms + rec.llm_ms, 3)
+        self.tool_ms = round(self.tool_ms + rec.tool_ms, 3)
+        self.llm_calls += rec.llm_calls
+        self.tool_calls += rec.tool_calls
+        self.prompt_tokens += rec.prompt_tokens
+        self.cached_tokens += rec.cached_tokens
+        self.completion_tokens += rec.completion_tokens
         self.last_turn = rec
 
     # 导出累计统计字典（直接拼装字段避免展开 last_turn 产生无效深拷贝）
@@ -160,12 +159,10 @@ class _CumulativeStats(_TurnMetrics):
 class TelemetryObserver:
     name = OBSERVER_NAME
 
-    # 初始化线程互斥锁、有界环形窗口与会话隔离累加器
+    # 初始化线程互斥锁与有界会话隔离累加器
     def __init__(self, config: TelemetryConfig | None = None) -> None:
         self.config = config or TelemetryConfig()
         self._lock = threading.Lock()
-        self._turns: deque[TurnRecord] = deque(maxlen=self.config.window_size)
-        self._tasks: deque[TaskRecord] = deque(maxlen=self.config.window_size)
         self._turn_seq = 0
         self._task_seq = 0
         self._bg_runs = 0
@@ -215,7 +212,6 @@ class TelemetryObserver:
                     cached_tokens=acc.cached_tokens,
                     completion_tokens=acc.completion_tokens,
                 )
-                self._turns.append(rec)
                 self._totals.add_turn(rec)
                 sess = _touch_bounded(self._sessions, session_key, _CumulativeStats, self.config.max_sessions)
                 sess.add_turn(rec)
@@ -234,7 +230,6 @@ class TelemetryObserver:
                     error=event.error,
                     details=dict(event.details),
                 )
-                self._tasks.append(t_rec)
                 self._bg_runs += 1
                 if event.error is not None:
                     self._bg_failures += 1
@@ -242,29 +237,7 @@ class TelemetryObserver:
                 self._bg_last = t_rec
                 self._bg_tokens.add_usage(usage)
 
-    # 按起始游标和可选会话键过滤有界环形窗口（仅在持锁时读取 deque）
-    def _filter(
-        self,
-        buf: deque[TurnRecord] | deque[TaskRecord],
-        session_key: str | None,
-        since_seq: int,
-    ) -> list[dict[str, object]]:
-        with self._lock:
-            return [
-                x.to_dict() if isinstance(x, TurnRecord) else asdict(x)
-                for x in buf
-                if x.seq > since_seq and (session_key is None or x.session_key == session_key)
-            ]
-
-    # 查询有界窗口中从 since_seq 之后的前台回合记录（支持按 session_key 过滤）
-    def recent_turns(self, *, session_key: str | None = None, since_seq: int = 0) -> list[dict[str, object]]:
-        return self._filter(self._turns, session_key, since_seq)
-
-    # 查询有界窗口中从 since_seq 之后的后台任务记录（支持按 session_key 过滤）
-    def recent_tasks(self, *, session_key: str | None = None, since_seq: int = 0) -> list[dict[str, object]]:
-        return self._filter(self._tasks, session_key, since_seq)
-
-    # 导出紧凑只读快照，供 AssistantApp.chat / /status / 前端展示（避免全量窗口膨胀）
+    # 导出紧凑只读快照，供 AssistantApp.chat / /status / 前端展示
     def snapshot(self, *, session_key: str | None = None) -> dict[str, object]:
         with self._lock:
             sess = self._sessions.get(session_key) if session_key is not None else None
@@ -275,9 +248,6 @@ class TelemetryObserver:
             data: dict[str, object] = {
                 "cursor": self._turn_seq,
                 "task_cursor": self._task_seq,
-                "window_size": self.config.window_size,
-                "buffered_turns": len(self._turns),
-                "buffered_tasks": len(self._tasks),
                 "totals": self._totals.to_dict(),
                 "last_turn": last.to_dict() if last is not None else None,
                 "background": {

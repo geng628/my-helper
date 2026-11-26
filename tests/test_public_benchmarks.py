@@ -208,7 +208,7 @@ def test_convert_locomo_for_memory_handles_speakers_and_adversarial() -> None:
     by_cat = {s["category"]: s for s in scenarios}
     assert by_cat["single-hop"]["steps"][-1]["expected_answer"] == "Max"
     assert by_cat["single-hop"]["steps"][-1]["is_abstention"] is False
-    assert "[Alice]" in by_cat["single-hop"]["steps"][0]["messages"][0]["content"]
+    assert "[Alice]" in by_cat["single-hop"]["shared_setup"]["steps"][0]["messages"][0]["content"]
     assert by_cat["adversarial"]["steps"][-1]["is_abstention"] is True
 
 
@@ -312,11 +312,13 @@ def test_locomo_shared_memory_full_sessions_max_convs_and_compact_jsonl_roundtri
 
     fake_locomo = [_make_conv("conv-1", "Kyoto"), _make_conv("conv-2", "Reykjavik")]
 
-    # max_convs=1 且不截断会话（None）时，只取 conv-1 但完整保留全部 6 个会话与第 6 会话证据题
+    # max_convs=1 且不截断会话（None）时，只取 conv-1 但完整保留全部 6 个会话与第 6 会话证据题（统一使用 shared_setup）
     scenarios = convert_locomo_for_memory(fake_locomo, limit=10, max_sessions_per_conv=None, max_convs=1, seed=42)
     assert len(scenarios) == 2
     assert all(sc["shared_group"] == "locomo-conv-1" for sc in scenarios)
-    assert all(sc["setup_step_count"] == 12 for sc in scenarios)
+    assert all("setup_step_count" not in sc for sc in scenarios)
+    assert all(len(sc["shared_setup"]["steps"]) == 12 for sc in scenarios)
+    assert all(len(sc["steps"]) == 1 and sc["steps"][0]["action"] == "ask" for sc in scenarios)
 
     out_path = tmp_path / "locomo_compact.jsonl"
     write_scenarios_jsonl(out_path, scenarios)

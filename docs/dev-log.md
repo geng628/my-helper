@@ -9,22 +9,22 @@
 
 1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`urllib`、`http.client`、`sqlite3`、`threading`、`http.server`、`shlex`、`ipaddress`、`unicodedata` 等）；`pytest` 仅作开发测试依赖。
 2. **三层单向依赖漏斗（`ai ← agent ← assistant`）**：
-   - `personal_assistant/ai/`（Layer 1）：零内部依赖的 LLM 传输底座（`OpenAIChatClient`）、强类型流式事件（含 `StreamDone.finish_reason`）、模型配置档案与按会话隔离的有界 `CacheMonitor`；
-   - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/` 的 30 余行单层 ReAct 核心循环（`iter_react` / `run_react`）、工具递进类型（`Tool(ToolSchema)`，自动推断默认可选参数并支持执行期 `tool_context`）与五大插件主板插槽（`Plugin(ABC)` + `PluginContext`），零业务路径或插件名硬编码；
-   - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零依赖分词与路径安全底座（`text_search.py` / `files_policy.py`）、SQLite 会话存储（`db.py`）、外层回合预算与编排（`app.py`，暴露常驻 `app.tools`）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
-   - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
+   - `personal_assistant/ai/`（Layer 1）：零内部依赖的 LLM 传输底座（`OpenAIChatClient` + `ModelProfile` 直通工厂 `from_model_profile`）、强类型流式事件（含 `StreamDone.finish_reason`）、通用命名角色配置表 `ModelsConfig.roles` 与按会话隔离的有界 `CacheMonitor`；
+   - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/` 的 30 余行单层 ReAct 核心循环（`iter_react` / `run_react`，单步 `convert_to_llm` 边界钩子）、纯值对象工具递进类型（`Tool(ToolSchema)` + `bind_tool_context`，自动推断默认可选参数并支持执行期 `tool_context`）与零业务字段 `PluginContext` 五大插件主板插槽（`Plugin(ABC)`），零业务路径、插件名或配置段硬编码；
+   - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆与内置零索引 `LinearRetriever` 兜底（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零内部依赖底座（`common.py` / `text_search.py` / `files_policy.py`）、SQLite 会话存储（`db.py`）、外层回合预算与统一编排（`app.py`，暴露常驻 `app.tools` 并支撑 `evals/` 统一 `AssistantApp(auto_consolidate=False)` 装配）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
+   - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫及 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树零 `# type: ignore` 静态硬守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
-   - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`）；
-   - Slot 2 `RetrieverProtocol`（`plugins/fts5_retriever.py`）；
-   - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`）；
-   - Slot 4 `LLMProviderProtocol`（`plugins/reasoning_provider.py`）；
-   - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`）；
+   - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
+   - Slot 2 `RetrieverProtocol`（`plugins/fts5_retriever.py`，未挂载时由 `LinearRetriever` 兜底）；
+   - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，`render` 具名强类型签名与协议严格对齐）；
+   - Slot 4 `LLMProviderProtocol`（`plugins/reasoning_provider.py`，经 `ModelProfile` 直通工厂装配）；
+   - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本）；
    - 所有插件在启动期仅执行一次 `initialize()`，零跨插件横向导入，并在 `AssistantApp.close()` 时经 `terminate_all()` 统一释放资源。
 4. **纵深安全与测试隔离基线**：
-   - 文件层：`NFKC + casefold()` + 零宽格式符剥离 + 敏感目标 `(st_dev, st_ino)` Inode 校验，写权限严格收敛于 `data/workspace/`；
-   - Shell 层：`shell=False`、隔离空 `HOME`、逐子命令只读 `git` 语法白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
-   - 网络与防注入层：`http.client` + `socket.create_connection((pinned_ip, port))` 直连已校验公网 IP 防 DNS Rebinding（天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `_PROVIDERS` 注册表（当前确定性单测 `198 passed`）。
+   - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + 轻量单层敏感目标 `(st_dev, st_ino)` Inode 校验，写权限严格收敛于 `data/workspace/`；
+   - Shell 层：`shell=False`、隔离空 `HOME`、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
+   - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `_PROVIDERS` 注册表（当前确定性单测 `202 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -69,7 +69,7 @@
 10. **`git branch` 写操作与裸 `<blob>`/`<tree>` 历史泄密（`1ad1e0d`）**：旧版仅放行 `git` 子命令名而未逐子命令锁死写标志，导致 `git branch -D` 可删分支、`--edit-description` 拉起编辑器挂起，且 `git show <blob>` 或 `git diff 4b825dc6... HEAD`（Git 内置空树 SHA）可读取历史提交中的敏感文件；修复为逐子命令严格只读参数白名单、`git cat-file -t` 拦截 `blob`/`tree` 端点、`git diff` 自动注入 `:(exclude,glob,icase)` 负向排除、隔离空 `HOME` 与 `os.killpg` 整组回收。
 11. **`urllib` 二次 DNS 解析重绑定与默认 Fake-IP 放行风险（`1ad1e0d`）**：校验阶段与实际建连各自解析 DNS 存在 TOCTOU 窗口，且默认走系统环境代理并放行 `198.18.0.0/15`；修复为自定义 `_PinnedHTTPConnection` / `_PinnedHTTPSConnection` 直连已校验 IP、`ProxyHandler({})` 禁代理、`allow_fake_ip` 默认改为 `False` 并补齐 NAT64/6to4/Teredo 校验。
 12. **间接提示词注入持久化篡改 `rules/`（`1ad1e0d` + `1b421d2`）**：恶意网页可诱导模型调用 `save_rule` 写入全局系统提示词；修复为同轮调用任何 `risk="network"` 工具后经 `turn_ctx["untrusted_tool_seen"]` 硬性锁死 `save_rule`，且无网络工具时亦校验用户原话中的显式长期规则意图词。
-13. **评测 Judge 提示词混入测试集人物实体与短词子串误判（`c761c81`）**：早期 `memory_eval.py` 的 `JUDGE_SYSTEM_PROMPT` 针对 LoCoMo 失败题写死测试集人物示例（`Caroline` / `Melanie`），且期望词匹配对 `"Go"` 使用普通子串包含可误中 `"Google"`；已清除全部具名示例升级为 `JUDGE_PROMPT_VERSION = "v2-neutral"`（记录 `prompt_sha256`），并对 `<= 3` 字符 ASCII 期望词强制非字母数字词边界匹配。
+13. **评测 Judge 提示词混入测试集人物实体与短词子串误判（`c761c81`）**：早期 `memory_eval.py` 的 `JUDGE_SYSTEM_PROMPT` 针对 LoCoMo 失败题写死测试集人物示例（`Caroline` / `Melanie`），且期望词匹配对 `"Go"` 使用普通子串包含可误中 `"Google"`；已清除全部具名示例升级为 `JUDGE_PROMPT_VERSION = "v2-neutral"`（记录 `prompt_sha256`），先对 `<= 3` 字符 ASCII 期望词强制非字母数字词边界匹配，后于 Wave 7（`#84`）进一步移除长度魔法阈值，统一为全长度纯 ASCII 词/数字字符边界匹配。
 
 ---
 
@@ -147,18 +147,37 @@
 
 ---
 
-### [2026-11-26] 去补丁与去双轨兼容提纯：回归单一契约与精简外围沙箱插件（Issues `#79` / `#80`，Commits `956e739` + 本次合流）
+### [2026-11-26] 去补丁与去双轨兼容提纯：回归单一契约与精简外围沙箱插件（Issues `#79` / `#80`，Commits `956e739`、`6bfe67b`）
 - **背景与目标**：清理前期快速演进与红队攻防中遗留的「新旧双轨兼容壳」与「特判补丁堆叠」，使全仓代码回归从数据结构自然生长出来的简洁对称形态，保持核心微内核 `react.py` **0 行改动** 与全部安全防线不退步。
 - **核心改动（两路合计净删生产代码逾 810 行，全仓净减近 900 行）**：
   1. **核心层单轨契约提纯（Issue `#79` / PR `#81`，`956e739`）**：
      - `StreamDone` 原生携带强类型 `finish_reason: str | None = None`，彻底拔除往业务 `message` 字典塞 `"finish_reason"` 及下游 `client.py` / `app.py` 三处外发剥离补丁；SSE `tool_calls` 拔除 60 余行跨帧猜槽状态机，回归 7 行标准 `index` 归槽；
      - 删除废弃 `AssistantApp.build_tools()`、`cli.py` 零调用 `build_repl_tools` / `run_repl(tools=...)` 分支及 `memory.py` 搬家重导出兼容壳；`AssistantApp` 暴露只读属性 `app.tools`，`MemoryToolsetProvider` 彻底移除全部构造期闭包回调（`get_user_message` / `get_today` / `turn_tag` / `on_remember`），动态回合状态 100% 统一经 `tool_context` 注入；
      - 删除 `builtin_tools.py` 硬编码关键词表 `RULE_INTENT_KEYWORDS`（保留正交的 `untrusted_tool_seen` 联网轮锁死 `save_rule` 机制）；将未提交 `(turn#...)` 暂存行隔离全部内聚至 `memory_lifecycle.py` 单点 `_is_inflight_turn_line` 与真实落盘 `applied_texts`，删除 `consolidator.py` 模糊子串过滤补丁（`consolidator.py` 对 `turn#` 100% 零感知）。
-  2. **外围沙箱与联网插件去臃肿提纯（Issue `#80` / PR `#82`）**：
+  2. **外围沙箱与联网插件去臃肿提纯（Issue `#80` / PR `#82`，`6bfe67b`）**：
      - `web_tools.py`（`824 -> 573` 行，`-30.5%`，`0` 处 `# type: ignore`）：删除 5 个自定义 `urllib.request` 子类（约 180 行），改用标准库 `http.client` + `socket.create_connection((pinned_ip, port))` + `ssl` 直接实现重定向循环（天然不读环境代理、天然钉住已校验 IP 并确定性关闭 `HTTPResponse` 套接字）；
      - `shell_tools.py`（`942 -> 713` 行，`-24.3%`）：删除预派生 `git cat-file -t` 子进程补丁与启发式修订号切分，在语法层直接拦截冒号对象引用 `:`、解引用 `^{`/`@{` 与裸对象哈希（含 4 位起短哈希与 `describe -g<sha>`），无显式安全文件时自动为 `git show`/`git diff` 补 `--stat`；
      - `files_policy.py`（`474 -> 337` 行，`-28.9%`）：移除 512 项 DFS 目录栈与双父链拼装，收敛为轻量单层敏感 Inode 采集与单一父链回溯。
 - **验证对比**：确定性单测保持 `198 passed`，离线检索保持 `38/40 (95.0%)`，AST 中文 `#` 注释与架构纯度守卫 `0` 违规。
+
+---
+
+### [2026-11-27] 三层核心净洁提纯、外围插件单轨化、评测统一装配与全仓零 `# type: ignore` 收官（Issues `#83` / `#84`，Commits `a775b7e` + 本次提交）
+- **背景与目标**：在 Wave 6 清除高频补丁后，继续沿「最小对称原语」收官两类残余耦合：其一是三层核心中仍存在的配置散包传参、`ModelsConfig` 业务角色字段、`PluginContext` 业务化绑定与 `transform_context` 冗余钩子；其二是外围 `plugins/` 的旧配置文件回退与重复工具函数、`evals/` 手搓装配（导致 `agent_eval.py` 漏传 `case["today"]` 存在时效用例到期隐患）、`scripts/` 测试迁就补丁及外围目录残余 `# type: ignore`。
+- **核心改动**：
+  1. **阶段一：三层净洁核心提纯（Issue `#83` / PR `#85`，`a775b7e`）**：
+     - Layer 1 `ai/`：`ProviderFactory` 改为 `ModelProfile` 直通工厂（`from_model_profile(profile)`）；`ModelsConfig` 以通用 `roles: dict[str, str]` 取代硬编码业务角色字段；
+     - Layer 2 `agent/`：`Tool(ToolSchema)` 回归纯值对象并提炼 `bind_tool_context()`；`react.py` 删除未使用的 `transform_context`，仅保留单步 `convert_to_llm`；`PluginContext` 清零业务字段与 `tool_bindings()`，由 Layer 3 `commands.py._build_plugin_bindings()` 注入运行时绑定；
+     - Layer 3 `assistant/`：`MemoryStore` 抽出内置零索引 `LinearRetriever` 兜底；`common.py` 沉淀 `today_shanghai`、`parse_iso_date`、`require_positive_int`、`atomic_write_text`；`assistant/__init__.py` 改为按需懒加载导出；`personal_assistant/` 全目录清零 `# type: ignore`。
+  2. **阶段二：外围插件单轨化、评测统一装配与四树零 `# type: ignore` 收官（Issue `#84`，本次提交）**：
+     - **外围插件 `plugins/`**：`shell_tools.py` 与 `web_tools.py` 移除 `from_config` 与 `config_path` 回退，统一单轨消费主板注入配置字典；`study_tools.py` 复用 `common.py` 原子写盘与日期工具，移除冗余 `project_root` 与隐式 CWD `Path("data")` 兜底（缺省显式报错）；`fts5_retriever.py` 与 `history_tools.py` 复用 `text_search.py` 新增的 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，删除 `_HistoryThresholdConfig` 鸭子协议与未使用分词重导出；`ModelsDSLCompiler.render` 与 `ConfigCompilerProtocol.render` 对齐为显式强类型具名参数；`telemetry.py` 移除 `getattr`/`setattr` 反射累加及 0 生产调用的 `recent_turns`/`recent_tasks`（`config/tools.json` 同步切换为 `max_sessions`）；删除冗余 `plugins/tools/__init__.py`；
+     - **评测统一装配 `evals/`**：`AssistantApp` 支持接收外部预加载 `tools_config`（按所有权释放）与 `auto_consolidate=False`；`evals/agent_eval.py` 改为基于 `AssistantApp(..., auto_consolidate=False, today_fn=...)` 执行并透传每题 `case["today"]` 修复 2026-11-30 时效到期隐患；`evals/memory_eval.py` 与 `evals/public_benchmarks.py` 移除 `setup_step_count` 旧格式双轨（统一 `shared_setup`）、通过 `AssistantApp` + `app.consolidator` 使双模型沉淀真实生效，并将 `_contains_keyword` 升级为无长度魔法阈值的全长度纯 ASCII 字母数字边界匹配；`evals/cli.py` 单次加载 `ToolsConfig` 向下透传、支持 `--consolidator-model` 并清理未使用导入；
+     - **入口脚本与静态守卫**：`scripts/web_chat.py` 移除迁就旧测试桩的 `auth_token` 三元分支，复用 `_is_loopback_host` 与 `StateStore.get_context_snapshot(chat_id, limit=40)`；`scripts/demo.py` 的 `run_live_ask` 对齐 `ToolsConfig` 加载；`tests/test_architecture.py` 将 `0` 处 `# type: ignore` 静态硬守卫扩大覆盖 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 全部四棵目录树。
+- **验证与同口径说明（`1b421d2` → 本次提交）**：
+  - 确定性单元测试：`198 passed → 202 passed`（100% 通过）；
+  - 离线检索基准（确定性）：`fts5_bm25` 保持 `38/40 (95.0%)`（Recall `0.9483`，MRR `0.9483`，负例干净度 `100%`）；内置 `linear` 保持 `32/40 (80.0%)`（Recall `0.9655`，MRR `0.908`）；
+  - 离线演示与静态硬守卫：`scripts/demo.py` 离线场景全部通过；AST 全仓（含 `tests/`）中文 `#` 注释缺失 `0`；`personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树 `# type: ignore` 命中 `0`；
+  - 实模评测口径：Wave 6 / Wave 7 均为架构提纯与装配统一，未发起新的实模 API 跑分，表四中的 `v2-neutral`（`sha256=08e7c0adcb56`）实模基线保持锚定于 `1b421d2`（`15/16`、`80/100`、`63/70`）。
 
 ---
 

@@ -227,18 +227,115 @@ def test_search_eval_supports_categories_and_temporal_today(tmp_path: Path) -> N
     assert report["cases"][0]["category"] == "temporal"
 
 
-# 测试 agent_eval 自动挂载 tools.json 配置的检索插件（fts5_bm25）并将 TOAST 落盘隔离在临时目录内
+# 测试 agent_eval 直接复用 AssistantApp 挂载 fts5_bm25、接入 case["today"] 防到期失效并隔离 TOAST 落盘
 def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from evals.agent_eval import _prepare_isolated_memory
     from personal_assistant.assistant.commands import ToolsConfig
     from personal_assistant.assistant.common import REPO_ROOT
 
     monkeypatch.delenv("MY_HELPER_DATA", raising=False)
+    data_dir = tmp_path / "temporal_data"
+    (data_dir / "memory").mkdir(parents=True)
+    (data_dir / "memory" / "schedule.md").write_text(
+        "# 日程备忘\n"
+        "- [2026-10-01] 旧版架构评审会 (until: 2026-10-15)\n"
+        "- [2026-11-15] 参加冬季压测演练 (until: 2026-11-30)\n",
+        encoding="utf-8",
+    )
+
+    seen_prompts: list[str] = []
+    seen_observations: list[str] = []
+
+    # 录制系统提示词并触发 search_markdown 核实逻辑日期 today 与 fts5_bm25 检索插件同时生效
+    class TemporalSpyLLM(LLMClient):
+        # 初始化调用计数
+        def __init__(self) -> None:
+            self._step = 0
+
+        # 首轮查询冬季压测演练与旧版评审会，次轮汇总观察结果
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            self._step += 1
+            if self._step == 1:
+                seen_prompts.append(str(messages[0].get("content") or ""))
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_active",
+                            "type": "function",
+                            "function": {
+                                "name": "search_markdown",
+                                "arguments": '{"query": "冬季压测演练", "root": "data/memory"}',
+                            },
+                        },
+                        {
+                            "id": "call_expired",
+                            "type": "function",
+                            "function": {
+                                "name": "search_markdown",
+                                "arguments": '{"query": "旧版架构评审会", "root": "data/memory"}',
+                            },
+                        },
+                        {
+                            "id": "call_toast",
+                            "type": "function",
+                            "function": {
+                                "name": "run_command",
+                                "arguments": '{"command": "cat personal_assistant/assistant/memory.py"}',
+                            },
+                        },
+                    ],
+                }
+            for msg in messages:
+                if msg.get("role") == "tool":
+                    seen_observations.append(str(msg.get("content") or ""))
+            return {"role": "assistant", "content": "冬季压测演练有效，旧版架构评审会已过期。"}
+
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
-    mem = _prepare_isolated_memory(REPO_ROOT / "evals" / "sample_data", tmp_path, cfg, REPO_ROOT)
-    assert getattr(mem.retriever, "name", None) == "fts5_bm25"
+    before_repo_offloads = (
+        set((REPO_ROOT / "data" / "workspace" / "tool_outputs").glob("*.txt"))
+        if (REPO_ROOT / "data" / "workspace" / "tool_outputs").is_dir()
+        else set()
+    )
+    try:
+        cases = [
+            {
+                "id": "temp-agent-today",
+                "category": "temporal",
+                "query": "我近期有什么压测演练或评审会安排？",
+                "today": "2026-11-20",
+                "answerable": True,
+                "expected_sources": [{"path": "data/memory/schedule.md", "quote": "参加冬季压测演练"}],
+                "expected_tools": ["search_markdown"],
+            }
+        ]
+        report = evaluate_agent(TemporalSpyLLM(), data_dir, cases, tools_config=cfg, git_commit="today-sha")
+    finally:
+        cfg.plugin_manager.terminate_all()
+
+    after_repo_offloads = (
+        set((REPO_ROOT / "data" / "workspace" / "tool_outputs").glob("*.txt"))
+        if (REPO_ROOT / "data" / "workspace" / "tool_outputs").is_dir()
+        else set()
+    )
+    assert after_repo_offloads == before_repo_offloads
+    assert report["summary"]["expected_tools_all_hit"] == 1
+    assert seen_prompts and "2026-11-20" in seen_prompts[0]
+    assert len(seen_observations) == 3
+    assert "参加冬季压测演练" in seen_observations[0]
+    assert "未在 data/memory 下找到" in seen_observations[1]
+    assert "data/memory/schedule.md" not in seen_observations[1]
+    assert "data/workspace/tool_outputs/" in seen_observations[2]
+    # 原始数据目录保持未修改（未触发归档、TOAST 落盘或创建 state）
+    assert not (data_dir / "memory" / "archive").exists()
+    assert not (data_dir / "workspace").exists()
+    assert not (data_dir / "state").exists()
 
 
 # 测试 evals CLI 统一复用 ToolsConfig.build_llm：支持外部 --config、models.dsl、预设名/模型 ID 与 --judge-model

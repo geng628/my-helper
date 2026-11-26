@@ -81,12 +81,7 @@ def _allowed_hosts_and_origins(
     extra_host: str | None = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
     clean, is_ipv6 = _parse_bind_host(host)
-    is_loopback = clean in {"127.0.0.1", "localhost", "::1"}
-    if not is_loopback and clean:
-        try:
-            is_loopback = ipaddress.ip_address(clean).is_loopback
-        except ValueError:
-            is_loopback = False
+    is_loopback = _is_loopback_host(host)
 
     formatted = f"[{clean}]" if is_ipv6 else clean
     if is_loopback:
@@ -298,8 +293,7 @@ def create_web_server(
             if parsed.path == "/api/history":
                 qs = parse_qs(parsed.query)
                 chat_id = (qs.get("chat_id") or ["web"])[0].strip() or "web"
-                compaction = app.state.get_compaction(chat_id)
-                msgs = app.state.active_messages(chat_id, limit=40)
+                compaction, msgs = app.state.get_context_snapshot(chat_id, limit=40)
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -427,11 +421,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _warn_if_non_loopback(args.host)
     app = build_app(model_name=args.model, consolidator_model=args.consolidator_model)
-    server = (
-        create_web_server(app, host=args.host, port=args.port, auth_token=args.auth_token)
-        if args.auth_token is not None
-        else create_web_server(app, host=args.host, port=args.port)
-    )
+    server = create_web_server(app, host=args.host, port=args.port, auth_token=args.auth_token)
     clean_host, is_ipv6 = _parse_bind_host(args.host)
     url_host = f"[{clean_host}]" if is_ipv6 else (clean_host or args.host)
     url = f"http://{url_host}:{server.server_port}"

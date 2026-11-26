@@ -24,7 +24,6 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlsplit
 from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import DEFAULT_SOFT_WRAP_CHARS, truncate_or_offload, truncate_utf8
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -57,30 +56,26 @@ class WebPolicy:
     offload_dir: Path | None = None
     allow_fake_ip: bool = False
 
-    # 从已解析的 web 配置字典直接构建 WebPolicy
+    # 从主板注入的 web 配置字典直接构建 WebPolicy（缺省使用安全默认值）
     @classmethod
-    def from_dict(cls, web_cfg: Mapping[str, object], *, offload_dir: Path | None = None) -> "WebPolicy":
+    def from_dict(cls, web_cfg: Mapping[str, object] | None = None, *, offload_dir: Path | None = None) -> "WebPolicy":
+        cfg = web_cfg or {}
+        raw_timeout = cfg.get("timeout", 15.0)
+        raw_dl = cfg.get("max_download_bytes", 2 * 1024 * 1024)
+        raw_out = cfg.get("max_output_bytes", 8192)
+        raw_res = cfg.get("max_results", 5)
+        timeout = float(raw_timeout) if isinstance(raw_timeout, (int, float, str)) and not isinstance(raw_timeout, bool) else 15.0
+        max_download = int(raw_dl) if isinstance(raw_dl, (int, float, str)) and not isinstance(raw_dl, bool) else 2 * 1024 * 1024
+        max_output = int(raw_out) if isinstance(raw_out, (int, float, str)) and not isinstance(raw_out, bool) else 8192
+        max_results = int(raw_res) if isinstance(raw_res, (int, float, str)) and not isinstance(raw_res, bool) else 5
         return cls(
-            timeout=float(web_cfg.get("timeout", 15.0)),
-            max_download_bytes=int(web_cfg.get("max_download_bytes", 2 * 1024 * 1024)),
-            max_output_bytes=int(web_cfg.get("max_output_bytes", 8192)),
-            max_results=max(1, min(10, int(web_cfg.get("max_results", 5)))),
+            timeout=timeout,
+            max_download_bytes=max_download,
+            max_output_bytes=max_output,
+            max_results=max(1, min(10, max_results)),
             offload_dir=offload_dir,
-            allow_fake_ip=bool(web_cfg.get("allow_fake_ip", False)),
+            allow_fake_ip=bool(cfg.get("allow_fake_ip", False)),
         )
-
-    # 从 config/tools.json 读取 web 配置段，缺省时使用安全默认值
-    @classmethod
-    def from_config(cls, config_path: Path | None = None, *, offload_dir: Path | None = None) -> "WebPolicy":
-        cfg_file = (
-            config_path or Path(os.getenv("MY_HELPER_CONFIG", str(REPO_ROOT / "config"))) / "tools.json"
-        ).resolve()
-        web_cfg: dict[str, object] = {}
-        if cfg_file.is_file():
-            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("web"), dict):
-                web_cfg = raw["web"]
-        return cls.from_dict(web_cfg, offload_dir=offload_dir)
 
 
 # 判断单个 IPv4/IPv6 地址是否属于允许访问的公网地址（阻断私网、回环、多播、NAT64 与隧道地址）
@@ -547,9 +542,8 @@ def execute_web_search(
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
     risk="network",
 )
-def web_search(query: str, *, config_path: Path | None = None, web_config: Mapping[str, object] | None = None) -> str:
-    policy = WebPolicy.from_dict(web_config) if isinstance(web_config, Mapping) else WebPolicy.from_config(config_path)
-    return execute_web_search(query, policy)
+def web_search(query: str, *, web_config: Mapping[str, object] | None = None) -> str:
+    return execute_web_search(query, WebPolicy.from_dict(web_config))
 
 
 # 插件工具入口：抓取指定公开网页并提取标题与纯文本正文（超长自动落盘分页）
@@ -563,11 +557,6 @@ def web_search(query: str, *, config_path: Path | None = None, web_config: Mappi
     risk="network",
 )
 def fetch_webpage(
-    url: str, *, config_path: Path | None = None, offload_dir: Path | None = None, web_config: Mapping[str, object] | None = None
+    url: str, *, offload_dir: Path | None = None, web_config: Mapping[str, object] | None = None
 ) -> str:
-    policy = (
-        WebPolicy.from_dict(web_config, offload_dir=offload_dir)
-        if isinstance(web_config, Mapping)
-        else WebPolicy.from_config(config_path, offload_dir=offload_dir)
-    )
-    return execute_fetch_webpage(url, policy)
+    return execute_fetch_webpage(url, WebPolicy.from_dict(web_config, offload_dir=offload_dir))

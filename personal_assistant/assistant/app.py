@@ -268,6 +268,7 @@ class AssistantApp:
         *,
         config_path: Path | None = None,
         project_root: Path | None = None,
+        tools_config: ToolsConfig | None = None,
         llm: LLMClient | None = None,
         memory: MemoryStore | None = None,
         state: StateStore | None = None,
@@ -296,17 +297,27 @@ class AssistantApp:
         self.data_root.mkdir(parents=True, exist_ok=True)
         self._today_fn = today_fn
 
-        self.config_path = config_path.resolve() if config_path is not None else None
-        self.project_root = (
-            project_root.resolve()
-            if project_root is not None
-            else (self.config_path.parent.parent if self.config_path else self.data_root.parent)
-        )
-        self.tools_config: ToolsConfig = (
-            ToolsConfig.load(self.config_path, project_root=self.project_root)
-            if (self.config_path is not None and self.config_path.is_file())
-            else ToolsConfig.empty(self.project_root)
-        )
+        self._owns_tools_config = tools_config is None
+        if tools_config is not None:
+            self.tools_config = tools_config
+            self.config_path = (
+                config_path.resolve() if config_path is not None else tools_config.config_path
+            )
+            self.project_root = (
+                project_root.resolve() if project_root is not None else tools_config.project_root
+            )
+        else:
+            self.config_path = config_path.resolve() if config_path is not None else None
+            self.project_root = (
+                project_root.resolve()
+                if project_root is not None
+                else (self.config_path.parent.parent if self.config_path else self.data_root.parent)
+            )
+            self.tools_config = (
+                ToolsConfig.load(self.config_path, project_root=self.project_root)
+                if (self.config_path is not None and self.config_path.is_file())
+                else ToolsConfig.empty(self.project_root)
+            )
 
         if memory is not None:
             self.memory = memory
@@ -472,11 +483,12 @@ class AssistantApp:
     def wait_for_consolidation(self, timeout: float = 15.0) -> None:
         self.background_consolidator.wait(timeout=timeout)
 
-    # 先等待后台沉淀收尾，再关闭已加载插件生命周期，最后关闭底层状态存储资源
+    # 先等待后台沉淀收尾，再按所有权关闭已加载插件生命周期，最后关闭底层状态存储资源
     def close(self) -> None:
         try:
             self.background_consolidator.wait(timeout=15.0)
-            self.tools_config.plugin_manager.terminate_all()
+            if self._owns_tools_config:
+                self.tools_config.plugin_manager.terminate_all()
         finally:
             self.state.close()
 

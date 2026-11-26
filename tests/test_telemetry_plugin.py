@@ -33,7 +33,7 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
             {
                 "enabled_tools": ["get_current_time"],
                 "plugins": ["plugins"],
-                "telemetry": {"enabled": True, "window_size": 5},
+                "telemetry": {"enabled": True, "max_sessions": 5},
                 "files": base_files,
                 "commands": [],
             }
@@ -45,7 +45,7 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
     assert len(observers_on) == 1
     assert isinstance(observers_on[0], ObserverProtocol)
     assert observers_on[0].name == "telemetry"
-    assert observers_on[0].config.window_size == 5
+    assert observers_on[0].config.max_sessions == 5
 
     cfg_off = tmp_path / "tools_off.json"
     cfg_off.write_text(
@@ -74,9 +74,11 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
         app_off.close()
 
 
-# 测试分阶段耗时拆解（ttft/llm/tool/overhead）、会话与前后台隔离及有界窗口游标
+# 测试分阶段耗时拆解（ttft/llm/tool/overhead）、会话与前后台隔离及有界 MRU 游标
 def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
-    obs = TelemetryObserver(TelemetryConfig(window_size=3, max_sessions=4))
+    obs = TelemetryObserver(TelemetryConfig(max_sessions=4))
+    assert not hasattr(obs, "recent_turns")
+    assert not hasattr(obs, "recent_tasks")
 
     # 1. 多步 ReAct 事件：验证 ttft 取首轮、llm_ms/tool_ms 累加及 overhead 差值
     obs.on_event(
@@ -171,7 +173,7 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     assert snap_s1["background"]["runs"] == 1
     assert snap_s1["background"]["prompt_tokens"] == 90
 
-    # 3. 验证有界窗口（window_size=3）、有界 MRU（max_sessions=4）、recent_tasks 与非负配置防错
+    # 3. 验证有界 MRU（max_sessions=4）、snapshot 单调游标与非负配置防错
     # 先对已存在的 main 触发一次 TurnEnd 刷新 MRU，再新增 3 个会话淘汰较久未活跃的 s1/s2
     obs.on_event("main", StreamDone(message={"role": "assistant", "content": "refresh"}, ttft_ms=-3.0, latency_ms=-5.0))
     obs.on_event("main", ToolStep(tool="noop", arguments="{}", observation="ok", duration_ms=-2.0))
@@ -187,12 +189,9 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
 
     final_snap = obs.snapshot()
     assert final_snap["cursor"] == 7
-    assert final_snap["buffered_turns"] == 3
+    assert final_snap["task_cursor"] == 1
     assert final_snap["totals"]["turns"] == 7
-    recent = obs.recent_turns(since_seq=5)
-    assert [item["seq"] for item in recent] == [6, 7]
     assert len(obs._sessions) == 4 and "main" in obs._sessions
-    assert len(obs.recent_tasks(session_key="s1")) == 1
 
     # 未收到 TurnEnd 的进行中会话超过 max_sessions 时也必须有界淘汰
     for idx in range(6):
@@ -200,11 +199,11 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     assert len(obs._in_flight) == 4
 
     # 非法/布尔配置安全回退默认值，直接构造 0 抛出 ValueError
-    bad_cfg = TelemetryConfig.from_dict({"window_size": True, "max_sessions": 0})
-    assert bad_cfg == TelemetryConfig(window_size=200, max_sessions=256)
+    bad_cfg = TelemetryConfig.from_dict({"max_sessions": True})
+    assert bad_cfg == TelemetryConfig(max_sessions=256)
     import pytest
     with pytest.raises(ValueError):
-        TelemetryConfig(window_size=0)
+        TelemetryConfig(max_sessions=0)
 
 
 # 测试 AssistantApp 真实配置自动装配 telemetry 插件并采集工具回合与后台沉淀指标
@@ -269,7 +268,7 @@ def test_assistant_app_end_to_end_telemetry_and_consolidation(tmp_path: Path) ->
 
 # 测试多线程并发上报主回合与后台成功/失败事件时的严格线程安全性
 def test_telemetry_thread_safety_under_concurrent_load() -> None:
-    obs = TelemetryObserver(TelemetryConfig(window_size=12))
+    obs = TelemetryObserver(TelemetryConfig(max_sessions=16))
     threads_n = 8
     turns_per_thread = 10
     barrier = threading.Barrier(threads_n)
@@ -308,9 +307,10 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
 
     snap = obs.snapshot()
     total_turns = threads_n * turns_per_thread
+    assert snap["cursor"] == total_turns
+    assert snap["task_cursor"] == total_turns
     assert snap["totals"]["turns"] == total_turns
     assert snap["totals"]["prompt_tokens"] == total_turns * 10
-    assert snap["buffered_turns"] == 12
     assert snap["background"]["runs"] == total_turns
     assert snap["background"]["failures"] == threads_n
     assert snap["background"]["prompt_tokens"] == (total_turns - threads_n) * 20

@@ -651,7 +651,21 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
         return _DummyApp()
 
     monkeypatch.setattr(web_mod, "build_app", fake_web_build_app)
-    monkeypatch.setattr(web_mod, "create_web_server", lambda _app, host="127.0.0.1", port=8765: _DummyServer())
+    monkeypatch.setattr(
+        web_mod,
+        "create_web_server",
+        lambda _app, host="127.0.0.1", port=8765, *, auth_token=None: _DummyServer(),
+    )
     web_mod.main(["--model", "reasoner", "--consolidator-model", "qwen"])
     assert captured_web["model_name"] == "reasoner"
     assert captured_web["consolidator_model"] == "qwen"
+
+    # 9. 确认 ModelsDSLCompiler.render 与 ConfigCompilerProtocol.render 均为显式强类型具名参数
+    import inspect
+    from personal_assistant.agent.plugins import ConfigCompilerProtocol
+    from plugins.models_dsl import ModelsDSLCompiler, render_models_dsl
+
+    proto_params = list(inspect.signature(ConfigCompilerProtocol.render).parameters)[1:]
+    impl_params = list(inspect.signature(ModelsDSLCompiler.render).parameters)[1:]
+    fn_params = list(inspect.signature(render_models_dsl).parameters)
+    assert proto_params == impl_params == fn_params

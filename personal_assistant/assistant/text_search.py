@@ -1,7 +1,9 @@
-"""中英双语文本分词与轻量词干归一化底座（零内部依赖）。"""
+"""中英双语文本分词、轻量词干归一化与检索阈值校验底座（零内部依赖）。"""
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Mapping
 
 _ASCII_WORD_RE = re.compile(r"[a-z0-9]+")
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
@@ -140,3 +142,43 @@ def tokenize_text(text: str, *, for_query: bool = False) -> list[str]:
             elif run:
                 tokens.append(run)
     return tokens
+
+
+# 校验检索词覆盖率（[0, 1]）与 BM25 下限（>= 0）数值范围，严格拒绝布尔值与非有限浮点
+def validate_retrieval_thresholds(min_term_coverage: float, min_bm25_score: float) -> tuple[float, float]:
+    if isinstance(min_term_coverage, bool) or isinstance(min_bm25_score, bool):
+        raise ValueError("retrieval 阈值参数不能为布尔值。")
+    if (
+        not isinstance(min_term_coverage, (int, float))
+        or not math.isfinite(min_term_coverage)
+        or not (0.0 <= min_term_coverage <= 1.0)
+    ):
+        raise ValueError("retrieval.min_term_coverage 必须在 [0, 1] 之间。")
+    if (
+        not isinstance(min_bm25_score, (int, float))
+        or not math.isfinite(min_bm25_score)
+        or min_bm25_score < 0.0
+    ):
+        raise ValueError("retrieval.min_bm25_score 必须 >= 0。")
+    return float(min_term_coverage), float(min_bm25_score)
+
+
+# 从检索配置映射解析并校验 (min_term_coverage, min_bm25_score) 阈值二元组
+def parse_retrieval_thresholds(
+    raw: Mapping[str, object] | None,
+    *,
+    default_coverage: float = 0.22,
+    default_min_bm25: float = 0.1,
+) -> tuple[float, float]:
+    cfg = raw or {}
+    raw_cov = cfg.get("min_term_coverage", default_coverage)
+    raw_bm25 = cfg.get("min_bm25_score", default_min_bm25)
+    if isinstance(raw_cov, bool) or isinstance(raw_bm25, bool):
+        raise ValueError("retrieval 阈值参数不能为布尔值。")
+    if raw_cov is not None and not isinstance(raw_cov, (int, float, str)):
+        raise TypeError("retrieval.min_term_coverage 必须是数字。")
+    if raw_bm25 is not None and not isinstance(raw_bm25, (int, float, str)):
+        raise TypeError("retrieval.min_bm25_score 必须是数字。")
+    coverage = default_coverage if raw_cov is None else float(raw_cov)
+    min_bm25 = default_min_bm25 if raw_bm25 is None else float(raw_bm25)
+    return validate_retrieval_thresholds(coverage, min_bm25)

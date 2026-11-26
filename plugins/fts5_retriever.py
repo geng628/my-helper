@@ -3,20 +3,20 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from personal_assistant.agent.plugins import Plugin
-from personal_assistant.assistant.common import today_shanghai
+from personal_assistant.assistant.common import require_positive_int, today_shanghai
 from personal_assistant.assistant.memory import SearchHit
 from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN
 from personal_assistant.assistant.text_search import (
-    EN_IRREGULAR_LEMMAS,
-    EN_STOPWORDS,
-    _normalize_en_word,
+    parse_retrieval_thresholds,
     tokenize_text,
+    validate_retrieval_thresholds,
 )
 
 if TYPE_CHECKING:
@@ -193,19 +193,22 @@ class FTS5Config:
     min_bm25_score: float = 0.1
     max_hits_per_file: int = 2
 
+    # 校验覆盖率、BM25 下限与单文件命中上限的数值范围
+    def __post_init__(self) -> None:
+        validate_retrieval_thresholds(self.min_term_coverage, self.min_bm25_score)
+        require_positive_int(self.max_hits_per_file, "retrieval.max_hits_per_file")
+
     # 从字典构造 FTS5Config 并校验数值范围
     @classmethod
-    def from_dict(cls, raw: dict[str, object] | None) -> "FTS5Config":
+    def from_dict(cls, raw: Mapping[str, object] | None) -> "FTS5Config":
         cfg = raw or {}
-        coverage = float(cfg.get("min_term_coverage", 0.22))
-        min_bm25 = float(cfg.get("min_bm25_score", 0.1))
-        per_file = int(cfg.get("max_hits_per_file", 2))
-        if not (0.0 <= coverage <= 1.0):
-            raise ValueError("retrieval.min_term_coverage 必须在 [0, 1] 之间。")
-        if min_bm25 < 0.0:
-            raise ValueError("retrieval.min_bm25_score 必须 >= 0。")
-        if per_file < 1:
-            raise ValueError("retrieval.max_hits_per_file 必须 >= 1。")
+        coverage, min_bm25 = parse_retrieval_thresholds(cfg)
+        raw_per_file = cfg.get("max_hits_per_file", 2)
+        if isinstance(raw_per_file, bool):
+            raise ValueError("retrieval.max_hits_per_file 必须是正整数。")
+        if raw_per_file is not None and not isinstance(raw_per_file, (int, float, str)):
+            raise TypeError("retrieval.max_hits_per_file 必须是整数。")
+        per_file = 2 if raw_per_file is None else int(raw_per_file)
         return cls(
             min_term_coverage=coverage,
             min_bm25_score=min_bm25,

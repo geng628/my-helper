@@ -9,16 +9,16 @@
 ## 架构概览
 
 1. **三层单向依赖漏斗（`ai ← agent ← assistant`）**：
-   - **Layer 1 `personal_assistant/ai/`**：零内部依赖的 LLM 传输客户端、SSE 流式解析、模型配置档案与按会话隔离的有界 KV Cache 观测。
-   - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/` 的通用单层 ReAct 循环、工具类型递进扩展（`ToolSchema → Tool`）与统一插件主板，不含业务路径或具体插件名硬编码。
-   - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（Markdown 记忆、安全策略、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入）。
-   - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图、业务字面量扫描与子进程 `sys.modules` 隔离测试守卫分层边界。
+   - **Layer 1 `personal_assistant/ai/`**：零内部依赖的 LLM 传输客户端、`ModelProfile` 直通工厂（`from_model_profile`）、通用命名角色配置 `ModelsConfig.roles`、SSE 流式解析与按会话隔离的有界 KV Cache 观测。
+   - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/` 的通用单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`）与零业务字段 `PluginContext` 统一插件主板，不含业务路径、具体插件名或配置段硬编码。
+   - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入）。
+   - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图、业务字面量扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
 2. **极简单层 ReAct 内核 + 外层安全预算**：
-   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为 30 余行单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `extract_tool_calls(assistant_msg)` 为空作为自然终止信号，并提供 `transform_context -> convert_to_llm` 边界转换钩子与执行期 `tool_context` 注入。
+   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为 30 余行单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `extract_tool_calls(assistant_msg)` 为空作为自然终止信号，并提供单步 `convert_to_llm` 边界转换钩子与执行期 `tool_context` 注入。
    - 防死循环与成本控制由 Layer 3 `AssistantApp` 的 `_GuardedTurnLLM` 在外层实施（默认单轮上限 `24` 步、`250,000` Token、`180s` 墙钟、连续 `3` 次等价工具调用熔断及 `finish_reason="length"` 截断工具调用熔断），兼顾内核简洁性与运行期有界性。
 3. **学习助手叠加能力（零微内核侵入）**：
    - **流式推导视图**：通过 `ThinkingDelta` 与 `ToolStart` 事件，在 CLI 与本地网页端实时展示可折叠的推理过程与慢工具执行状态，同时保持落库历史仅含纯净问答正文。
-   - **前后台双模型分槽**：支持在 `config/models.dsl` 中配置 `consolidator <模型名>`，前台使用推理模型（如 `deepseek-reasoner`）讲题推导，后台使用轻量对话模型（如 `deepseek-chat`）执行结构化记忆沉淀。
+   - **前后台双模型分槽**：支持在 `config/models.dsl` 中配置 `consolidator <模型名>`（编译至通用角色映射 `ModelsConfig.roles["consolidator"]`），前台使用推理模型（如 `deepseek-reasoner`）讲题推导，后台使用轻量对话模型（如 `deepseek-chat`）执行结构化记忆沉淀。
    - **纯 Markdown 间隔复习卡片**：通过外围插件 [plugins/tools/study_tools.py](plugins/tools/study_tools.py) 提供 `save_study_card` 与 `list_due_reviews`，在 `data/workspace/study/` 下维护人类可读的复习卡片与调度计划。
 
 ---
@@ -26,13 +26,13 @@
 ## 核心工程特性
 
 ### 1. 五大插件主板插槽与单次初始化生命周期
-- 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向 `PluginContext` 注册五类子协议，关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
-  1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 中的 `@tool` 函数，受 `config/tools.json` 白名单管控。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`），结合英文词形还原与中文虚词切分 + Bigram，共享零依赖分词底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py)。
-  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为 `ModelsConfig` 标准字典。
-  4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），处理轮内 `reasoning_content` 续传与跨轮剥离。
-  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以有界环形窗口统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件。
-- `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
+- 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
+  1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`）外挂双语 BM25 索引，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
+  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ModelsDSLCompiler.render` 与协议共享显式强类型具名参数签名。
+  4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），经 `ModelProfile` 直通工厂（`from_model_profile`）构造客户端，处理轮内 `reasoning_content` 续传与跨轮剥离。
+  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件。
+- `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 
 ### 2. KV Cache 友好的 Markdown 记忆、原子会话快照与沉淀韧性
 - **前缀冻结**：`data/memory/MEMORY.md` 限制为前 100 行 / 4000 字符索引，与 `rules/` 摘要按 `(today_str, chat_id)` 在会话内冻结于 `system` 前缀，跨自然日自动刷新。
@@ -41,9 +41,9 @@
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
-- **APFS Unicode 折叠与 Inode 文件隔离**：[personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验，阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
-- **逐子命令只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及裸 `<blob>`/`<tree>` `show`/`diff`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
-- **DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` 直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
+- **APFS Unicode 折叠与 Inode 文件隔离**：零内部依赖的 [personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合轻量单层受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验，阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
+- **语法级只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行语法级逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及冒号引用/解引用/裸对象哈希，无显式文件时自动补 `--stat`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
+- **直连 `http.client` + TLS/DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` + TLS SNI/证书校验直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
 - **本地 Web 服务防护**：[scripts/web_chat.py](scripts/web_chat.py) 校验 `Host`、`Origin`、`Sec-Fetch-Site` 与单一 `Content-Type: application/json`，下发 CSP / `nosniff` / `DENY` 响应头，支持非回环绑定下的常量时间 Bearer Token 鉴权；密钥配置文件纳入 `.gitignore` 并以 `0600` 权限原子写入。
 
 ---
@@ -56,7 +56,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全守卫（自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全守卫（202 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -94,7 +94,7 @@ consolidator deepseek
 ### 运行实模评测
 
 ```bash
-# 单轮隔离 Agent 评测（逐题重建独立 MemoryStore 沙箱）
+# 单轮隔离 Agent 评测（逐题基于 AssistantApp(auto_consolidate=False) 沙箱并透传逻辑日期 today）
 uv run python -m evals --mode agent --model deepseek --output /tmp/eval-agent.json
 
 # 16 场景多轮记忆生命周期评测（中立 v2-neutral Judge）
@@ -162,7 +162,7 @@ my_helper_v2/
 │   ├── fts5_retriever.py              # RetrieverProtocol：SQLite FTS5 + BM25 双语检索
 │   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器
 │   ├── reasoning_provider.py          # LLMProviderProtocol：reasoning_content 推理模型协议
-│   └── telemetry.py                   # ObserverProtocol：有界窗口耗时拆解与后台任务观测
+│   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
 │   ├── ai/                            # Layer 1：types.py / client.py / cache.py
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py

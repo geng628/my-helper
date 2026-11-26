@@ -7,11 +7,14 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import truncate_utf8
-from personal_assistant.assistant.text_search import tokenize_text
+from personal_assistant.assistant.text_search import (
+    parse_retrieval_thresholds,
+    tokenize_text,
+    validate_retrieval_thresholds,
+)
 
 DEFAULT_HISTORY_LIMIT = 5
 DEFAULT_CONTEXT_WINDOW = 1
@@ -21,41 +24,20 @@ MAX_OUTPUT_BYTES = 10000
 MAX_CACHED_DBS = 16
 
 
-# 历史检索阈值配置协议：兼容 HistorySearchConfig 及任意提供覆盖率与 BM25 下限属性的配置对象
-class _HistoryThresholdConfig(Protocol):
-    min_term_coverage: float
-    min_bm25_score: float
-
-
-# 历史对话检索阈值配置（插件自持轻量配置，彻底解除对 fts5_retriever 的跨插件耦合）
+# 历史对话检索阈值配置（与 FTS5Config 共享 text_search 阈值解析原语，解除跨插件耦合）
 @dataclass(frozen=True)
 class HistorySearchConfig:
     min_term_coverage: float = 0.22
     min_bm25_score: float = 0.1
 
-    # 校验覆盖率与 BM25 下限取值合法性（严格拒绝布尔值）
+    # 校验覆盖率与 BM25 下限取值合法性（复用共享阈值校验原语）
     def __post_init__(self) -> None:
-        if isinstance(self.min_term_coverage, bool) or isinstance(self.min_bm25_score, bool):
-            raise ValueError("retrieval 阈值参数不能为布尔值。")
-        if not (0.0 <= self.min_term_coverage <= 1.0):
-            raise ValueError("retrieval.min_term_coverage 必须在 [0, 1] 之间。")
-        if not (self.min_bm25_score >= 0.0):
-            raise ValueError("retrieval.min_bm25_score 必须 >= 0。")
+        validate_retrieval_thresholds(self.min_term_coverage, self.min_bm25_score)
 
     # 从字典或 Mapping 配置解析 HistorySearchConfig 并校验取值范围
     @classmethod
     def from_dict(cls, raw: Mapping[str, object] | None) -> "HistorySearchConfig":
-        cfg = raw or {}
-        raw_cov = cfg.get("min_term_coverage", 0.22)
-        raw_bm25 = cfg.get("min_bm25_score", 0.1)
-        if isinstance(raw_cov, bool) or isinstance(raw_bm25, bool):
-            raise ValueError("retrieval 阈值参数不能为布尔值。")
-        if raw_cov is not None and not isinstance(raw_cov, (int, float, str)):
-            raise TypeError("retrieval.min_term_coverage 必须是数字。")
-        if raw_bm25 is not None and not isinstance(raw_bm25, (int, float, str)):
-            raise TypeError("retrieval.min_bm25_score 必须是数字。")
-        coverage = 0.22 if raw_cov is None else float(raw_cov)
-        min_bm25 = 0.1 if raw_bm25 is None else float(raw_bm25)
+        coverage, min_bm25 = parse_retrieval_thresholds(raw)
         return cls(min_term_coverage=coverage, min_bm25_score=min_bm25)
 
 
@@ -219,7 +201,7 @@ class _HistoryFTSIndex:
         before_msg_id: int | None = None,
         limit: int = DEFAULT_HISTORY_LIMIT,
         context_window: int = DEFAULT_CONTEXT_WINDOW,
-        config: _HistoryThresholdConfig | None = None,
+        config: HistorySearchConfig | None = None,
     ) -> list[HistoryHit]:
         cfg = config if config is not None else HistorySearchConfig()
         query_terms = list(dict.fromkeys(tokenize_text(query, for_query=True)))
@@ -444,7 +426,7 @@ def execute_search_chat_history(
     before_msg_id: int | None = None,
     limit: int = DEFAULT_HISTORY_LIMIT,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
-    config: _HistoryThresholdConfig | None = None,
+    config: HistorySearchConfig | None = None,
 ) -> str:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("搜索关键词不能为空。")
