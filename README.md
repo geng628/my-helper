@@ -43,7 +43,7 @@
 ### 3. 纵深安全边界
 - **APFS Unicode 折叠与 Inode 文件隔离**：[personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验，阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
 - **逐子命令只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及裸 `<blob>`/`<tree>` `show`/`diff`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
-- **DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 禁用环境代理、默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 内嵌私网地址，并通过自定义 `_PinnedHTTPConnection` / `_PinnedHTTPSConnection` 直连已校验 IP 消除 DNS Rebinding 窗口；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
+- **DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` 直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
 - **本地 Web 服务防护**：[scripts/web_chat.py](scripts/web_chat.py) 校验 `Host`、`Origin`、`Sec-Fetch-Site` 与单一 `Content-Type: application/json`，下发 CSP / `nosniff` / `DENY` 响应头，支持非回环绑定下的常量时间 Bearer Token 鉴权；密钥配置文件纳入 `.gitignore` 并以 `0600` 权限原子写入。
 
 ---

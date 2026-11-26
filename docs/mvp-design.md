@@ -147,10 +147,10 @@ data/
 1. **原子契约（[../personal_assistant/ai/types.py](../personal_assistant/ai/types.py)）**：
    - `ToolSchema`：定义工具签名（`name`、`description`、`parameters`、`param_enums`、`required`），按精确必填参数集导出 OpenAI Function Calling JSON Schema。
    - `ToolCall` 与 `extract_tool_calls()`：将 OpenAI wire 字典或扁平工具调用解析为强类型 `ToolCall(id, name, arguments)`，空参数保底 `"{}"`。
-   - 流式与用量模型：`TextDelta`、`ThinkingDelta`、`StreamDone(message, usage, ttft_ms, latency_ms)`、`TokenUsage`、`ModelProfile` 与 `ModelsConfig`（提供 `redacted_dict()` 密钥脱敏）。
+   - 流式与用量模型：`TextDelta`、`ThinkingDelta`、`StreamDone(message, usage, ttft_ms, latency_ms, finish_reason)`、`TokenUsage`、`ModelProfile` 与 `ModelsConfig`（提供 `redacted_dict()` 密钥脱敏）。
 2. **传输底座与流式解析（[../personal_assistant/ai/client.py](../personal_assistant/ai/client.py)）**：
    - `OpenAIChatClient(LLMClient)` 提供 `_prepare_messages`、`_extra_payload`、`_thinking_delta_fields` 与 `_normalize_response_message` 四个受保护钩子，统一支撑标准 `OpenAICompatibleLLM` 与外围推理模型插件。
-   - SSE 流式解析器同时支持标准带 `index` 的并发工具增量帧与部分第三方网关省略 `index` 的工具流（覆盖零参工具、缺失 `id` 的连续 `function` 块及单帧多元素数组），并将最后一帧 `finish_reason` 挂入本地 `StreamDone.message` 供外层检测输出截断；外发下一轮请求时，`_prepare_messages` 与 `_build_request` 自动剥离内部 `finish_reason` 键，防止严格校验 Schema 的上游网关报 HTTP 400。
+   - SSE 流式解析器按标准 `index`（缺省回退帧内位置）聚合工具调用增量，并将结束原因挂在强类型 `StreamDone.finish_reason` 事件属性上供外层检测截断，保持业务 `message` 字典纯净无污染。
    - `_post_with_retry` 对瞬时网络/TLS 异常及 HTTP `429`/`5xx` 做最多 2 次指数退避重试，并在重抛的 `HTTPError` 中附带截断（上限 1024 字节）且经密钥脱敏的上游错误响应体以便排障；流式请求对不支持 `stream_options.include_usage` 的 HTTP 400 自动降级一次。
 3. **有界 KV 缓存观测（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)）**：
    - `CacheMonitor(max_records=2000, max_sessions=256)` 维护线程安全的有界滑动窗口、MRU 会话前缀表、单调游标 `snapshot_index()` 与 $O(1)$ 全局累计账本；`summary(since=..., session_key=...)` 支持按 `session_key` 过滤单会话切片，避免多会话并发流式对话时互相污染缓存统计。
@@ -176,19 +176,19 @@ data/
 1. **零内部依赖底座（`common.py`、`text_search.py`、`files_policy.py`）**：
    - `common.py` 提供北京时间带星期格式 `format_date_with_weekday`、`load_dotenv` 与 `truncate_or_offload()`（超长工具输出按 1 MB 上限落盘至 `data/workspace/tool_outputs/` 并返回带行号的 `head` / `head_tail` 预览）；
    - `text_search.py` 提供中英双语分词 `tokenize_text`，由 `fts5_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入；
-   - `files_policy.py` 提供 `normalize_segment`（剥离 Unicode `Cf` 格式控制符 + `NFKC` + `casefold()`）、`is_sensitive_segment`、受保护目录有界递归 `(st_dev, st_ino)` Inode 采集与 `FilesPolicy` 读写路径白名单，供 `MemoryStore` 与 `shell_tools.py` 共享同一套路径防线。
+   - `files_policy.py` 提供 `normalize_segment`（剥离 Unicode `Cf` 格式控制符 + `NFKC` + `casefold()`）、`is_sensitive_segment`、轻量受保护文件 `(st_dev, st_ino)` Inode 采集与 `FilesPolicy` 读写路径白名单，供 `MemoryStore` 与 `shell_tools.py` 共享同一套路径防线。
 2. **Markdown 记忆生命周期与内置工具（`memory.py`、`builtin_tools.py`、`memory_lifecycle.py`）**：
    - `MemoryStore` 使用可重入写锁 `_write_lock` 保护磁盘写入与 `audit.jsonl`；`remember_user_statement` 在流式轮内先写入 `(turn#<tag>)` 暂存标记，回合落库成功后经 `finalize_turn_fact` 升级为 `(msg#<id>)`，中断异常时回滚清理；
-   - `apply_topic_operations` 支持 `add`、`merge`、`replace`、`remove` 四类操作，被替换或移除的旧条目附带 `-> superseded_by: ...` 软退休至 `data/memory/archive/YYYY-MM.md`（默认热检索隔离归档目录），每日首次对话自动归档过期 `(until: YYYY-MM-DD)` 条目；
-   - `MemoryToolsetProvider` 导出 `list_files`、`search_markdown`、`read_markdown`、`write_file`、`remember_fact`、`save_rule` 6 个内置工具。
+   - `apply_topic_operations`、`read_topic_snapshots`、`archive_expired_topics` 与 `prune_raw_facts_for_batch` 通过单点 `_is_inflight_turn_line` 原生隔离未提交 `(turn#...)` 暂存行，支持 `add`、`merge`、`replace`、`remove` 四类操作，被替换或移除的旧条目附带 `-> superseded_by: ...` 软退休至 `data/memory/archive/YYYY-MM.md`（默认热检索隔离归档目录），每日首次对话自动归档过期 `(until: YYYY-MM-DD)` 条目；
+   - `MemoryToolsetProvider` 导出 `list_files`、`search_markdown`、`read_markdown`、`write_file`、`remember_fact`、`save_rule` 6 个内置工具，所有动态回合状态统一经 `tool_context` 单轨注入。
 3. **成对原子 SQLite 状态存储（[../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py)）**：
    - `StateStore` 基于 SQLite WAL 与 `RLock` 管理 `messages` 与 `session_compactions`：
      - `append_turn(chat_id, user_content, assistant_content)` 在同一事务中成对写入问答消息；
      - `get_context_snapshot(chat_id)` 在同一把锁内原子返回二元组 `(compaction, active_messages)`，消除前情摘要与活跃历史错配导致的消息漏读或重复注入（快照上界由独立的 `max_message_id()` 获取）。
 4. **外层回合预算、自适应滑窗与后台沉淀韧性（`app.py`、`consolidator.py`）**：
-   - `_GuardedTurnLLM` 在 `AssistantApp._run_stream_turn` 外层实施五项安全预算：单轮最大步数 `max_turn_steps=24`、累计 Token 上限 `max_turn_tokens=250_000`、单调墙钟上限 `max_turn_seconds=180.0`、完全相同工具与归一化 JSON 参数连续重复上限 `max_repeated_tool_calls=3`，以及 `finish_reason == "length"` 导致工具参数截断时的熔断收束；触发熔断后直接生成结构化降级说明、释放会话锁并保持后续轮次正常可用；
+   - `_GuardedTurnLLM` 在 `AssistantApp._run_stream_turn` 外层实施五项安全预算：单轮最大步数 `max_turn_steps=24`、累计 Token 上限 `max_turn_tokens=250_000`、单调墙钟上限 `max_turn_seconds=180.0`、完全相同工具与归一化 JSON 参数连续重复上限 `max_repeated_tool_calls=3`，以及 `StreamDone.finish_reason == "length"` 导致工具参数截断时的熔断收束；触发熔断后直接生成结构化降级说明、释放会话锁并保持后续轮次正常可用；
    - 自适应活跃历史滑窗 `_select_adaptive_history`：常态保留最近 `20` 条活跃消息；当后台沉淀仍在运行或处于失败退避导致未压缩消息超过 `20` 条时，在 `60` 条且 `24,000` 字符有界上限内自动拓宽保留未压缩历史，并强制窗口首条对齐 `user` 角色，防止旧消息在未进入摘要前从上下文静默丢失；
-   - `MemoryConsolidator` 与 `BackgroundConsolidator`：单批最多截取 `ConsolidationPolicy.max_batch_messages=24` 条偶数成对消息以防超长积压撑爆单次沉淀上下文；在进入 `memory._write_lock` 后经 `_filter_safe_operations` 重读磁盘最新 `facts.md`，保护前台并发在途 `(turn#...)` 行不被后台陈旧快照误改或误删；后台沉淀失败后按 `chat_id` 记录指数退避冷却（默认 `2s -> 4s -> ... -> 256s`，上限封顶 `300s`），避免每轮对话重复打爆故障接口；
+   - `MemoryConsolidator` 与 `BackgroundConsolidator`：单批最多截取 `ConsolidationPolicy.max_batch_messages=24` 条偶数成对消息以防超长积压撑爆单次沉淀上下文；仅按真实落盘生效的 `applied_texts` 清理已吸收原始事实；后台沉淀失败后按 `chat_id` 记录指数退避冷却（默认 `2s -> 4s -> ... -> 256s`，上限封顶 `300s`），避免每轮对话重复打爆故障接口；
    - `AssistantApp` 同时绑定 `consolidator` 的逻辑时钟 `today_fn`、在 `reload_llm()` / `configure_model()` 中通过 `_llm_lock` 串行化热切换，并在 `close()` 中调用 `plugin_manager.terminate_all()`。
 
 ---
@@ -212,16 +212,15 @@ data/
 
 1. **APFS Unicode 折叠与 Inode 路径防线（`files_policy.py`）**：
    - 所有路径段校验统一先剥离 Unicode `Cf` 零宽/格式控制符，再执行 `NFKC` 与 `.casefold()`，拦截 macOS APFS 大小写折叠等价字符（如长 s `ſ` U+017F 折叠为 `s` 绕过 `data/state` 或 `config/models.json`）及 `.env.*` / `.tmp-models-*` 变体（仅精确放行 `.env.example`）；
-   - 同时对受保护根目录与子项有界递归采集 `(st_dev, st_ino)`，即使工作区内存在指向敏感文件的硬链接或符号链接亦直接拦截。
+   - 同时采集受保护敏感文件与目录直属项的 `(st_dev, st_ino)`，即使工作区内存在指向敏感文件的硬链接或符号链接亦直接拦截。
 2. **受控白名单 Shell 沙箱与进程组回收（[../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)）**：
    - 仅允许白名单可执行名，以 `shell=False`、新进程会话（`start_new_session=True`）与隔离空 `HOME`（叠加 `GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`）执行；
    - `pytest` 强制限制在真实 `tests/` 目录并注入 `--ignore=data` 封堵 `write_file + pytest` 两步代码执行；
-   - `git` 采用严格逐子命令只读参数白名单：封堵 `git branch -D/-d/-m/-M/-c/-f/--edit-description` 等一切写操作与编辑器挂起、`git log -p/--raw/--all` 历史泄密，以及 `git show`/`git diff` 通过裸 `<blob>`/`<tree>`/空树 SHA 读取曾提交敏感文件的绕过，并为 `git diff` 自动追加 `:(exclude,glob,icase)` 敏感路径负向排除规格；
+   - `git` 采用简洁对称的逐子命令只读参数白名单：封堵 `git branch -D/-d/-m/-M/-c/-f/--edit-description` 等写操作与编辑器挂起、`git log -p/--raw/--all` 历史泄密，在语法层直接拒绝冒号对象语法 `rev:path`、解引用 `^{`/`@{` 及裸对象哈希（含 4 位起短哈希与 `describe -g<sha>`）；无显式安全文件路径时自动为 `git show`/`git diff` 补 `--stat`，带通配符路径时自动附加敏感路径负向排除；
    - 子进程 stdout/stderr 通过有界流式管道读取（单流硬上限 1 MB），超时、输出超限或父进程秒退后仍有孙进程持有管道时，统一调用 `os.killpg` 强杀整个进程组。
 3. **DNS Pinning 防重绑定 SSRF 与外部工具隔离（`web_tools.py`、`builtin_tools.py`、`prompts.py`）**：
-   - `fetch_webpage` 使用 `ProxyHandler({})` 忽略环境变量代理，默认关闭 Fake-IP 放行（`allow_fake_ip=False`，仅在 `config/tools.json` 显式配置 `"allow_fake_ip": true` 时兼容本地 TUN `198.18.0.0/15`），拦截私网、回环、多播、保留段及 NAT64（`64:ff9b::/96`、`64:ff9b:1::/48`）、`ipv4_mapped`、`sixtofour`、Teredo 内嵌私网地址；
-   - 自定义 `_PinnedHTTPConnection` / `_PinnedHTTPSConnection` 在 TCP 建连时直接连向已校验 IP（HTTPS 保持原始域名作为 TLS SNI 与证书主机名校验目标），消除校验与建连之间的 DNS Rebinding 窗口，并按 `time.monotonic()` 施加跨重定向总截止时间；
-   - `prompts.py` 在系统提示词注入 `data/memory/rules/` 时显式声明规则仅作沟通风格与偏好参考、不得覆盖系统安全边界或诱导越权访问；当同轮已调用任何 `risk == "network"` 工具时，`AssistantApp` 通过执行期上下文标记 `untrusted_tool_seen=True` 硬性拒绝同轮调用 `save_rule`，且日常调用 `save_rule` 亦须匹配用户原话中的显式长期规则设定意图。
+   - `fetch_webpage` 基于标准库 `http.client` 与 `socket.create_connection((pinned_ip, port))` 直接连接已校验公网 IP（天然不读取系统代理环境变量，HTTPS 保留原始域名用于 TLS SNI 与证书校验），默认关闭 Fake-IP 放行（`allow_fake_ip=False`，仅在 `config/tools.json` 显式开启时兼容本地 TUN `198.18.0.0/15`），拦截私网、回环、多播、保留段及 NAT64、`ipv4_mapped`、`sixtofour`、Teredo 隧道地址，并施加单调总截止时间与确定性 `HTTPResponse` 套接字关闭；
+   - `prompts.py` 在系统提示词注入 `data/memory/rules/` 时显式声明规则仅作沟通风格与偏好参考、不得覆盖系统安全边界或诱导越权访问；当同轮已调用任何 `risk == "network"` 工具时，`AssistantApp` 通过执行期上下文标记 `untrusted_tool_seen=True` 硬性拒绝同轮调用 `save_rule`。
 4. **本地 HTTP/SSE 服务边界（[../scripts/web_chat.py](../scripts/web_chat.py)）**：
    - 全路由校验 `Host` 白名单（支持 IPv6 RFC 5952 规范化），敏感 `GET /api/*` 与全部 `POST` 校验同源 `Origin` 与 `Sec-Fetch-Site in {"same-origin", "none"}`，强制单一 `Content-Type: application/json`；
    - 全响应附加 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Content-Security-Policy`（API 路由附加 `Cache-Control: no-store`）；SSE 流通过 `contextlib.closing` 确保客户端断连时立即触发生成器 `finally` 释放会话锁；绑定非回环地址时支持 `--auth-token` / `MY_HELPER_WEB_TOKEN` 常量时间 UTF-8 Bearer 鉴权。
