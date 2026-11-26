@@ -504,6 +504,8 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
                                 "operations": [
                                     {"op": "remove", "old": "(turn#deadbeef1234)"},
                                     {"op": "replace", "old": "(turn#deadbeef", "new": "被篡改"},
+                                    {"op": "remove", "old": "在途事实"},
+                                    {"op": "replace", "old": "尚未落库", "new": "被子串误伤"},
                                     {"op": "add", "text": "2025-03-14 买了新键盘。"},
                                 ],
                             }

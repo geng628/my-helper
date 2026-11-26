@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -68,10 +69,10 @@ def _validate_positive_int(value: int, name: str) -> int:
     return value
 
 
-# 校验运行期浮点秒数预算配置为非负有限数（严格拒绝布尔值）
+# 校验运行期浮点秒数预算配置为非负有限数（严格拒绝布尔值、NaN 与 Inf）
 def _validate_non_negative_float(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise ValueError(f"{name} 必须是非负数字。")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} 必须是非负有限数字。")
     return float(value)
 
 
@@ -115,6 +116,8 @@ def _select_adaptive_history(
             break
         selected_rev.append(msg)
         used_chars += item_len
+    while len(selected_rev) > 1 and selected_rev[-1].get("role") == "assistant":
+        selected_rev.pop()
     selected_rev.reverse()
     return selected_rev
 
@@ -225,7 +228,7 @@ class _GuardedTurnLLM(LLMClient):
             fallback_msg = self._fallback_message(breach)
             fallback_text = str(fallback_msg["content"])
             yield TextDelta(text=fallback_text)
-            yield StreamDone(message=fallback_msg, usage=None, ttft_ms=0.0, latency_ms=0.0)
+            yield StreamDone(message=fallback_msg, usage=None, ttft_ms=None, latency_ms=0.0)
             return
         self.steps += 1
         self.last_usage = None

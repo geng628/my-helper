@@ -249,7 +249,7 @@ def _consume_openai_sse(
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
     finish_reason: str | None = None
-    last_implicit_idx: int | None = None
+    implicit_slots: list[int] = []
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -290,13 +290,16 @@ def _consume_openai_sse(
             yield TextDelta(text=piece)
         raw_tool_calls = delta.get("tool_calls") or ()
         if isinstance(raw_tool_calls, (list, tuple)):
-            frame_slots_seen: set[int] = set()
-            for tc in raw_tool_calls:
-                if not isinstance(tc, dict):
-                    continue
+            valid_tcs = [tc for tc in raw_tool_calls if isinstance(tc, dict)]
+            multi_implicit = len(valid_tcs) > 1 and all(
+                not (isinstance(tc.get("index"), int) and not isinstance(tc.get("index"), bool) and tc.get("index") >= 0)  # type: ignore[operator]
+                for tc in valid_tcs
+            )
+            for pos, tc in enumerate(valid_tcs):
                 ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
                 raw_idx = tc.get("index")
                 tc_id = tc["id"] if isinstance(tc.get("id"), str) and tc["id"] else ""
+                tc_type = tc.get("type") if isinstance(tc.get("type"), str) else ""
                 fn = tc.get("function") or {}
                 fn_name = (
                     fn["name"]
@@ -310,18 +313,39 @@ def _consume_openai_sse(
                 )
                 if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and raw_idx >= 0:
                     idx = raw_idx
-                elif last_implicit_idx is None:
-                    idx = (max(tool_acc) + 1) if tool_acc else 0
-                else:
-                    curr = tool_acc[last_implicit_idx]
-                    diff_id = bool(tc_id and curr["id"] and tc_id != curr["id"])
-                    new_fn_after_args = bool(fn_name and curr["name"] and curr["args"])
-                    if last_implicit_idx in frame_slots_seen or diff_id or new_fn_after_args:
-                        idx = (max(tool_acc) + 1) if tool_acc else 0
+                elif multi_implicit:
+                    if pos < len(implicit_slots):
+                        cand_idx = implicit_slots[pos]
+                        curr = tool_acc[cand_idx]
+                        starts_new = bool(
+                            (tc_id and ((curr["id"] and tc_id != curr["id"]) or (not curr["id"] and (curr["name"] or curr["args"]))))
+                            or (tc_type == "function" and curr["name"] and not (tc_id and tc_id == curr["id"]))
+                            or (fn_name and curr["name"] and curr["args"])
+                        )
+                        if starts_new:
+                            idx = (max(tool_acc) + 1) if tool_acc else 0
+                            implicit_slots = implicit_slots[:pos] + [idx]
+                        else:
+                            idx = cand_idx
                     else:
-                        idx = last_implicit_idx
-                last_implicit_idx = idx
-                frame_slots_seen.add(idx)
+                        idx = (max(tool_acc) + 1) if tool_acc else 0
+                        implicit_slots.append(idx)
+                elif not implicit_slots:
+                    idx = (max(tool_acc) + 1) if tool_acc else 0
+                    implicit_slots.append(idx)
+                else:
+                    curr_idx = implicit_slots[-1]
+                    curr = tool_acc[curr_idx]
+                    starts_new = bool(
+                        (tc_id and ((curr["id"] and tc_id != curr["id"]) or (not curr["id"] and (curr["name"] or curr["args"]))))
+                        or (tc_type == "function" and curr["name"] and not (tc_id and tc_id == curr["id"]))
+                        or (fn_name and curr["name"] and curr["args"])
+                    )
+                    if starts_new:
+                        idx = (max(tool_acc) + 1) if tool_acc else 0
+                        implicit_slots.append(idx)
+                    else:
+                        idx = curr_idx
                 acc = tool_acc.setdefault(idx, {"id": "", "name": "", "args": []})
                 if tc_id:
                     acc["id"] = tc_id
@@ -447,9 +471,12 @@ class OpenAIChatClient(LLMClient):
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
-    # 预处理发往接口的消息列表（子类可按协议边界重写，默认原样透传）
+    # 预处理发往接口的消息列表（默认剥离本地附加的 finish_reason，子类可按协议边界重写）
     def _prepare_messages(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
-        return messages
+        return [
+            {k: v for k, v in msg.items() if k != "finish_reason"} if "finish_reason" in msg else msg
+            for msg in messages
+        ]
 
     # 返回附加到请求体顶层的协议参数（如 temperature，默认为空）
     def _extra_payload(self) -> dict[str, object]:
@@ -463,7 +490,7 @@ class OpenAIChatClient(LLMClient):
     def _normalize_response_message(self, message: dict[str, object]) -> dict[str, object]:
         return message
 
-    # 组装 /chat/completions 的请求地址、请求体与鉴权头（同步与流式调用共用）
+    # 组装 /chat/completions 的请求地址、请求体与鉴权头（统一兜底剥离外发消息中的内部 finish_reason）
     def _build_request(
         self,
         messages: list[dict[str, object]],
@@ -471,9 +498,13 @@ class OpenAIChatClient(LLMClient):
         *,
         stream: bool,
     ) -> tuple[str, dict[str, object], dict[str, str]]:
+        wire_messages = [
+            {k: v for k, v in msg.items() if k != "finish_reason"} if "finish_reason" in msg else msg
+            for msg in self._prepare_messages(messages)
+        ]
         payload: dict[str, object] = {
             "model": self.model,
-            "messages": self._prepare_messages(messages),
+            "messages": wire_messages,
             **self._extra_payload(),
             "stream": stream,
         }

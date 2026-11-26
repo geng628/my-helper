@@ -17,6 +17,7 @@ from personal_assistant.ai.types import TokenUsage
 from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
+from personal_assistant.assistant.memory_lifecycle import clean_memory_body
 
 CONSOLIDATION_SYSTEM_PROMPT = (
     "你是个人助手的后台记忆整理器。你会收到当前日期、已有主题记忆内容、MEMORY.md 索引、前情摘要，以及一段即将从活跃窗口移除的历史对话。\n"
@@ -140,7 +141,7 @@ class MemoryConsolidator:
 
     # 检查指定会话是否达到沉淀阈值；若达到则返回（旧摘要，待沉淀旧消息批次），否则返回 None
     def select_batch(self, chat_id: str) -> tuple[str, list[dict[str, object]]] | None:
-        active = self.state.active_messages(chat_id)
+        compaction, active = self.state.get_context_snapshot(chat_id)
         if not active:
             return None
         total_chars = sum(len(str(msg.get("content") or "")) for msg in active)
@@ -164,8 +165,40 @@ class MemoryConsolidator:
             ):
                 cap -= 1
             cutoff = max(1, cap)
-        existing_summary = str(self.state.get_compaction(chat_id).get("summary") or "")
+        existing_summary = str(compaction.get("summary") or "")
         return existing_summary, active[:cutoff]
+
+    # 在记忆写锁内过滤会误命中 facts.md 前台在途 (turn#...) 暂存行的修改/删除操作
+    def _filter_safe_operations(
+        self,
+        topic: str,
+        raw_ops: object,
+    ) -> list[dict[str, object]]:
+        if not isinstance(raw_ops, list):
+            return []
+        slug = re.sub(r"[^a-z0-9_-]+", "-", topic.lower()).strip("-_")[:40]
+        inflight_lines: list[str] = []
+        if slug == "facts" and self.memory.facts_file.is_file():
+            inflight_lines = [
+                ln.lower()
+                for ln in self.memory.facts_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                if "(turn#" in ln
+            ]
+        safe_ops: list[dict[str, object]] = []
+        for op in raw_ops:
+            if not isinstance(op, dict):
+                continue
+            op_name = str(op.get("op") or "add").strip().lower()
+            raw_old = str(op.get("old") or "").strip()
+            raw_rem = str(op.get("text") or "").strip() if op_name == "remove" else ""
+            if "(turn#" in raw_old.lower() or "(turn#" in raw_rem.lower():
+                continue
+            if inflight_lines and op_name in {"merge", "replace", "remove"}:
+                needle = clean_memory_body(raw_old or raw_rem).lower()
+                if needle and any(needle in ln for ln in inflight_lines):
+                    continue
+            safe_ops.append(op)
+        return safe_ops
 
     # 对指定会话执行一次完整沉淀：归档过期记忆、读旧改旧消冲突、生成滚动摘要并原子推进游标
     def consolidate_once(
@@ -234,28 +267,16 @@ class MemoryConsolidator:
                 if not topic:
                     continue
 
-                # 仅解析结构化 operations（add/merge/replace/remove），并跳过触碰在途 (turn#...) 的操作
+                # 在记忆可重入写锁临界区内原子过滤在途 (turn#...) 冲突并执行记忆变更，彻底消除并发误删竞态
                 raw_ops = entry.get("operations")
-                ops = (
-                    [
-                        op
-                        for op in raw_ops
-                        if isinstance(op, dict)
-                        and "(turn#" not in str(op.get("old") or "").lower()
-                        and not (
-                            str(op.get("op") or "").strip().lower() == "remove"
-                            and "(turn#" in str(op.get("text") or "").lower()
-                        )
-                    ]
-                    if isinstance(raw_ops, list)
-                    else []
-                )
-                if not ops:
-                    continue
                 try:
-                    saved = self.memory.apply_memory_operations(
-                        topic, title, index_summary, ops, today=ref_day
-                    )
+                    with self.memory._write_lock:
+                        ops = self._filter_safe_operations(topic, raw_ops)
+                        if not ops:
+                            continue
+                        saved = self.memory.apply_memory_operations(
+                            topic, title, index_summary, ops, today=ref_day
+                        )
                 except ValueError:
                     continue
                 if saved:
@@ -413,12 +434,14 @@ class BackgroundConsolidator:
         for thread in threads:
             thread.join(timeout=timeout)
 
-    # 返回当前后台沉淀运行状态、退避中会话数与最近一次结果/错误信息，供 /status 展示
+    # 返回当前后台沉淀运行状态、当前处于冷却期内的会话数与最近一次结果/错误信息，供 /status 展示
     def status(self) -> dict[str, object]:
+        now = self._clock()
         with self._lock:
+            active_backoffs = sum(1 for _, until in self._failures.values() if until > now)
             return {
                 "running_sessions": sorted(self._in_flight),
-                "backoff_sessions": len(self._failures),
+                "backoff_sessions": active_backoffs,
                 "last_result": self.last_result,
                 "last_error": self.last_error,
             }

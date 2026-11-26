@@ -840,6 +840,69 @@ def test_sse_tool_calls_without_index_and_finish_reason_preservation(tmp_path: P
     finally:
         app.close()
 
+    # 4. 直连 Layer 1/2 run_react（无 AssistantApp._convert_context_to_llm）以及零参无 id / type="function" / 多元素续传切槽
+    from personal_assistant.agent import ToolRegistry, run_react, tool as agent_tool
+    from plugins.reasoning_provider import OpenAIReasoningLLM
+
+    # 测试用无参探针工具
+    @agent_tool(description="探针无参工具")
+    def noop_ping() -> str:
+        return "pong"
+
+    direct_sent: list[list[dict[str, object]]] = []
+
+    # 捕获直连 OpenAIReasoningLLM 多步工具调用时发往接口的原始 messages
+    def direct_reasoner_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        direct_sent.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
+        if len(direct_sent) == 1:
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"先调工具","tool_calls":[{"id":"r_tc","type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+                    "data: [DONE]\n",
+                ]
+            )
+        return iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","content":"直连完成"}}]}\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                "data: [DONE]\n",
+            ]
+        )
+
+    direct_llm = OpenAIReasoningLLM(
+        api_key="sk-direct",
+        base_url="https://api.example.com/v1",
+        model="deepseek-reasoner",
+        post_stream=direct_reasoner_stream,
+    )
+    direct_msgs: list[dict[str, object]] = [{"role": "user", "content": "测试直连剥离 finish_reason"}]
+    assert run_react(direct_llm, direct_msgs, ToolRegistry(noop_ping.__agent_tool__)) == "直连完成"
+    assert len(direct_sent) == 2
+    assert all("finish_reason" not in m for m in direct_sent[1])
+
+    # 零参无 id 后接显式 id、以及连续带 type="function" 无 id 零参工具均切入独立槽位
+    sse_zero_arg_edges = [
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"name":"get_current_time","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","function":{"name":"list_files","arguments":"{}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"remember_fact","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
+        "data: [DONE]\n",
+    ]
+    edge_client = OpenAIChatClient(
+        api_key="sk-edge",
+        base_url="https://api.example.com/v1",
+        model="m-edge",
+        post_stream=lambda _u, _p, _h: iter(sse_zero_arg_edges),
+    )
+    edge_done = next(ev for ev in edge_client.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
+    assert [c["function"]["name"] for c in edge_done.message["tool_calls"]] == [  # type: ignore[index]
+        "get_current_time",
+        "list_files",
+        "remember_fact",
+        "noop_ping",
+    ]
+
 
 # 测试 HTTPError 错误体截断透出与令牌脱敏、stream_options 400 精准降级以及 429 Retry-After 退避
 def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_after(
