@@ -15,6 +15,7 @@ from personal_assistant.agent.tools import tool
 VALID_GRADES = frozenset({"again", "hard", "good", "easy"})
 _STUDY_LOCK = threading.Lock()
 _TOPIC_PREFIX = "# 学习卡片："
+_EMPTY_MSG = "学习卡片目录为空（data/workspace/study 暂无卡片），请先使用 save_study_card 记录知识点。"
 _DISALLOWED_SLUG_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9_-]+")
 _META_RE = re.compile(r"^- 掌握度:\s*(again|hard|good|easy)\s*\|\s*复习次数:\s*(\d+)\s*\|\s*间隔天数:\s*(\d+)\s*\|\s*下次复习:\s*(\d{4}-\d{2}-\d{2})\s*\|\s*最近更新:\s*(\d{4}-\d{2}-\d{2})\s*$")
 
@@ -35,29 +36,39 @@ class StudyCard:
 def _resolve_today(today: date | str | None) -> date:
     if today is None:
         return datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    if isinstance(today, datetime):
-        return today.date()
-    if isinstance(today, date):
-        return today
-    if isinstance(today, str) and today.strip():
+    if isinstance(today, (date, datetime)):
+        return today.date() if isinstance(today, datetime) else today
+    if isinstance(today, str) and (text := today.strip()):
         try:
-            return date.fromisoformat(today.strip())
+            return date.fromisoformat(text)
         except ValueError as error:
             raise ValueError(f"日期格式无效，应为 YYYY-MM-DD：{today}") from error
     raise ValueError("逻辑日期 today 必须是 date 或 YYYY-MM-DD 字符串。")
 
 
-# 校验专题名称并生成安全文件短名 slug 与规范化单行展示标题
+# 规范化多行要点文本：将全部 splitlines() 行分隔符统一转为 \n 并剥离首尾纯空白行
+def _normalize_summary(raw: str) -> str:
+    if not isinstance(raw, str) or "\x00" in raw:
+        raise ValueError("要点总结必须是非空有效文本且不能包含 NUL。")
+    lines = raw.splitlines()
+    non_empty = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not non_empty:
+        raise ValueError("要点总结不能为空。")
+    return "\n".join(lines[non_empty[0] : non_empty[-1] + 1])
+
+
+# 校验专题名称并生成安全文件短名 slug（限 120 字节）与规范化单行展示标题
 def _slugify_topic(topic: str) -> tuple[str, str]:
-    if not isinstance(topic, str) or "\x00" in topic:
+    if not isinstance(topic, str) or "\x00" in topic or not (stripped := topic.strip()):
         raise ValueError("专题名称必须是非空有效文本。")
-    stripped = topic.strip()
-    if not stripped or set(stripped) <= {"."} or "/" in stripped or "\\" in stripped or ".." in stripped:
-        raise ValueError("专题名称不能为空、纯点号或包含路径分隔符/..。")
+    if set(stripped) <= {"."} or "/" in stripped or "\\" in stripped or ".." in stripped:
+        raise ValueError("专题名称不能为纯点号或包含路径分隔符/..。")
     title = " ".join(stripped.split())
     slug = re.sub(r"-{2,}", "-", _DISALLOWED_SLUG_RE.sub("-", title)).strip("-_").lower()
     if not slug or set(slug) <= {"."}:
         raise ValueError("专题名称未包含有效的中文、字母或数字字符。")
+    if len(slug.encode("utf-8")) > 120:
+        raise ValueError("专题名称过长（UTF-8 编码不能超过 120 字节）。")
     return slug, title
 
 
@@ -68,10 +79,9 @@ def _resolve_study_dir(data_root: Path | None, project_root: Path | None) -> Pat
     raw_base = Path(data_root) if data_root is not None else ((Path(project_root).resolve() / "data") if project_root is not None else Path("data"))
     if raw_base.is_symlink():
         raise ValueError("安全校验失败：数据目录不能是符号链接。")
-    if data_root is not None and project_root is not None:
-        abs_proj, abs_base = Path(os.path.abspath(project_root)), Path(os.path.abspath(raw_base))
+    if data_root is not None and project_root is not None and (abs_base := Path(os.path.abspath(raw_base))).is_relative_to(abs_proj := Path(os.path.abspath(project_root))):
         cur = abs_proj
-        for part in (abs_base.relative_to(abs_proj).parts if abs_base.is_relative_to(abs_proj) else ()):
+        for part in abs_base.relative_to(abs_proj).parts:
             if (cur := cur / part).is_symlink():
                 raise ValueError(f"安全校验失败：父目录不能包含符号链接（{part}）。")
     base_data = raw_base.resolve()
@@ -84,10 +94,10 @@ def _resolve_study_dir(data_root: Path | None, project_root: Path | None) -> Pat
     return study_dir
 
 
-# 校验目标卡片文件不含符号链接且严格位于 study_dir 目录边界内
+# 校验目标卡片文件不含符号链接、非普通文件且严格位于 study_dir 目录边界内
 def _assert_safe_target(study_dir: Path, target_file: Path) -> None:
-    if target_file.is_symlink() or (target_file.exists() and target_file.is_dir()):
-        raise ValueError(f"安全校验失败：学习卡片文件不能是符号链接或目录（{target_file.name}）。")
+    if target_file.is_symlink() or (target_file.exists() and not target_file.is_file()):
+        raise ValueError(f"安全校验失败：学习卡片文件不能是符号链接或非普通文件（{target_file.name}）。")
     if not target_file.resolve(strict=False).is_relative_to(study_dir.resolve()):
         raise ValueError("安全校验失败：卡片文件路径越出学习目录边界。")
 
@@ -103,7 +113,6 @@ def _atomic_write(study_dir: Path, target_file: Path, content: str) -> None:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=study_dir, prefix=f".{target_file.stem}.", suffix=".tmp", delete=False) as handle:
             tmp_path = Path(handle.name)
             handle.write(content)
-            handle.flush()
         os.replace(tmp_path, target_file)
     except BaseException:
         if tmp_path is not None:
@@ -111,9 +120,9 @@ def _atomic_write(study_dir: Path, target_file: Path, content: str) -> None:
         raise
 
 
-# 解析单个专题 Markdown 文件，精确还原多行要点并防止内嵌标题切碎卡片边界
+# 解析单个专题 Markdown 文件（仅按 \n 切行与渲染对称），精确还原多行要点
 def parse_study_file(text: str, *, default_title: str = "") -> tuple[str, list[StudyCard]]:
-    lines = text.splitlines()
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     topic_title = next((ln[len(_TOPIC_PREFIX) :].strip() or default_title for ln in lines if ln.startswith(_TOPIC_PREFIX)), default_title)
     starts = [idx for idx, line in enumerate(lines) if line.startswith("## ")]
     cards: list[StudyCard] = []
@@ -133,26 +142,24 @@ def parse_study_file(text: str, *, default_title: str = "") -> tuple[str, list[S
     return topic_title, cards
 
 
-# 将专题标题与卡片列表序列化为人类可读且无损往返的 Markdown 文本
+# 将专题标题与卡片列表序列化为人类可读且无损往返的 Markdown 文本（消除任何非 \n 分隔符）
 def render_study_file(topic_title: str, cards: list[StudyCard]) -> str:
     blocks = [f"{_TOPIC_PREFIX}{topic_title}"]
     for card in cards:
-        indented = "\n".join(f"  {ln}" if ln else "" for ln in card.summary.split("\n"))
+        indented = "\n".join(f"  {ln}" if ln else "" for ln in card.summary.splitlines())
         blocks.append(f"## {card.concept}\n- 掌握度: {card.grade} | 复习次数: {card.reps} | 间隔天数: {card.interval_days} | 下次复习: {card.due.isoformat()} | 最近更新: {card.updated.isoformat()}\n- 要点与易错点:\n{indented}")
     return "\n\n".join(blocks) + "\n"
 
 
-# 按精简 Leitner/SM-2 规则根据掌握度计算下一轮复习次数、间隔天数与到期日
+# 按严格单调递进 Leitner/SM-2 规则计算下一轮复习次数、间隔天数与到期日（again <= hard <= good <= easy）
 def _compute_schedule(grade: str, prev_reps: int, prev_interval: int, ref_day: date) -> tuple[int, int, date]:
     if grade == "again":
         return 0, 1, ref_day + timedelta(days=1)
     reps = prev_reps + 1
-    if grade == "hard":
-        interval = 1 if prev_reps == 0 else max(2, round(prev_interval * 1.2))
-    elif grade == "good":
-        interval = 1 if prev_reps == 0 else (3 if prev_reps == 1 else min(180, prev_interval * 2))
-    else:
-        interval = 4 if prev_reps == 0 else min(365, max(prev_interval + 1, round(prev_interval * 2.5)))
+    hard_iv = 1 if prev_reps == 0 else min(180, max(2, round(prev_interval * 1.2)))
+    good_iv = 1 if prev_reps == 0 else min(180, max(3, prev_interval * 2))
+    easy_iv = 4 if prev_reps == 0 else min(365, max(good_iv + 1, round(prev_interval * 2.5)))
+    interval = hard_iv if grade == "hard" else (good_iv if grade == "good" else easy_iv)
     return reps, interval, ref_day + timedelta(days=interval)
 
 
@@ -182,27 +189,30 @@ def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_
     slug, topic_title = _slugify_topic(topic)
     if not isinstance(concept, str) or "\x00" in concept or not (norm_concept := " ".join(concept.split())):
         raise ValueError("知识点标题必须是非空有效文本。")
-    if not isinstance(summary, str) or "\x00" in summary or not (clean_summary := summary.replace("\r\n", "\n").replace("\r", "\n").strip("\n")).strip():
-        raise ValueError("要点总结必须是非空有效文本且不能包含 NUL。")
-    clean_grade = grade.strip().lower() if isinstance(grade, str) else ""
-    if clean_grade not in VALID_GRADES:
+    clean_summary = _normalize_summary(summary)
+    if (clean_grade := grade.strip().lower() if isinstance(grade, str) else "") not in VALID_GRADES:
         raise ValueError("掌握度 grade 必须是 again、hard、good 或 easy 之一。")
     ref_day = _resolve_today(today)
     with _STUDY_LOCK:
         study_dir = _resolve_study_dir(data_root, project_root)
         target_file = study_dir / f"{slug}.md"
         _assert_safe_target(study_dir, target_file)
-        existing_title, cards = parse_study_file(target_file.read_text(encoding="utf-8"), default_title=topic_title) if target_file.exists() else (topic_title, [])
-        topic_title = existing_title or topic_title
+        cards: list[StudyCard] = []
+        if target_file.exists():
+            raw_text = target_file.read_text(encoding="utf-8")
+            existing_title, cards = parse_study_file(raw_text, default_title=topic_title)
+            if raw_text.strip() and not raw_text.startswith(_TOPIC_PREFIX) and not cards:
+                raise ValueError(f"目标文件 {target_file.name} 不是有效学习卡片格式，拒绝覆盖非卡片笔记。")
+            topic_title = existing_title or topic_title
         idx = next((i for i, c in enumerate(cards) if c.concept.casefold() == norm_concept.casefold()), -1)
         prev = cards[idx] if idx >= 0 else None
         reps, interval, due = _compute_schedule(clean_grade, prev.reps if prev else 0, prev.interval_days if prev else 0, ref_day)
         card = StudyCard(norm_concept, clean_grade, reps, interval, due, ref_day, clean_summary)
         if idx >= 0:
-            cards[idx], action = card, "更新"
+            cards[idx] = card
         else:
             cards.append(card)
-            action = "创建"
+        action = "更新" if idx >= 0 else "创建"
         _atomic_write(study_dir, target_file, render_study_file(topic_title, cards))
     return f"已{action}学习卡片：data/workspace/study/{slug}.md\n- 专题: {topic_title} | 知识点: {norm_concept}\n- 掌握度: {clean_grade} | 复习次数: {reps} | 间隔天数: {interval} 天 | 下次复习: {due.isoformat()}"
 
@@ -213,36 +223,33 @@ def list_due_reviews(scope: str, *, data_root: Path | None = None, project_root:
     if not isinstance(scope, str) or "\x00" in scope or not (raw_scope := scope.strip()):
         raise ValueError("查询范围 scope 必须是非空字符串。")
     mode = raw_scope.lower()
-    if mode not in {"due", "all"} and ("/" in raw_scope or "\\" in raw_scope or ".." in raw_scope):
-        raise ValueError("查询专题名称不能包含路径分隔符或 ..。")
+    if mode not in {"due", "all"} and (set(raw_scope) <= {"."} or "/" in raw_scope or "\\" in raw_scope or ".." in raw_scope):
+        raise ValueError("查询专题名称不能为纯点号、路径分隔符或 ..。")
     ref_day = _resolve_today(today)
+    probe_slug = ""
+    topics: list[tuple[str, str, list[StudyCard]]] = []
     with _STUDY_LOCK:
         study_dir = _resolve_study_dir(data_root, project_root)
-        if not study_dir.exists():
-            return "学习卡片目录为空（data/workspace/study 暂无卡片），请先使用 save_study_card 记录知识点。"
-        probe_slug = ""
-        if mode not in {"due", "all"}:
-            try:
-                probe_slug, _ = _slugify_topic(raw_scope)
-                _assert_safe_target(study_dir, study_dir / f"{probe_slug}.md")
-            except ValueError as error:
-                if "符号链接" in str(error) or "越出" in str(error):
-                    raise
-        topics: list[tuple[str, str, list[StudyCard]]] = []
-        for entry in sorted(study_dir.iterdir(), key=lambda p: p.name):
-            if not entry.name.startswith(".") and entry.suffix.lower() == ".md":
-                _assert_safe_target(study_dir, entry)
-                title, cards = parse_study_file(entry.read_text(encoding="utf-8"), default_title=entry.stem)
-                if cards:
-                    topics.append((entry.stem, title or entry.stem, cards))
-    all_items = [(slug, title, c) for slug, title, cs in topics for c in cs]
-    if not all_items:
-        return "学习卡片目录为空（data/workspace/study 暂无卡片），请先使用 save_study_card 记录知识点。"
+        if study_dir.exists():
+            if mode not in {"due", "all"}:
+                try:
+                    probe_slug, _ = _slugify_topic(raw_scope)
+                    _assert_safe_target(study_dir, study_dir / f"{probe_slug}.md")
+                except ValueError as error:
+                    if any(k in str(error) for k in ("符号链接", "越出", "非普通文件")):
+                        raise
+            for entry in sorted(study_dir.iterdir(), key=lambda p: p.name):
+                if not entry.name.startswith(".") and entry.suffix.lower() == ".md":
+                    _assert_safe_target(study_dir, entry)
+                    title, cards = parse_study_file(entry.read_text(encoding="utf-8"), default_title=entry.stem)
+                    if cards:
+                        topics.append((entry.stem, title or entry.stem, cards))
+    if not (all_items := [(slug, title, c) for slug, title, cs in topics for c in cs]):
+        return _EMPTY_MSG
     if mode == "due":
-        due_items = sorted((item for item in all_items if item[2].due <= ref_day), key=lambda x: (x[2].due, x[2].interval_days, x[0], x[2].concept))
-        if not due_items:
+        if not (due_items := sorted((item for item in all_items if item[2].due <= ref_day), key=lambda x: (x[2].due, x[2].interval_days, x[0], x[2].concept))):
             return f"今天（{ref_day.isoformat()}）没有到期或逾期的复习卡片（共 {len(all_items)} 张卡片，最近待复习：{min(c.due for _, _, c in all_items).isoformat()}）。"
-        rows = [f"{i}. [{_format_card_status(c.due, ref_day, c.summary)[0]}] {t}（{s}）｜{c.concept}｜掌握度: {c.grade} | 复习次数: {c.reps} | 间隔: {c.interval_days} 天 | 到期: {c.due.isoformat()}\n   要点: {_format_card_status(c.due, ref_day, c.summary)[1]}" for i, (s, t, c) in enumerate(due_items, 1)]
+        rows = [f"{idx}. [{st[0]}] {t}（{s}）｜{c.concept}｜掌握度: {c.grade} | 复习次数: {c.reps} | 间隔: {c.interval_days} 天 | 到期: {c.due.isoformat()}\n   要点: {st[1]}" for idx, (s, t, c) in enumerate(due_items, 1) for st in (_format_card_status(c.due, ref_day, c.summary),)]
         return "\n".join([f"待复习队列（基准日期：{ref_day.isoformat()}，共 {len(due_items)} 张到期/逾期）：", *rows])
     if mode == "all":
         due_count = sum(1 for _, _, c in all_items if c.due <= ref_day)

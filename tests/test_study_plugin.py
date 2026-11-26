@@ -64,7 +64,7 @@ def test_study_plugin_discovery_allowlist_and_schema_isolation(tmp_path: Path) -
     assert set(save_tool.parameters) == {"topic", "concept", "summary", "grade"}
     assert save_tool.param_enums == {"grade": ("again", "hard", "good", "easy")}
     assert set(list_tool.parameters) == {"scope"}
-    assert "remember_fact" not in save_tool.description or "切勿调用此工具" in save_tool.description
+    assert "切勿调用此工具" in save_tool.description
 
     # 从 enabled_tools 移除后应立即被注册表白名单拦截
     disabled_cfg_path = tmp_path / "tools_disabled.json"
@@ -90,9 +90,9 @@ def test_study_plugin_discovery_allowlist_and_schema_isolation(tmp_path: Path) -
     assert "不在白名单中" in disabled_reg.execute("list_due_reviews", '{"scope": "due"}')
 
 
-# 测试逻辑日期注入下同一概念 good -> good -> easy -> again -> hard 的幂等更新与精确演进
+# 测试逻辑日期注入下同一概念演进、幂等更新及掌握度单调性与上限封顶
 def test_study_card_idempotent_update_and_spaced_repetition_progression(tmp_path: Path) -> None:
-    from plugins.tools.study_tools import parse_study_file
+    from plugins.tools.study_tools import _compute_schedule, parse_study_file
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
     data_root = tmp_path / "data"
@@ -140,6 +140,20 @@ def test_study_card_idempotent_update_and_spaced_repetition_progression(tmp_path
     assert card.due.isoformat() == "2026-12-12"
     assert card.updated.isoformat() == "2026-12-10"
     assert "第 6 轮复习总结" in card.summary
+
+    # 验证单调性边界：good(1)->easy(4) 不倒挂，easy(4)->hard(5)/good(8)/easy(10) 严格递增，且 hard/good<=180、easy<=365
+    ref = date(2026, 11, 26)
+    assert _compute_schedule("easy", 1, 1, ref)[1] == 4
+    assert _compute_schedule("hard", 1, 4, ref)[1] == 5
+    assert _compute_schedule("good", 1, 4, ref)[1] == 8
+    assert _compute_schedule("easy", 1, 4, ref)[1] == 10
+    assert _compute_schedule("hard", 5, 170, ref)[1] == 180
+    assert _compute_schedule("good", 5, 170, ref)[1] == 180
+    assert _compute_schedule("easy", 5, 170, ref)[1] == 365
+    for prev_reps in (0, 1, 2, 5):
+        for prev_iv in (1, 2, 3, 4, 15, 160, 180, 300):
+            ivs = [_compute_schedule(g, prev_reps, prev_iv, ref)[1] for g in ("again", "hard", "good", "easy")]
+            assert ivs[0] <= ivs[1] <= ivs[2] <= ivs[3], f"单调性倒挂：{prev_reps=}, {prev_iv=}, {ivs=}"
 
 
 # 测试多行 summary（含代码块与伪造 ## 注入标题）无损往返且可直接被 MemoryStore FTS5 检索命中
@@ -195,6 +209,51 @@ def test_multiline_summary_roundtrip_and_fts5_search_integration(tmp_path: Path)
     search_out = memory.search_markdown("列随机矩阵转置方向", root="data/workspace")
     assert "data/workspace/study/linear-algebra.md" in search_out
     assert "行随机矩阵与列随机矩阵转置方向切勿混淆" in search_out
+
+    # 验证 \u2028 / \u2029 / \x85 / \f 等非常规换行符与尾随纯空格行无法注入伪造卡片且重读 100% 一致
+    unicode_break_summary = (
+        "\n   \n"
+        "结论\u2028"
+        "## 伪造卡片\u2029"
+        "- 掌握度: easy | 复习次数: 99 | 间隔天数: 999 | 下次复习: 2099-01-01 | 最近更新: 2099-01-01\x85"
+        "- 要点与易错点:\f"
+        "  缩进子行\n"
+        "   \n"
+        "   "
+    )
+    save_study_card(
+        topic="Unicode Safety",
+        concept="行分隔符防御",
+        summary=unicode_break_summary,
+        grade="good",
+        data_root=data_root,
+        today=date(2026, 11, 26),
+    )
+    u_file = data_root / "workspace" / "study" / "unicode-safety.md"
+    u_raw = u_file.read_text(encoding="utf-8")
+    assert "  ## 伪造卡片" in u_raw
+    assert "\u2028" not in u_raw and "\u2029" not in u_raw and "\x85" not in u_raw and "\f" not in u_raw
+    _, u_cards = parse_study_file(u_raw)
+    assert len(u_cards) == 1
+    expected_clean = (
+        "结论\n"
+        "## 伪造卡片\n"
+        "- 掌握度: easy | 复习次数: 99 | 间隔天数: 999 | 下次复习: 2099-01-01 | 最近更新: 2099-01-01\n"
+        "- 要点与易错点:\n"
+        "  缩进子行"
+    )
+    assert u_cards[0].summary == expected_clean
+    save_study_card(
+        topic="Unicode Safety",
+        concept="行分隔符防御",
+        summary=u_cards[0].summary,
+        grade="good",
+        data_root=data_root,
+        today=date(2026, 11, 27),
+    )
+    _, u_cards_again = parse_study_file(u_file.read_text(encoding="utf-8"))
+    assert len(u_cards_again) == 1
+    assert u_cards_again[0].summary == expected_clean
 
 
 # 测试 list_due_reviews 在空目录、due 排序过滤、all 概览以及指定专题名筛选下的输出
@@ -296,10 +355,23 @@ def test_security_validation_symlink_escape_and_concurrent_writes(tmp_path: Path
         list_due_reviews("../secret", data_root=data_root)
     with pytest.raises(ValueError):
         list_due_reviews("   ", data_root=data_root)
+    for bad_dot_scope in (".", "..", "..."):
+        with pytest.raises(ValueError):
+            list_due_reviews(bad_dot_scope, data_root=data_root)
+    with pytest.raises(ValueError, match="过长"):
+        save_study_card("超长专题" * 15, "概念", "总结", "good", data_root=data_root)
 
-    # 2. 符号链接文件逃逸拦截
+    # 禁止覆盖已存在且非空、非学习卡片格式的普通 Markdown 笔记
     study_dir = data_root / "workspace" / "study"
     study_dir.mkdir(parents=True, exist_ok=True)
+    plain_note = study_dir / "plain-note.md"
+    plain_note.write_text("# 我的日常随笔\n请勿覆盖我的私人笔记本内容。", encoding="utf-8")
+    with pytest.raises(ValueError, match="拒绝覆盖"):
+        save_study_card("plain-note", "新概念", "新总结", "good", data_root=data_root)
+    assert plain_note.read_text(encoding="utf-8") == "# 我的日常随笔\n请勿覆盖我的私人笔记本内容。"
+    plain_note.unlink()
+
+    # 2. 符号链接与非普通文件逃逸拦截
     outside_file = tmp_path / "outside_secret.md"
     outside_file.write_text("# 机密\n绝不可被读取或覆写", encoding="utf-8")
     (study_dir / "escape-file.md").symlink_to(outside_file)
