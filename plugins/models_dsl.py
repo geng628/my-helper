@@ -107,6 +107,7 @@ def render_models_dsl(
     name: str = "",
     provider: str = "",
     temperature: float = 0.2,
+    consolidator: str = "",
 ) -> str:
     header = "# 由 My Helper 自动生成（已默认 .gitignore + 0600 权限 + 沙箱屏蔽保护）\n"
     matched = resolve_preset(preset)
@@ -114,6 +115,9 @@ def render_models_dsl(
     clean_model = model.strip()
     clean_url = base_url.strip()
     clean_provider = provider.strip(" \t").lower()
+    clean_consolidator = consolidator.strip(" \t")
+    if clean_consolidator and not _MODEL_NAME_RE.fullmatch(clean_consolidator):
+        raise ValueError(f"模型名称 {clean_consolidator!r} 仅允许字母、数字、下划线、点或连字符。")
     final_provider = clean_provider or (matched.provider if matched else "openai_compatible")
 
     if matched is not None and not clean_url and final_provider == matched.provider and temperature == 0.2:
@@ -121,11 +125,16 @@ def render_models_dsl(
             if not clean_key:
                 raise ValueError(f"使用 {matched.label} 需要填写 API Key。")
             if clean_model and clean_model != matched.default_model:
-                return f"{header}use {matched.id} {_format_dsl_value(clean_model)} {_format_dsl_value(clean_key)}\n"
-            return f"{header}use {matched.id} {_format_dsl_value(clean_key)}\n"
-        if clean_model and clean_model != matched.default_model:
-            return f"{header}use {matched.id} {_format_dsl_value(clean_model)}\n"
-        return f"{header}use {matched.id}\n"
+                use_line = f"use {matched.id} {_format_dsl_value(clean_model)} {_format_dsl_value(clean_key)}\n"
+            else:
+                use_line = f"use {matched.id} {_format_dsl_value(clean_key)}\n"
+        elif clean_model and clean_model != matched.default_model:
+            use_line = f"use {matched.id} {_format_dsl_value(clean_model)}\n"
+        else:
+            use_line = f"use {matched.id}\n"
+        if clean_consolidator:
+            return f"{header}{use_line}consolidator {clean_consolidator}\n"
+        return f"{header}{use_line}"
 
     # 自定义接口或高级覆盖模式：生成清晰的标准 model 块
     profile_name = (name.strip(" \t") or (matched.id if matched else "custom")).lower()
@@ -141,9 +150,15 @@ def render_models_dsl(
     lines = [
         header.rstrip("\n"),
         f"default {profile_name}",
-        "",
-        f"model {profile_name} {{",
     ]
+    if clean_consolidator:
+        lines.append(f"consolidator {clean_consolidator}")
+    lines.extend(
+        [
+            "",
+            f"model {profile_name} {{",
+        ]
+    )
     if final_provider != "openai_compatible":
         lines.append(f"  provider {_format_dsl_value(final_provider)}")
     lines.extend(
@@ -188,11 +203,12 @@ class ModelDecl:
     col: int
 
 
-# 顶层 DSL 程序 AST 节点（可选 default 声明 + 全部 model 块）
+# 顶层 DSL 程序 AST 节点（可选 default / consolidator 声明 + 全部 model 块）
 @dataclass(frozen=True)
 class ModelsDSLProgram:
     default_model: tuple[str, int, int] | None
     models: tuple[ModelDecl, ...]
+    consolidator_model: tuple[str, int, int] | None = None
 
 
 # 词法分析器：支持 # 注释、单双引号字符串、免引号裸值（URL/密钥/数字）与花括号块
@@ -330,6 +346,7 @@ class _DSLParser:
     # 解析整篇 DSL 文件，产出 ModelsDSLProgram AST
     def parse(self) -> ModelsDSLProgram:
         default_decl: tuple[str, int, int] | None = None
+        consolidator_decl: tuple[str, int, int] | None = None
         models: list[ModelDecl] = []
 
         self._skip_newlines()
@@ -337,7 +354,7 @@ class _DSLParser:
             tok = self._peek()
             if tok.kind != "WORD":
                 raise DSLCompileError(
-                    f"顶层期望 use、add、default 或 model 声明，实际遇到 {tok.value!r}。",
+                    f"顶层期望 use、add、default、consolidator 或 model 声明，实际遇到 {tok.value!r}。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -348,6 +365,13 @@ class _DSLParser:
                 if default_decl is not None:
                     raise DSLCompileError("不允许重复声明 default。", source=self._source, line=tok.line, col=tok.col)
                 default_decl = (target.value, target.line, target.col)
+                self._expect_line_end()
+            elif tok.value == "consolidator":
+                self._advance()
+                target = self._expect("WORD", "consolidator 后必须指定后台沉淀模型名称。")
+                if consolidator_decl is not None:
+                    raise DSLCompileError("不允许重复声明 consolidator。", source=self._source, line=tok.line, col=tok.col)
+                consolidator_decl = (target.value, target.line, target.col)
                 self._expect_line_end()
             elif tok.value in {"use", "add"}:
                 decl, is_default = self._parse_preset_line()
@@ -365,14 +389,18 @@ class _DSLParser:
                 models.append(self._parse_model_block())
             else:
                 raise DSLCompileError(
-                    f"未知顶层指令 {tok.value!r}（支持 use、add、default 与 model）。",
+                    f"未知顶层指令 {tok.value!r}（支持 use、add、default、consolidator 与 model）。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
                 )
             self._skip_newlines()
 
-        return ModelsDSLProgram(default_model=default_decl, models=tuple(models))
+        return ModelsDSLProgram(
+            default_model=default_decl,
+            models=tuple(models),
+            consolidator_model=consolidator_decl,
+        )
 
     # 解析极简一行预设语句：`use/add <厂商> [模型名] [api_key]`，自动展开为完整 ModelDecl AST
     def _parse_preset_line(self) -> tuple[ModelDecl, bool]:
@@ -481,6 +509,28 @@ class _DSLParser:
         return ModelDecl(name=name_tok.value, fields=fields, line=name_tok.line, col=name_tok.col)
 
 
+# 解析顶层模型引用（default / consolidator）：先按名称精确匹配，再按内置预设别名映射到 preset.id
+def _resolve_target_model(
+    target: tuple[str, int, int],
+    emitted_models: dict[str, dict[str, object]],
+    *,
+    directive: str,
+    source: str,
+) -> str:
+    raw_name, line, col = target
+    if raw_name in emitted_models:
+        return raw_name
+    preset = resolve_preset(raw_name)
+    if preset is not None and preset.id in emitted_models:
+        return preset.id
+    raise DSLCompileError(
+        f"{directive} 指向未定义的模型：{raw_name!r}。",
+        source=source,
+        line=line,
+        col=col,
+    )
+
+
 # 解析并编译极简模型配置 DSL 文本为标准 models.json 字典（支持一行预设与完整 model 块）
 def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, object]:
     tokens = tokenize_dsl(text, source=source)
@@ -555,14 +605,12 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
         emitted_models[decl.name] = entry
 
     if program.default_model is not None:
-        default_name, def_line, def_col = program.default_model
-        if default_name not in emitted_models:
-            raise DSLCompileError(
-                f"default 指向未定义的模型：{default_name!r}。",
-                source=source,
-                line=def_line,
-                col=def_col,
-            )
+        default_name = _resolve_target_model(
+            program.default_model,
+            emitted_models,
+            directive="default",
+            source=source,
+        )
     elif len(emitted_models) == 1:
         default_name = next(iter(emitted_models))
     else:
@@ -573,10 +621,18 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
             col=1,
         )
 
-    return {
+    compiled: dict[str, object] = {
         "default": default_name,
         "models": emitted_models,
     }
+    if program.consolidator_model is not None:
+        compiled["consolidator"] = _resolve_target_model(
+            program.consolidator_model,
+            emitted_models,
+            directive="consolidator",
+            source=source,
+        )
+    return compiled
 
 
 # 实现内层 ConfigCompilerProtocol 协议的强类型配置编译器（支持 compile / presets / render）
@@ -601,6 +657,7 @@ class ModelsDSLCompiler:
             name=str(kwargs.get("name") or ""),
             provider=str(kwargs.get("provider") or ""),
             temperature=float(kwargs.get("temperature", 0.2)),  # type: ignore[arg-type]
+            consolidator=str(kwargs.get("consolidator") or ""),
         )
 
 

@@ -7,3 +7,8 @@ use deepseek sk-替换为你的真实密钥
 # 可选：用 add 追加更多备用模型（内置支持 deepseek / qwen(通义千问) / kimi / glm(智谱) / openai / siliconflow / ollama）
 # add 通义千问 sk-你的通义千问密钥
 # add ollama
+
+# 学习助手推荐双模型分槽配置（前台用推理模型深度推导讲题，后台用低成本对话模型整理记忆笔记）：
+# use reasoner sk-替换为你的真实密钥
+# add deepseek sk-替换为你的真实密钥
+# consolidator deepseek

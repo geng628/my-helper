@@ -196,6 +196,30 @@
       background: none;
       padding: 0;
     }
+    details.thinking {
+      width: 100%;
+      background: rgba(91, 140, 255, 0.08);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    details.thinking summary {
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 500;
+    }
+    .thinking-body {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.55;
+      color: #c2cbe0;
+    }
     details.tools {
       width: 100%;
       background: var(--panel-2);
@@ -217,6 +241,9 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .tool-item.pending {
+      color: var(--warn);
     }
     .tool-name { color: #8cb4ff; font-weight: 600; }
     .submeta {
@@ -531,7 +558,7 @@
       }
     }
 
-    function appendToolStep(wrap, bubble, state, step, { openOnCreate = true } = {}) {
+    function ensureToolsPanel(wrap, bubble, state, { openOnCreate = true } = {}) {
       if (!state.details) {
         const details = document.createElement("details");
         details.className = "tools";
@@ -542,17 +569,151 @@
         state.details = details;
         state.summary = summary;
       }
+      if (!state.pending) state.pending = [];
+    }
+
+    function appendThinkingDelta(wrap, bubble, thinkingState, toolState, text) {
+      const chunk = String(text || "");
+      if (!chunk) return;
+      if (!thinkingState.details) {
+        const details = document.createElement("details");
+        details.className = "thinking";
+        details.open = true;
+        const summary = document.createElement("summary");
+        const body = document.createElement("div");
+        body.className = "thinking-body";
+        details.appendChild(summary);
+        details.appendChild(body);
+        wrap.insertBefore(details, (toolState && toolState.details) || bubble);
+        thinkingState.details = details;
+        thinkingState.summary = summary;
+        thinkingState.body = body;
+      }
+      if (thinkingState.stepBreak) {
+        if (thinkingState.text && !thinkingState.text.endsWith("\n")) {
+          thinkingState.text += "\n\n";
+        }
+        thinkingState.stepBreak = false;
+      }
+      thinkingState.details.open = true;
+      thinkingState.collapsed = false;
+      thinkingState.summary.textContent = "💭 推导思路（思考中…）";
+      thinkingState.text += chunk;
+      thinkingState.body.innerHTML = escapeHtml(thinkingState.text);
+    }
+
+    function markStepBreak(ctx, { runningTool = false } = {}) {
+      if (ctx.thinkingState) {
+        ctx.thinkingState.stepBreak = true;
+        if (runningTool && ctx.thinkingState.details && ctx.thinkingState.text && !ctx.thinkingState.collapsed) {
+          ctx.thinkingState.summary.textContent = "💭 推导思路（执行工具中…）";
+        }
+      }
+      if (ctx.replyText) {
+        ctx.textStepBreak = true;
+      }
+    }
+
+    function collapseThinking(thinkingState) {
+      if (!thinkingState || !thinkingState.details) return;
+      thinkingState.summary.textContent = `💭 推导思路（${thinkingState.text.length} 字，点击展开）`;
+      if (!thinkingState.collapsed) {
+        thinkingState.details.open = false;
+        thinkingState.collapsed = true;
+      }
+    }
+
+    function startToolStep(wrap, bubble, state, ev) {
+      ensureToolsPanel(wrap, bubble, state, { openOnCreate: true });
+      state.details.open = true;
+      const toolName = String(ev.tool || "");
+      const argsText = String(ev.arguments || "");
+      const callId = String(ev.call_id || "");
+      state.summary.textContent = `🔧 正在调用 ${toolName}…`;
+      const item = document.createElement("div");
+      item.className = "tool-item pending";
+      item.setAttribute("data-call-id", callId);
+      item.innerHTML = `<span class="tool-name">[调用中] ${escapeHtml(toolName)}</span>(${escapeHtml(argsText)}) …`;
+      state.details.appendChild(item);
+      state.pending.push({ callId, item });
+    }
+
+    function appendToolStep(wrap, bubble, state, step, { openOnCreate = true } = {}) {
+      ensureToolsPanel(wrap, bubble, state, { openOnCreate });
+      const stepCallId = String(step.call_id || "");
+      let item = null;
+      if (state.pending.length > 0) {
+        let idx = -1;
+        if (stepCallId) {
+          idx = state.pending.findIndex((p) => p.callId === stepCallId);
+          if (idx === -1) idx = state.pending.findIndex((p) => !p.callId);
+        } else {
+          idx = 0;
+        }
+        if (idx !== -1) {
+          item = state.pending.splice(idx, 1)[0].item;
+        }
+      }
+      const isNew = item === null;
+      if (isNew) {
+        item = document.createElement("div");
+      }
+      item.className = "tool-item";
       state.count += 1;
       state.summary.textContent = `🔧 工具调用轨迹（${state.count} 步）`;
-      const item = document.createElement("div");
-      item.className = "tool-item";
       const obs = String(step.observation || "");
       const preview = obs.length > 600 ? obs.slice(0, 600) + "\n…（已折叠）" : obs;
       const durText = typeof step.duration_ms === "number" ? ` (${step.duration_ms.toFixed(1)}ms)` : "";
       item.innerHTML =
         `<span class="tool-name">[Act] ${escapeHtml(step.tool)}</span>(${escapeHtml(step.arguments)})${escapeHtml(durText)}\n` +
         `[Observe] ${escapeHtml(preview)}`;
-      state.details.appendChild(item);
+      if (isNew) {
+        state.details.appendChild(item);
+      }
+    }
+
+    function applyStreamEvent(ctx, ev) {
+      if (ev.type === "thinking_delta") {
+        appendThinkingDelta(ctx.wrap, ctx.bubble, ctx.thinkingState, ctx.toolState, ev.text);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "tool_start") {
+        markStepBreak(ctx, { runningTool: true });
+        startToolStep(ctx.wrap, ctx.bubble, ctx.toolState, ev);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "tool_step") {
+        markStepBreak(ctx);
+        appendToolStep(ctx.wrap, ctx.bubble, ctx.toolState, ev);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "text_delta") {
+        if (ctx.thinkingState && !ctx.thinkingState.collapsed) {
+          collapseThinking(ctx.thinkingState);
+        }
+        const piece = String(ev.text || "");
+        if (piece) {
+          if (ctx.textStepBreak) {
+            if (ctx.replyText && !ctx.replyText.endsWith("\n")) {
+              ctx.replyText += "\n\n";
+            }
+            ctx.textStepBreak = false;
+          }
+          ctx.replyText += piece;
+          ctx.bubble.innerHTML = renderMarkdownLite(ctx.replyText);
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "done") {
+        if (ctx.thinkingState && !ctx.thinkingState.details && ev.thinking) {
+          appendThinkingDelta(ctx.wrap, ctx.bubble, ctx.thinkingState, ctx.toolState, ev.thinking);
+        }
+        collapseThinking(ctx.thinkingState);
+        const finalReply = String(ev.reply || ctx.replyText);
+        ctx.bubble.innerHTML = renderMarkdownLite(finalReply);
+        if (ctx.toolState && ctx.toolState.details) ctx.toolState.details.open = false;
+        renderMetaRow(ctx.wrap, ev.cache, ev.consolidation_scheduled, ev.telemetry);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "error") {
+        ctx.wrap.classList.add("error");
+        ctx.bubble.textContent = String(ev.error || "流式对话失败");
+      }
     }
 
     function appendMessage(role, content, extra = {}) {
@@ -566,7 +727,7 @@
       wrap.appendChild(bubble);
 
       if (extra.toolCalls && extra.toolCalls.length > 0) {
-        const state = { details: null, summary: null, count: 0 };
+        const state = { details: null, summary: null, count: 0, pending: [] };
         for (const step of extra.toolCalls) {
           appendToolStep(wrap, bubble, state, step, { openOnCreate: false });
         }
@@ -628,31 +789,21 @@
       appendMessage("user", text);
       const wrap = appendMessage("assistant", "思考与执行工具中…");
       const bubble = wrap.querySelector(".bubble");
-      const toolState = { details: null, summary: null, count: 0 };
-      let replyText = "";
+      const streamCtx = {
+        wrap,
+        bubble,
+        toolState: { details: null, summary: null, count: 0, pending: [] },
+        thinkingState: { details: null, summary: null, body: null, text: "", collapsed: false, stepBreak: false },
+        replyText: "",
+        textStepBreak: false,
+      };
 
       function handleSseBlock(block) {
         for (const rawLine of block.split("\n")) {
           const line = rawLine.trim();
           if (!line.startsWith("data:")) continue;
           const ev = JSON.parse(line.slice(5).trim());
-          if (ev.type === "tool_step") {
-            appendToolStep(wrap, bubble, toolState, ev);
-            chatEl.scrollTop = chatEl.scrollHeight;
-          } else if (ev.type === "text_delta") {
-            replyText += String(ev.text || "");
-            bubble.innerHTML = renderMarkdownLite(replyText);
-            chatEl.scrollTop = chatEl.scrollHeight;
-          } else if (ev.type === "done") {
-            const finalReply = String(ev.reply || replyText);
-            bubble.innerHTML = renderMarkdownLite(finalReply);
-            if (toolState.details) toolState.details.open = false;
-            renderMetaRow(wrap, ev.cache, ev.consolidation_scheduled, ev.telemetry);
-            chatEl.scrollTop = chatEl.scrollHeight;
-          } else if (ev.type === "error") {
-            wrap.classList.add("error");
-            bubble.textContent = String(ev.error || "流式对话失败");
-          }
+          applyStreamEvent(streamCtx, ev);
         }
       }
 
@@ -723,7 +874,9 @@
           .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}（默认：${escapeHtml(p.default_model)}）</option>`)
           .join("") + `<option value="custom">自定义 OpenAI 兼容接口</option>`;
         const configuredText = data.configured
-          ? `当前已生效默认模型：${escapeHtml(data.configured.default)}`
+          ? `当前已生效默认模型：${escapeHtml(data.configured.default)}${
+              data.configured.consolidator ? `（后台沉淀：${escapeHtml(data.configured.consolidator)}）` : ""
+            }`
           : "尚未配置模型，填好下面两项即可直接使用。";
 
         modalBody.innerHTML = `

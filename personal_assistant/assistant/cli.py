@@ -9,9 +9,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
+from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
-from personal_assistant.ai import TextDelta
+from personal_assistant.ai import TextDelta, ThinkingDelta
 from personal_assistant.ai.cache import format_cache_summary
 from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient, from_env
 from personal_assistant.ai.types import ModelsConfig
@@ -64,25 +64,51 @@ def _print_tool_step(step: ToolStep) -> None:
 
 # 创建终端流式打印器：返回实时事件回调与回合收尾函数（直连工具模式与 AssistantApp 模式共用）
 def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], None]]:
-    streamed = False
+    mode = "idle"
+    streamed_text = False
 
-    # 实时打印单个 Agent 事件：文本增量逐字输出，工具步骤前先补换行
+    # 实时打印单个 Agent 事件：按 idle / thinking / text 三态切换行前缀与换行
     def on_event(ev: AgentEvent) -> None:
-        nonlocal streamed
-        if isinstance(ev, ToolStep):
-            if streamed:
+        nonlocal mode, streamed_text
+        if isinstance(ev, ThinkingDelta) and ev.text:
+            if mode != "thinking":
+                if mode == "text":
+                    print()
+                print("  [推导] ", end="", flush=True)
+                mode = "thinking"
+            print(ev.text, end="", flush=True)
+        elif isinstance(ev, ToolStart):
+            if mode != "idle":
                 print()
-                streamed = False
+                mode = "idle"
+            streamed_text = False
+            print(f"  [调用] {ev.tool}({ev.arguments}) ...", flush=True)
+        elif isinstance(ev, ToolStep):
+            if mode != "idle":
+                print()
+                mode = "idle"
+            streamed_text = False
             _print_tool_step(ev)
         elif isinstance(ev, TextDelta) and ev.text:
-            if not streamed:
+            if mode != "text":
+                if mode == "thinking":
+                    print()
                 print("助手> ", end="", flush=True)
-                streamed = True
+                mode = "text"
+                streamed_text = True
             print(ev.text, end="", flush=True)
 
-    # 回合收尾：已流式输出则补换行，否则整段打印最终回复
+    # 回合收尾：已流式输出过正文仅在未归零时补换行，否则补换行并整段打印最终回复
     def finish(reply: str) -> None:
-        print() if streamed else print(f"助手> {reply}")
+        nonlocal mode
+        if streamed_text:
+            if mode != "idle":
+                print()
+        else:
+            if mode != "idle":
+                print()
+            print(f"助手> {reply}")
+        mode = "idle"
 
     return on_event, finish
 
@@ -235,6 +261,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--data", default=None, help="数据目录路径（默认读取 MY_HELPER_DATA 或 data）")
     parser.add_argument("--config", default=None, help="配置目录路径（默认读取 MY_HELPER_CONFIG 或 config）")
     parser.add_argument("--model", default=None, help="指定 models.dsl / models.json 中定义的模型档案名称")
+    parser.add_argument("--consolidator-model", default=None, help="指定后台记忆沉淀专用模型档案名称")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
     subparsers.add_parser("setup", help="10 秒零代码交互式向导：选厂商 + 贴密钥，自动生成模型配置")
@@ -259,6 +286,7 @@ def main(argv: list[str] | None = None) -> None:
             data_root=Path(args.data) if args.data else None,
             config_root=cfg_dir,
             model_name=args.model,
+            consolidator_model=args.consolidator_model,
         )
         if isinstance(app.llm, NoopLLMClient):
             print("提示：当前尚未配置大模型。运行 `uv run python -m personal_assistant setup` 可 10 秒零代码一键配置。")

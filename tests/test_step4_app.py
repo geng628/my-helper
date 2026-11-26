@@ -587,6 +587,8 @@ def test_atomic_turn_persistence_prevents_fts5_ghost_and_handles_fact_lifecycle(
         assert app.state.count_messages("s-ghost") == 6
 
         gen = app.stream_chat("记住，提前关闭不应留下的Beta偏好", chat_id="s-ghost")
+        start_frame = next(gen)
+        assert start_frame["type"] == "tool_start"
         step_frame = next(gen)
         assert step_frame["type"] == "tool_step"
         gen.close()

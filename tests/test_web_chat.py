@@ -237,6 +237,189 @@ console.log("WEB_UI_RENDER_OK");
     assert "WEB_UI_RENDER_OK" in proc.stdout
 
 
+# 测试网页端流式思维链 thinking_delta（含 XSS 防护、正文到达/done 自动折叠）与 tool_start -> tool_step 就地状态升级
+def test_web_ui_thinking_delta_xss_and_tool_start_upgrade() -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("本机未安装 node，跳过前端流式渲染单测")
+
+    html = (Path(__file__).resolve().parent.parent / "scripts" / "web_ui.html").read_text(encoding="utf-8")
+    assert "details.thinking" in html
+    assert "applyStreamEvent" in html
+
+    start = html.index("function escapeHtml(")
+    end = html.index("async function refreshStatus(")
+    js_snippet = html[start:end]
+
+    script = f"""
+const assert = require("node:assert/strict");
+function makeElement(tag) {{
+  const el = {{
+    tagName: tag.toUpperCase(),
+    className: "",
+    open: false,
+    _innerHTML: "",
+    _textContent: "",
+    attrs: {{}},
+    children: [],
+    parentNode: null,
+    style: {{}},
+    setAttribute(k, v) {{ this.attrs[k] = String(v); }},
+    getAttribute(k) {{ return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }},
+    appendChild(child) {{
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    }},
+    insertBefore(newNode, refNode) {{
+      newNode.parentNode = this;
+      const idx = this.children.indexOf(refNode);
+      if (idx === -1) this.children.push(newNode);
+      else this.children.splice(idx, 0, newNode);
+      return newNode;
+    }},
+    querySelector(sel) {{
+      if (sel.startsWith(".")) {{
+        const cls = sel.slice(1);
+        return this.children.find((c) => c.className.split(/\\s+/).includes(cls)) || null;
+      }}
+      return null;
+    }},
+    get innerHTML() {{ return this._innerHTML; }},
+    set innerHTML(val) {{ this._innerHTML = String(val); this._textContent = String(val); }},
+    get textContent() {{ return this._textContent; }},
+    set textContent(val) {{ this._textContent = String(val); this._innerHTML = String(val); }},
+  }};
+  return el;
+}}
+const chatEl = makeElement("main");
+chatEl.scrollTop = 0;
+chatEl.scrollHeight = 100;
+const emptyEl = makeElement("div");
+const document = {{ createElement: makeElement }};
+{js_snippet}
+
+// 1. 完整流式交互：thinking_delta(含 XSS) -> tool_start -> tool_step(同 call_id 就地替换) -> text_delta(自动折叠) -> done
+const wrap = appendMessage("assistant", "思考与执行工具中…");
+const bubble = wrap.querySelector(".bubble");
+const ctx = {{
+  wrap,
+  bubble,
+  toolState: {{ details: null, summary: null, count: 0, pending: [] }},
+  thinkingState: {{ details: null, summary: null, body: null, text: "", collapsed: false }},
+  replyText: "",
+}};
+
+applyStreamEvent(ctx, {{ type: "thinking_delta", text: "先推导 " }});
+applyStreamEvent(ctx, {{ type: "thinking_delta", text: "<img src=x onerror=alert(1)> 结束" }});
+assert(ctx.thinkingState.details !== null, "thinking details not created");
+assert.equal(ctx.thinkingState.details.className, "thinking");
+assert.equal(ctx.thinkingState.details.open, true);
+assert.equal(ctx.thinkingState.summary.textContent, "💭 推导思路（思考中…）");
+assert(!ctx.thinkingState.body.innerHTML.toLowerCase().includes("<img"), "XSS not escaped: " + ctx.thinkingState.body.innerHTML);
+assert(ctx.thinkingState.body.innerHTML.includes("&lt;img src=x onerror=alert(1)&gt;"));
+assert.equal(bubble.innerHTML, "<p>思考与执行工具中…</p>");
+
+applyStreamEvent(ctx, {{ type: "tool_start", tool: "web_search", arguments: '{{"q":"algo"}}', call_id: "c1" }});
+assert(ctx.toolState.details !== null, "tools details not created");
+assert.equal(ctx.toolState.details.open, true);
+assert.equal(ctx.toolState.summary.textContent, "🔧 正在调用 web_search…");
+assert.equal(wrap.children[0], ctx.thinkingState.details, "thinking must be above tools");
+assert.equal(wrap.children[1], ctx.toolState.details, "tools must be above bubble");
+assert.equal(wrap.children[2], bubble);
+const toolItemsBefore = ctx.toolState.details.children.filter((c) => c.className.includes("tool-item"));
+assert.equal(toolItemsBefore.length, 1);
+assert.equal(toolItemsBefore[0].getAttribute("data-call-id"), "c1");
+assert(toolItemsBefore[0].innerHTML.includes("[调用中]") && toolItemsBefore[0].innerHTML.includes("web_search"));
+
+applyStreamEvent(ctx, {{ type: "tool_step", tool: "web_search", arguments: '{{"q":"algo"}}', observation: "命中结果", duration_ms: 12.3, call_id: "c1" }});
+const toolItemsAfter = ctx.toolState.details.children.filter((c) => c.className.includes("tool-item"));
+assert.equal(toolItemsAfter.length, 1, "tool_step must replace pending item in place");
+assert.equal(ctx.toolState.summary.textContent, "🔧 工具调用轨迹（1 步）");
+assert(toolItemsAfter[0].innerHTML.includes("[Act]") && toolItemsAfter[0].innerHTML.includes("(12.3ms)") && toolItemsAfter[0].innerHTML.includes("[Observe] 命中结果"));
+assert(!toolItemsAfter[0].innerHTML.includes("[调用中]"));
+
+// 匿名 call_id 走队首替换，不匹配 call_id 时追加新节点
+applyStreamEvent(ctx, {{ type: "tool_start", tool: "get_time", arguments: "{{}}", call_id: "" }});
+applyStreamEvent(ctx, {{ type: "tool_step", tool: "get_time", arguments: "{{}}", observation: "12:00", duration_ms: 1.0, call_id: "" }});
+applyStreamEvent(ctx, {{ type: "tool_step", tool: "extra", arguments: "{{}}", observation: "extra_obs", duration_ms: 2.0, call_id: "unmatched" }});
+const toolItemsFinal = ctx.toolState.details.children.filter((c) => c.className.includes("tool-item"));
+assert.equal(toolItemsFinal.length, 3);
+assert.equal(ctx.toolState.summary.textContent, "🔧 工具调用轨迹（3 步）");
+
+const expectedLen = "先推导 <img src=x onerror=alert(1)> 结束".length;
+applyStreamEvent(ctx, {{ type: "text_delta", text: "最终**回答**" }});
+assert.equal(ctx.thinkingState.details.open, false, "first text_delta must collapse thinking");
+assert.equal(ctx.thinkingState.summary.textContent, `💭 推导思路（${{expectedLen}} 字，点击展开）`);
+assert(bubble.innerHTML.includes("<strong>回答</strong>"));
+
+applyStreamEvent(ctx, {{ type: "done", reply: "最终**回答**", thinking: "先推导 <img src=x onerror=alert(1)> 结束" }});
+assert.equal(ctx.toolState.details.open, false);
+assert.equal(ctx.thinkingState.details.open, false);
+
+// 2. 仅有 thinking_delta 直接到 done（无 text_delta）同样必须自动折叠并标注字数
+const wrap2 = appendMessage("assistant", "思考与执行工具中…");
+const ctx2 = {{
+  wrap: wrap2,
+  bubble: wrap2.querySelector(".bubble"),
+  toolState: {{ details: null, summary: null, count: 0, pending: [] }},
+  thinkingState: {{ details: null, summary: null, body: null, text: "", collapsed: false, stepBreak: false }},
+  replyText: "",
+  textStepBreak: false,
+}};
+applyStreamEvent(ctx2, {{ type: "thinking_delta", text: "纯思考" }});
+assert.equal(ctx2.thinkingState.details.open, true);
+applyStreamEvent(ctx2, {{ type: "done", reply: "直接结果", thinking: "纯思考" }});
+assert.equal(ctx2.thinkingState.details.open, false);
+assert.equal(ctx2.thinkingState.summary.textContent, "💭 推导思路（3 字，点击展开）");
+
+// 3. 多步推导与跨工具正文分段（thinking -> text -> tool_start -> tool_step -> thinking -> text -> done）
+const wrap3 = appendMessage("assistant", "思考与执行工具中…");
+const ctx3 = {{
+  wrap: wrap3,
+  bubble: wrap3.querySelector(".bubble"),
+  toolState: {{ details: null, summary: null, count: 0, pending: [] }},
+  thinkingState: {{ details: null, summary: null, body: null, text: "", collapsed: false, stepBreak: false }},
+  replyText: "",
+  textStepBreak: false,
+}};
+applyStreamEvent(ctx3, {{ type: "thinking_delta", text: "第一步推导" }});
+applyStreamEvent(ctx3, {{ type: "text_delta", text: "过渡说明" }});
+applyStreamEvent(ctx3, {{ type: "tool_start", tool: "search", arguments: "{{}}", call_id: "s1" }});
+assert.equal(ctx3.thinkingState.stepBreak, true);
+assert.equal(ctx3.textStepBreak, true);
+applyStreamEvent(ctx3, {{ type: "tool_step", tool: "search", arguments: "{{}}", observation: "ok", duration_ms: 2.0, call_id: "s1" }});
+applyStreamEvent(ctx3, {{ type: "thinking_delta", text: "第二步推导" }});
+assert.equal(ctx3.thinkingState.text, "第一步推导\\n\\n第二步推导");
+assert.equal(ctx3.thinkingState.stepBreak, false);
+applyStreamEvent(ctx3, {{ type: "text_delta", text: "最终正文" }});
+assert.equal(ctx3.replyText, "过渡说明\\n\\n最终正文");
+assert.equal(ctx3.textStepBreak, false);
+applyStreamEvent(ctx3, {{ type: "done", reply: "最终正文", thinking: "第一步推导第二步推导" }});
+assert.equal(ctx3.thinkingState.details.open, false);
+
+// 若正在思考时即进入 tool_start（未先收 text_delta），标题需显示执行工具中…
+const wrap4 = appendMessage("assistant", "思考与执行工具中…");
+const ctx4 = {{
+  wrap: wrap4,
+  bubble: wrap4.querySelector(".bubble"),
+  toolState: {{ details: null, summary: null, count: 0, pending: [] }},
+  thinkingState: {{ details: null, summary: null, body: null, text: "", collapsed: false, stepBreak: false }},
+  replyText: "",
+  textStepBreak: false,
+}};
+applyStreamEvent(ctx4, {{ type: "thinking_delta", text: "先查一下" }});
+applyStreamEvent(ctx4, {{ type: "tool_start", tool: "calc", arguments: "{{}}", call_id: "c4" }});
+assert.equal(ctx4.thinkingState.summary.textContent, "💭 推导思路（执行工具中…）");
+console.log("WEB_UI_STREAM_OK");
+"""
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Node 流式渲染校验失败：{proc.stderr or proc.stdout}"
+    assert "WEB_UI_STREAM_OK" in proc.stdout
+
+
 # 使用底层 HTTPConnection 发送可控原始请求头（支持多值/重复同名头、伪造 Host/Origin/Sec-Fetch-Site/Content-Type）
 def _raw_http_request(
     base_url: str,

@@ -14,6 +14,7 @@ from personal_assistant.agent.plugins import ObserverProtocol
 from personal_assistant.agent.react import (
     AgentEvent,
     RuntimeEvent,
+    ToolStart,
     ToolStep,
     TurnEnd,
     iter_react,
@@ -21,7 +22,7 @@ from personal_assistant.agent.react import (
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
-from personal_assistant.ai.types import TextDelta
+from personal_assistant.ai.types import TextDelta, ThinkingDelta
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
@@ -85,6 +86,7 @@ class AssistantApp:
         consolidator_llm: LLMClient | None = None,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
+        consolidator_model: str | None = None,
         observers: Iterable[ObserverProtocol] | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
@@ -135,11 +137,22 @@ class AssistantApp:
             self.observers = tuple(self.tools_config.build_observers())
         else:
             self.observers = ()
+        clean_cons_model = (consolidator_model or "").strip() or None
+        self._consolidator_model = clean_cons_model
         self._custom_consolidator_llm = consolidator_llm is not None
+        if consolidator_llm is not None:
+            resolved_consolidator_llm = consolidator_llm
+        elif llm is not None and clean_cons_model is None:
+            resolved_consolidator_llm = self.llm
+        else:
+            resolved_consolidator_llm = self._resolve_consolidator_llm(
+                self.llm,
+                consolidator_model=clean_cons_model,
+            )
         self.consolidator = MemoryConsolidator(
             self.state,
             self.memory,
-            consolidator_llm or self.llm,
+            resolved_consolidator_llm,
             policy=consolidation_policy,
         )
         self.background_consolidator = BackgroundConsolidator(
@@ -184,15 +197,52 @@ class AssistantApp:
             "llm_configured": not isinstance(self.llm, NoopLLMClient),
         }
 
-    # 按最新 models.dsl / models.json 热切换当前运行中的 LLMClient（无需重启服务）
-    def reload_llm(self, model_name: str | None = None) -> None:
+    # 按配置槽位、显式参数或 LLM_CONSOLIDATOR_MODEL 解析后台沉淀 LLM；未配置时原样返回 fallback_llm
+    def _resolve_consolidator_llm(
+        self,
+        fallback_llm: LLMClient,
+        *,
+        consolidator_model: str | None = None,
+    ) -> LLMClient:
+        clean_target = (consolidator_model or "").strip() or None
+        if self.tools_config is not None and self.config_path is not None:
+            return self.tools_config.build_consolidator_llm(
+                self.config_path.parent,
+                fallback_llm=fallback_llm,
+                model_name=clean_target,
+            )
+        env_model = (clean_target or os.getenv("LLM_CONSOLIDATOR_MODEL", "")).strip()
+        if env_model:
+            merged = dict(os.environ)
+            merged["LLM_MODEL"] = env_model
+            return from_env(merged)
+        return fallback_llm
+
+    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 LLMClient（失败时保持原实例零污染）
+    def reload_llm(
+        self,
+        model_name: str | None = None,
+        *,
+        consolidator_model: str | None = None,
+    ) -> None:
+        next_cons_model = (
+            self._consolidator_model
+            if consolidator_model is None
+            else (consolidator_model.strip() or None)
+        )
         if self.tools_config is not None and self.config_path is not None:
             new_llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
         else:
             new_llm = from_env()
+        new_cons_llm = (
+            self.consolidator.llm
+            if self._custom_consolidator_llm
+            else self._resolve_consolidator_llm(new_llm, consolidator_model=next_cons_model)
+        )
+        self._consolidator_model = next_cons_model
         self.llm = new_llm
         if not self._custom_consolidator_llm:
-            self.consolidator.llm = new_llm
+            self.consolidator.llm = new_cons_llm
 
     # 零代码自动生成 models.dsl 与 models.json（0600 权限）并立即热生效，返回脱敏摘要
     def configure_model(
@@ -216,7 +266,7 @@ class AssistantApp:
             name=name,
             temperature=temperature,
         )
-        self.reload_llm(model_name=models_cfg.default)
+        self.reload_llm(model_name=models_cfg.default, consolidator_model="")
         return models_cfg.redacted_dict()
 
     # 等待所有在途后台沉淀任务完成（供退出收尾或测试调用）
@@ -254,7 +304,10 @@ class AssistantApp:
         )
         effective_before = before_msg_id if before_msg_id is not None else message_id
         if self.tools_config is not None:
-            tool_ctx: dict[str, object] = {"history_db_path": self.state.db_path}
+            tool_ctx: dict[str, object] = {
+                "history_db_path": self.state.db_path,
+                "today": self._today(),
+            }
             if effective_before is not None:
                 tool_ctx["before_msg_id"] = effective_before
             return self.tools_config.build_registry(
@@ -451,6 +504,7 @@ class AssistantApp:
                 )
 
                 traces: list[dict[str, object]] = []
+                thinking_parts: list[str] = []
                 reply = ""
                 start_idx = self.cache_monitor.snapshot_index()
                 tracked_llm = self.cache_monitor.wrap(self.llm, session_key=chat_id)
@@ -463,13 +517,24 @@ class AssistantApp:
                     self._emit_event(chat_id, event)
                     if on_event is not None:
                         on_event(event)
-                    if isinstance(event, TextDelta):
+                    if isinstance(event, ThinkingDelta) and event.text:
+                        thinking_parts.append(event.text)
+                        yield {"type": "thinking_delta", "text": event.text}
+                    elif isinstance(event, ToolStart):
+                        yield {
+                            "type": "tool_start",
+                            "tool": event.tool,
+                            "arguments": event.arguments,
+                            "call_id": event.call_id,
+                        }
+                    elif isinstance(event, TextDelta):
                         yield {"type": "text_delta", "text": event.text}
                     elif isinstance(event, ToolStep):
                         step_dict: dict[str, object] = {
                             "tool": event.tool,
                             "arguments": event.arguments,
                             "observation": event.observation,
+                            "call_id": event.call_id,
                             "duration_ms": event.duration_ms,
                         }
                         traces.append(step_dict)
@@ -492,6 +557,7 @@ class AssistantApp:
             done_payload: dict[str, object] = {
                 "type": "done",
                 "reply": reply,
+                "thinking": "".join(thinking_parts),
                 "chat_id": chat_id,
                 "message_id": assistant_msg_id,
                 "tool_calls": traces,
@@ -574,6 +640,7 @@ def build_app(
     *,
     project_root: Path | None = None,
     model_name: str | None = None,
+    consolidator_model: str | None = None,
 ) -> AssistantApp:
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
     cfg_dir = (config_root or Path(os.getenv("MY_HELPER_CONFIG", "config"))).resolve()
@@ -589,4 +656,5 @@ def build_app(
         project_root=proj,
         llm=llm,
         model_name=model_name,
+        consolidator_model=consolidator_model,
     )

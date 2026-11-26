@@ -207,8 +207,9 @@ class ModelProfile:
 class ModelsConfig:
     default: str
     models: dict[str, ModelProfile]
+    consolidator: str | None = None
 
-    # 从标准 JSON 字典构造 ModelsConfig 并校验默认模型存在
+    # 从标准 JSON 字典构造 ModelsConfig 并校验默认模型与可选后台沉淀模型存在
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> "ModelsConfig":
         if not isinstance(raw, dict):
@@ -230,7 +231,13 @@ class ModelsConfig:
                 raise ValueError("配置多个模型时必须指定 default 默认模型。")
         if default_name not in parsed:
             raise ValueError(f"default 指向不存在的模型：{default_name!r}")
-        return cls(default=default_name, models=parsed)
+        raw_consolidator = raw.get("consolidator")
+        if raw_consolidator is not None and not isinstance(raw_consolidator, str):
+            raise ValueError("consolidator 必须是模型名称字符串。")
+        consolidator_name = (raw_consolidator or "").strip() or None
+        if consolidator_name is not None and consolidator_name not in parsed:
+            raise ValueError(f"consolidator 指向不存在的模型：{consolidator_name!r}")
+        return cls(default=default_name, models=parsed, consolidator=consolidator_name)
 
     # 按名称读取目标模型档案（缺省返回 default 模型）
     def get_profile(self, name: str | None = None) -> ModelProfile:
@@ -242,7 +249,10 @@ class ModelsConfig:
 
     # 导出全部模型配置的脱敏摘要，供终端打印与 /status 展示
     def redacted_dict(self, env: Mapping[str, str] | None = None) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "default": self.default,
             "models": {name: profile.redacted_dict(env) for name, profile in self.models.items()},
         }
+        if self.consolidator is not None:
+            result["consolidator"] = self.consolidator
+        return result
