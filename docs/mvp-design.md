@@ -35,7 +35,7 @@ flowchart TD
 
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
         App --> Prompts["系统提示词组装 (assistant/prompts.py)"]
-        App --> Mem["Markdown 记忆与生命周期 (assistant/memory.py & memory_lifecycle.py)"]
+        App --> Mem["Markdown 记忆与工具集 (files_policy / memory / builtin_tools / memory_lifecycle)"]
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与压缩 MemoryConsolidator (assistant/consolidator.py)"]
         App --> Cfg["总配置与模型装配 ToolsConfig (assistant/commands.py)"]
@@ -102,7 +102,8 @@ my_helper_v2/
 │   ├── __main__.py
 │   ├── ai/                            # Layer 1：types.py / client.py / cache.py
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
-│   └── assistant/                     # Layer 3：common.py / prompts.py / memory.py / memory_lifecycle.py /
+│   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
+│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
@@ -143,7 +144,7 @@ data/
 ### 3.1 Layer 1：LLM 协议与缓存观测底座（`personal_assistant/ai/`）
 
 1. **原子契约（[../personal_assistant/ai/types.py](../personal_assistant/ai/types.py)）**：
-   - `ToolSchema`：最底层工具签名（`name`、`description`、`parameters`、`param_enums`），仅负责导出 OpenAI Function Calling JSON Schema，不含本地执行器。
+   - `ToolSchema`：最底层工具签名（`name`、`description`、`parameters`、`param_enums`、`required`），仅负责导出精确的 OpenAI Function Calling JSON Schema，不含本地执行器。
    - `ToolCall` & `extract_tool_calls()`：统一将 OpenAI wire 字典或扁平工具调用解析为强类型 `ToolCall(id, name, arguments)`，空参数兜底 `"{}"`。
    - 流式事件：`TextDelta(text)`、`ThinkingDelta(text)`、`StreamDone(message, usage, ttft_ms, latency_ms)`、`TokenUsage(prompt_tokens, cached_tokens, completion_tokens)`。
    - 模型档案：`ModelProfile`（支持 `provider`、`base_url`、`model`、`api_key`、`key_env`、`temperature`）与 `ModelsConfig`，统一提供 `redacted_dict()` 脱敏导出。
@@ -160,12 +161,12 @@ data/
 ### 3.2 Layer 2：通用 ReAct 内核与统一插件主板（`personal_assistant/agent/`）
 
 1. **工具类型递进扩展与统一注册表（[../personal_assistant/agent/tools.py](../personal_assistant/agent/tools.py)）**：
-   - `Tool(ToolSchema)` 继承底层签名并新增 `handler` 与 `run(**values)`；
-   - `build_tool()` 统一将普通函数或子类适配为 `Tool` 实例，经 `inspect.signature()` 自动按参数名绑定运行时上下文（`project_root`、`data_root`、`config_path`、`offload_dir` 等），并挂载 `ToolMetadata(risk, always_on)` 与 `ToolDocument(source_type, source_name)`；
+   - `Tool(ToolSchema)` 继承底层签名并以 `kw_only=True` 承载 `metadata`、`document`、`bound_kwargs` 与 `accepted_context_keys`，提供 `run_with_context(values, context=None)`（对自定义重写 `run()` 的子类严格隔离上下文，绝不污染 `**values`）；
+   - `build_tool()` 仅在构造期执行一次 `inspect.signature()`，自动从 Python 默认参数推断可选参数（缩减 `ToolSchema.required`）并记录可接受的上下文键，彻底消除动态 `type()` 造类与 `object.__setattr__` 猴子补丁；`bind_tool_context()` 基于 `dataclasses.replace` 纯函数轻量重绑；
    - `ToolsetProvider` 统一抽象三大工具来源（内置 `MemoryToolsetProvider`、插件 `PluginManager`、固定命令 `CommandToolsetProvider`）；
-   - `ToolRegistry` 维护 `_all_tools` 与激活视图 `_tools`（受白名单 `allowed_names` 或 `always_on` 控制），校验 JSON 对象、必填键、非 bool 数值自动转字符串与枚举范围，任何参数或运行异常均转为 `"错误：..."` 观察回传模型自愈。
+   - `ToolRegistry` 维护 `_all_tools` 与激活视图 `_tools`（受白名单 `allowed_names` 或 `always_on` 控制），支持省略可选参数回退 Python 默认值，并经 `execute(..., context=...)` 注入执行期上下文，任何参数或运行异常均转为 `"错误：..."` 观察回传模型自愈。
 2. **纯粹单层 ReAct 循环与两阶段消息边界（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：
-   - `iter_react()` / `run_react()` 维持极简 `while True` 循环：进入循环前固定 `tool_defs`，每轮先经可选边界管道 `_prepare_llm_messages(messages, transform_context, convert_to_llm)`（未传钩子时零拷贝透传；传钩子时对消息字典浅拷贝以防污染外部会话），调用 `llm.stream()` 并透传 `TextDelta` / `ThinkingDelta` / `StreamDone`；
+   - `iter_react()` / `run_react()` 维持极简 `while True` 循环：进入循环前固定 `tool_defs`，支持可选 `tool_context` 透传至 `tools.execute()`；每轮先经可选边界管道 `_prepare_llm_messages(messages, transform_context, convert_to_llm)`（未传钩子时零拷贝透传；传钩子时对消息字典浅拷贝以防污染外部会话），调用 `llm.stream()` 并透传 `TextDelta` / `ThinkingDelta` / `StreamDone`；
    - 仅当 `extract_tool_calls(assistant_msg)` 为空时记录最终回复并产出 `TurnEnd`，否则在执行每个强类型 `ToolCall` 前发出 `ToolStart(tool, arguments, call_id)`，完成后发出 `ToolStep(tool, arguments, observation, duration_ms, call_id)` 并追加 `role="tool"` 观察消息；
    - `_normalize_stored_assistant` 保留 `assistant_msg` 上的协议扩展字段（如轮内工具调用的 `reasoning_content`），同时统一清理或标准化 `tool_calls`。
 3. **统一插件主板与单次初始化生命周期（[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)）**：
@@ -175,7 +176,7 @@ data/
      - 插槽 3：`register_compiler` → `ConfigCompilerProtocol`（`compile(...)` / `presets()` / `render(...)`）
      - 插槽 4：`register_provider` → `LLMProviderProtocol`（`build(env)`）
      - 插槽 5：`register_observer` → `ObserverProtocol`（`on_event(session_key, event)` / `snapshot(session_key=...)`）
-   - `PluginManager.from_entries()` 按文件指纹 `(st_mtime_ns, st_size, st_ino)` 缓存动态导入模块并**仅执行一次** `Plugin.initialize()`，记录原始 `_PluginToolSpec`；执行期调用 `PluginManager.build_tools(context)` 仅按当前请求上下文重绑函数型工具签名参数并克隆自定义 `Tool` 子类（`_clone_custom_tool`），彻底消除每轮重复初始化开销与模块状态清空竞态。
+   - `PluginContext.tool_bindings()` 将顶层字典配置通用映射为 `<section>_config`（Layer 2 零业务路径与插件名硬编码，由 `test_architecture.py` AST 守卫强制校验）；`PluginManager.from_entries()` 按文件指纹缓存模块并**仅执行一次** `Plugin.initialize()`，后续 `build_tools(context)` 直接通过 `bind_tool_context` 轻量重绑。
 
 ---
 
@@ -184,8 +185,9 @@ data/
 1. **无内部依赖基础原语与 TOAST 卸载（[../personal_assistant/assistant/common.py](../personal_assistant/assistant/common.py)）**：
    - 提供 `format_date_with_weekday`（注入如 `2026-11-26（星期四，北京时间）` 消除相对日期推算误差）、`load_dotenv`、`truncate_utf8` 与 `truncate_or_offload()`；
    - `truncate_or_offload()` 对超预算的网页/命令输出做单行软折行与 1 MB 封顶落盘至 `data/workspace/tool_outputs/`，按 `head` 或 `head_tail` 模式返回带精确行号与 `read_markdown` / `search_markdown` 续读指引的预览，并懒清理保留最新 20 个 / 24 小时 TTL。
-2. **Markdown 记忆、生命周期与 6 个内置工具（`memory.py` + `memory_lifecycle.py`）**：
-   - `MemoryStore` 使用可重入写锁 `_write_lock` 保护所有磁盘写盘与 `audit.jsonl` 审计日志；`read_memory_index(max_lines=100, max_chars=4000)` 与 `read_rules_summary(limit=30)` 供会话冻结前缀使用；
+2. **单一职责记忆存储、安全策略、双语分词与 6 个内置工具（`files_policy.py` + `text_search.py` + `memory.py` + `builtin_tools.py` + `memory_lifecycle.py`）**：
+   - `files_policy.py` 与 `text_search.py` 均为零内部依赖底座：前者封装 `FilesPolicy` 目录白名单与 `_atomic_write` 原子落盘，后者封装中英双语分词 `tokenize_text`（供 `fts5_retriever.py` 与 `history_tools.py` 共享，确保插件间零横向耦合）；
+   - `MemoryStore`（`memory.py`）使用可重入写锁 `_write_lock` 保护所有磁盘写盘与 `audit.jsonl` 审计日志；`read_memory_index(max_lines=100, max_chars=4000)` 与 `read_rules_summary(limit=30)` 供会话冻结前缀使用；
    - `list_files` 与 `iter_searchable_files`（基于 `os.scandir` 高效遍历）默认跳过 `data/memory/archive/`，仅当显式指定 `root="data/memory/archive"` 时开放查阅；
    - `remember_user_statement` 支持流内 `turn_tag`（`(turn#<tag>)`）暂存与回合末 `finalize_turn_fact(turn_tag, message_id=...)` 升级绑定 `(msg#<id>)` 或中断回滚；
    - `apply_topic_operations` 实现四元操作码：

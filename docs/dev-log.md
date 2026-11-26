@@ -854,3 +854,29 @@
   - 单元测试 (`uv run pytest -v`)：**167 passed → 171 passed**（含三层依赖守卫与插件物理隔离测试）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：合入 Issue `#69`（提纯 Layer 2 洋葱微内核、执行期 `tool_context` 单次工具表构建与 `ToolSchema.required` 默认参数推断），并执行合流后同口径实模配对回归。
+
+
+---
+
+### [2026-11-26] 提纯 Layer 2 洋葱微内核、执行期 `tool_context` 常驻工具表与 `ToolSchema.required` 默认参数推断（Issue `#69`）
+- **背景与架构痛点**：
+  1. **Layer 2 业务字面量泄漏与猴子补丁**：`personal_assistant/agent/plugins.py`（609 行）仍残留 `"data/memory"`、`"workspace" / "tool_outputs"` 及具名插件配置键（`shell_config` / `web_config` / `retrieval_config`），且 `tools.py` / `plugins.py` 依赖动态 `type()` 造类与 `object.__setattr__` 塞隐藏属性；
+  2. **每轮重复实例化工具表**：`AssistantApp._run_stream_turn` 每轮对话都重新构造 `ToolRegistry` 与 `Tool` 实例来绑定当前轮 `user_text` / `before_msg_id` / `turn_tag` / `today`；
+  3. **默认参数强迫必传**：`ToolSchema.to_openai_schema()` 与 `ToolRegistry._validate_values()` 将所有参数一律标为 `required`，迫使模型每次调用 `list_files`、`search_markdown`、`read_markdown` 都重复输出默认目录与起止行号。
+- **改动文件（初版 `b7d14a1` → 合流单次工具表收口 `d3819de` + 文档同步）**：
+  - [personal_assistant/ai/types.py](../personal_assistant/ai/types.py)：`ToolSchema` 新增 `required: tuple[str, ...] | None = field(default=None, kw_only=True)`，精确导出 OpenAI Function Schema 必填字段。
+  - [personal_assistant/agent/tools.py](../personal_assistant/agent/tools.py)、[personal_assistant/agent/__init__.py](../personal_assistant/agent/__init__.py)：删除全部动态 `type()` 造类与 `object.__setattr__`；`Tool` 以 `kw_only=True` 原生承载 `metadata`、`document`、`bound_kwargs`、`accepted_context_keys` 并实现 `run_with_context(values, context=None)`（重写 `run()` 的自定义子类严格隔离，绝不混入上下文）；`build_tool` 仅在构造期解析一次函数签名自动推断可选默认参数与可接受上下文键；`bind_tool_context` 基于 `dataclasses.replace` 纯函数重绑；`ToolRegistry.execute(..., context=...)` 支持省略可选参数回退 Python 默认值。
+  - [personal_assistant/agent/react.py](../personal_assistant/agent/react.py)：`iter_react` 与 `run_react` 新增可选 `tool_context` 并透传至 `tools.execute(..., context=tool_context)`。
+  - [personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)（由 `609` 行精简至 `431` 行）：剥离全部业务路径字面量，将 `raw_config` 顶层字典段通用映射为 `<section>_config`，并用 `bind_tool_context` 取代反射克隆胶水。
+  - [personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)：启动期通过 `_build_base_registry()` 一次性构建常驻 `self._tool_registry`，`_run_stream_turn()` 与 `status()` 跨轮直接复用并通过 `tool_context=turn_ctx` 注入动态回合上下文。
+  - [tests/test_architecture.py](../tests/test_architecture.py)、[tests/test_step1_react.py](../tests/test_step1_react.py)、[tests/test_step2_tools.py](../tests/test_step2_tools.py)、[tests/test_plugins.py](../tests/test_plugins.py)、[tests/test_step4_app.py](../tests/test_step4_app.py) 与 [README.md](../README.md)、[docs/mvp-design.md](mvp-design.md)：新增 Layer 1/2 零业务字面量、零 `__setattr__` 与零动态 `type()` 的 AST 硬守卫，以及封死 `build_tools` 的跨轮常驻 `_tool_registry` 回归测试。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`b7d14a1`）→ `Pass`**（`0 Blockers / 4 Nits`）；
+  - **Round 2（变基合流 `#68` + 收口 `app.py` 常驻 `_tool_registry` + 采纳全部 4 项 Nit，`d3819de`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径验证与实模配对回归对比（改前 Wave 3 基线 `623f357` / `cede4bb` → 改后合流 `d3819de`）**：
+  - **确定性单元测试 (`uv run pytest -v`)**：**`167 passed` → `179 passed`**（`+12` 项架构纯度与边界单测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - **离线检索基准（`fts5_bm25` 40 题）**：保持 **`38/40 (95.0%)`**（`MRR=0.9483`，负例干净度 `100%`），零退步。
+  - **16 场景真实模型多轮记忆配对评测（`deepseek-chat`）**：
+    - 通过率保持 **`15/16 (93.75%)`**（`0` 退步，5/6 分类 `100%`，唯一未过项仍为 `rolling-multi-compaction` 答“企业微信”未命中字面简称 `'企微'`）；
+    - 受益于默认参数从 `required` 精简（模型无需每轮手写默认 `root` / `pattern` / `start_line` / `end_line`）与常驻工具 Schema 字节级恒定：`llm_calls` 由 `115` 降至 **`112`**，`prompt_tokens` 由 `251,820` 降至 **`240,098`**（`-4.7%`），**`completion_tokens` 由 `12,674` 大幅降至 `9,919`（节省 `21.7%`）**，服务端 KV Cache 命中率由 `66.18%` 跃升至 **`82.37%`（`+16.19 pp`）**，本地前缀复用率升至 **`93.55%`**。
+- **下一步**：四波架构演进与减法提纯已全部收官，代码库达到严格三层洋葱纯度、插件完全正交与学习助手全链路可用状态；后续仅在真实使用遇到纯同义词语义召回瓶颈时再按需评估可选 `RetrieverProtocol` 插件扩展。
