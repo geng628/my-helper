@@ -816,3 +816,20 @@
 - **同口径确定性验证对比（改前 `main` `f23e288` → 改后 `3f1b2fc`）**：
   - 单元测试 (`uv run pytest -v`)：**162 passed → 167 passed**（含三层依赖守卫与 Node.js 前端流式/XSS 单测）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+
+
+---
+
+### [2026-11-26] 全景升级 `README.md` 与 `docs/mvp-design.md`，并完成 Wave 3 同口径实模配对回归与双模型流式冒烟（Issue `#65`）
+- **文档升级目标**：
+  - 清除早期平铺结构遗留路径与断链（如 `[plugins/tools/custom_tools.py](plugins/tools/custom_tools.py)`），面向 AI Agent / Agent Infra 技术评审完整呈现「零第三方运行依赖 + 借鉴 Pi 洋葱模型的三层单向依赖漏斗（`ai ← agent ← assistant`）+ 五大主板插件插槽 + 个人学习助手叠加层 + 纵深安全边界 + 四层评测总账」。
+- **改动文件（初版 `39874dc` → 二审校对收敛）**：
+  - [README.md](../README.md)、[docs/mvp-design.md](mvp-design.md)、[docs/dev-log.md](dev-log.md)。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`39874dc`）→ `Request Changes`**（修正 `telemetry.py` 线程锁准确表述、补齐 `--consolidator-model` 与五级沉淀模型解析优先级链及 `default`/`model <name> { ... }` 语法细节）；
+  - **Round 2 → `Pass`**（`0 Blockers / 0 Nits`，48 处相对链接与全目录树 100% 校验通过）。
+- **Wave 3 合流同口径实模配对回归（改前 `7e64db0` → 改后 `623f357`）**：
+  - **确定性单元测试 (`uv run pytest -v`)**：**`167 passed`**（含三层依赖守卫、38 条 Shell 红队向量、Web 防 CSRF/XSS 与学习卡片并发单测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - **离线检索基准（`fts5_bm25`）**：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`，负例干净度 `100%`），零退步。
+  - **16 场景真实模型多轮记忆评测（`deepseek-chat`, `workers=4`）**：由 **`13/16 (81.25%)` → `15/16 (93.75%)`**（**`+2` 改善 / `0` 退步**，`temporal` 由 `1/3` 升至 **`3/3 (100%)`**，`get_current_time` 逻辑时钟对齐直接修通 `relative-date-resolution`；5/6 分类达 `100%`，唯一未过项 `rolling-multi-compaction` 实答“企业微信机器人”正确但未命中严苛字面简称 `'企微'`；开启 `study_tools.py` 白名单后日常记忆场景 **0 误触发**，前缀复用率 **`92.73%`**、服务端 KV Cache 命中率 **`66.18%`**）。
+  - **真机双模型 + 学习卡片 SSE 流式端到端冒烟（`use reasoner` + `consolidator deepseek`，测于 `623f357`）**：前台装配 `OpenAIReasoningLLM(deepseek-reasoner)` 实时流式推送 **217 个 `thinking_delta` 分片** 并按序触发 `tool_start -> tool_step` 创建 `data/workspace/study/agent-loop.md`；达阈值后后台切换 `OpenAICompatibleLLM(deepseek-chat)` 静默完成记忆沉淀压缩（`last_error=None`），跨轮服务端 KV Cache 命中 **`58.15%`**、前缀复用 **`89.28%`**。
