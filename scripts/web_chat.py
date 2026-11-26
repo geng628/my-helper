@@ -23,7 +23,7 @@ from personal_assistant.assistant.common import load_dotenv
 UI_HTML_PATH = Path(__file__).resolve().parent / "web_ui.html"
 MAX_REQUEST_BYTES = 256 * 1024
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
-ALLOWED_SEC_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
+ALLOWED_SEC_FETCH_SITES = frozenset({"same-origin", "none"})
 
 
 # 标记 POST 请求 Content-Type 非 application/json 时的 415 协议错误
@@ -31,20 +31,25 @@ class _UnsupportedMediaTypeError(ValueError):
     pass
 
 
-# 解析绑定主机名（去括号与大小写规范化）并判断是否为 IPv6 字面量
+# 解析绑定主机名（去括号、IP 字面量 RFC 5952 规范化与小写处理）并判断是否为 IPv6 字面量
 def _parse_bind_host(host: str) -> tuple[str, bool]:
     clean = host.strip().strip("[]").lower()
     if not clean:
         return "", False
     try:
         ip = ipaddress.ip_address(clean)
-        return clean, ip.version == 6
+        return str(ip), ip.version == 6
     except ValueError:
         return clean, False
 
 
-# 基于绑定地址与实际监听端口构造允许的 Host 与同源 Origin 白名单
-def _allowed_hosts_and_origins(host: str, port: int) -> tuple[frozenset[str], frozenset[str]]:
+# 基于绑定地址与实际监听端口构造允许的 Host 与同源 Origin 白名单（支持补充通配绑定下的落地地址）
+def _allowed_hosts_and_origins(
+    host: str,
+    port: int,
+    *,
+    extra_host: str | None = None,
+) -> tuple[frozenset[str], frozenset[str]]:
     clean, is_ipv6 = _parse_bind_host(host)
     is_loopback = clean in {"127.0.0.1", "localhost", "::1"}
     if not is_loopback and clean:
@@ -65,6 +70,9 @@ def _allowed_hosts_and_origins(host: str, port: int) -> tuple[frozenset[str], fr
     else:
         base_hosts = {formatted}
 
+    if extra_host:
+        base_hosts.add(extra_host)
+
     allowed_hosts: set[str] = set()
     allowed_origins: set[str] = set()
     for item in base_hosts:
@@ -75,18 +83,6 @@ def _allowed_hosts_and_origins(host: str, port: int) -> tuple[frozenset[str], fr
             allowed_hosts.add(item)
             allowed_origins.add(f"http://{item}")
     return frozenset(allowed_hosts), frozenset(allowed_origins)
-
-
-# 扩展标准库集合以补充单一地址字面量对应的 Host 与同源 Origin
-def _extend_with_literal_host(
-    allowed_hosts: frozenset[str],
-    allowed_origins: frozenset[str],
-    literal_host: str,
-    port: int,
-) -> tuple[frozenset[str], frozenset[str]]:
-    extra_hosts = {f"{literal_host}:{port}"} | ({literal_host} if port == 80 else set())
-    extra_origins = {f"http://{literal_host}:{port}"} | ({f"http://{literal_host}"} if port == 80 else set())
-    return allowed_hosts | extra_hosts, allowed_origins | extra_origins
 
 
 # 创建绑定了 AssistantApp 的本地多线程 HTTP 服务（不依赖任何第三方 Web 框架）
@@ -112,6 +108,7 @@ def create_web_server(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(raw)
 
@@ -120,6 +117,14 @@ def create_web_server(
             raw = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
             self.wfile.write(raw)
             self.wfile.flush()
+
+        # 安全读取同名多值请求头列表（兼容 HTTP/0.9 等 dict headers 无 get_all 的情况）
+        def _get_header_values(self, name: str) -> list[str]:
+            get_all = getattr(self.headers, "get_all", None)
+            if callable(get_all):
+                return list(get_all(name) or ())
+            value = self.headers.get(name) if isinstance(self.headers, dict) else None
+            return [value] if isinstance(value, str) else []
 
         # 在通配地址绑定模式下获取当前连接落地的本机 IP（用于局域网 Host/Origin 放行）
         def _socket_local_host(self) -> str | None:
@@ -134,16 +139,12 @@ def create_web_server(
 
         # 校验 Host（全路由）及同源 Origin / Sec-Fetch-Site（敏感 API 读写），拦截 DNS Rebinding 与 CSRF
         def _check_request_boundary(self, *, check_origin: bool) -> bool:
-            listen_port = self.server.server_port
-            allowed_hosts, allowed_origins = _allowed_hosts_and_origins(host, listen_port)
-            if is_wildcard_bind:
-                sock_host = self._socket_local_host()
-                if sock_host:
-                    allowed_hosts, allowed_origins = _extend_with_literal_host(
-                        allowed_hosts, allowed_origins, sock_host, listen_port
-                    )
+            sock_host = self._socket_local_host() if is_wildcard_bind else None
+            allowed_hosts, allowed_origins = _allowed_hosts_and_origins(
+                host, self.server.server_port, extra_host=sock_host
+            )
 
-            host_headers = self.headers.get_all("Host") or []
+            host_headers = self._get_header_values("Host")
             if len(host_headers) != 1 or host_headers[0].strip().lower() not in allowed_hosts:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Host 请求头。"})
                 return False
@@ -151,12 +152,12 @@ def create_web_server(
             if not check_origin:
                 return True
 
-            sec_fetch_sites = [v.strip().lower() for v in (self.headers.get_all("Sec-Fetch-Site") or [])]
+            sec_fetch_sites = [v.strip().lower() for v in self._get_header_values("Sec-Fetch-Site")]
             if len(sec_fetch_sites) > 1 or (sec_fetch_sites and sec_fetch_sites[0] not in ALLOWED_SEC_FETCH_SITES):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "禁止跨站访问本地接口。"})
                 return False
 
-            origin_headers = self.headers.get_all("Origin") or []
+            origin_headers = self._get_header_values("Origin")
             if len(origin_headers) > 1:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Origin 请求头。"})
                 return False
@@ -166,10 +167,10 @@ def create_web_server(
 
             return True
 
-        # 校验 POST 请求是否显式携带 application/json 主媒体类型（忽略 charset 等参数）
+        # 校验 POST 请求是否显式携带唯一且无逗号折叠的 application/json 主媒体类型
         def _is_json_content_type(self) -> bool:
-            ct_headers = self.headers.get_all("Content-Type") or []
-            if len(ct_headers) != 1:
+            ct_headers = self._get_header_values("Content-Type")
+            if len(ct_headers) != 1 or "," in ct_headers[0]:
                 return False
             media_type = ct_headers[0].split(";", 1)[0].strip().lower()
             return media_type == "application/json"
@@ -327,7 +328,7 @@ def create_web_server(
 
         return _IPv6ThreadingHTTPServer((clean_bind_host, port), WebChatHandler)
 
-    return ThreadingHTTPServer((host, port), WebChatHandler)
+    return ThreadingHTTPServer((clean_bind_host or host.strip(), port), WebChatHandler)
 
 
 # 命令行启动入口：加载 .env、启动本地网页服务并在 Ctrl+C 时优雅收尾后台沉淀任务
