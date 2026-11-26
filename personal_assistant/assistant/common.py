@@ -54,17 +54,17 @@ def require_positive_int(value: object, name: str) -> int:
     return value
 
 
-# 通过同目录 .tmp- 临时文件与 os.replace 原子落盘 UTF-8 文本（可选指定文件权限如 0o600）
+# 通过同目录 .tmp- 临时文件与 os.replace 原子落盘 UTF-8 文本（可选在写内容前通过 fchmod 设置权限如 0o600）
 def atomic_write_text(target: Path, content: str, *, mode: int | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
     tmp_path = Path(tmp_name)
     try:
-        if mode is not None:
-            os.chmod(tmp_path, mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
             handle.write(content)
-        if mode is not None:
+        if mode is not None and not hasattr(os, "fchmod"):
             os.chmod(tmp_path, mode)
         os.replace(tmp_path, target)
         if mode is not None:

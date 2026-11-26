@@ -94,7 +94,7 @@ def _redact_error_tokens(text: str) -> str:
 
 # 纯函数读取最多 1024 字节 HTTPError 响应体并脱敏，构造零猴子补丁的新 HTTPError 与组合诊断文本
 def _format_http_error(error: HTTPError) -> tuple[HTTPError, str]:
-    orig_reason = str(error.reason or "").strip()
+    orig_reason = _redact_error_tokens(str(error.reason or "").strip())
     body = ""
     try:
         raw = error.read(_MAX_HTTP_ERROR_BODY_BYTES)
@@ -578,9 +578,12 @@ def from_model_profile(
     if not api_key:
         return NoopLLMClient()
     provider_key = profile.provider.strip().lower() or "openai_compatible"
-    factory = (providers.get(provider_key) if providers is not None else None) or _PROVIDERS.get(provider_key)
+    local_providers = (
+        {name.strip().lower(): factory for name, factory in providers.items()} if providers is not None else {}
+    )
+    factory = local_providers.get(provider_key) or _PROVIDERS.get(provider_key)
     if factory is None:
-        all_names = sorted(set(_PROVIDERS) | (set(providers) if providers is not None else set()))
+        all_names = sorted(set(_PROVIDERS) | set(local_providers))
         raise ValueError(
             f"模型 {profile.name!r} 使用了未知 provider={provider_key!r}，可用：{', '.join(all_names)}"
         )

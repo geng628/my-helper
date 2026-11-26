@@ -577,6 +577,7 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "models.json").write_text('{"api_key":"MODEL_JSON_SECRET"}\n', encoding="utf-8")
     (tmp_path / "config" / "models.dsl").write_text("api_key MODEL_DSL_SECRET\n", encoding="utf-8")
+    (tmp_path / "config" / ".tmp-abc123").write_text("TMP_MODEL_SECRET\n", encoding="utf-8")
     (tmp_path / "data" / "state").mkdir(parents=True)
     (tmp_path / "data" / "state" / "db.txt").write_text("STATE_DB_SECRET\n", encoding="utf-8")
     (tmp_path / "data" / "workspace").mkdir(parents=True)
@@ -615,29 +616,35 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     policy = ShellPolicy(
         project_root=tmp_path,
         cwd=tmp_path,
-        allowed_executables=("cat", "ls", "git", "env", "rg", "sh", "yes"),
+        allowed_executables=("cat", "ls", "git", "env", "grep", "rg", "sh", "yes"),
         timeout=1.5,
         offload_dir=tmp_path / "data" / "workspace" / "tool_outputs",
     )
 
-    # 1. APFS Unicode 折叠（data/ſtate、config/modelſ.json）、零宽字符与硬链接 Inode 绕过全部拦截
+    # 1. APFS Unicode 折叠（data/ſtate、config/modelſ.json）、.tmp-* 暂存文件、零宽字符与硬链接 Inode 绕过全部拦截
     unicode_and_inode_blocked = [
         "cat data/ſtate/db.txt",
         "cat data/ſtate/nonexistent.txt",
         "ls data/ſtate",
         "cat config/modelſ.json",
         "cat config/modelſ.dsl",
+        "cat config/.tmp-abc123",
+        "cat config/.tmp-\u200babc123",
         "cat .e\u200bnv",
         "cat .ENV.EXAMPLE",
         "cat data/workspace/hardlink_models.txt",
         "git diff HEAD -- 'config/modelſ.*'",
         "rg -g '*modelſ*' .",
+        "rg -g '*.tmp-*' .",
     ]
     for cmd in unicode_and_inode_blocked:
         out = execute_safe_command(cmd, policy)
         assert out.startswith("错误："), f"应被拦截但放行：{cmd!r} -> {out!r}"
         assert "MODEL_JSON_SECRET" not in out
+        assert "TMP_MODEL_SECRET" not in out
         assert "STATE_DB_SECRET" not in out
+    grep_tmp_out = execute_safe_command("grep -r TMP_MODEL_SECRET config", policy)
+    assert "TMP_MODEL_SECRET" not in grep_tmp_out
 
     # 2. Git 严格逐子命令白名单：全面封堵 branch 写操作/改名/删分支、log 导出补丁与裸 show <blob>
     git_blocked = [

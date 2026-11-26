@@ -652,7 +652,7 @@ class ModelsDSLCompiler:
     # 按表单参数自动生成极简一行或块状 DSL 文本
     def render(self, **kwargs: object) -> str:
         raw_temp = kwargs.get("temperature", 0.2)
-        temperature = float(raw_temp) if isinstance(raw_temp, (int, float, str)) else 0.2
+        temperature = float(raw_temp) if (not isinstance(raw_temp, bool) and isinstance(raw_temp, (int, float, str))) else 0.2
         return render_models_dsl(
             preset=str(kwargs.get("preset") or ""),
             api_key=str(kwargs.get("api_key") or ""),

@@ -16,7 +16,7 @@ def normalize_segment(part: str) -> str:
     return unicodedata.normalize("NFKC", cleaned).casefold()
 
 
-# 判断单个路径段是否命中受保护敏感名称（仅精确放行 .env.example）
+# 判断单个路径段是否命中受保护敏感名称（仅精确放行 .env.example，并屏蔽 .env.* 与原子写盘 .tmp-* 暂存文件）
 def is_sensitive_segment(part: str, reject_segments: tuple[str, ...] = DEFAULT_REJECT_SEGMENTS) -> bool:
     if part == ".env.example":
         return False
@@ -24,7 +24,7 @@ def is_sensitive_segment(part: str, reject_segments: tuple[str, ...] = DEFAULT_R
     if not folded:
         return True
     rejected = {normalize_segment(seg) for seg in reject_segments}
-    return folded in rejected or folded.startswith(".env.")
+    return folded in rejected or folded.startswith((".env.", ".tmp-"))
 
 
 # 安全记录路径自身（lstat）与解引用目标（stat）的设备号与 Inode 元组

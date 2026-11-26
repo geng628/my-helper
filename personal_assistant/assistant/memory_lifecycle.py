@@ -361,6 +361,7 @@ def archive_expired_topics(
     ref_day = today or today_shanghai()
     archived_counts: dict[str, int] = {}
     pending_entries: list[str] = []
+    pending_rewrites: list[tuple[Path, str]] = []
     pending_audits: list[tuple[str, list[str]]] = []
 
     for path in sorted(memory_dir.glob("*.md")):
@@ -381,7 +382,7 @@ def archive_expired_topics(
         if not expired_lines:
             continue
 
-        write_fn(path, "\n".join(active_lines).rstrip() + "\n")
+        pending_rewrites.append((path, "\n".join(active_lines).rstrip() + "\n"))
         pending_entries.extend(f"{line} (from: {path.name})" for line in expired_lines)
         rel_path = f"data/memory/{path.name}"
         archived_counts[rel_path] = len(expired_lines)
@@ -390,7 +391,10 @@ def archive_expired_topics(
     if not pending_entries:
         return {}
 
+    # Write-Ahead：先单次落盘月度归档文件，再回写各源主题文件，避免中途写盘失败导致过期条目丢失
     archive_rel = _append_to_monthly_archive(archive_dir, ref_day, pending_entries, write_fn=write_fn)
+    for path, active_content in pending_rewrites:
+        write_fn(path, active_content)
     for rel_path, expired_lines in pending_audits:
         audit_fn(
             action="archive_expired",

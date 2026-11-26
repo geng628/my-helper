@@ -766,3 +766,118 @@ class BareToolPlugin(Plugin):
     manager.register_into(reg_override, context={"custom_mod_config": {"limit": 15}, "prefix": "override"})
     assert reg_override.execute("bare_probe", '{"query": "hi", "mode": "deep"}') == "hi:deep:15"
     assert reg_override.execute("prefix_word", '{"word": "ok"}') == "override:ok"
+
+
+# 测试 register_tools_from_module 严格拦截项目外软链/非 .py 文件及同文件重名工具（允许同一对象别名去重）
+def test_register_tools_from_module_security_and_duplicate_checks(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    outside = tmp_path / "outside_evil.py"
+    outside.write_text("from personal_assistant.agent.tools import tool\n@tool(description='x')\ndef evil() -> str:\n    return 'x'\n", encoding="utf-8")
+    escape_link = root / "escape.py"
+    escape_link.symlink_to(outside)
+    not_py = root / "notes.txt"
+    not_py.write_text("hello", encoding="utf-8")
+
+    ctx = PluginContext(project_root=root)
+    with pytest.raises(ValueError, match="超出项目范围"):
+        ctx.register_tools_from_module(escape_link)
+    with pytest.raises(ValueError, match="超出项目范围"):
+        ctx.register_tools_from_module(Path("../outside_evil.py"))
+    with pytest.raises(ValueError, match="不存在或非 .py 文件"):
+        ctx.register_tools_from_module(not_py)
+    with pytest.raises(ValueError, match="不存在或非 .py 文件"):
+        ctx.register_tools_from_module(Path("missing.py"))
+
+    # 同文件同一 Tool 对象别名应去重通过
+    alias_mod = root / "alias_tools.py"
+    alias_mod.write_text(
+        """
+from personal_assistant.agent.tools import tool
+
+# 测试用去重工具
+@tool(description="ok")
+def ok_tool() -> str:
+    return "ok"
+
+ok_alias = ok_tool
+""",
+        encoding="utf-8",
+    )
+    ctx.register_tools_from_module(Path("alias_tools.py"))
+    assert [spec.name for spec in ctx.tool_specs] == ["ok_tool"]
+
+    # 同文件两个不同函数声明相同工具名应显式抛 ValueError 而非静默吞掉
+    dup_mod = root / "dup_tools.py"
+    dup_mod.write_text(
+        """
+from personal_assistant.agent.tools import tool
+
+# 重名工具一
+@tool(name="dup_name", description="one")
+def first_fn() -> str:
+    return "1"
+
+# 重名工具二
+@tool(name="dup_name", description="two")
+def second_fn() -> str:
+    return "2"
+""",
+        encoding="utf-8",
+    )
+    ctx_dup = PluginContext(project_root=root)
+    with pytest.raises(ValueError, match="工具名称不能重复"):
+        ctx_dup.register_tools_from_module(dup_mod)
+
+
+# 测试 Provider 插件插槽与 from_model_profile 局部 providers 映射均统一小写归一化
+def test_provider_registration_and_local_lookup_case_insensitive(tmp_path: Path) -> None:
+    from personal_assistant.ai import LLMClient, ModelProfile, from_model_profile
+
+    # 测试用最小 LLM 客户端
+    class _DummyClient(LLMClient):
+        # 记录已解析的 ModelProfile
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        # 返回固定响应
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            return {"role": "assistant", "content": self.profile.model}
+
+    # 测试用大写名称 Provider 实现
+    class _MixedCaseProvider:
+        name = "Anthropic"
+
+        # 构造最小客户端
+        def build(self, profile: ModelProfile) -> LLMClient:
+            return _DummyClient(profile)
+
+    # 测试用同义全大写冲突 Provider 实现
+    class _UpperProvider:
+        name = "ANTHROPIC"
+
+        # 构造最小客户端
+        def build(self, profile: ModelProfile) -> LLMClient:
+            return _DummyClient(profile)
+
+    ctx = PluginContext(project_root=tmp_path)
+    ctx.register_provider(_MixedCaseProvider())
+    assert "anthropic" in ctx.providers
+    with pytest.raises(ValueError, match="名称重复"):
+        ctx.register_provider(_UpperProvider())
+
+    prof = ModelProfile.from_dict(
+        "claude",
+        {"provider": "Anthropic", "base_url": "https://api.example.com/v1", "model": "claude-x", "api_key": "sk-test"},
+    )
+    client_from_ctx = from_model_profile(prof, providers=ctx.providers)
+    assert isinstance(client_from_ctx, _DummyClient)
+    assert client_from_ctx.profile.provider == "anthropic"
+
+    client_from_mixed = from_model_profile(prof, providers={"Anthropic": _MixedCaseProvider().build})
+    assert isinstance(client_from_mixed, _DummyClient)
+    assert client_from_mixed.profile.model == "claude-x"

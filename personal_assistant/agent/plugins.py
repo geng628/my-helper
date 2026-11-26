@@ -124,10 +124,13 @@ def _register_named_protocol(
     label: str,
     *,
     transform: Callable[[Any], Any] | None = None,
+    case_insensitive: bool = False,
 ) -> None:
     if not isinstance(item, protocol_cls):
         raise TypeError(f"{label}必须实现 {protocol_cls.__name__}：{item!r}")
     clean_name = item.name.strip()
+    if case_insensitive:
+        clean_name = clean_name.lower()
     if not clean_name:
         raise ValueError(f"{label}名称不能为空。")
     if clean_name in slot:
@@ -178,15 +181,22 @@ class PluginContext:
             raise ValueError(f"工具名称不能重复：{base_tool.name}")
         self.tool_specs.append(base_tool)
 
-    # 扫描指定 Python 模块文件中的全部 @tool 装饰函数并去重注册进当前主板插槽
+    # 校验目标 .py 模块位于 project_root 内，扫描全部 @tool 装饰函数并按对象身份去重注册进当前主板插槽
     def register_tools_from_module(self, file_path: Path) -> None:
-        module = _import_plugin_module(file_path)
-        seen_in_file: set[str] = set()
+        root = self.project_root.resolve()
+        candidate = file_path if file_path.is_absolute() else (root / file_path)
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"插件工具模块路径超出项目范围：{file_path}")
+        if resolved.suffix != ".py" or not resolved.is_file():
+            raise ValueError(f"插件工具模块不存在或非 .py 文件：{file_path}")
+        module = _import_plugin_module(resolved)
+        seen_ids: set[int] = set()
         for value in vars(module).values():
             if is_tool(value):
                 spec = extract_tool(value)
-                if spec.name not in seen_in_file:
-                    seen_in_file.add(spec.name)
+                if id(spec) not in seen_ids:
+                    seen_ids.add(id(spec))
                     self.register_tool(spec)
 
     # 插槽 2：向主板注册检索引擎子协议实现（支持传入 RetrieverProtocol 实例或工厂函数）
@@ -197,10 +207,15 @@ class PluginContext:
     def register_compiler(self, compiler: ConfigCompilerProtocol) -> None:
         _register_named_protocol(self.compilers, compiler, ConfigCompilerProtocol, "配置编译器插件")
 
-    # 插槽 4：向主板注册大模型客户端驱动子协议实现（仅接受 LLMProviderProtocol 实例）
+    # 插槽 4：向主板注册大模型客户端驱动子协议实现（仅接受 LLMProviderProtocol 实例，名称统一小写归一化）
     def register_provider(self, provider: LLMProviderProtocol) -> None:
         _register_named_protocol(
-            self.providers, provider, LLMProviderProtocol, "模型 Provider 插件", transform=lambda p: p.build
+            self.providers,
+            provider,
+            LLMProviderProtocol,
+            "模型 Provider 插件",
+            transform=lambda p: p.build,
+            case_insensitive=True,
         )
 
     # 插槽 5：向主板注册运行观测器子协议实现（支持传入 ObserverProtocol 实例或工厂函数）
