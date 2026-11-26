@@ -8,13 +8,14 @@ from urllib.error import HTTPError
 
 import pytest
 
-from personal_assistant.agent import PluginManager, ThinkingDelta, ToolStart, ToolStep, TurnEnd
+from personal_assistant.agent import PluginManager, ToolStart, ToolStep, TurnEnd
 from personal_assistant.ai import (
     LLMClient,
     OpenAIChatClient,
     OpenAICompatibleLLM,
     StreamDone,
     TextDelta,
+    ThinkingDelta,
     TokenUsage,
     available_providers,
 )

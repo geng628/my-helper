@@ -123,18 +123,15 @@ def default_post_stream(
             yield raw_line.decode("utf-8")
 
 
-# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 ThinkingDelta/TextDelta、拼接分片 tool_calls 并按需聚合扩展文本增量字段
+# 逐行解析 OpenAI 兼容 SSE 流：实时吐出 ThinkingDelta/TextDelta、拼接分片 tool_calls 并聚合思维链字段
 def _consume_openai_sse(
     lines: Iterable[str],
     t0: float,
     *,
-    extra_delta_fields: Iterable[str] = (),
     thinking_delta_fields: Iterable[str] = (),
 ) -> Iterator[LLMStreamEvent]:
     thinking_fields = tuple(dict.fromkeys(thinking_delta_fields))
-    thinking_set = set(thinking_fields)
-    all_extra_fields = tuple(dict.fromkeys((*extra_delta_fields, *thinking_fields)))
-    extra_parts: dict[str, list[str]] = {name: [] for name in all_extra_fields}
+    thinking_parts: dict[str, list[str]] = {name: [] for name in thinking_fields}
     role, parts, tool_acc = "assistant", [], {}
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
@@ -160,13 +157,12 @@ def _consume_openai_sse(
             continue
         if isinstance(delta.get("role"), str) and delta["role"]:
             role = str(delta["role"])
-        for field_name in all_extra_fields:
-            extra_piece = delta.get(field_name)
-            if isinstance(extra_piece, str) and extra_piece:
+        for field_name in thinking_fields:
+            thinking_piece = delta.get(field_name)
+            if isinstance(thinking_piece, str) and thinking_piece:
                 ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
-                extra_parts[field_name].append(extra_piece)
-                if field_name in thinking_set:
-                    yield ThinkingDelta(text=extra_piece)
+                thinking_parts[field_name].append(thinking_piece)
+                yield ThinkingDelta(text=thinking_piece)
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
             ttft_ms = ttft_ms if ttft_ms is not None else round((time.perf_counter() - t0) * 1000, 3)
@@ -193,14 +189,14 @@ def _consume_openai_sse(
         ToolCall(
             id=str(a["id"]),
             name=str(a["name"]),
-            arguments="".join(a["args"]),  # type: ignore[arg-type]
+            arguments="".join(a["args"]) or "{}",  # type: ignore[arg-type]
         ).to_openai_dict()
         for _, a in sorted(tool_acc.items())
     ]
     msg: dict[str, object] = {"role": role, "content": full_text if (full_text or not calls) else None}
     if calls:
         msg["tool_calls"] = calls
-    for field_name, chunks in extra_parts.items():
+    for field_name, chunks in thinking_parts.items():
         if chunks:
             msg[field_name] = "".join(chunks)
     yield StreamDone(message=msg, usage=usage, ttft_ms=ttft_ms, latency_ms=round((time.perf_counter() - t0) * 1000, 3))
@@ -304,10 +300,6 @@ class OpenAIChatClient(LLMClient):
     def _extra_payload(self) -> dict[str, object]:
         return {}
 
-    # 返回流式解析时需按字符串聚合的扩展增量字段名（默认为空）
-    def _stream_delta_fields(self) -> tuple[str, ...]:
-        return ()
-
     # 返回流式解析时需实时吐出 ThinkingDelta 并按字符串聚合的思维链字段名（默认为空）
     def _thinking_delta_fields(self) -> tuple[str, ...]:
         return ()
@@ -364,12 +356,7 @@ class OpenAIChatClient(LLMClient):
         self.last_usage = None
         t0 = time.perf_counter()
         lines = _open_openai_stream(self.post_stream, url, payload, headers)
-        for event in _consume_openai_sse(
-            lines,
-            t0,
-            extra_delta_fields=self._stream_delta_fields(),
-            thinking_delta_fields=self._thinking_delta_fields(),
-        ):
+        for event in _consume_openai_sse(lines, t0, thinking_delta_fields=self._thinking_delta_fields()):
             if isinstance(event, StreamDone):
                 event = StreamDone(
                     message=self._normalize_response_message(event.message),

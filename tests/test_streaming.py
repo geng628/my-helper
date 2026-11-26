@@ -14,7 +14,6 @@ import pytest
 from personal_assistant.agent import (
     ObserverProtocol,
     TaskEvent,
-    ThinkingDelta,
     Tool,
     ToolRegistry,
     ToolStart,
@@ -30,6 +29,7 @@ from personal_assistant.ai import (
     OpenAICompatibleLLM,
     StreamDone,
     TextDelta,
+    ThinkingDelta,
     TokenUsage,
 )
 from personal_assistant.assistant.app import AssistantApp
@@ -411,9 +411,10 @@ def test_web_chat_sse_stream_endpoint_end_to_end(tmp_path: Path) -> None:
         app.close()
 
 
-# 测试 OpenAIChatClient 通用协议底座、声明式 _stream_delta_fields 扩展与底层流/线程语义
+# 测试 OpenAIChatClient 通用协议底座、声明式 _thinking_delta_fields 扩展与底层流/线程语义
 def test_openai_chat_client_base_and_delta_field_extension() -> None:
     from dataclasses import dataclass
+    from personal_assistant import agent as agent_pkg
     from personal_assistant import ai as ai_pkg
     from personal_assistant.ai import OpenAIChatClient
 
@@ -421,12 +422,16 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
     assert OpenAICompatibleLLM.stream is OpenAIChatClient.stream
     assert not hasattr(ai_pkg, "open_openai_stream")
     assert not hasattr(ai_pkg, "consume_openai_sse")
+    assert not hasattr(OpenAIChatClient, "_stream_delta_fields")
+    assert not hasattr(agent_pkg, "ThinkingDelta")
+    assert not hasattr(agent_pkg, "TextDelta")
+    assert not hasattr(agent_pkg, "StreamDone")
 
-    # 声明式扩展子类：收集自定义字符串 delta 字段并统一规范化同步与流式响应
+    # 声明式扩展子类：收集自定义思考 delta 字段实时吐出 ThinkingDelta，并统一规范化同步与流式响应
     @dataclass
-    class _ExtraDeltaClient(OpenAIChatClient):
-        # 声明需从 SSE delta 中聚合的扩展文本字段
-        def _stream_delta_fields(self) -> tuple[str, ...]:
+    class _ThinkingDeltaClient(OpenAIChatClient):
+        # 声明需从 SSE delta 中实时吐出 ThinkingDelta 并聚合的字段
+        def _thinking_delta_fields(self) -> tuple[str, ...]:
             return ("extra",)
 
         # 同步与流式共用响应规范化钩子
@@ -440,7 +445,7 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         'data: {"choices":[{"delta":{"extra":"续段","content":"正文"}}]}\n',
         "data: [DONE]\n",
     ]
-    ext_client = _ExtraDeltaClient(
+    ext_client = _ThinkingDeltaClient(
         api_key="sk-ext",
         base_url="https://api.example.com/v1",
         model="m-ext",
@@ -448,6 +453,7 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         post_json=lambda _u, _p, _h: {"choices": [{"message": {"role": "assistant", "content": "同步", "extra": "元"}}]},
     )
     events = list(ext_client.stream([{"role": "user", "content": "hi"}]))
+    assert [e.text for e in events if isinstance(e, ThinkingDelta)] == ["首段", "续段"]
     assert [e.text for e in events if isinstance(e, TextDelta)] == ["正文"]
     done = next(e for e in events if isinstance(e, StreamDone))
     assert done.ttft_ms is not None and done.ttft_ms >= 0.0
@@ -457,6 +463,23 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         "content": "同步",
         "extra": "[元]",
     }
+
+    # SSE 流式返回无参 tool_calls 且未推送 arguments 时，必须补齐合法 JSON "{}" 而非空串
+    empty_args_client = OpenAIChatClient(
+        api_key="sk-args",
+        base_url="https://api.example.com/v1",
+        model="m-args",
+        post_stream=lambda _u, _p, _h: iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_empty","type":"function","function":{"name":"ping","arguments":""}}]}}]}\n',
+                "data: [DONE]\n",
+            ]
+        ),
+    )
+    empty_args_done = next(e for e in empty_args_client.stream([{"role": "user", "content": "ping"}]) if isinstance(e, StreamDone))
+    assert empty_args_done.message["tool_calls"] == [
+        {"id": "c_empty", "type": "function", "function": {"name": "ping", "arguments": "{}"}}
+    ]
 
     captured_payloads: list[dict[str, object]] = []
 

@@ -1,7 +1,7 @@
 """Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：复用 ai 层流式事件并产出 ToolStart / ToolStep / TurnEnd，不含业务与统计逻辑。"""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 
@@ -58,7 +58,7 @@ AgentEvent = TextDelta | ThinkingDelta | StreamDone | ToolStart | ToolStep | Tur
 RuntimeEvent = AgentEvent | TaskEvent
 
 
-# 准备单轮发往大模型的上下文消息切片，确保两阶段管道变换绝不原地污染主消息列表
+# 准备单轮发往大模型的上下文消息切片，确保两阶段管道变换绝不原地污染主消息列表及字典键
 def _prepare_llm_messages(
     messages: list[dict[str, object]],
     transform_context: ContextTransformer | None,
@@ -66,15 +66,17 @@ def _prepare_llm_messages(
 ) -> list[dict[str, object]]:
     if transform_context is None and convert_to_llm is None:
         return messages
-    ctx_msgs = transform_context(list(messages)) if transform_context is not None else list(messages)
-    if convert_to_llm is None:
-        return ctx_msgs if isinstance(ctx_msgs, list) else list(ctx_msgs)
-    safe_ctx = list(ctx_msgs) if ctx_msgs is messages else ctx_msgs
-    llm_msgs = convert_to_llm(safe_ctx)
-    return llm_msgs if isinstance(llm_msgs, list) else list(llm_msgs)
+    ctx_msgs: list[dict[str, object]] = [dict(msg) for msg in messages]
+    if transform_context is not None:
+        transformed = transform_context(ctx_msgs)
+        ctx_msgs = transformed if isinstance(transformed, list) else list(transformed)
+    if convert_to_llm is not None:
+        converted = convert_to_llm(ctx_msgs)
+        ctx_msgs = converted if isinstance(converted, list) else list(converted)
+    return ctx_msgs
 
 
-# 规范化写入历史的消息字典：保留扩展字段、补齐 role，并确保退出文本或 ToolCall 符合协议格式
+# 规范化写入历史的消息字典：保留扩展字段、补齐 role，并统一将 tool_calls 归一化或剥离
 def _normalize_stored_assistant(
     assistant_msg: Mapping[str, object],
     *,
@@ -85,12 +87,9 @@ def _normalize_stored_assistant(
     stored["role"] = str(stored.get("role") or "assistant")
     if reply is not None:
         stored["content"] = reply
-        if "tool_calls" in stored and not stored["tool_calls"]:
-            stored.pop("tool_calls", None)
+        stored.pop("tool_calls", None)
     elif tool_calls:
-        raw_calls = stored.get("tool_calls")
-        if isinstance(raw_calls, Sequence) and any(isinstance(item, ToolCall) for item in raw_calls):
-            stored["tool_calls"] = [call.to_openai_dict() for call in tool_calls]
+        stored["tool_calls"] = [call.to_openai_dict() for call in tool_calls]
     return stored
 
 

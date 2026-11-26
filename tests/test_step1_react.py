@@ -412,6 +412,37 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
     assert ToolStart(tool="ping", arguments='{"host": "127.0.0.1"}', call_id="call_a") in events
     assert any(isinstance(ev, ToolStep) and ev.call_id == "call_a" for ev in events)
 
+    # 验证扁平字典 / arguments=None 的 tool_calls 写回 messages 与发往下一轮 LLM 时均已统一归一化为标准 OpenAI wire 字典
+    noop_tools = ToolRegistry(Tool(name="ping", description="探测", parameters={}, handler=lambda: "pong"))
+    norm_llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "先探测",
+                "tool_calls": [
+                    {"id": "flat_1", "name": "ping", "arguments": {"host": "127.0.0.1"}},
+                    {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": None}},
+                ],
+            },
+            {"role": "assistant", "content": "归一化完成", "tool_calls": []},
+        ]
+    )
+    norm_msgs: list[dict[str, object]] = [{"role": "user", "content": "探测"}]
+    assert run_react(norm_llm, norm_msgs, noop_tools) == "归一化完成"
+    expected_wire_calls = [
+        {"id": "flat_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
+        {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+    ]
+    assert norm_msgs[1] == {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "先探测",
+        "tool_calls": expected_wire_calls,
+    }
+    assert norm_llm.requests[1][0][1]["tool_calls"] == expected_wire_calls
+    assert "tool_calls" not in norm_msgs[-1]
+
 
 # 测试净化退出消息：移除硬编码中文兜底并保留 assistant_msg 上的 reasoning_content 等扩展字段
 def test_exit_message_purified_and_preserves_extension_fields() -> None:
@@ -472,17 +503,21 @@ def test_transform_context_and_convert_to_llm_pipeline() -> None:
         {"role": "artifact", "content": "仅前端渲染的卡片对象"},
         {"role": "user", "content": "请调用 echo"},
     ]
-    snapshot_before = list(messages)
+    snapshot_before = [dict(m) for m in messages]
 
-    # 第一阶段：克隆后追加临时提示（并尝试污染列表尾部验证不影响主历史）
+    # 第一阶段：克隆后追加临时提示并原地改写首条消息字段（验证不污染外部主历史及原字典键）
     def transform_context(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
         seen_stages.append("transform")
+        ctx[0]["injected"] = "dirty"
         ctx.append({"role": "transient_hint", "content": "临时提醒"})
         return ctx
 
-    # 第二阶段：过滤掉应用层自定义角色（artifact / transient_hint），仅保留标准 LLM 消息
+    # 第二阶段：原地 pop 自定义消息键并过滤掉应用层自定义角色，仅保留标准 LLM 消息
     def convert_to_llm(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
         seen_stages.append("convert")
+        for msg in ctx:
+            if msg.get("role") == "artifact":
+                msg.pop("content", None)
         return [m for m in ctx if m.get("role") in {"system", "user", "assistant", "tool"}]
 
     reply = run_react(
@@ -495,8 +530,10 @@ def test_transform_context_and_convert_to_llm_pipeline() -> None:
 
     assert reply == "管道执行完毕"
     assert seen_stages == ["transform", "convert", "transform", "convert"]
-    # 原始自定义消息仍完整保留在主 messages 中，且未被注入 transient_hint
+    # 原始自定义消息及首条消息字典键均完整保留，未被原地篡改或注入 transient_hint
     assert messages[:3] == snapshot_before
+    assert "injected" not in messages[0]
+    assert messages[1] == {"role": "artifact", "content": "仅前端渲染的卡片对象"}
     assert not any(m.get("role") == "transient_hint" for m in messages)
     # 发往模型的请求已彻底剥离 artifact 与 transient_hint
     for req_msgs, _ in llm.requests:
