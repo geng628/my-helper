@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import threading
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
-from statistics import mean
+from fractions import Fraction
 
 from personal_assistant.ai.client import LLMClient
 from personal_assistant.ai.types import LLMStreamEvent, StreamDone, TokenUsage
@@ -50,23 +51,50 @@ class CallCacheRecord:
         }
 
 
+# 校验有界容量参数为正整数（排除布尔值）
+def _validate_positive_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数。")
+    return value
+
+
+# 根据聚合后的标量计数构建标准缓存摘要字典
+def _build_summary(
+    *,
+    llm_calls: int,
+    prompt_tokens: int,
+    cached_tokens: int,
+    completion_tokens: int,
+    warm_calls: int,
+    prefix_rate_sum: Fraction,
+) -> dict[str, object]:
+    server_rate = round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
+    mean_prefix = round(float(prefix_rate_sum / warm_calls), 4) if warm_calls > 0 else None
+    return {
+        "llm_calls": llm_calls,
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "completion_tokens": completion_tokens,
+        "server_cache_hit_rate": server_rate,
+        "warm_calls": warm_calls,
+        "mean_prefix_reuse_rate": mean_prefix,
+    }
+
+
 # 汇总一组调用记录的服务端缓存命中率与本地平均前缀复用率
 def summarize_records(records: list[CallCacheRecord]) -> dict[str, object]:
     prompt_tokens = sum(r.usage.prompt_tokens for r in records if r.usage is not None)
     cached_tokens = sum(r.usage.cached_tokens for r in records if r.usage is not None)
     completion_tokens = sum(r.usage.completion_tokens for r in records if r.usage is not None)
     warm_rates = [r.prefix_reuse_rate for r in records if r.prefix_reuse_rate is not None]
-    server_rate = round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
-    mean_prefix = round(mean(warm_rates), 4) if warm_rates else None
-    return {
-        "llm_calls": len(records),
-        "prompt_tokens": prompt_tokens,
-        "cached_tokens": cached_tokens,
-        "completion_tokens": completion_tokens,
-        "server_cache_hit_rate": server_rate,
-        "warm_calls": len(warm_rates),
-        "mean_prefix_reuse_rate": mean_prefix,
-    }
+    return _build_summary(
+        llm_calls=len(records),
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+        warm_calls=len(warm_rates),
+        prefix_rate_sum=sum((Fraction(r) for r in warm_rates), Fraction(0)),
+    )
 
 
 # 将缓存汇总字典格式化为终端单行可读摘要
@@ -90,18 +118,32 @@ def format_cache_summary(summary: dict[str, object]) -> str:
     return f"{server_part} | {prefix_part} | 模型调用 {calls} 次"
 
 
-# 缓存监控器：按会话隔离记录上一次请求前缀，并线程安全地累积全部调用统计
+# 缓存监控器：按会话隔离记录上一次请求前缀，并线程安全地维护有界窗口与全生命周期累计统计
 class CacheMonitor:
-    # 初始化线程互斥锁、会话前缀缓存与调用明细列表
-    def __init__(self) -> None:
+    # 初始化线程互斥锁、有界会话前缀缓存、有界记录窗口与全量累计账本
+    def __init__(self, *, max_records: int = 2000, max_sessions: int = 256) -> None:
+        self.max_records = _validate_positive_int(max_records, "max_records")
+        self.max_sessions = _validate_positive_int(max_sessions, "max_sessions")
         self._lock = threading.Lock()
         self._last_serialized: dict[str, str] = {}
-        self.records: list[CallCacheRecord] = []
+        self._records: deque[CallCacheRecord] = deque(maxlen=self.max_records)
+        self._total_recorded = 0
+        self._total_prompt_tokens = 0
+        self._total_cached_tokens = 0
+        self._total_completion_tokens = 0
+        self._total_warm_calls = 0
+        self._total_prefix_rate_sum = Fraction(0)
 
-    # 返回当前已记录条数，用于截取单轮或单题区间的增量统计
+    # 返回当前窗口内调用记录的只读列表快照，兼容既有下标与迭代契约
+    @property
+    def records(self) -> list[CallCacheRecord]:
+        with self._lock:
+            return list(self._records)
+
+    # 返回单调递增的累计调用游标，用于截取单轮或单题区间的增量统计
     def snapshot_index(self) -> int:
         with self._lock:
-            return len(self.records)
+            return self._total_recorded
 
     # 记录一次成功完成的 LLM 调用并计算其与同会话上一次请求的前缀复用率
     def record(
@@ -111,7 +153,7 @@ class CacheMonitor:
         usage: TokenUsage | None = None,
     ) -> CallCacheRecord:
         with self._lock:
-            prev = self._last_serialized.get(session_key)
+            prev = self._last_serialized.pop(session_key, None)
             total = len(serialized)
             if prev is None or total == 0:
                 prefix_len = 0
@@ -119,6 +161,8 @@ class CacheMonitor:
             else:
                 prefix_len = common_prefix_len(prev, serialized)
                 reuse_rate = round(prefix_len / total, 4)
+            if len(self._last_serialized) >= self.max_sessions:
+                self._last_serialized.pop(next(iter(self._last_serialized)))
             self._last_serialized[session_key] = serialized
             entry = CallCacheRecord(
                 session_key=session_key,
@@ -127,13 +171,35 @@ class CacheMonitor:
                 prefix_reuse_rate=reuse_rate,
                 usage=usage,
             )
-            self.records.append(entry)
+            self._records.append(entry)
+            self._total_recorded += 1
+            if usage is not None:
+                self._total_prompt_tokens += usage.prompt_tokens
+                self._total_cached_tokens += usage.cached_tokens
+                self._total_completion_tokens += usage.completion_tokens
+            if reuse_rate is not None:
+                self._total_warm_calls += 1
+                self._total_prefix_rate_sum += Fraction(reuse_rate)
             return entry
 
-    # 汇总从 since 位置起的调用统计（默认汇总全部历史调用）
+    # 汇总从 since 位置起的调用统计（since=0 返回全生命周期精确累计，since>0 按单调游标切片当前窗口）
     def summary(self, since: int = 0) -> dict[str, object]:
         with self._lock:
-            snapshot = list(self.records[since:])
+            if since == 0:
+                return _build_summary(
+                    llm_calls=self._total_recorded,
+                    prompt_tokens=self._total_prompt_tokens,
+                    cached_tokens=self._total_cached_tokens,
+                    completion_tokens=self._total_completion_tokens,
+                    warm_calls=self._total_warm_calls,
+                    prefix_rate_sum=self._total_prefix_rate_sum,
+                )
+            if since < 0:
+                snapshot = list(self._records)[since:]
+            else:
+                window_start = self._total_recorded - len(self._records)
+                offset = max(0, since - window_start)
+                snapshot = list(self._records)[offset:]
         return summarize_records(snapshot)
 
     # 包装任意 LLMClient，在不侵入上层循环的前提下自动采集缓存统计

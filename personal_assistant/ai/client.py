@@ -1,13 +1,16 @@
 """Layer 1 零依赖大模型客户端与 Provider 注册中心（对标 pi-ai）：不感知任何 Agent 或业务模块。"""
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import ssl
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import Any, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -67,14 +70,25 @@ def extract_usage(response: dict[str, object]) -> TokenUsage | None:
     )
 
 
-# 构造带退避重试的 POST HTTP 响应打开器（仅在连接建立前重试，避免流式中途重复发送）
-def _open_with_retry(
+_T = TypeVar("_T")
+_TRANSIENT_HTTP_ERRORS = (
+    URLError,
+    TimeoutError,
+    ConnectionError,
+    http.client.IncompleteRead,
+    ssl.SSLError,
+)
+
+
+# 构造 JSON POST 请求，并在连接或指定读取阶段遇到瞬时网络/TLS/5xx/429 异常时按指数退避重试
+def _post_with_retry(
     url: str,
     payload: dict[str, object],
     headers: dict[str, str],
     *,
     max_retries: int = 2,
-):
+    operation: Callable[[Any], _T],
+) -> _T:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req_headers = {
         "Content-Type": "application/json",
@@ -84,21 +98,27 @@ def _open_with_retry(
     for attempt in range(max_retries + 1):
         request = Request(url, data=body, headers=req_headers, method="POST")
         try:
-            return urlopen(request, timeout=60)
+            return operation(urlopen(request, timeout=60))
         except HTTPError as error:
             # 4xx 客户端错误（429 限流除外）不重试，直接抛出
             if error.code < 500 and error.code != 429:
                 raise
             if attempt >= max_retries:
                 raise
-        except (URLError, TimeoutError, ConnectionError):
+        except _TRANSIENT_HTTP_ERRORS:
             if attempt >= max_retries:
                 raise
         time.sleep(0.5 * (2**attempt))
     raise RuntimeError("请求重试耗尽。")
 
 
-# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求，并对瞬时网络/TLS 抖动自动退避重试
+# 完整读取 HTTP 响应字节流并按 UTF-8 解码为字符串
+def _read_utf8_body(response: Any) -> str:
+    with response:
+        return response.read().decode("utf-8")
+
+
+# 使用 Python 标准库 urllib 向指定接口发送 JSON POST 请求，将响应读取与解码纳入瞬时网络/TLS 抖动重试闭环
 def default_post_json(
     url: str,
     payload: dict[str, object],
@@ -106,11 +126,17 @@ def default_post_json(
     *,
     max_retries: int = 2,
 ) -> dict[str, object]:
-    with _open_with_retry(url, payload, headers, max_retries=max_retries) as response:
-        return json.loads(response.read().decode("utf-8"))
+    raw_text = _post_with_retry(
+        url,
+        payload,
+        headers,
+        max_retries=max_retries,
+        operation=_read_utf8_body,
+    )
+    return json.loads(raw_text)
 
 
-# 使用 Python 标准库 urllib 向指定接口发起 SSE 流式 POST 请求并逐行吐出 UTF-8 文本
+# 使用 Python 标准库 urllib 向指定接口发起 SSE 流式 POST 请求并逐行吐出 UTF-8 文本（仅在连接建立前重试）
 def default_post_stream(
     url: str,
     payload: dict[str, object],
@@ -118,7 +144,13 @@ def default_post_stream(
     *,
     max_retries: int = 2,
 ) -> Iterator[str]:
-    with _open_with_retry(url, payload, headers, max_retries=max_retries) as response:
+    with _post_with_retry(
+        url,
+        payload,
+        headers,
+        max_retries=max_retries,
+        operation=lambda response: response,
+    ) as response:
         for raw_line in response:
             yield raw_line.decode("utf-8")
 
@@ -333,7 +365,7 @@ class OpenAIChatClient(LLMClient):
             {"Authorization": f"Bearer {self.api_key}"},
         )
 
-    # 组装 OpenAI 格式请求体调用 /chat/completions，记录 usage 并返回首条 assistant 消息
+    # 组装 OpenAI 格式请求体调用 /chat/completions，校验响应结构、记录 usage 并返回首条 assistant 消息
     def respond(
         self,
         messages: list[dict[str, object]],
@@ -342,7 +374,18 @@ class OpenAIChatClient(LLMClient):
         url, payload, headers = self._build_request(messages, tools, stream=False)
         self.last_usage = None
         response = self.post_json(url, payload, headers)
-        msg = self._normalize_response_message(dict(response["choices"][0]["message"]))
+        if not isinstance(response, dict):
+            raise RuntimeError(f"模型接口返回格式错误：期望 JSON 对象，实际为 {type(response).__name__}")
+        if response.get("error") is not None:
+            raise RuntimeError(f"模型接口返回错误：{response['error']}")
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("模型接口返回缺少非空 choices 列表。")
+        first = choices[0]
+        raw_message = first.get("message") if isinstance(first, dict) else None
+        if not isinstance(raw_message, dict):
+            raise RuntimeError("模型接口返回 choices[0] 缺少有效的 message 对象。")
+        msg = self._normalize_response_message(dict(raw_message))
         self.last_usage = extract_usage(response)
         return msg
 

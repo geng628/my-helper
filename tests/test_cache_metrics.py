@@ -254,3 +254,69 @@ def test_openai_compatible_llm_last_usage_and_cache_monitor_thread_safe() -> Non
     with pytest.raises(RuntimeError, match="boom"):
         client.respond([{"role": "user", "content": "thread-0"}])
     assert client.last_usage is None
+
+
+# 测试 CacheMonitor 的有界记录窗口、MRU 会话淘汰、单调游标增量汇总与非法容量校验
+def test_cache_monitor_bounded_eviction_and_exact_summaries() -> None:
+    for bad_val in (0, -1, True):
+        with pytest.raises(ValueError):
+            CacheMonitor(max_records=bad_val)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            CacheMonitor(max_sessions=bad_val)  # type: ignore[arg-type]
+
+    unbounded = CacheMonitor()
+    bounded = CacheMonitor(max_records=5, max_sessions=3)
+
+    # 先依次写入 s1/s2/s3，再重访 s1 刷新 MRU，随后写入 s4 应淘汰最旧未访问的 s2（保留 s3/s1/s4）
+    sequence = [
+        ("s1", "sys\nu1\n", TokenUsage(prompt_tokens=100, cached_tokens=0, completion_tokens=10)),
+        ("s2", "sys\nu2\n", TokenUsage(prompt_tokens=120, cached_tokens=20, completion_tokens=12)),
+        ("s3", "sys\nu3\n", TokenUsage(prompt_tokens=140, cached_tokens=40, completion_tokens=14)),
+        ("s1", "sys\nu1\na1\nu1b\n", TokenUsage(prompt_tokens=160, cached_tokens=96, completion_tokens=16)),
+        ("s4", "sys\nu4\n", TokenUsage(prompt_tokens=110, cached_tokens=0, completion_tokens=11)),
+        ("s4", "sys\nu4\na4\nu4b\n", TokenUsage(prompt_tokens=150, cached_tokens=90, completion_tokens=15)),
+        ("s3", "sys\nu3\na3\nu3b\n", TokenUsage(prompt_tokens=180, cached_tokens=120, completion_tokens=18)),
+        ("s1", "sys\nu1\na1\nu1b\na1b\nu1c\n", TokenUsage(prompt_tokens=210, cached_tokens=160, completion_tokens=20)),
+        ("s5", "sys\nu5\n", None),
+    ]
+    for sk, serialized, usage in sequence:
+        unbounded.record(sk, serialized, usage)
+        bounded.record(sk, serialized, usage)
+
+    assert len(bounded._last_serialized) == 3
+    assert set(bounded._last_serialized) == {"s3", "s1", "s5"}
+    assert len(bounded.records) == 5
+    assert bounded.snapshot_index() == 9
+
+    # 窗口发生滚动淘汰后，抓取单轮起点游标，再追加 3 条跨会话记录，验证区间统计与全量累计精确一致
+    turn_idx = bounded.snapshot_index()
+    assert turn_idx == unbounded.snapshot_index() == 9
+    tail_sequence = [
+        ("s5", "sys\nu5\na5\nu5b\n", TokenUsage(prompt_tokens=170, cached_tokens=100, completion_tokens=17)),
+        ("s1", "sys\nu1\na1\nu1b\na1b\nu1c\na1c\nu1d\n", TokenUsage(prompt_tokens=240, cached_tokens=200, completion_tokens=22)),
+        ("s3", "sys\nu3\na3\nu3b\na3b\nu3c\n", TokenUsage(prompt_tokens=200, cached_tokens=150, completion_tokens=19)),
+    ]
+    for sk, serialized, usage in tail_sequence:
+        unbounded.record(sk, serialized, usage)
+        bounded.record(sk, serialized, usage)
+
+    assert len(bounded._last_serialized) == 3
+    assert len(bounded.records) == 5
+    assert bounded.snapshot_index() == 12
+    assert isinstance(bounded.records, list)
+    assert [r.session_key for r in bounded.records] == ["s1", "s5", "s5", "s1", "s3"]
+
+    assert bounded.summary() == unbounded.summary()
+    assert bounded.summary(since=0) == unbounded.summary(since=0)
+    assert bounded.summary()["llm_calls"] == 12
+    assert bounded.summary(since=turn_idx) == unbounded.summary(since=turn_idx)
+    assert bounded.summary(since=turn_idx)["llm_calls"] == 3
+    assert bounded.summary(since=bounded.snapshot_index())["llm_calls"] == 0
+    assert bounded.summary(since=-2) == unbounded.summary(since=-2)
+
+    # 已被淘汰出 _last_serialized 的旧会话 s2 再次出现时，按冷启动处理且窗口上限不突破
+    revisited = bounded.record("s2", "sys\nu2\na2\n", TokenUsage(prompt_tokens=130, cached_tokens=0, completion_tokens=13))
+    assert revisited.prefix_reuse_rate is None
+    assert len(bounded._last_serialized) == 3
+    assert len(bounded.records) == 5
+
