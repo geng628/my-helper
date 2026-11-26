@@ -649,19 +649,28 @@ class ModelsDSLCompiler:
     def presets(self) -> list[dict[str, object]]:
         return list_presets()
 
-    # 按表单参数自动生成极简一行或块状 DSL 文本
-    def render(self, **kwargs: object) -> str:
-        raw_temp = kwargs.get("temperature", 0.2)
-        temperature = float(raw_temp) if (not isinstance(raw_temp, bool) and isinstance(raw_temp, (int, float, str))) else 0.2
+    # 按显式表单参数自动生成极简一行或块状 DSL 文本
+    def render(
+        self,
+        *,
+        preset: str,
+        api_key: str = "",
+        model: str = "",
+        base_url: str = "",
+        name: str = "",
+        provider: str = "",
+        temperature: float = 0.2,
+        consolidator: str = "",
+    ) -> str:
         return render_models_dsl(
-            preset=str(kwargs.get("preset") or ""),
-            api_key=str(kwargs.get("api_key") or ""),
-            model=str(kwargs.get("model") or ""),
-            base_url=str(kwargs.get("base_url") or ""),
-            name=str(kwargs.get("name") or ""),
-            provider=str(kwargs.get("provider") or ""),
+            preset=preset,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            name=name,
+            provider=provider,
             temperature=temperature,
-            consolidator=str(kwargs.get("consolidator") or ""),
+            consolidator=consolidator,
         )
 
 

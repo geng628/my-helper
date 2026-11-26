@@ -3,10 +3,25 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import date, datetime
 from pathlib import Path
 
+from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
 from personal_assistant.assistant.memory import MemoryStore
+
+
+# 安全解析可选的 ISO 日期字符串（YYYY-MM-DD）或 date 对象，空值返回 None，非法格式抛 ValueError
+def parse_optional_date(raw: object) -> date | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return date.fromisoformat(raw.strip())
 
 
 # 获取当前仓库短 Git Commit SHA（若有未提交改动则追加 -dirty），用于绑定评测基线
@@ -95,6 +110,20 @@ def resolve_eval_paths(config_path: Path | None) -> tuple[Path, Path]:
     candidate_root = cfg_path.parent.parent
     project_root = candidate_root if (candidate_root / "plugins").is_dir() else REPO_ROOT
     return cfg_path, project_root
+
+
+# 统一解析评测配置：优先复用调用方透传的 ToolsConfig，否则按路径单次加载并标记所有权
+def resolve_eval_tools_config(
+    config_path: Path | None,
+    tools_config: ToolsConfig | None = None,
+) -> tuple[Path | None, Path, ToolsConfig | None, bool]:
+    if tools_config is not None:
+        cfg_path = config_path.resolve() if config_path is not None else tools_config.config_path
+        return cfg_path, tools_config.project_root, tools_config, False
+    cfg_path, project_root = resolve_eval_paths(config_path)
+    if cfg_path.is_file():
+        return cfg_path, project_root, ToolsConfig.load(cfg_path, project_root=project_root), True
+    return cfg_path, project_root, None, False
 
 
 # 将评测报告写入指定 JSON 文件，禁止输出到 --data-dir 内部以防污染数据目录

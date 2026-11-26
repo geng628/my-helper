@@ -553,12 +553,18 @@ def test_shell_plugin_blocks_attached_short_flags_git_colon_refs_and_env_variant
     wc_out = execute_safe_command("wc --files0-from .env", wc_policy)
     assert wc_out.startswith("错误：") and "找不到可执行程序" not in wc_out
 
-    # 验证 config/tools.json 的 shell.reject_segments 已同步包含 .git，且合法 git --no-pager / 安全通配符放行
+    # 验证 config/tools.json 的 shell.reject_segments 已同步包含 .git，单轨移除 from_config/config_path，且合法 git 命令放行
+    import inspect
+    from plugins.tools.shell_tools import run_command
+
+    assert not hasattr(ShellPolicy, "from_config")
+    assert "config_path" not in inspect.signature(run_command).parameters
+
     repo_root = Path(__file__).resolve().parent.parent
     raw_tools = json.loads((repo_root / "config" / "tools.json").read_text(encoding="utf-8"))
     assert ".git" in raw_tools["shell"]["reject_segments"]
 
-    repo_policy = ShellPolicy.from_config(repo_root / "config" / "tools.json")
+    repo_policy = ShellPolicy.from_dict(raw_tools["shell"], project_root=repo_root)
     no_pager_out = execute_safe_command("git --no-pager status --short", repo_policy)
     assert "退出码：0" in no_pager_out
     safe_glob_out = execute_safe_command("git diff HEAD -- '*.py'", repo_policy)

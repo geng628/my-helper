@@ -64,8 +64,18 @@ class ConfigCompilerProtocol(Protocol):
     # 返回内置厂商预设列表
     def presets(self) -> list[dict[str, object]]: ...
 
-    # 按表单参数自动渲染生成配置文本
-    def render(self, **kwargs: object) -> str: ...
+    # 按通用模型参数自动渲染生成配置文本（具体插件实现可按需追加带默认值的扩展关键字参数）
+    def render(
+        self,
+        *,
+        preset: str,
+        api_key: str = "",
+        model: str = "",
+        base_url: str = "",
+        name: str = "",
+        provider: str = "",
+        temperature: float = 0.2,
+    ) -> str: ...
 
 
 # 内层子协议 4：大模型客户端驱动极简协议（单轨直通已实化的 ModelProfile）

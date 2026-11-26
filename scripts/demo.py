@@ -13,7 +13,8 @@ if str(ROOT) not in sys.path:
 from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.react import AgentEvent, ToolStep, run_react
 from personal_assistant.agent.tools import ToolRegistry
-from personal_assistant.ai.client import LLMClient, LLMNotConfigured, from_env
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured
+from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import load_dotenv
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
@@ -137,33 +138,48 @@ def run_offline_demo(show_messages: bool = False) -> None:
         print(json.dumps(msgs2, ensure_ascii=False, indent=2))
 
 
-# 读取 .env 并向真实模型发起单句提问，用于快速验证真实工具调用链路
-def run_live_ask(question: str, show_messages: bool = False) -> int:
+# 统一通过 ToolsConfig 加载模型（支持 models.dsl / models.json / Provider 插件与 .env）并向真实模型发起单句提问
+def run_live_ask(
+    question: str,
+    show_messages: bool = False,
+    *,
+    model_name: str | None = None,
+) -> int:
     load_dotenv()
-    client = from_env()
-    tools = build_demo_tools()
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-    print(f"你> {question}")
+    cfg_path = ROOT / "config" / "tools.json"
+    cfg = ToolsConfig.load(cfg_path, project_root=ROOT) if cfg_path.is_file() else ToolsConfig.empty(ROOT)
     try:
-        reply = run_react(client, messages, tools, on_event=_print_event)
-    except LLMNotConfigured as error:
-        print(f"助手> {error}")
-        print("提示：不配置 API Key 也可直接运行 `uv run python scripts/demo.py` 查看离线演示。")
-        return 1
-    print(f"助手> {reply}")
-    if show_messages:
-        print("\n--- 完整 messages 轨迹 ---")
-        print(json.dumps(messages, ensure_ascii=False, indent=2))
-    return 0
+        client = cfg.build_llm(cfg_path.parent if cfg_path.is_file() else None, model_name=model_name)
+        tools = (
+            ToolRegistry(*cfg.plugin_manager.build_tools(), allowed_names=["get_current_time"])
+            if cfg_path.is_file()
+            else build_demo_tools()
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
+        print(f"你> {question}")
+        try:
+            reply = run_react(client, messages, tools, on_event=_print_event)
+        except LLMNotConfigured as error:
+            print(f"助手> {error}")
+            print("提示：不配置 API Key 也可直接运行 `uv run python scripts/demo.py` 查看离线演示。")
+            return 1
+        print(f"助手> {reply}")
+        if show_messages:
+            print("\n--- 完整 messages 轨迹 ---")
+            print(json.dumps(messages, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        cfg.plugin_manager.terminate_all()
 
 
 # 演示脚本命令行入口：不传 --ask 跑离线演示，传 --ask 跑真实模型提问
 def main() -> int:
     parser = argparse.ArgumentParser(description="测试与演示最小 ReAct 循环")
-    parser.add_argument("--ask", help="使用 .env 中配置的真实模型测试单句提问")
+    parser.add_argument("--ask", help="使用 config/models.dsl 或 .env 中配置的真实模型测试单句提问")
+    parser.add_argument("--model", default=None, help="指定 models.dsl 档案名、预设名或模型 ID")
     parser.add_argument(
         "--show-messages",
         action="store_true",
@@ -171,7 +187,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     if args.ask:
-        return run_live_ask(args.ask, show_messages=args.show_messages)
+        return run_live_ask(args.ask, show_messages=args.show_messages, model_name=args.model)
     run_offline_demo(show_messages=args.show_messages)
     return 0
 

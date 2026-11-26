@@ -359,6 +359,17 @@ def convert_locomo_for_memory(
             continue
         eval_day = (last_day or date(2023, 6, 1)).isoformat()
         group_id = f"locomo-{sample_id}"
+        shared_policy: dict[str, object] = {
+            "max_active_messages": 1,
+            "keep_recent_messages": 0,
+            "min_batch_messages": 1,
+        }
+        shared_setup: dict[str, object] = {
+            "record_type": "shared_setup",
+            "shared_group": group_id,
+            "policy": shared_policy,
+            "steps": session_steps,
+        }
 
         for qa_idx, qa in enumerate(item.get("qa") or [], start=1):
             if not isinstance(qa, dict):
@@ -392,16 +403,11 @@ def convert_locomo_for_memory(
                     "id": f"locomo-{sample_id}-q{qa_idx:03d}",
                     "source": "locomo",
                     "shared_group": group_id,
-                    "setup_step_count": len(session_steps),
+                    "shared_setup": shared_setup,
                     "category": category,
                     "description": f"LoCoMo ({category}): {question[:80]}",
-                    "policy": {
-                        "max_active_messages": 1,
-                        "keep_recent_messages": 0,
-                        "min_batch_messages": 1,
-                    },
+                    "policy": shared_policy,
                     "steps": [
-                        *session_steps,
                         {
                             "action": "ask",
                             "chat_id": "eval-query",
@@ -425,40 +431,19 @@ def write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-# 将多轮记忆场景写出为紧凑 JSONL：自动提取相同 shared_group 的共享前置步骤，避免巨量冗余复制
+# 将多轮记忆场景写出为紧凑 JSONL：自动提取相同 shared_group 的 shared_setup，避免冗余复制
 def write_scenarios_jsonl(path: Path, scenarios: list[dict[str, object]]) -> None:
     setup_records: dict[str, dict[str, object]] = {}
     compact_scenarios: list[dict[str, object]] = []
     for sc in scenarios:
         group_id = str(sc.get("shared_group") or "").strip()
-        raw_count = sc.get("setup_step_count")
         raw_setup = sc.get("shared_setup")
-        steps = list(sc.get("steps") or [])
-        if group_id and isinstance(raw_count, int) and raw_count > 0:
+        if group_id and isinstance(raw_setup, dict):
             if group_id not in setup_records:
-                setup_entry: dict[str, object] = {
-                    "record_type": "shared_setup",
-                    "shared_group": group_id,
-                    "policy": sc.get("policy"),
-                    "steps": steps[:raw_count],
-                }
-                if sc.get("seed_memories"):
-                    setup_entry["seed_memories"] = sc.get("seed_memories")
-                if sc.get("today"):
-                    setup_entry["today"] = sc.get("today")
-                setup_records[group_id] = setup_entry
-            slim = {
-                k: v
-                for k, v in sc.items()
-                if k not in {"setup_step_count", "shared_setup"}
-            }
-            slim["steps"] = steps[raw_count:]
-            compact_scenarios.append(slim)
-        elif group_id and isinstance(raw_setup, dict):
-            if group_id not in setup_records:
-                setup_records[group_id] = dict(raw_setup, record_type="shared_setup", shared_group=group_id)
-            slim = {k: v for k, v in sc.items() if k != "shared_setup"}
-            compact_scenarios.append(slim)
+                setup_records[group_id] = dict(
+                    raw_setup, record_type="shared_setup", shared_group=group_id
+                )
+            compact_scenarios.append({k: v for k, v in sc.items() if k != "shared_setup"})
         else:
             compact_scenarios.append(sc)
     write_jsonl(path, [*setup_records.values(), *compact_scenarios])

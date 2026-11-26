@@ -1200,5 +1200,41 @@ class ProbeLifecyclePlugin(Plugin):
             assert no_bg_app.chat("第二句", chat_id="s-nobg")["consolidation_scheduled"] is False
         finally:
             no_bg_app.close()
+
+        # 8. 验证借用外部预加载 tools_config 时 app.close() 不提前调用 terminate_all()，仍由外部所有者回收
+        from dataclasses import replace
+
+        from personal_assistant.agent.plugins import Plugin, PluginContext, PluginManager
+        from personal_assistant.assistant.commands import ToolsConfig
+
+        terminated_ids: list[str] = []
+
+        # 探针插件：记录 terminate() 调用次数以验证借用态所有权边界
+        class _ProbeBorrowedPlugin(Plugin):
+            plugin_id = "probe_borrowed"
+
+            # 空初始化占位
+            def initialize(self) -> None:
+                return None
+
+            # 记录资源回收事件
+            def terminate(self) -> None:
+                terminated_ids.append(self.plugin_id)
+
+        probe_pm = PluginManager(
+            plugins=(_ProbeBorrowedPlugin(PluginContext(project_root=tmp_path)),),
+            project_root=tmp_path,
+        )
+        borrowed_cfg = replace(ToolsConfig.empty(project_root=tmp_path), plugin_manager=probe_pm)
+        borrowed_app = AssistantApp(
+            data_root=tmp_path / "borrowed_data",
+            tools_config=borrowed_cfg,
+            llm=RecordingLLM([]),
+            auto_consolidate=False,
+        )
+        borrowed_app.close()
+        assert terminated_ids == []
+        borrowed_cfg.plugin_manager.terminate_all()
+        assert terminated_ids == ["probe_borrowed"]
     finally:
         app_conc.close()

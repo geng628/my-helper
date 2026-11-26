@@ -1,19 +1,12 @@
 """离线 Markdown 检索评测（零模型调用）：评估来源召回率、MRR、引文覆盖、分类指标与负例干净度。"""
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from statistics import mean
 from time import perf_counter
 
 from personal_assistant.assistant.memory import MemoryStore
-from evals.common import current_git_commit, normalize_expected_sources
-
-
-# 安全解析可选的 ISO 日期字符串（YYYY-MM-DD），供单题时间过期过滤使用
-def _parse_optional_date(raw: object) -> date | None:
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    return date.fromisoformat(raw.strip())
+from evals.common import current_git_commit, normalize_expected_sources, parse_optional_date
 
 
 # 评测单道检索题（区分可回答正例与无命中负例），返回明细记录与可选失败原因
@@ -27,7 +20,7 @@ def _score_search_case(
     case_id = str(case["id"])
     query = str(case["query"])
     category = str(case.get("category") or "uncategorized").strip() or "uncategorized"
-    ref_day = _parse_optional_date(case.get("today"))
+    ref_day = parse_optional_date(case.get("today"))
     expected = normalize_expected_sources(memory, case.get("expected_sources"))
     answerable = bool(case.get("answerable", bool(expected)))
     if answerable and not expected:

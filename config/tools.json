@@ -23,7 +23,7 @@
   },
   "telemetry": {
     "enabled": true,
-    "window_size": 200
+    "max_sessions": 256
   },
   "web": {
     "timeout": 15,

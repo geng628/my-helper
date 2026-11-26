@@ -189,8 +189,16 @@ def test_fetch_webpage_parses_html_enforces_limits_and_blocks_binary(tmp_path: P
 
 # 测试 fetch_webpage 的 TOAST 卸载分页续读、2MB 下载上限与超限显式提醒、以及 JSON 自动美化
 def test_fetch_webpage_toast_offload_download_cap_notice_and_json_pretty(tmp_path: Path) -> None:
+    import inspect
+    from plugins.tools.web_tools import fetch_webpage, web_search
+
+    assert not hasattr(WebPolicy, "from_config")
+    assert "config_path" not in inspect.signature(web_search).parameters
+    assert "config_path" not in inspect.signature(fetch_webpage).parameters
+
     repo_root = Path(__file__).resolve().parent.parent
-    default_policy = WebPolicy.from_config(repo_root / "config" / "tools.json")
+    raw_tools = json.loads((repo_root / "config" / "tools.json").read_text(encoding="utf-8"))
+    default_policy = WebPolicy.from_dict(raw_tools["web"])
     assert default_policy.max_download_bytes >= 2 * 1024 * 1024
 
     offload_dir = tmp_path / "workspace" / "tool_outputs"

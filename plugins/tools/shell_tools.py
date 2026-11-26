@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 import os
 import re
 import shlex
@@ -95,42 +94,52 @@ class ShellPolicy:
     max_output_bytes: int = 8192
     offload_dir: Path | None = None
 
-    # 从已解析的 shell 配置字典与上下文路径直接构建 ShellPolicy
+    # 从主板注入的 shell 配置字典与上下文路径直接构建 ShellPolicy（缺省使用安全默认值）
     @classmethod
     def from_dict(
-        cls, shell_cfg: Mapping[str, object], *, project_root: Path = REPO_ROOT, offload_dir: Path | None = None
+        cls,
+        shell_cfg: Mapping[str, object] | None = None,
+        *,
+        project_root: Path = REPO_ROOT,
+        offload_dir: Path | None = None,
     ) -> "ShellPolicy":
-        cwd_raw = str(shell_cfg.get("cwd") or ".").strip()
+        cfg = shell_cfg or {}
+        cwd_raw = str(cfg.get("cwd") or ".").strip()
         cwd_rel = Path(cwd_raw)
         if cwd_rel.is_absolute() or ".." in cwd_rel.parts:
             raise ValueError(f"shell.cwd 必须是项目内相对路径：{cwd_raw}")
         cwd = (project_root / cwd_rel).resolve()
         if not cwd.is_relative_to(project_root.resolve()) or not cwd.is_dir():
             raise ValueError(f"shell.cwd 不存在或超出项目范围：{cwd_raw}")
+        raw_exes = cfg.get("allowed_executables")
+        raw_git = cfg.get("allowed_git_subcommands")
+        raw_reject = cfg.get("reject_segments")
+        raw_timeout = cfg.get("timeout", 10.0)
+        raw_max_out = cfg.get("max_output_bytes", 8192)
+        timeout = float(raw_timeout) if isinstance(raw_timeout, (int, float, str)) and not isinstance(raw_timeout, bool) else 10.0
+        max_output_bytes = int(raw_max_out) if isinstance(raw_max_out, (int, float, str)) and not isinstance(raw_max_out, bool) else 8192
         return cls(
             project_root=project_root.resolve(),
             cwd=cwd,
-            allowed_executables=tuple(str(x) for x in shell_cfg.get("allowed_executables", list(DEFAULT_ALLOWED_EXECUTABLES))),
-            allowed_git_subcommands=tuple(str(x) for x in shell_cfg.get("allowed_git_subcommands", list(DEFAULT_GIT_SUBCOMMANDS))),
-            reject_segments=tuple(str(x) for x in shell_cfg.get("reject_segments", list(DEFAULT_REJECT_SEGMENTS))),
-            timeout=float(shell_cfg.get("timeout", 10.0)),
-            max_output_bytes=int(shell_cfg.get("max_output_bytes", 8192)),
+            allowed_executables=(
+                tuple(str(x) for x in raw_exes)
+                if isinstance(raw_exes, (list, tuple))
+                else DEFAULT_ALLOWED_EXECUTABLES
+            ),
+            allowed_git_subcommands=(
+                tuple(str(x) for x in raw_git)
+                if isinstance(raw_git, (list, tuple))
+                else DEFAULT_GIT_SUBCOMMANDS
+            ),
+            reject_segments=(
+                tuple(str(x) for x in raw_reject)
+                if isinstance(raw_reject, (list, tuple))
+                else DEFAULT_REJECT_SEGMENTS
+            ),
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
             offload_dir=offload_dir,
         )
-
-    # 从 config/tools.json 读取 shell 白名单配置，缺失时回退到安全默认值
-    @classmethod
-    def from_config(cls, config_path: Path | None = None, *, offload_dir: Path | None = None) -> "ShellPolicy":
-        cfg_file = (
-            config_path or Path(os.getenv("MY_HELPER_CONFIG", str(REPO_ROOT / "config"))) / "tools.json"
-        ).resolve()
-        project_root = cfg_file.parent.parent if cfg_file.is_file() else REPO_ROOT
-        shell_cfg: dict[str, object] = {}
-        if cfg_file.is_file():
-            raw = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("shell"), dict):
-                shell_cfg = raw["shell"]
-        return cls.from_dict(shell_cfg, project_root=project_root, offload_dir=offload_dir)
 
 
 # 词法解析单条命令并拦截未引用的管道、拼接、重定向与命令替换语法
@@ -701,13 +710,12 @@ def run_command(
     command: str,
     *,
     project_root: Path | None = None,
-    config_path: Path | None = None,
     offload_dir: Path | None = None,
     shell_config: Mapping[str, object] | None = None,
 ) -> str:
-    policy = (
-        ShellPolicy.from_dict(shell_config, project_root=project_root or REPO_ROOT, offload_dir=offload_dir)
-        if isinstance(shell_config, Mapping)
-        else ShellPolicy.from_config(config_path, offload_dir=offload_dir)
+    policy = ShellPolicy.from_dict(
+        shell_config,
+        project_root=project_root or REPO_ROOT,
+        offload_dir=offload_dir,
     )
     return execute_safe_command(command, policy)

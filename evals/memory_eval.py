@@ -17,13 +17,10 @@ from typing import TypeVar, cast
 from personal_assistant.ai.cache import CallCacheRecord, summarize_records
 from personal_assistant.ai.client import LLMClient, NoopLLMClient
 from personal_assistant.assistant.app import AssistantApp
-from personal_assistant.assistant.common import REPO_ROOT, today_shanghai
-from personal_assistant.assistant.consolidator import (
-    ConsolidationPolicy,
-    MemoryConsolidator,
-    _parse_json_object,
-)
-from evals.common import current_git_commit, resolve_eval_paths
+from personal_assistant.assistant.commands import ToolsConfig
+from personal_assistant.assistant.common import today_shanghai
+from personal_assistant.assistant.consolidator import ConsolidationPolicy, _parse_json_object
+from evals.common import current_git_commit, parse_optional_date, resolve_eval_tools_config
 
 ProgressCallback = Callable[[int, int, dict[str, object]], None]
 SetupDoneCallback = Callable[[dict[str, object]], None]
@@ -114,22 +111,12 @@ def load_scenarios(path: Path) -> list[dict[str, object]]:
     # 将紧凑格式中引用 shared_group 的场景与对应 shared_setup 定义绑定，便于后续过滤与并发复用
     for item in scenarios:
         group_id = str(item.get("shared_group") or "").strip()
-        if not group_id:
-            continue
-        has_inline = isinstance(item.get("setup_step_count"), int) and int(item["setup_step_count"]) > 0
-        if isinstance(item.get("shared_setup"), dict) or has_inline:
+        if not group_id or isinstance(item.get("shared_setup"), dict):
             continue
         if group_id not in shared_setups:
             raise ValueError(f"场景 {item['id']} 引用了未定义的 shared_group：{group_id}")
         item["shared_setup"] = shared_setups[group_id]
     return scenarios
-
-
-# 安全解析可选的 ISO 日期字符串（YYYY-MM-DD）
-def _parse_optional_date(raw: object) -> date | None:
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    return date.fromisoformat(raw.strip())
 
 
 # 根据场景配置构造 ConsolidationPolicy
@@ -210,11 +197,11 @@ def judge_answer(
     }
 
 
-# 判断文本是否包含目标词条：长度 <= 3 的纯 ASCII 词条按大小写不敏感词边界匹配，其余保留子串匹配
+# 判断文本是否包含目标词条：纯 ASCII 词/数字关键字使用同类 ASCII 字符边界匹配，含中文或标点时执行规范子串匹配
 def _contains_keyword(text: str, keyword: str) -> bool:
     if not keyword:
         return True
-    if keyword.isascii() and len(keyword) <= 3 and keyword.isalnum():
+    if keyword.isascii() and keyword.isalnum():
         if keyword.isalpha():
             boundary = "[A-Za-z]"
         elif keyword.isdigit():
@@ -317,36 +304,22 @@ def _copy_data_snapshot(src_data: Path, dst_data: Path) -> None:
             shutil.copytree(src_sub, dst_data / sub, symlinks=False)
 
 
-# 提取场景的共享前缀信息，返回 (group_id, setup_spec, qa_steps)
+# 提取场景的共享前缀信息（统一仅接受 shared_setup 格式），返回 (group_id, setup_spec, qa_steps)
 def _split_shared_setup(
     scenario: dict[str, object],
 ) -> tuple[str | None, dict[str, object] | None, list[dict[str, object]]]:
     steps = list(scenario.get("steps") or [])
     group_id = str(scenario.get("shared_group") or "").strip()
-    if not group_id:
-        return None, None, steps
     raw_setup = scenario.get("shared_setup")
-    if isinstance(raw_setup, dict):
+    if group_id and isinstance(raw_setup, dict):
         return group_id, raw_setup, steps
-    raw_count = scenario.get("setup_step_count")
-    if isinstance(raw_count, int) and raw_count > 0:
-        setup_spec: dict[str, object] = {
-            "shared_group": group_id,
-            "policy": scenario.get("policy"),
-            "seed_memories": scenario.get("seed_memories"),
-            "today": scenario.get("today"),
-            "steps": steps[:raw_count],
-        }
-        return group_id, setup_spec, steps[raw_count:]
     return None, None, steps
 
 
-# 在指定 AssistantApp 实例上顺序执行一组评测步骤，返回步骤日志与失败原因列表
+# 在指定 AssistantApp 实例上顺序执行一组评测步骤（直接复用 app.consolidator 确保双模型生效）
 def _execute_steps(
     app: AssistantApp,
-    llm: LLMClient,
     steps: list[dict[str, object]],
-    policy: ConsolidationPolicy,
     clock_day: list[date | None],
     current_today: Callable[[], date],
     *,
@@ -360,7 +333,7 @@ def _execute_steps(
             continue
         action = str(raw_step.get("action") or "").strip().lower()
         chat_id = str(raw_step.get("chat_id") or "default")
-        step_day = _parse_optional_date(raw_step.get("today"))
+        step_day = parse_optional_date(raw_step.get("today"))
         if step_day is not None and step_day != clock_day[0]:
             clock_day[0] = step_day
             app.reset_session_prompt(chat_id)
@@ -396,9 +369,14 @@ def _execute_steps(
             )
         elif action == "consolidate":
             ref_day = step_day or current_today()
-            tracked = app.cache_monitor.wrap(llm, session_key=f"consolidate-{chat_id}")
-            runner = MemoryConsolidator(app.state, app.memory, tracked, policy=policy)
-            c_res = runner.consolidate_once(chat_id, today=ref_day)
+            orig_cons_llm = app.consolidator.llm
+            app.consolidator.llm = app.cache_monitor.wrap(
+                orig_cons_llm, session_key=f"consolidate-{chat_id}"
+            )
+            try:
+                c_res = app.consolidator.consolidate_once(chat_id, today=ref_day)
+            finally:
+                app.consolidator.llm = orig_cons_llm
             app.reset_session_prompt(chat_id)
             if c_res is None:
                 reasons.append(f"step#{idx} consolidate 未触发（请检查消息数与 policy 阈值）")
@@ -463,24 +441,24 @@ def _execute_steps(
     return step_logs, reasons
 
 
-# 为共享长记忆组执行一次前置历史注入与沉淀，产出可供多道 QA 并发拷贝复用的基准目录快照
-def _build_shared_setup(
+# 公共沙箱会话构造与执行辅助函数：统一基于 AssistantApp(auto_consolidate=False) 执行步骤并回收资源
+def _run_eval_session(
+    *,
+    data_root: Path,
     llm: LLMClient,
-    group_id: str,
-    setup_spec: dict[str, object],
-    base_data_dir: Path,
+    consolidator_llm: LLMClient | None,
     cfg_path: Path | None,
     project_root: Path,
-) -> tuple[dict[str, object], list[CallCacheRecord]]:
-    policy = _build_policy(setup_spec.get("policy"))
-    steps = list(setup_spec.get("steps") or [])
-    has_explicit_consolidate = any(
-        isinstance(s, dict) and s.get("action") == "consolidate" for s in steps
-    )
-    t0 = perf_counter()
-    clock_day: list[date | None] = [_parse_optional_date(setup_spec.get("today"))]
+    tools_config: ToolsConfig | None,
+    spec: dict[str, object],
+    steps: list[dict[str, object]],
+    base_data_dir: Path | None = None,
+    judge_llm: LLMClient | None = None,
+) -> tuple[list[dict[str, object]], list[str], list[CallCacheRecord], dict[str, object], str | None]:
+    policy = _build_policy(spec.get("policy"))
+    clock_day: list[date | None] = [parse_optional_date(spec.get("today"))]
 
-    # 返回当前共享前置构建的逻辑日期
+    # 返回当前评测沙箱的逻辑日期（未指定时回退北京时间当日）
     def current_today() -> date:
         return clock_day[0] or today_shanghai()
 
@@ -489,41 +467,74 @@ def _build_shared_setup(
     reasons: list[str] = []
     records: list[CallCacheRecord] = []
     cache_summary = summarize_records([])
-    setup_exception: str | None = None
+    exc_text: str | None = None
     try:
+        if base_data_dir is not None:
+            _copy_data_snapshot(base_data_dir, data_root)
         app = AssistantApp(
-            data_root=base_data_dir,
+            data_root=data_root,
             config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
             project_root=project_root,
+            tools_config=tools_config,
             llm=llm,
+            consolidator_llm=consolidator_llm,
             consolidation_policy=policy,
-            auto_consolidate=not has_explicit_consolidate,
+            auto_consolidate=False,
             today_fn=current_today,
         )
-        for seed in setup_spec.get("seed_memories") or []:
-            if not isinstance(seed, dict):
-                continue
-            app.memory.apply_memory_operations(
-                str(seed.get("topic") or "facts"),
-                str(seed.get("title") or "预置记忆"),
-                str(seed.get("index_summary") or "预置主题记忆"),
-                list(seed.get("operations") or []),
-                today=_parse_optional_date(seed.get("today")),
-            )
+        if base_data_dir is None:
+            for seed in spec.get("seed_memories") or []:
+                if not isinstance(seed, dict):
+                    continue
+                app.memory.apply_memory_operations(
+                    str(seed.get("topic") or "facts"),
+                    str(seed.get("title") or "预置记忆"),
+                    str(seed.get("index_summary") or "预置主题记忆"),
+                    list(seed.get("operations") or []),
+                    today=parse_optional_date(seed.get("today")),
+                )
         step_logs, reasons = _execute_steps(
-            app, llm, steps, policy, clock_day, current_today, judge_llm=None
+            app, steps, clock_day, current_today, judge_llm=judge_llm
         )
         records = list(app.cache_monitor.records)
         cache_summary = app.cache_monitor.summary()
     except Exception as exc:  # noqa: BLE001
-        setup_exception = f"{type(exc).__name__}: {exc}"
-        reasons = [f"shared_setup_exception: {setup_exception}"]
+        exc_text = f"{type(exc).__name__}: {exc}"
         if app is not None:
             records = list(app.cache_monitor.records)
             cache_summary = app.cache_monitor.summary()
     finally:
         if app is not None:
             app.close()
+    return step_logs, reasons, records, cache_summary, exc_text
+
+
+# 为共享长记忆组执行一次前置历史注入与沉淀，产出可供多道 QA 并发拷贝复用的基准目录快照
+def _build_shared_setup(
+    llm: LLMClient,
+    group_id: str,
+    setup_spec: dict[str, object],
+    base_data_dir: Path,
+    cfg_path: Path | None,
+    project_root: Path,
+    *,
+    tools_config: ToolsConfig | None = None,
+    consolidator_llm: LLMClient | None = None,
+) -> tuple[dict[str, object], list[CallCacheRecord]]:
+    steps = list(setup_spec.get("steps") or [])
+    t0 = perf_counter()
+    step_logs, reasons, records, cache_summary, setup_exception = _run_eval_session(
+        data_root=base_data_dir,
+        llm=llm,
+        consolidator_llm=consolidator_llm,
+        cfg_path=cfg_path,
+        project_root=project_root,
+        tools_config=tools_config,
+        spec=setup_spec,
+        steps=steps,
+    )
+    if setup_exception is not None:
+        reasons = [f"shared_setup_exception: {setup_exception}"]
 
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
     summary: dict[str, object] = {
@@ -545,10 +556,11 @@ def _run_single_scenario(
     cfg_path: Path | None,
     project_root: Path,
     *,
+    tools_config: ToolsConfig | None = None,
+    consolidator_llm: LLMClient | None = None,
     judge_llm: LLMClient | None = None,
     base_data_dir: Path | None = None,
     steps_override: list[dict[str, object]] | None = None,
-    disable_auto_consolidation: bool = False,
     setup_error: str | None = None,
 ) -> tuple[dict[str, object], list[CallCacheRecord]]:
     sc_id = str(scenario["id"])
@@ -569,66 +581,24 @@ def _run_single_scenario(
             fail_record["shared_group"] = group_id
         return fail_record, []
 
-    policy = _build_policy(scenario.get("policy"))
     steps = list(steps_override) if steps_override is not None else list(scenario.get("steps") or [])
-    has_explicit_consolidate = disable_auto_consolidation or any(
-        isinstance(s, dict) and s.get("action") == "consolidate" for s in steps
-    )
-
     t0 = perf_counter()
-    clock_day: list[date | None] = [_parse_optional_date(scenario.get("today"))]
-
-    # 返回当前场景逻辑日期（若未指定则回退北京时间当日）
-    def current_today() -> date:
-        return clock_day[0] or today_shanghai()
-
-    step_logs: list[dict[str, object]] = []
-    reasons: list[str] = []
-    records: list[CallCacheRecord] = []
-    cache_summary = summarize_records([])
     safe_sc_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", sc_id) or "scenario"
     with tempfile.TemporaryDirectory(prefix=f"my-helper-memeval-{safe_sc_id}-") as tmp:
-        data_root = Path(tmp) / "data"
-        app: AssistantApp | None = None
-        try:
-            if base_data_dir is not None:
-                _copy_data_snapshot(base_data_dir, data_root)
-            app = AssistantApp(
-                data_root=data_root,
-                config_path=cfg_path if (cfg_path and cfg_path.is_file()) else None,
-                project_root=project_root,
-                llm=llm,
-                consolidation_policy=policy,
-                # 含显式 consolidate 步骤时关闭自动后台线程，保证步骤顺序确定不竞争
-                auto_consolidate=not has_explicit_consolidate,
-                today_fn=current_today,
-            )
-            # 非共享快照场景下，注入场景预设的初始记忆
-            if base_data_dir is None:
-                for seed in scenario.get("seed_memories") or []:
-                    if not isinstance(seed, dict):
-                        continue
-                    app.memory.apply_memory_operations(
-                        str(seed.get("topic") or "facts"),
-                        str(seed.get("title") or "预置记忆"),
-                        str(seed.get("index_summary") or "预置主题记忆"),
-                        list(seed.get("operations") or []),
-                        today=_parse_optional_date(seed.get("today")),
-                    )
-
-            step_logs, reasons = _execute_steps(
-                app, llm, steps, policy, clock_day, current_today, judge_llm=judge_llm
-            )
-            records = list(app.cache_monitor.records)
-            cache_summary = app.cache_monitor.summary()
-        except Exception as exc:  # noqa: BLE001
-            reasons = [f"scenario_exception: {type(exc).__name__}: {exc}"]
-            if app is not None:
-                records = list(app.cache_monitor.records)
-                cache_summary = app.cache_monitor.summary()
-        finally:
-            if app is not None:
-                app.close()
+        step_logs, reasons, records, cache_summary, exc_text = _run_eval_session(
+            data_root=Path(tmp) / "data",
+            llm=llm,
+            consolidator_llm=consolidator_llm,
+            cfg_path=cfg_path,
+            project_root=project_root,
+            tools_config=tools_config,
+            spec=scenario,
+            steps=steps,
+            base_data_dir=base_data_dir,
+            judge_llm=judge_llm,
+        )
+    if exc_text is not None:
+        reasons = [f"scenario_exception: {exc_text}"]
 
     elapsed_ms = round((perf_counter() - t0) * 1000, 3)
     record: dict[str, object] = {
@@ -709,6 +679,8 @@ def evaluate_memory(
     scenarios: list[dict[str, object]],
     *,
     config_path: Path | None = None,
+    tools_config: ToolsConfig | None = None,
+    consolidator_llm: LLMClient | None = None,
     judge_llm: LLMClient | None = None,
     git_commit: str | None = None,
     workers: int = 1,
@@ -718,9 +690,11 @@ def evaluate_memory(
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers 必须为 >= 1 的整数。")
 
-    cfg_path, project_root = resolve_eval_paths(config_path)
+    cfg_path, project_root, loaded_cfg, owns_cfg = resolve_eval_tools_config(
+        config_path, tools_config
+    )
 
-    # 识别本轮所有待构建的共享长记忆组，并保留每个场景剥离前置后的独立执行步骤
+    # 识别本轮所有待构建的共享长记忆组，并保留每个场景对应的独立执行步骤
     shared_specs: dict[str, dict[str, object]] = {}
     prepared_items: list[tuple[dict[str, object], str | None, list[dict[str, object]]]] = []
     for scenario in scenarios:
@@ -737,77 +711,90 @@ def evaluate_memory(
     all_cache_records: list[CallCacheRecord] = []
     latencies: list[float] = []
 
-    with tempfile.TemporaryDirectory(prefix="my-helper-shared-eval-") as shared_tmp:
-        shared_dirs: dict[str, Path] = {}
-        setup_items = list(shared_specs.items())
-        for idx, (gid, _) in enumerate(setup_items):
-            safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
-            shared_dirs[gid] = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="my-helper-shared-eval-") as shared_tmp:
+            shared_dirs: dict[str, Path] = {}
+            setup_items = list(shared_specs.items())
+            for idx, (gid, _) in enumerate(setup_items):
+                safe_dir = re.sub(r"[^a-zA-Z0-9_-]+", "_", gid) or f"group_{idx}"
+                shared_dirs[gid] = Path(shared_tmp) / f"{idx:03d}_{safe_dir}"
 
-        # Phase 1：先构建全部共享长记忆只读快照（workers>1 且存在多组时并发）
-        setup_results = _run_ordered_jobs(
-            setup_items,
-            lambda item: _build_shared_setup(
-                llm, item[0], item[1], shared_dirs[item[0]], cfg_path, project_root
-            ),
-            workers=workers,
-            on_done=(lambda _i, _n, item: on_setup_done(item[0])) if on_setup_done is not None else None,
-        )
-        for (gid, _), (s_rep, s_recs) in zip(setup_items, setup_results, strict=True):
-            shared_setups_report[gid] = s_rep
-            setup_cache_records.extend(s_recs)
-        all_cache_records.extend(setup_cache_records)
-
-        # Phase 2：并发或串行执行各隔离场景并按输入原序汇总
-        run_jobs = [
-            (
-                scenario,
-                qa_steps,
-                shared_dirs.get(gid) if gid else None,
-                bool(
-                    gid
-                    and any(
-                        isinstance(s, dict) and s.get("action") == "consolidate"
-                        for s in (shared_specs.get(gid, {}).get("steps") or [])
-                    )
+            # Phase 1：先构建全部共享长记忆只读快照（workers>1 且存在多组时并发）
+            setup_results = _run_ordered_jobs(
+                setup_items,
+                lambda item: _build_shared_setup(
+                    llm,
+                    item[0],
+                    item[1],
+                    shared_dirs[item[0]],
+                    cfg_path,
+                    project_root,
+                    tools_config=loaded_cfg,
+                    consolidator_llm=consolidator_llm,
                 ),
-                cast(str | None, shared_setups_report.get(gid, {}).get("exception")) if gid else None,
+                workers=workers,
+                on_done=(
+                    (lambda _i, _n, item: on_setup_done(item[0]))
+                    if on_setup_done is not None
+                    else None
+                ),
             )
-            for scenario, gid, qa_steps in prepared_items
-        ]
-        scenario_results = _run_ordered_jobs(
-            run_jobs,
-            lambda job: _run_single_scenario(
-                llm,
-                job[0],
-                cfg_path,
-                project_root,
-                judge_llm=judge_llm,
-                base_data_dir=job[2],
-                steps_override=job[1],
-                disable_auto_consolidation=job[3],
-                setup_error=job[4],
-            ),
-            workers=workers,
-            on_done=(lambda done, total_n, item: on_progress(done, total_n, item[0]))
-            if on_progress is not None
-            else None,
-        )
+            for (gid, _), (s_rep, s_recs) in zip(setup_items, setup_results, strict=True):
+                shared_setups_report[gid] = s_rep
+                setup_cache_records.extend(s_recs)
+            all_cache_records.extend(setup_cache_records)
 
-        for record, cache_records in scenario_results:
-            per_scenario.append(record)
-            grouped.setdefault(str(record["category"]), []).append(record)
-            all_cache_records.extend(cache_records)
-            latencies.append(float(record["latency_ms"]))
-            if not record["passed"]:
-                failures.append(
-                    {
-                        "id": record["id"],
-                        "category": record["category"],
-                        "reason": "; ".join(record["reasons"]),
-                        "reasons": record["reasons"],
-                    }
+            # Phase 2：并发或串行执行各隔离场景并按输入原序汇总
+            run_jobs = [
+                (
+                    scenario,
+                    qa_steps,
+                    shared_dirs.get(gid) if gid else None,
+                    cast(str | None, shared_setups_report.get(gid, {}).get("exception"))
+                    if gid
+                    else None,
                 )
+                for scenario, gid, qa_steps in prepared_items
+            ]
+            scenario_results = _run_ordered_jobs(
+                run_jobs,
+                lambda job: _run_single_scenario(
+                    llm,
+                    job[0],
+                    cfg_path,
+                    project_root,
+                    tools_config=loaded_cfg,
+                    consolidator_llm=consolidator_llm,
+                    judge_llm=judge_llm,
+                    base_data_dir=job[2],
+                    steps_override=job[1],
+                    setup_error=job[3],
+                ),
+                workers=workers,
+                on_done=(
+                    (lambda done, total_n, item: on_progress(done, total_n, item[0]))
+                    if on_progress is not None
+                    else None
+                ),
+            )
+
+            for record, cache_records in scenario_results:
+                per_scenario.append(record)
+                grouped.setdefault(str(record["category"]), []).append(record)
+                all_cache_records.extend(cache_records)
+                latencies.append(float(record["latency_ms"]))
+                if not record["passed"]:
+                    failures.append(
+                        {
+                            "id": record["id"],
+                            "category": record["category"],
+                            "reason": "; ".join(record["reasons"]),
+                            "reasons": record["reasons"],
+                        }
+                    )
+    finally:
+        if owns_cfg and loaded_cfg is not None:
+            loaded_cfg.plugin_manager.terminate_all()
 
     effective_judge = judge_llm
     use_judge = effective_judge is not None and not isinstance(effective_judge, NoopLLMClient)

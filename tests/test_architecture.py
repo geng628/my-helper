@@ -430,18 +430,28 @@ def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None
                 )
 
 
-# 方法 5：Issue #83 硬红线守卫——personal_assistant/ 全目录零 type: ignore，且 PluginContext 零业务字段泄漏
+# 方法 5：Issue #83 / #84 硬红线守卫——全仓四棵受管目录树零 type: ignore，无冗余包壳，且 PluginContext 零业务字段泄漏
 def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
     from dataclasses import fields
     from personal_assistant.agent.plugins import PluginContext
 
-    all_pkg_files = sorted(PKG_ROOT.rglob("*.py"))
-    assert all_pkg_files
-    for py_file in all_pkg_files:
-        for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
-            assert "type: ignore" not in line, (
-                f"{py_file.relative_to(REPO_ROOT)}:{lineno} 禁止出现 # type: ignore：{line.strip()!r}"
-            )
+    assert not (REPO_ROOT / "plugins" / "tools" / "__init__.py").exists(), (
+        "plugins/tools/__init__.py 冗余包壳已删除，不应重新引入"
+    )
+
+    guarded_trees: dict[str, list[Path]] = {
+        "personal_assistant": sorted(p for p in PKG_ROOT.rglob("*.py") if "__pycache__" not in p.parts),
+        "plugins": sorted(p for p in (REPO_ROOT / "plugins").rglob("*.py") if "__pycache__" not in p.parts),
+        "scripts": sorted(p for p in (REPO_ROOT / "scripts").rglob("*.py") if "__pycache__" not in p.parts),
+        "evals": _iter_evals_python_files(),
+    }
+    for tree_name, py_files in guarded_trees.items():
+        assert py_files, f"受守卫目录 {tree_name}/ 未找到任何 Python 文件"
+        for py_file in py_files:
+            for lineno, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), start=1):
+                assert "type: ignore" not in line, (
+                    f"{py_file.relative_to(REPO_ROOT)}:{lineno} 禁止出现 # type: ignore：{line.strip()!r}"
+                )
 
     plugins_py = PKG_ROOT / "agent" / "plugins.py"
     plugins_src = plugins_py.read_text(encoding="utf-8")
@@ -453,9 +463,10 @@ def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
         "extra_bindings",
         "active_plugin_id",
         "tool_registry",
+        "consolidator",
     ):
         assert forbidden_field not in plugins_src, (
-            f"agent/plugins.py 严禁泄漏业务字段 {forbidden_field!r}"
+            f"agent/plugins.py 严禁泄漏业务字段或角色名 {forbidden_field!r}"
         )
 
     ctx_fields = {f.name for f in fields(PluginContext)}

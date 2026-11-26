@@ -457,15 +457,21 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
         },
         {"action": "consolidate", "chat_id": "conv-s1", "today": "2023-05-01"},
     ]
+    shared_policy = {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1}
+    shared_setup = {
+        "record_type": "shared_setup",
+        "shared_group": "conv-shared",
+        "policy": shared_policy,
+        "steps": setup_steps,
+    }
     raw_scenarios = [
         {
             "id": "qa-1",
             "category": "single-hop",
             "shared_group": "conv-shared",
-            "setup_step_count": len(setup_steps),
-            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "shared_setup": shared_setup,
+            "policy": shared_policy,
             "steps": [
-                *setup_steps,
                 {
                     "action": "ask",
                     "chat_id": "eval-query",
@@ -483,10 +489,9 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
             "id": "qa-2",
             "category": "multi-hop",
             "shared_group": "conv-shared",
-            "setup_step_count": len(setup_steps),
-            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+            "shared_setup": shared_setup,
+            "policy": shared_policy,
             "steps": [
-                *setup_steps,
                 {
                     "action": "ask",
                     "chat_id": "eval-query",
@@ -729,17 +734,26 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         {"action": "seed_history", "chat_id": "conv-s1", "messages": [{"role": "user", "content": "Alice adopted Max."}, {"role": "assistant", "content": "Nice."}]},
         {"action": "consolidate", "chat_id": "conv-s1", "today": "2023-05-01"},
     ]
+    shared_conc_policy = {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1}
+    shared_conc_setup = {
+        "record_type": "shared_setup",
+        "shared_group": "conv-shared-conc",
+        "policy": shared_conc_policy,
+        "steps": setup_steps,
+    }
     shared_scenarios = [
         {
             "id": f"shared-qa-{i}",
             "category": "single-hop",
             "shared_group": "conv-shared-conc",
-            "setup_step_count": len(setup_steps),
-            "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
-            "steps": [*setup_steps, {
-                "action": "ask", "chat_id": "eval-query", "today": "2023-05-10", "message": f"QA{i}_TAG: dog name?", "must_include": ["Max"],
-                "file_checks": [{"path": "data/memory/pets.md", "must_include": ["Max"]}, {"path": "data/memory/facts.md", "must_include": ["QA0_TAG"] if i == 0 else [], "must_not_include": [] if i == 0 else ["QA0_TAG"]}],
-            }],
+            "shared_setup": shared_conc_setup,
+            "policy": shared_conc_policy,
+            "steps": [
+                {
+                    "action": "ask", "chat_id": "eval-query", "today": "2023-05-10", "message": f"QA{i}_TAG: dog name?", "must_include": ["Max"],
+                    "file_checks": [{"path": "data/memory/pets.md", "must_include": ["Max"]}, {"path": "data/memory/facts.md", "must_include": ["QA0_TAG"] if i == 0 else [], "must_not_include": [] if i == 0 else ["QA0_TAG"]}],
+                }
+            ],
         }
         for i in range(3)
     ]
@@ -932,11 +946,17 @@ def test_evaluate_memory_isolates_scenario_and_shared_setup_exceptions() -> None
             "id": "sc-bad-setup",
             "category": "multi-session",
             "shared_group": "bad-grp",
-            "setup_step_count": 2,
+            "shared_setup": {
+                "record_type": "shared_setup",
+                "shared_group": "bad-grp",
+                "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+                "steps": [
+                    {"action": "seed_history", "chat_id": "b1", "messages": [{"role": "user", "content": "FAIL_SETUP"}, {"role": "assistant", "content": "ack"}]},
+                    {"action": "consolidate", "chat_id": "b1", "today": "2026-11-20"},
+                ],
+            },
             "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
             "steps": [
-                {"action": "seed_history", "chat_id": "b1", "messages": [{"role": "user", "content": "FAIL_SETUP"}, {"role": "assistant", "content": "ack"}]},
-                {"action": "consolidate", "chat_id": "b1", "today": "2026-11-20"},
                 {"action": "ask", "chat_id": "b2", "message": "should skip", "must_include": ["ok-reply"]},
             ],
         },
@@ -944,11 +964,17 @@ def test_evaluate_memory_isolates_scenario_and_shared_setup_exceptions() -> None
             "id": "sc-good-setup",
             "category": "multi-session",
             "shared_group": "good-grp",
-            "setup_step_count": 2,
+            "shared_setup": {
+                "record_type": "shared_setup",
+                "shared_group": "good-grp",
+                "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
+                "steps": [
+                    {"action": "seed_history", "chat_id": "g1", "messages": [{"role": "user", "content": "GOOD_SETUP"}, {"role": "assistant", "content": "ack"}]},
+                    {"action": "consolidate", "chat_id": "g1", "today": "2026-11-20"},
+                ],
+            },
             "policy": {"max_active_messages": 1, "keep_recent_messages": 0, "min_batch_messages": 1},
             "steps": [
-                {"action": "seed_history", "chat_id": "g1", "messages": [{"role": "user", "content": "GOOD_SETUP"}, {"role": "assistant", "content": "ack"}]},
-                {"action": "consolidate", "chat_id": "g1", "today": "2026-11-20"},
                 {"action": "ask", "chat_id": "g2", "message": "ask good", "must_include": ["ok-reply"]},
             ],
         },
@@ -1038,3 +1064,141 @@ def test_lexical_word_boundary_and_tightened_memory_scenarios() -> None:
     assert accum_ask["must_include"] == ["DDIA", "SICP", "CSAPP"]
     assert "3" not in accum_ask["must_include_any"]
     assert "三" not in accum_ask["must_include_any"]
+
+    # 4. 校验已移除 len<=3 魔法阈值：任意长度纯 ASCII 词/数字均受同类边界保护，中文或标点走子串匹配
+    from evals.memory_eval import _contains_keyword
+
+    assert not _contains_keyword("Google is great", "Go")
+    assert not _contains_keyword("JavaScript runtime", "Java")
+    assert not _contains_keyword("端口为 10000", "1000")
+    assert not _contains_keyword("100 天", "10")
+    assert _contains_keyword("使用Java开发，端口1000元", "Java")
+    assert _contains_keyword("使用Java开发，端口1000元", "1000")
+    assert _contains_keyword("归档周期 10天", "10")
+    assert _contains_keyword("采用 Go语言", "Go")
+    assert _contains_keyword("编号 ok-0 已完成", "ok-0")
+    assert _contains_keyword("接入企业微信通知", "企业微信")
+
+
+# 测试 memory_eval 复用的 AssistantApp.consolidator 真实路由到双模型 consolidator_llm 且 CLI 仅加载一次 ToolsConfig
+def test_memory_eval_uses_dual_model_consolidator_and_cli_loads_tools_config_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from personal_assistant.assistant.commands import ToolsConfig
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    main_calls: list[str] = []
+    cons_calls: list[str] = []
+
+    # 仅处理前台问答，若误入沉淀提示词则直接报错
+    class MainOnlyLLM(LLMClient):
+        # 记录前台问答请求并返回预设答复
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            assert "后台记忆整理器" not in str(messages[0].get("content") or "")
+            main_calls.append(str(messages[-1].get("content") or ""))
+            return {"role": "assistant", "content": "星云端口为 7788。"}
+
+    # 仅处理后台记忆沉淀，验证 consolidate 步骤真正经由 app.consolidator 调用双模型
+    class ConsolidatorOnlyLLM(LLMClient):
+        # 记录沉淀请求并返回结构化 JSON 记忆操作
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            assert "后台记忆整理器" in str(messages[0].get("content") or "")
+            cons_calls.append("consolidate")
+            return {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "session_summary": "星云服务监听端口 7788。",
+                        "memories": [
+                            {
+                                "topic": "projects",
+                                "title": "项目",
+                                "index_summary": "星云端口",
+                                "operations": [{"op": "add", "text": "星云服务监听端口 7788。"}],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+
+    scenarios = [
+        {
+            "id": "dual-consolidator-check",
+            "category": "extraction",
+            "policy": {"max_active_messages": 2, "keep_recent_messages": 0, "min_batch_messages": 2},
+            "steps": [
+                {
+                    "action": "seed_history",
+                    "chat_id": "s1",
+                    "messages": [
+                        {"role": "user", "content": "星云服务端口 7788。"},
+                        {"role": "assistant", "content": "已收到。"},
+                    ],
+                },
+                {"action": "consolidate", "chat_id": "s1", "today": "2026-11-20"},
+                {
+                    "action": "ask",
+                    "chat_id": "s2",
+                    "message": "星云端口是多少？",
+                    "must_include": ["7788"],
+                    "file_checks": [{"path": "data/memory/projects.md", "must_include": ["7788"]}],
+                },
+            ],
+        }
+    ]
+    report = evaluate_memory(
+        MainOnlyLLM(),
+        scenarios,
+        consolidator_llm=ConsolidatorOnlyLLM(),
+        git_commit="dual-sha",
+    )
+    assert report["summary"]["passed_scenarios"] == 1
+    assert cons_calls == ["consolidate"]
+    assert len(main_calls) == 1
+
+    # 验证 evals/cli.py 单次加载 ToolsConfig 并透传 tools_config 与 models.dsl 中的 consolidator 模型
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    tools_json = cfg_dir / "tools.json"
+    tools_json.write_text((REPO_ROOT / "config" / "tools.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (cfg_dir / "models.dsl").write_text(
+        "use reasoner sk-r1\nadd deepseek sk-ds\nconsolidator deepseek\n",
+        encoding="utf-8",
+    )
+    sc_file = tmp_path / "sc.jsonl"
+    sc_file.write_text(
+        json.dumps({"id": "m1", "steps": [{"action": "ask", "message": "hi"}]}) + "\n",
+        encoding="utf-8",
+    )
+
+    load_count = 0
+    orig_load = ToolsConfig.load
+
+    # 统计 ToolsConfig.load 调用次数
+    def counting_load(cls, config_path: Path, project_root: Path | None = None) -> ToolsConfig:
+        nonlocal load_count
+        load_count += 1
+        return orig_load(config_path, project_root=project_root)
+
+    captured_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(ToolsConfig, "load", classmethod(counting_load))
+    monkeypatch.setattr(
+        "evals.cli.evaluate_memory",
+        lambda llm, _sc, **kw: captured_kwargs.update({"llm": llm, **kw})
+        or {"mode": "memory", "git_commit": "t", "summary": {}, "failures": [], "scenarios": []},
+    )
+    assert main(["--mode", "memory", "--config", str(tools_json), "--cases", str(sc_file), "--no-judge"]) == 0
+    assert load_count == 1
+    assert isinstance(captured_kwargs.get("tools_config"), ToolsConfig)
+    cons_obj = captured_kwargs.get("consolidator_llm")
+    assert isinstance(cons_obj, OpenAICompatibleLLM)
+    assert cons_obj.model == "deepseek-chat"

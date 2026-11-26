@@ -1,16 +1,14 @@
 """零微内核改动学习助手知识卡片与间隔复习插件：纯 Markdown 落盘、原子写入与精简间隔重复。"""
 from __future__ import annotations
 
-import os
 import re
-import tempfile
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from personal_assistant.agent.tools import tool
+from personal_assistant.assistant.common import atomic_write_text, parse_iso_date, today_shanghai
 
 VALID_GRADES = frozenset({"again", "hard", "good", "easy"})
 _STUDY_LOCK = threading.Lock()
@@ -32,18 +30,16 @@ class StudyCard:
     summary: str
 
 
-# 解析逻辑当前日期：缺省取北京时间当日，支持 date 实例与 YYYY-MM-DD 字符串
+# 解析逻辑当前日期：缺省取北京时间当日，复用 common.parse_iso_date 校验 date 实例与 YYYY-MM-DD 字符串
 def _resolve_today(today: date | str | None) -> date:
     if today is None:
-        return datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    if isinstance(today, (date, datetime)):
-        return today.date() if isinstance(today, datetime) else today
-    if isinstance(today, str) and (text := today.strip()):
-        try:
-            return date.fromisoformat(text)
-        except ValueError as error:
-            raise ValueError(f"日期格式无效，应为 YYYY-MM-DD：{today}") from error
-    raise ValueError("逻辑日期 today 必须是 date 或 YYYY-MM-DD 字符串。")
+        return today_shanghai()
+    if not isinstance(today, (date, str)):
+        raise ValueError("逻辑日期 today 必须是 date 或 YYYY-MM-DD 字符串。")
+    parsed = parse_iso_date(today)
+    if parsed is None:
+        raise ValueError(f"日期格式无效，应为 YYYY-MM-DD：{today}")
+    return parsed
 
 
 # 规范化多行要点文本：将全部 splitlines() 行分隔符统一转为 \n 并剥离首尾纯空白行
@@ -72,18 +68,13 @@ def _slugify_topic(topic: str) -> tuple[str, str]:
     return slug, title
 
 
-# 校验并解析学习卡片目录 data/workspace/study，拒绝受控父链与目录符号链接
-def _resolve_study_dir(data_root: Path | None, project_root: Path | None) -> Path:
-    if project_root is not None and Path(project_root).is_symlink():
-        raise ValueError("安全校验失败：project_root 不能是符号链接。")
-    raw_base = Path(data_root) if data_root is not None else ((Path(project_root).resolve() / "data") if project_root is not None else Path("data"))
+# 校验并解析学习卡片目录 data/workspace/study，强制要求显式 data_root 并拒绝符号链接
+def _resolve_study_dir(data_root: Path | None) -> Path:
+    if data_root is None:
+        raise ValueError("缺少数据目录 data_root，学习卡片工具需要显式注入 data_root。")
+    raw_base = Path(data_root)
     if raw_base.is_symlink():
         raise ValueError("安全校验失败：数据目录不能是符号链接。")
-    if data_root is not None and project_root is not None and (abs_base := Path(os.path.abspath(raw_base))).is_relative_to(abs_proj := Path(os.path.abspath(project_root))):
-        cur = abs_proj
-        for part in abs_base.relative_to(abs_proj).parts:
-            if (cur := cur / part).is_symlink():
-                raise ValueError(f"安全校验失败：父目录不能包含符号链接（{part}）。")
     base_data = raw_base.resolve()
     study_dir = base_data / "workspace" / "study"
     for node in (base_data, base_data / "workspace", study_dir):
@@ -102,22 +93,13 @@ def _assert_safe_target(study_dir: Path, target_file: Path) -> None:
         raise ValueError("安全校验失败：卡片文件路径越出学习目录边界。")
 
 
-# 通过同目录临时文件 + os.replace 原子写入卡片文本，防止半截文件损坏
+# 校验学习卡片目录与目标文件边界后，复用 common.atomic_write_text 原子落盘
 def _atomic_write(study_dir: Path, target_file: Path, content: str) -> None:
     study_dir.mkdir(parents=True, exist_ok=True)
     if study_dir.is_symlink():
         raise ValueError("安全校验失败：study 目录不能是符号链接。")
     _assert_safe_target(study_dir, target_file)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=study_dir, prefix=f".{target_file.stem}.", suffix=".tmp", delete=False) as handle:
-            tmp_path = Path(handle.name)
-            handle.write(content)
-        os.replace(tmp_path, target_file)
-    except BaseException:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-        raise
+    atomic_write_text(target_file, content)
 
 
 # 解析单个专题 Markdown 文件（仅按 \n 切行与渲染对称），精确还原多行要点
@@ -185,7 +167,7 @@ def _render_topic_sections(header_lines: list[str], topics: list[tuple[str, str,
 
 # 插件工具：在 data/workspace/study/ 下按专题创建或幂等更新 Markdown 知识卡片并推进间隔复习计划
 @tool(description="仅在用户学习课程/技术概念、整理错题笔记或完成复习自测时调用：在 data/workspace/study/ 下按专题创建或幂等更新 Markdown 知识卡片，并按掌握度自动计算下次间隔复习日期。日常个人偏好、杂事或临时日程切勿调用此工具。", parameters={"topic": "学科或专题短名（如 agent-loop、linear-algebra）", "concept": "具体知识点或错题标题", "summary": "核心推导要点、理解总结或易错点", "grade": "掌握度评级：again（重学）/ hard（吃力）/ good（掌握）/ easy（熟练）"}, param_enums={"grade": ("again", "hard", "good", "easy")}, risk="write")
-def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_root: Path | None = None, project_root: Path | None = None, today: date | str | None = None) -> str:
+def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_root: Path | None = None, today: date | str | None = None) -> str:
     slug, topic_title = _slugify_topic(topic)
     if not isinstance(concept, str) or "\x00" in concept or not (norm_concept := " ".join(concept.split())):
         raise ValueError("知识点标题必须是非空有效文本。")
@@ -194,7 +176,7 @@ def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_
         raise ValueError("掌握度 grade 必须是 again、hard、good 或 easy 之一。")
     ref_day = _resolve_today(today)
     with _STUDY_LOCK:
-        study_dir = _resolve_study_dir(data_root, project_root)
+        study_dir = _resolve_study_dir(data_root)
         target_file = study_dir / f"{slug}.md"
         _assert_safe_target(study_dir, target_file)
         cards: list[StudyCard] = []
@@ -219,7 +201,7 @@ def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_
 
 # 插件工具：查询学习卡片与间隔复习队列（due / all / 指定专题）
 @tool(description="查询 data/workspace/study/ 中的学习卡片与间隔复习队列（传 'due' 查看今日及逾期需复习卡片，传 'all' 查看全局学习概览与统计，或传具体专题名筛选该专题卡片），用于主动出题考评与查漏补缺。", parameters={"scope": "查询范围：'due'（今日及逾期需复习）、'all'（全部概览）或具体专题名称"}, risk="read")
-def list_due_reviews(scope: str, *, data_root: Path | None = None, project_root: Path | None = None, today: date | str | None = None) -> str:
+def list_due_reviews(scope: str, *, data_root: Path | None = None, today: date | str | None = None) -> str:
     if not isinstance(scope, str) or "\x00" in scope or not (raw_scope := scope.strip()):
         raise ValueError("查询范围 scope 必须是非空字符串。")
     mode = raw_scope.lower()
@@ -229,7 +211,7 @@ def list_due_reviews(scope: str, *, data_root: Path | None = None, project_root:
     probe_slug = ""
     topics: list[tuple[str, str, list[StudyCard]]] = []
     with _STUDY_LOCK:
-        study_dir = _resolve_study_dir(data_root, project_root)
+        study_dir = _resolve_study_dir(data_root)
         if study_dir.exists():
             if mode not in {"due", "all"}:
                 try:

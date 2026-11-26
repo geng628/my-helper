@@ -318,9 +318,24 @@ def test_list_due_reviews_modes_sorting_and_empty_states(tmp_path: Path) -> None
     assert "MVCC 快照读" not in slug_out
 
 
-# 测试非法 topic 拦截、符号链接逃逸拦截与 8 线程并发写入同专题不同概念零丢失
-def test_security_validation_symlink_escape_and_concurrent_writes(tmp_path: Path) -> None:
+# 测试非法 topic 拦截、缺失 data_root 显式报错、符号链接逃逸拦截与 8 线程并发写入同专题不同概念零丢失
+def test_security_validation_symlink_escape_and_concurrent_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inspect
     from plugins.tools.study_tools import list_due_reviews, parse_study_file, save_study_card
+
+    # 显式校验移除 project_root 冗余参数，且缺失 data_root 时报错绝不静默写到 CWD/data
+    assert "project_root" not in inspect.signature(save_study_card).parameters
+    assert "project_root" not in inspect.signature(list_due_reviews).parameters
+    cwd_sandbox = tmp_path / "cwd_guard"
+    cwd_sandbox.mkdir()
+    monkeypatch.chdir(cwd_sandbox)
+    with pytest.raises(ValueError, match="data_root"):
+        save_study_card("python", "GIL", "总结", "good")
+    with pytest.raises(ValueError, match="data_root"):
+        list_due_reviews("due")
+    assert not (cwd_sandbox / "data").exists()
 
     data_root = tmp_path / "data"
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)

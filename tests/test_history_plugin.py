@@ -8,7 +8,6 @@ import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -652,7 +651,7 @@ def _plugin_imports(py_file: Path, plugins_root: Path) -> set[str]:
     return deps
 
 
-# AST 正交守卫：plugins/ 下所有模块不得导入兄弟插件（仅允许 plugins/tools/__init__.py 导入 plugins.tools.plugin）
+# AST 正交守卫：plugins/ 下所有模块零豁免禁止导入兄弟插件
 def test_plugins_ast_orthogonal_no_cross_plugin_imports() -> None:
     plugins_root = REPO_ROOT / "plugins"
     violations: list[str] = []
@@ -661,9 +660,6 @@ def test_plugins_ast_orthogonal_no_cross_plugin_imports() -> None:
             continue
         rel = py_file.relative_to(REPO_ROOT).as_posix()
         deps = _plugin_imports(py_file, plugins_root)
-        if rel == "plugins/tools/__init__.py":
-            deps.discard("plugins.tools.plugin")
-            deps.discard("plugins.tools")
         if deps:
             violations.append(f"{rel} -> {sorted(deps)}")
     assert not violations, f"检测到跨插件耦合导入：{violations}"
@@ -718,9 +714,11 @@ def test_history_plugin_isolated_without_fts5_retriever(
     assert "9092" in obs
     assert "东京机房 Atlas 监听端口是 9092" in obs
 
-    # 2. 验证 HistorySearchConfig 范围校验与鸭子类型 config 对象兼容
+    # 2. 验证 HistorySearchConfig 共享阈值校验，且已彻底删除 _HistoryThresholdConfig 鸭子协议
+    import plugins.tools.history_tools as history_mod
     from plugins.tools.history_tools import HistorySearchConfig, execute_search_chat_history
 
+    assert not hasattr(history_mod, "_HistoryThresholdConfig")
     default_cfg = HistorySearchConfig.from_dict(None)
     assert default_cfg.min_term_coverage == 0.22
     assert default_cfg.min_bm25_score == 0.1
@@ -731,8 +729,8 @@ def test_history_plugin_isolated_without_fts5_retriever(
     with pytest.raises(ValueError):
         HistorySearchConfig.from_dict({"min_bm25_score": -0.1})
 
-    duck_cfg = SimpleNamespace(min_term_coverage=0.99, min_bm25_score=0.0)
+    strict_cfg = HistorySearchConfig(min_term_coverage=0.99, min_bm25_score=0.0)
     assert (
-        execute_search_chat_history(db_path, "Atlas NonExistentKeyword", config=duck_cfg)
+        execute_search_chat_history(db_path, "Atlas NonExistentKeyword", config=strict_cfg)
         == "未找到匹配的历史对话记录。"
     )
