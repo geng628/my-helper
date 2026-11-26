@@ -1,8 +1,9 @@
 """Layer 1 原子契约类型（对标 pi-ai）：工具签名 Schema、工具调用、模型配置档案与 Token/缓存统计。"""
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 
@@ -36,6 +37,12 @@ class TextDelta:
     text: str
 
 
+# 单次大模型流式响应产生的思维链增量片段
+@dataclass(frozen=True)
+class ThinkingDelta:
+    text: str
+
+
 # 单次大模型流式响应结束事件（携带完整 assistant 消息、Token 统计与首字/总耗时）
 @dataclass(frozen=True)
 class StreamDone:
@@ -45,7 +52,7 @@ class StreamDone:
     latency_ms: float = 0.0
 
 
-LLMStreamEvent = TextDelta | StreamDone
+LLMStreamEvent = TextDelta | ThinkingDelta | StreamDone
 
 
 # 底层最小工具契约：仅描述暴露给模型的工具签名，不包含任何本地执行逻辑（供中层 Tool 递进继承）
@@ -85,6 +92,44 @@ class ToolCall:
     id: str
     name: str
     arguments: str
+
+    # 从 ToolCall 实例、OpenAI wire 字典或扁平工具调用字典解析标准 ToolCall
+    @classmethod
+    def from_raw(cls, raw: object) -> "ToolCall":
+        if isinstance(raw, cls):
+            return raw
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"非法的 tool_call 对象：{raw!r}")
+        fn = raw.get("function")
+        if isinstance(fn, Mapping):
+            name = str(fn.get("name") or "")
+            raw_args = fn.get("arguments")
+        else:
+            name = str(raw.get("name") or "")
+            raw_args = raw.get("arguments")
+        if isinstance(raw_args, Mapping):
+            arguments = json.dumps(raw_args, ensure_ascii=False)
+        elif raw_args is None or raw_args == "":
+            arguments = "{}"
+        else:
+            arguments = str(raw_args)
+        return cls(id=str(raw.get("id") or ""), name=name, arguments=arguments)
+
+    # 导出标准 OpenAI Chat Completions tool_calls 条目字典
+    def to_openai_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+# 从 assistant 消息字典中提取规范化的 ToolCall 列表（兼容 ToolCall 实例与 OpenAI wire 字典）
+def extract_tool_calls(message: Mapping[str, object]) -> list[ToolCall]:
+    raw_calls = message.get("tool_calls")
+    if not raw_calls or not isinstance(raw_calls, Iterable) or isinstance(raw_calls, (str, bytes, Mapping)):
+        return []
+    return [ToolCall.from_raw(item) for item in raw_calls]
 
 
 # 单个大模型的标准配置档案（仅认识结构化字典/JSON，支持直写 api_key 或引用环境变量 key_env）

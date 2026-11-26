@@ -11,9 +11,11 @@ from personal_assistant.ai import (
     LLMNotConfigured,
     NoopLLMClient,
     OpenAICompatibleLLM,
+    ToolCall,
+    extract_tool_calls,
     from_env,
 )
-from personal_assistant.agent.react import ToolStep, run_react
+from personal_assistant.agent.react import ToolStart, ToolStep, TurnEnd, iter_react, run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
@@ -346,3 +348,210 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
     with pytest.raises(HTTPError):
         llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert bad_attempts["count"] == 1
+
+
+# 测试 ToolCall 双向契约与 extract_tool_calls 对字典和实例的兼容提取
+def test_tool_call_contract_and_extract_tool_calls() -> None:
+    tc = ToolCall(id="call_a", name="ping", arguments='{"host": "127.0.0.1"}')
+    wire = tc.to_openai_dict()
+    assert wire == {
+        "id": "call_a",
+        "type": "function",
+        "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'},
+    }
+    assert ToolCall.from_raw(wire) == tc
+    assert ToolCall.from_raw(tc) is tc
+    assert ToolCall.from_raw({"id": "c_empty", "type": "function", "function": {"name": "noop", "arguments": ""}}) == ToolCall(
+        id="c_empty",
+        name="noop",
+        arguments="{}",
+    )
+    assert ToolCall.from_raw({"id": "c_none", "type": "function", "function": {"name": "noop", "arguments": None}}) == ToolCall(
+        id="c_none",
+        name="noop",
+        arguments="{}",
+    )
+    assert ToolCall.from_raw({"id": "c_flat", "name": "echo", "arguments": {"text": "hi"}}) == ToolCall(
+        id="c_flat",
+        name="echo",
+        arguments='{"text": "hi"}',
+    )
+    with pytest.raises(TypeError):
+        ToolCall.from_raw("invalid-tool-call")
+
+    extracted = extract_tool_calls({"role": "assistant", "tool_calls": [tc, wire]})
+    assert extracted == [tc, tc]
+    assert extract_tool_calls({"role": "assistant", "content": "hi"}) == []
+    assert extract_tool_calls({"role": "assistant", "tool_calls": None}) == []
+
+    # 验证 iter_react 可直接消费 ToolCall 实例，并先产出 ToolStart 再执行工具后产出 ToolStep
+    exec_order: list[str] = []
+    tools = ToolRegistry(
+        Tool(
+            name="ping",
+            description="探测",
+            parameters={"host": "主机"},
+            handler=lambda host: (exec_order.append(f"exec:{host}") or f"pong:{host}"),
+        )
+    )
+    llm = ScriptedLLM(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [tc]},
+            {"role": "assistant", "content": "完成探测"},
+        ]
+    )
+    events: list[object] = []
+    for ev in iter_react(llm, [{"role": "user", "content": "ping"}], tools):
+        if isinstance(ev, ToolStart):
+            exec_order.append(f"start:{ev.call_id}")
+        elif isinstance(ev, ToolStep):
+            exec_order.append(f"step:{ev.call_id}")
+        events.append(ev)
+
+    assert exec_order == ["start:call_a", "exec:127.0.0.1", "step:call_a"]
+    assert ToolStart(tool="ping", arguments='{"host": "127.0.0.1"}', call_id="call_a") in events
+    assert any(isinstance(ev, ToolStep) and ev.call_id == "call_a" for ev in events)
+
+    # 验证扁平字典 / arguments=None 的 tool_calls 写回 messages 与发往下一轮 LLM 时均已统一归一化为标准 OpenAI wire 字典
+    noop_tools = ToolRegistry(Tool(name="ping", description="探测", parameters={}, handler=lambda: "pong"))
+    norm_llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "先探测",
+                "tool_calls": [
+                    {"id": "flat_1", "name": "ping", "arguments": {"host": "127.0.0.1"}},
+                    {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": None}},
+                ],
+            },
+            {"role": "assistant", "content": "归一化完成", "tool_calls": []},
+        ]
+    )
+    norm_msgs: list[dict[str, object]] = [{"role": "user", "content": "探测"}]
+    assert run_react(norm_llm, norm_msgs, noop_tools) == "归一化完成"
+    expected_wire_calls = [
+        {"id": "flat_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
+        {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+    ]
+    assert norm_msgs[1] == {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "先探测",
+        "tool_calls": expected_wire_calls,
+    }
+    assert norm_llm.requests[1][0][1]["tool_calls"] == expected_wire_calls
+    assert "tool_calls" not in norm_msgs[-1]
+
+
+# 测试净化退出消息：移除硬编码中文兜底并保留 assistant_msg 上的 reasoning_content 等扩展字段
+def test_exit_message_purified_and_preserves_extension_fields() -> None:
+    empty_llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "空回复前的内部推理",
+                "custom_meta": {"source": "model"},
+            }
+        ]
+    )
+    msgs1: list[dict[str, object]] = [{"role": "user", "content": "hi"}]
+    reply1 = run_react(empty_llm, msgs1, ToolRegistry())
+    assert reply1 == ""
+    assert "模型没有返回回复" not in reply1
+    assert msgs1[-1] == {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "空回复前的内部推理",
+        "custom_meta": {"source": "model"},
+    }
+
+    text_llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": "  最终答案  ",
+                "reasoning_content": "推演细节",
+            }
+        ]
+    )
+    msgs2: list[dict[str, object]] = [{"role": "user", "content": "q"}]
+    reply2 = run_react(text_llm, msgs2, ToolRegistry())
+    assert reply2 == "最终答案"
+    assert msgs2[-1] == {
+        "role": "assistant",
+        "content": "最终答案",
+        "reasoning_content": "推演细节",
+    }
+
+
+# 测试双阶段上下文管道（transform_context -> convert_to_llm）不污染原列表且每轮过滤应用自定义消息
+def test_transform_context_and_convert_to_llm_pipeline() -> None:
+    seen_stages: list[str] = []
+    tools = ToolRegistry(
+        Tool(name="echo", description="回显", parameters={"v": "值"}, handler=lambda v: f"ok:{v}")
+    )
+    llm = ScriptedLLM(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c1", "echo", '{"v": "1"}')]},
+            {"role": "assistant", "content": "管道执行完毕"},
+        ]
+    )
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "sys"},
+        {"role": "artifact", "content": "仅前端渲染的卡片对象"},
+        {"role": "user", "content": "请调用 echo"},
+    ]
+    snapshot_before = [dict(m) for m in messages]
+
+    # 第一阶段：克隆后追加临时提示并原地改写首条消息字段（验证不污染外部主历史及原字典键）
+    def transform_context(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
+        seen_stages.append("transform")
+        ctx[0]["injected"] = "dirty"
+        ctx.append({"role": "transient_hint", "content": "临时提醒"})
+        return ctx
+
+    # 第二阶段：原地 pop 自定义消息键并过滤掉应用层自定义角色，仅保留标准 LLM 消息
+    def convert_to_llm(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
+        seen_stages.append("convert")
+        for msg in ctx:
+            if msg.get("role") == "artifact":
+                msg.pop("content", None)
+        return [m for m in ctx if m.get("role") in {"system", "user", "assistant", "tool"}]
+
+    reply = run_react(
+        llm,
+        messages,
+        tools,
+        transform_context=transform_context,
+        convert_to_llm=convert_to_llm,
+    )
+
+    assert reply == "管道执行完毕"
+    assert seen_stages == ["transform", "convert", "transform", "convert"]
+    # 原始自定义消息及首条消息字典键均完整保留，未被原地篡改或注入 transient_hint
+    assert messages[:3] == snapshot_before
+    assert "injected" not in messages[0]
+    assert messages[1] == {"role": "artifact", "content": "仅前端渲染的卡片对象"}
+    assert not any(m.get("role") == "transient_hint" for m in messages)
+    # 发往模型的请求已彻底剥离 artifact 与 transient_hint
+    for req_msgs, _ in llm.requests:
+        assert all(m.get("role") in {"system", "user", "assistant", "tool"} for m in req_msgs)
+    assert [m["role"] for m in llm.requests[0][0]] == ["system", "user"]
+    assert [m["role"] for m in llm.requests[1][0]] == ["system", "user", "assistant", "tool"]
+
+    # 剥离全部钩子（默认 None）且仅传 convert_to_llm 时同样不污染原 messages
+    filtered_msgs: list[dict[str, object]] = [
+        {"role": "artifact", "content": "ui"},
+        {"role": "user", "content": "hi"},
+    ]
+    clean_llm = ScriptedLLM([{"role": "assistant", "content": "ok"}])
+
+    # 仅提供 convert_to_llm，并在回调中 pop 测试是否隔离原列表
+    def mutating_convert(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [m for m in ctx if m.get("role") != "artifact"] + [{"role": "user", "content": "extra"}]
+
+    assert run_react(clean_llm, filtered_msgs, ToolRegistry(), convert_to_llm=mutating_convert) == "ok"
+    assert [m["role"] for m in filtered_msgs] == ["artifact", "user", "assistant"]
+    assert [m["role"] for m in clean_llm.requests[0][0]] == ["user", "user"]

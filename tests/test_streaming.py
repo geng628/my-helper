@@ -11,7 +11,16 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from personal_assistant.agent import ObserverProtocol, TaskEvent, Tool, ToolRegistry, TurnEnd, ToolStep, iter_react
+from personal_assistant.agent import (
+    ObserverProtocol,
+    TaskEvent,
+    Tool,
+    ToolRegistry,
+    ToolStart,
+    ToolStep,
+    TurnEnd,
+    iter_react,
+)
 from personal_assistant.ai import (
     CacheMonitor,
     LLMClient,
@@ -20,6 +29,7 @@ from personal_assistant.ai import (
     OpenAICompatibleLLM,
     StreamDone,
     TextDelta,
+    ThinkingDelta,
     TokenUsage,
 )
 from personal_assistant.assistant.app import AssistantApp
@@ -145,33 +155,162 @@ def test_openai_sse_tool_calls_400_fallback_and_midstream_error(monkeypatch: pyt
         list(gen)
 
 
-# 测试 iter_react 直接透传 TextDelta / StreamDone 并产出 ToolStep(duration_ms) 与 TurnEnd
+# 测试 iter_react 直接透传 ThinkingDelta / TextDelta / StreamDone 并按序产出 ToolStart -> ToolStep -> TurnEnd
 def test_iter_react_emits_slim_typed_events() -> None:
+    observed_before_exec: list[object] = []
+    streamed_events: list[object] = []
+
+    # 在工具执行瞬间快照已产出事件，验证 ToolStart 必先于工具执行、ToolStep 必在之后
+    def double_handler(n: str) -> str:
+        observed_before_exec.extend(streamed_events)
+        return str(int(n) * 2)
+
     llm = ScriptedStreamLLM(
         [
             [
+                ThinkingDelta(text="先调用翻倍工具"),
                 StreamDone(
-                    message={"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "double", "arguments": '{"n": "21"}'}}]},
+                    message={
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "先调用翻倍工具",
+                        "tool_calls": [
+                            {
+                                "id": "t1",
+                                "type": "function",
+                                "function": {"name": "double", "arguments": '{"n": "21"}'},
+                            }
+                        ],
+                    },
                     usage=TokenUsage(prompt_tokens=50, cached_tokens=20, completion_tokens=10),
                     ttft_ms=12.0,
                     latency_ms=30.0,
-                )
+                ),
             ],
             [
+                ThinkingDelta(text="整理答案"),
                 TextDelta(text="结果"),
                 TextDelta(text="是 42"),
-                StreamDone(message={"role": "assistant", "content": "结果是 42"}, usage=TokenUsage(prompt_tokens=80, cached_tokens=50, completion_tokens=6), ttft_ms=8.5, latency_ms=25.0),
+                StreamDone(
+                    message={
+                        "role": "assistant",
+                        "content": "结果是 42",
+                        "reasoning_content": "整理答案",
+                    },
+                    usage=TokenUsage(prompt_tokens=80, cached_tokens=50, completion_tokens=6),
+                    ttft_ms=8.5,
+                    latency_ms=25.0,
+                ),
             ],
         ]
     )
-    registry = ToolRegistry(Tool(name="double", description="翻倍", parameters={"n": "整数"}, handler=lambda n: str(int(n) * 2)))
+    registry = ToolRegistry(Tool(name="double", description="翻倍", parameters={"n": "整数"}, handler=double_handler))
     msgs: list[dict[str, object]] = [{"role": "user", "content": "21 翻倍"}]
-    events = list(iter_react(llm, msgs, registry))
+    for ev in iter_react(llm, msgs, registry):
+        streamed_events.append(ev)
 
-    assert isinstance(events[0], StreamDone)
-    assert isinstance(events[1], ToolStep) and events[1].tool == "double" and events[1].observation == "42" and events[1].duration_ms >= 0.0
-    assert [ev.text for ev in events if isinstance(ev, TextDelta)] == ["结果", "是 42"]
-    assert isinstance(events[-1], TurnEnd) and events[-1].reply == "结果是 42" and events[-1].total_ms >= 0.0
+    assert isinstance(observed_before_exec[-1], ToolStart)
+    assert not any(isinstance(ev, ToolStep) for ev in observed_before_exec)
+    assert [type(ev) for ev in streamed_events] == [
+        ThinkingDelta,
+        StreamDone,
+        ToolStart,
+        ToolStep,
+        ThinkingDelta,
+        TextDelta,
+        TextDelta,
+        StreamDone,
+        TurnEnd,
+    ]
+    assert streamed_events[0] == ThinkingDelta(text="先调用翻倍工具")
+    assert streamed_events[2] == ToolStart(tool="double", arguments='{"n": "21"}', call_id="t1")
+    step = streamed_events[3]
+    assert isinstance(step, ToolStep)
+    assert step.tool == "double" and step.observation == "42" and step.call_id == "t1" and step.duration_ms >= 0.0
+    assert [ev.text for ev in streamed_events if isinstance(ev, TextDelta)] == ["结果", "是 42"]
+    end = streamed_events[-1]
+    assert isinstance(end, TurnEnd) and end.reply == "结果是 42" and end.total_ms >= 0.0
+
+    # 验证同步基类 LLMClient.stream() 对 reasoning_content 的 ThinkingDelta 兼容（且 tool_calls 时不误发 TextDelta）
+    sync_llm = ScriptedStreamLLM(
+        [
+            {
+                "role": "assistant",
+                "content": "忽略占位",
+                "reasoning_content": "同步思考",
+                "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "double", "arguments": '{"n":"1"}'}}],
+            },
+            {
+                "role": "assistant",
+                "content": "同步回答",
+                "reasoning_content": "同步总结",
+            },
+        ]
+    )
+    sync_ev1 = list(sync_llm.stream([{"role": "user", "content": "a"}]))
+    assert [type(ev) for ev in sync_ev1] == [ThinkingDelta, StreamDone]
+    assert sync_ev1[0] == ThinkingDelta(text="同步思考")
+    sync_ev2 = list(sync_llm.stream([{"role": "user", "content": "b"}]))
+    assert [type(ev) for ev in sync_ev2] == [ThinkingDelta, TextDelta, StreamDone]
+    assert sync_ev2[0] == ThinkingDelta(text="同步总结")
+    assert sync_ev2[1] == TextDelta(text="同步回答")
+
+
+# 测试 TelemetryObserver 与 AssistantApp 忽略 ThinkingDelta / ToolStart 等新事件不崩且统计精确
+def test_telemetry_and_app_handle_thinking_delta_and_tool_start(tmp_path: Path) -> None:
+    from plugins.telemetry import TelemetryObserver
+
+    obs = TelemetryObserver()
+    llm = ScriptedStreamLLM(
+        [
+            [
+                ThinkingDelta(text="先看当前时间"),
+                StreamDone(
+                    message={
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "先看当前时间",
+                        "tool_calls": [
+                            {"id": "tc_1", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}}
+                        ],
+                    },
+                    usage=TokenUsage(prompt_tokens=60, cached_tokens=20, completion_tokens=10),
+                    ttft_ms=11.0,
+                    latency_ms=22.0,
+                ),
+            ],
+            [
+                ThinkingDelta(text="整理答复"),
+                TextDelta(text="你好！"),
+                StreamDone(
+                    message={"role": "assistant", "content": "你好！", "reasoning_content": "整理答复"},
+                    usage=TokenUsage(prompt_tokens=90, cached_tokens=60, completion_tokens=5),
+                    ttft_ms=7.0,
+                    latency_ms=18.0,
+                ),
+            ],
+        ]
+    )
+    seen_events: list[object] = []
+    app = AssistantApp(data_root=tmp_path / "data", llm=llm, observers=[obs])
+    try:
+        frames = list(app.stream_chat("现在几点", chat_id="s-think", on_event=seen_events.append))
+    finally:
+        app.close()
+
+    assert any(isinstance(ev, ThinkingDelta) for ev in seen_events)
+    assert any(isinstance(ev, ToolStart) and ev.tool == "get_current_time" and ev.call_id == "tc_1" for ev in seen_events)
+    assert [f["type"] for f in frames] == ["tool_step", "text_delta", "done"]
+    done_frame = frames[-1]
+    assert done_frame["reply"] == "你好！"
+    last_turn = done_frame["telemetry"]["telemetry"]["last_turn"]  # type: ignore[index]
+    assert last_turn["llm_calls"] == 2
+    assert last_turn["tool_calls"] == 1
+    assert last_turn["tools"] == ["get_current_time"]
+    assert last_turn["ttft_ms"] == 11.0
+    assert last_turn["llm_ms"] == 40.0
+    assert last_turn["prompt_tokens"] == 150
+    assert last_turn["cached_tokens"] == 80
 
 
 # 测试 AssistantApp.stream_chat、后台沉淀 TaskEvent 广播及坏观测插件的故障隔离
@@ -272,9 +411,10 @@ def test_web_chat_sse_stream_endpoint_end_to_end(tmp_path: Path) -> None:
         app.close()
 
 
-# 测试 OpenAIChatClient 通用协议底座、声明式 _stream_delta_fields 扩展与底层流/线程语义
+# 测试 OpenAIChatClient 通用协议底座、声明式 _thinking_delta_fields 扩展与底层流/线程语义
 def test_openai_chat_client_base_and_delta_field_extension() -> None:
     from dataclasses import dataclass
+    from personal_assistant import agent as agent_pkg
     from personal_assistant import ai as ai_pkg
     from personal_assistant.ai import OpenAIChatClient
 
@@ -282,12 +422,16 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
     assert OpenAICompatibleLLM.stream is OpenAIChatClient.stream
     assert not hasattr(ai_pkg, "open_openai_stream")
     assert not hasattr(ai_pkg, "consume_openai_sse")
+    assert not hasattr(OpenAIChatClient, "_stream_delta_fields")
+    assert not hasattr(agent_pkg, "ThinkingDelta")
+    assert not hasattr(agent_pkg, "TextDelta")
+    assert not hasattr(agent_pkg, "StreamDone")
 
-    # 声明式扩展子类：收集自定义字符串 delta 字段并统一规范化同步与流式响应
+    # 声明式扩展子类：收集自定义思考 delta 字段实时吐出 ThinkingDelta，并统一规范化同步与流式响应
     @dataclass
-    class _ExtraDeltaClient(OpenAIChatClient):
-        # 声明需从 SSE delta 中聚合的扩展文本字段
-        def _stream_delta_fields(self) -> tuple[str, ...]:
+    class _ThinkingDeltaClient(OpenAIChatClient):
+        # 声明需从 SSE delta 中实时吐出 ThinkingDelta 并聚合的字段
+        def _thinking_delta_fields(self) -> tuple[str, ...]:
             return ("extra",)
 
         # 同步与流式共用响应规范化钩子
@@ -301,7 +445,7 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         'data: {"choices":[{"delta":{"extra":"续段","content":"正文"}}]}\n',
         "data: [DONE]\n",
     ]
-    ext_client = _ExtraDeltaClient(
+    ext_client = _ThinkingDeltaClient(
         api_key="sk-ext",
         base_url="https://api.example.com/v1",
         model="m-ext",
@@ -309,6 +453,7 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         post_json=lambda _u, _p, _h: {"choices": [{"message": {"role": "assistant", "content": "同步", "extra": "元"}}]},
     )
     events = list(ext_client.stream([{"role": "user", "content": "hi"}]))
+    assert [e.text for e in events if isinstance(e, ThinkingDelta)] == ["首段", "续段"]
     assert [e.text for e in events if isinstance(e, TextDelta)] == ["正文"]
     done = next(e for e in events if isinstance(e, StreamDone))
     assert done.ttft_ms is not None and done.ttft_ms >= 0.0
@@ -318,6 +463,23 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
         "content": "同步",
         "extra": "[元]",
     }
+
+    # SSE 流式返回无参 tool_calls 且未推送 arguments 时，必须补齐合法 JSON "{}" 而非空串
+    empty_args_client = OpenAIChatClient(
+        api_key="sk-args",
+        base_url="https://api.example.com/v1",
+        model="m-args",
+        post_stream=lambda _u, _p, _h: iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_empty","type":"function","function":{"name":"ping","arguments":""}}]}}]}\n',
+                "data: [DONE]\n",
+            ]
+        ),
+    )
+    empty_args_done = next(e for e in empty_args_client.stream([{"role": "user", "content": "ping"}]) if isinstance(e, StreamDone))
+    assert empty_args_done.message["tool_calls"] == [
+        {"id": "c_empty", "type": "function", "function": {"name": "ping", "arguments": "{}"}}
+    ]
 
     captured_payloads: list[dict[str, object]] = []
 

@@ -703,3 +703,22 @@
   - 单元测试 (`uv run pytest -v`)：**135 passed → 139 passed**（含三层依赖守卫与 Web SSE 流式单测）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：继续验收合入并行推进的 Issue `#54`（极简内核 `ToolCall` / `ThinkingDelta` / 两层消息边界）与 Issue `#52`（`shell_tools.py` 沙箱加固）。
+
+
+---
+
+### [2026-11-26] 激活强类型 `ToolCall` / `ThinkingDelta` / `ToolStart` 并补齐单层内核两阶段消息转换边界（Issue `#54`）
+- **背景与架构思想（借鉴 Pi 洋葱模型：极简通用内核 + 学习助手按需叠加）**：
+  - 结合 `my_helper_v2` 作为**个人学习助手**的产品定位，明确不照搬 `coding-agent` 专属的 `steering` / `followUp` 双层队列循环，保持 `iter_react` 为 30 余行一眼看穿的单层 `while True` 极简内核（“剥掉任何一层，里层仍能跑”）。
+  - 针对层间数据契约的四处断层做正交提纯：① 激活此前 `0` 引用的 `ToolCall` 原子类型，剥离 `react.py` 对 OpenAI 私有 `call["function"]` 字典的耦合；② 新增一等公民 `ThinkingDelta`（流式输出推理模型思维链，契合学习助手展示推导过程）与 `ToolStart`（慢工具执行前通知）；③ 移除 Layer 2 硬编码中文兜底文案并保留 `assistant_msg` 扩展字段；④ 在 `iter_react` / `run_react` 原生提供可选 `transform_context` 与 `convert_to_llm` 纯函数边界钩子（缺省 `None` 零拷贝直通）。
+- **改动文件（代码提交 `fff4d5d` → 去胶水收口 `d5a99cc`）**：
+  - Layer 1：[personal_assistant/ai/types.py](personal_assistant/ai/types.py)、[personal_assistant/ai/client.py](personal_assistant/ai/client.py)、[personal_assistant/ai/__init__.py](personal_assistant/ai/__init__.py) 与插件 [plugins/reasoning_provider.py](plugins/reasoning_provider.py)（新增 `ThinkingDelta`、`ToolCall.from_raw` / `to_openai_dict`、`extract_tool_calls`；删除 `0` 生产引用的旧 `_stream_delta_fields` 钩子，统一收敛为单一正交的 `_thinking_delta_fields()`，SSE 无参工具保底 `"{}"`）。
+  - Layer 2：[personal_assistant/agent/react.py](personal_assistant/agent/react.py)、[personal_assistant/agent/__init__.py](personal_assistant/agent/__init__.py)（新增 `ToolStart`；统一归一化 `stored["tool_calls"]` 与退出清理，消除类型嗅探补丁；启用钩子时自动字典级浅拷贝防原地篡改外部 `messages`；保持 Layer 1/2 事件导出边界对称）。
+  - 单测：[tests/test_step1_react.py](tests/test_step1_react.py)、[tests/test_streaming.py](tests/test_streaming.py)、[tests/test_reasoning_provider.py](tests/test_reasoning_provider.py)。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`fff4d5d`）→ `Request Changes`**（指出残留 `0` 引用的 `_stream_delta_fields` 双轨胶水与 `_normalize_stored_assistant` 半截 `isinstance` 嗅探 2 项 Blocker 及 3 项对称性 Nit）；
+  - **Round 2（`d5a99cc`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径验证对比（改前 `main` → 改后 `d5a99cc`）**：
+  - 单元测试 (`uv run pytest -v`)：**+4 用例全量通过**（含 `tests/test_architecture.py` 三层依赖漏斗与子进程断层隔离验证）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：合入 Issue `#52`（`shell_tools.py` 沙箱加固），随后推进工具执行期上下文解耦（消除每轮重跑插件 `initialize()`）与学习助手特色叠加功能。

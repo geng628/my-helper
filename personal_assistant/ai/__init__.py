@@ -32,9 +32,11 @@ from personal_assistant.ai.types import (
     ModelsConfig,
     StreamDone,
     TextDelta,
+    ThinkingDelta,
     TokenUsage,
     ToolCall,
     ToolSchema,
+    extract_tool_calls,
 )
 
 __all__ = [
@@ -53,6 +55,7 @@ __all__ = [
     "ProviderFactory",
     "StreamDone",
     "TextDelta",
+    "ThinkingDelta",
     "TokenUsage",
     "ToolCall",
     "ToolSchema",
@@ -61,6 +64,7 @@ __all__ = [
     "common_prefix_len",
     "default_post_json",
     "default_post_stream",
+    "extract_tool_calls",
     "extract_usage",
     "format_cache_summary",
     "from_env",
