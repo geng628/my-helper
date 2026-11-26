@@ -833,3 +833,24 @@
   - **离线检索基准（`fts5_bm25`）**：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`，负例干净度 `100%`），零退步。
   - **16 场景真实模型多轮记忆评测（`deepseek-chat`, `workers=4`）**：由 **`13/16 (81.25%)` → `15/16 (93.75%)`**（**`+2` 改善 / `0` 退步**，`temporal` 由 `1/3` 升至 **`3/3 (100%)`**，`get_current_time` 逻辑时钟对齐直接修通 `relative-date-resolution`；5/6 分类达 `100%`，唯一未过项 `rolling-multi-compaction` 实答“企业微信机器人”正确但未命中严苛字面简称 `'企微'`；开启 `study_tools.py` 白名单后日常记忆场景 **0 误触发**，前缀复用率 **`92.73%`**、服务端 KV Cache 命中率 **`66.18%`**）。
   - **真机双模型 + 学习卡片 SSE 流式端到端冒烟（`use reasoner` + `consolidator deepseek`，测于 `623f357`）**：前台装配 `OpenAIReasoningLLM(deepseek-reasoner)` 实时流式推送 **217 个 `thinking_delta` 分片** 并按序触发 `tool_start -> tool_step` 创建 `data/workspace/study/agent-loop.md`；达阈值后后台切换 `OpenAICompatibleLLM(deepseek-chat)` 静默完成记忆沉淀压缩（`last_error=None`），跨轮服务端 KV Cache 命中 **`58.15%`**、前缀复用 **`89.28%`**。
+
+
+---
+
+### [2026-11-26] 插件正交解耦与 `memory.py` 单一职责瘦身拆分（Issue `#68`）
+- **背景与架构痛点**：
+  1. **跨插件硬耦合**：`plugins/tools/history_tools.py` 直接 `from plugins.fts5_retriever import FTS5Config, tokenize_text`，违背「删除任意单插件绝不破坏其他兄弟插件」的主板插件正交原则；
+  2. **核心模块职责混杂**：`personal_assistant/assistant/memory.py` 膨胀至 `972` 行，混杂目录安全策略（`FilesPolicy` / `_atomic_write`）、Markdown 记忆存储（`MemoryStore`）与内核工具集提供方（`BuiltinTool` / `MemoryToolsetProvider`）三重职责。
+- **改动文件（初版 `7da55cc` → 二审收敛 `cb93622`）**：
+  - [personal_assistant/assistant/text_search.py](../personal_assistant/assistant/text_search.py)（新增，零内部依赖）：抽离中英双语分词底座 `tokenize_text`、`EN_STOPWORDS`、`EN_IRREGULAR_LEMMAS` 与 `_normalize_en_word`；[plugins/fts5_retriever.py](../plugins/fts5_retriever.py)（精简至 `381` 行）与 [plugins/tools/history_tools.py](../plugins/tools/history_tools.py)（自持轻量 `HistorySearchConfig` 阈值校验与鸭子类型协议）均改为依赖该底座，彻底消除跨插件导入。
+  - [personal_assistant/assistant/files_policy.py](../personal_assistant/assistant/files_policy.py)（新增，零内部依赖）：抽离 `DEFAULT_REJECT_SEGMENTS`、`FilesPolicy` 与 `_atomic_write`。
+  - [personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py)（新增，零反向依赖 `memory.py`）：抽离 `BuiltinTool` 与 `MemoryToolsetProvider`；为 `read_markdown(path, start_line="1", end_line="120")` 赋予默认首屏行号，为 `search_markdown` 与 `remember_fact` 增加可选执行期关键字上下文参数（缺省平滑回退构造期回调）。
+  - [personal_assistant/assistant/memory.py](../personal_assistant/assistant/memory.py)（由 `972` 行瘦身至 `570` 行）与 [personal_assistant/assistant/__init__.py](../personal_assistant/assistant/__init__.py)：专注 `SearchHit` 与 `MemoryStore` 存储与审计逻辑，同时完整保留向后兼容重导出与模块级 `_atomic_write` 并发钩子。
+  - [tests/test_history_plugin.py](../tests/test_history_plugin.py)、[tests/test_step3_memory.py](../tests/test_step3_memory.py)：新增 `plugins/` 全目录零跨插件导入 AST 守卫、物理删除 `fts5_retriever.py` 隔离加载实测、新底座零内部依赖与 `memory.py <= 600` 行预算守卫及执行期关键字边界单测。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`7da55cc`）→ `Changes Requested`**（检出 `remember_fact` 空白 `user_text` 未回退与显式 `message_id` 被 `turn_tag` 静默吞没、以及 `_collect_repo_deps` 漏检 `from ... import memory` 2 项 Blocker 与 3 项类型校验 Nit）；
+  - **Round 2（`cb93622`）→ `Pass`**（`0 Blockers`）。
+- **同口径验证对比（改前 `main` `cede4bb` → 改后 `cb93622`）**：
+  - 单元测试 (`uv run pytest -v`)：**167 passed → 171 passed**（含三层依赖守卫与插件物理隔离测试）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：合入 Issue `#69`（提纯 Layer 2 洋葱微内核、执行期 `tool_context` 单次工具表构建与 `ToolSchema.required` 默认参数推断），并执行合流后同口径实模配对回归。
