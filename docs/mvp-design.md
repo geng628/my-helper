@@ -35,7 +35,7 @@ flowchart TD
     Entry --> App["应用编排与回合预算层 AssistantApp (assistant/app.py)"]
 
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
-        App --> Prompts["系统提示词与外部输出围栏 (assistant/prompts.py)"]
+        App --> Prompts["系统提示词与规则边界声明 (assistant/prompts.py)"]
         App --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与指数退避压缩 (assistant/consolidator.py)"]
@@ -151,7 +151,7 @@ data/
 2. **传输底座与流式解析（[../personal_assistant/ai/client.py](../personal_assistant/ai/client.py)）**：
    - `OpenAIChatClient(LLMClient)` 提供 `_prepare_messages`、`_extra_payload`、`_thinking_delta_fields` 与 `_normalize_response_message` 四个受保护钩子，统一支撑标准 `OpenAICompatibleLLM` 与外围推理模型插件。
    - SSE 流式解析器同时支持标准带 `index` 的并发工具增量帧与部分第三方网关省略 `index` 的工具流（覆盖零参工具、缺失 `id` 的连续 `function` 块及单帧多元素数组），并将最后一帧 `finish_reason` 挂入本地 `StreamDone.message` 供外层检测输出截断；外发下一轮请求时，`_prepare_messages` 与 `_build_request` 自动剥离内部 `finish_reason` 键，防止严格校验 Schema 的上游网关报 HTTP 400。
-   - `_post_with_retry` 对瞬时网络/TLS 异常及 HTTP `429`/`5xx` 做最多 2 次指数退避重试，并在抛出的 `RuntimeError` 中保留截断后的上游 HTTP 错误响应体以便排障；流式请求对不支持 `stream_options.include_usage` 的 HTTP 400 自动降级一次。
+   - `_post_with_retry` 对瞬时网络/TLS 异常及 HTTP `429`/`5xx` 做最多 2 次指数退避重试，并在重抛的 `HTTPError` 中附带截断（上限 1024 字节）且经密钥脱敏的上游错误响应体以便排障；流式请求对不支持 `stream_options.include_usage` 的 HTTP 400 自动降级一次。
 3. **有界 KV 缓存观测（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)）**：
    - `CacheMonitor(max_records=2000, max_sessions=256)` 维护线程安全的有界滑动窗口、MRU 会话前缀表、单调游标 `snapshot_index()` 与 $O(1)$ 全局累计账本；`summary(since=..., session_key=...)` 支持按 `session_key` 过滤单会话切片，避免多会话并发流式对话时互相污染缓存统计。
 
@@ -184,11 +184,11 @@ data/
 3. **成对原子 SQLite 状态存储（[../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py)）**：
    - `StateStore` 基于 SQLite WAL 与 `RLock` 管理 `messages` 与 `session_compactions`：
      - `append_turn(chat_id, user_content, assistant_content)` 在同一事务中成对写入问答消息；
-     - `get_context_snapshot(chat_id)` 在同一把锁内原子返回 `(compaction, active_messages, max_message_id)`，消除前情摘要与活跃历史错配导致的消息漏读或重复注入。
+     - `get_context_snapshot(chat_id)` 在同一把锁内原子返回二元组 `(compaction, active_messages)`，消除前情摘要与活跃历史错配导致的消息漏读或重复注入（快照上界由独立的 `max_message_id()` 获取）。
 4. **外层回合预算、自适应滑窗与后台沉淀韧性（`app.py`、`consolidator.py`）**：
    - `_GuardedTurnLLM` 在 `AssistantApp._run_stream_turn` 外层实施五项安全预算：单轮最大步数 `max_turn_steps=24`、累计 Token 上限 `max_turn_tokens=250_000`、单调墙钟上限 `max_turn_seconds=180.0`、完全相同工具与归一化 JSON 参数连续重复上限 `max_repeated_tool_calls=3`，以及 `finish_reason == "length"` 导致工具参数截断时的熔断收束；触发熔断后直接生成结构化降级说明、释放会话锁并保持后续轮次正常可用；
    - 自适应活跃历史滑窗 `_select_adaptive_history`：常态保留最近 `20` 条活跃消息；当后台沉淀仍在运行或处于失败退避导致未压缩消息超过 `20` 条时，在 `60` 条且 `24,000` 字符有界上限内自动拓宽保留未压缩历史，并强制窗口首条对齐 `user` 角色，防止旧消息在未进入摘要前从上下文静默丢失；
-   - `MemoryConsolidator` 与 `BackgroundConsolidator`：单批最多截取 `ConsolidationPolicy.max_batch_messages=24` 条偶数成对消息以防超长积压撑爆单次沉淀上下文；在进入 `memory._write_lock` 后经 `_filter_safe_operations` 重读磁盘最新 `facts.md`，保护前台并发在途 `(turn#...)` 行不被后台陈旧快照误改或误删；后台沉淀失败后按 `chat_id` 记录指数退避冷却（`30s -> 60s -> ... -> 300s`），避免每轮对话重复打爆故障接口；
+   - `MemoryConsolidator` 与 `BackgroundConsolidator`：单批最多截取 `ConsolidationPolicy.max_batch_messages=24` 条偶数成对消息以防超长积压撑爆单次沉淀上下文；在进入 `memory._write_lock` 后经 `_filter_safe_operations` 重读磁盘最新 `facts.md`，保护前台并发在途 `(turn#...)` 行不被后台陈旧快照误改或误删；后台沉淀失败后按 `chat_id` 记录指数退避冷却（默认 `2s -> 4s -> ... -> 256s`，上限封顶 `300s`），避免每轮对话重复打爆故障接口；
    - `AssistantApp` 同时绑定 `consolidator` 的逻辑时钟 `today_fn`、在 `reload_llm()` / `configure_model()` 中通过 `_llm_lock` 串行化热切换，并在 `close()` 中调用 `plugin_manager.terminate_all()`。
 
 ---
@@ -199,7 +199,7 @@ data/
    - **设计选择**：`StateStore.messages` 仅保存每轮 `user` 提问与 `assistant` 最终文本回复，不跨轮持久化轮内中间 `tool_calls` 与 `role="tool"` 原始观察。
    - **收益与代价**：大幅压缩多轮上下文体积，避免长网页或命令行输出反复计费，并保持跨轮 Prefix Caching 稳定；代价是若上一轮工具输出中的细节未被助手归纳进最终回复，后续轮次追问该细节时模型需要重新调用读取工具。
 2. **回合中断的回滚范围区分**：
-   - **事务回滚项**：流式对话因网络中断或客户端断连中止时，`StateStore.append_turn` 不会写入孤儿消息，`remember_fact` 产生的 `(turn#<tag>)` 暂存事实会在 `except BaseException` 分支自动回滚删除。
+   - **事务回滚项**：流式对话因网络中断或客户端断连中止时，`StateStore.append_turn` 不会写入孤儿消息，`remember_fact` 产生的 `(turn#<tag>)` 暂存事实会在流生成器的 `finally` 分支（覆盖客户端断连 `GeneratorExit` 等 `BaseException`）自动回滚删除。
    - **即时落盘项**：回合中已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件操作，不参与跨文件事务回滚；覆盖写入依靠 `data/workspace/.backups/` 自动时间戳备份提供恢复手段。
 3. **外层装饰器预算与内核循环解耦**：
    - 步数、Token、墙钟与重复调用熔断放在 Layer 3 `_GuardedTurnLLM` 而非 Layer 2 `agent/react.py`，使 `react.py` 维持无业务策略的最小事件循环；若未来其他宿主直接复用 Layer 2 `run_react()`，需自行提供外层超时或预算包装。
@@ -221,10 +221,10 @@ data/
 3. **DNS Pinning 防重绑定 SSRF 与外部工具隔离（`web_tools.py`、`builtin_tools.py`、`prompts.py`）**：
    - `fetch_webpage` 使用 `ProxyHandler({})` 忽略环境变量代理，默认关闭 Fake-IP 放行（`allow_fake_ip=False`，仅在 `config/tools.json` 显式配置 `"allow_fake_ip": true` 时兼容本地 TUN `198.18.0.0/15`），拦截私网、回环、多播、保留段及 NAT64（`64:ff9b::/96`、`64:ff9b:1::/48`）、`ipv4_mapped`、`sixtofour`、Teredo 内嵌私网地址；
    - 自定义 `_PinnedHTTPConnection` / `_PinnedHTTPSConnection` 在 TCP 建连时直接连向已校验 IP（HTTPS 保持原始域名作为 TLS SNI 与证书主机名校验目标），消除校验与建连之间的 DNS Rebinding 窗口，并按 `time.monotonic()` 施加跨重定向总截止时间；
-   - 系统提示词用 `<untrusted_tool_output>` 声明外部网页、搜索与文件输出仅作参考数据；当同轮已调用任何 `risk == "network"` 工具时，`AssistantApp` 通过执行期上下文标记 `untrusted_tool_seen=True` 硬性拒绝同轮调用 `save_rule`，且日常调用 `save_rule` 亦须匹配用户原话中的显式长期规则设定意图。
+   - `prompts.py` 在系统提示词注入 `data/memory/rules/` 时显式声明规则仅作沟通风格与偏好参考、不得覆盖系统安全边界或诱导越权访问；当同轮已调用任何 `risk == "network"` 工具时，`AssistantApp` 通过执行期上下文标记 `untrusted_tool_seen=True` 硬性拒绝同轮调用 `save_rule`，且日常调用 `save_rule` 亦须匹配用户原话中的显式长期规则设定意图。
 4. **本地 HTTP/SSE 服务边界（[../scripts/web_chat.py](../scripts/web_chat.py)）**：
    - 全路由校验 `Host` 白名单（支持 IPv6 RFC 5952 规范化），敏感 `GET /api/*` 与全部 `POST` 校验同源 `Origin` 与 `Sec-Fetch-Site in {"same-origin", "none"}`，强制单一 `Content-Type: application/json`；
-   - 全响应附加 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Content-Security-Policy`（API 路由附加 `Cache-Control: no-store`）；SSE 流通过 `contextlib.closing` 确保客户端断连时立即触发生成器 `finally` 释放会话锁；绑定非回环地址时支持 `--auth-token` / `WEB_CHAT_TOKEN` 常量时间 UTF-8 Bearer 鉴权。
+   - 全响应附加 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Content-Security-Policy`（API 路由附加 `Cache-Control: no-store`）；SSE 流通过 `contextlib.closing` 确保客户端断连时立即触发生成器 `finally` 释放会话锁；绑定非回环地址时支持 `--auth-token` / `MY_HELPER_WEB_TOKEN` 常量时间 UTF-8 Bearer 鉴权。
 
 ---
 

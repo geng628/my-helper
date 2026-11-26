@@ -28,7 +28,7 @@
 ### 1. 五大插件主板插槽与单次初始化生命周期
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向 `PluginContext` 注册五类子协议，关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 中的 `@tool` 函数，受 `config/tools.json` 白名单管控。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`），结合英文词形还原與中文虚词切分 + Bigram，共享零依赖分词底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py)。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`），结合英文词形还原与中文虚词切分 + Bigram，共享零依赖分词底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py)。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为 `ModelsConfig` 标准字典。
   4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），处理轮内 `reasoning_content` 续传与跨轮剥离。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以有界环形窗口统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件。
@@ -37,7 +37,7 @@
 ### 2. KV Cache 友好的 Markdown 记忆、原子会话快照与沉淀韧性
 - **前缀冻结**：`data/memory/MEMORY.md` 限制为前 100 行 / 4000 字符索引，与 `rules/` 摘要按 `(today_str, chat_id)` 在会话内冻结于 `system` 前缀，跨自然日自动刷新。
 - **记忆生命周期与轮内暂存**：`remember_fact` 轮内先写入 `(turn#<tag>)` 暂存行，回合成功落库后升级为 `(msg#<id>)`，流中断时自动回滚；后台沉淀支持 `add` / `merge` / `replace` / `remove`，被替换或删除的旧事实软退休至 `data/memory/archive/YYYY-MM.md`（热检索默认隔离归档目录）。
-- **成对原子落库与自适应滑窗**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史；当后台沉淀繁忙或处于指数退避（`30s` 起，上限 `300s`）导致未压缩消息超过 `20` 条时，活跃窗口在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩上下文，单次沉淀批次上限 `24` 条并在写锁内保护前台在途 `(turn#...)` 事实不被覆盖。
+- **成对原子落库与自适应滑窗**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；当后台沉淀繁忙或处于指数退避（默认 `2s` 起步至 `256s`，上限 `300s`）导致未压缩消息超过 `20` 条时，活跃窗口在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩上下文，单次沉淀批次上限 `24` 条并在写锁内保护前台在途 `(turn#...)` 事实不被覆盖。
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
@@ -100,7 +100,7 @@ uv run python -m evals --mode agent --model deepseek --output /tmp/eval-agent.js
 # 16 场景多轮记忆生命周期评测（中立 v2-neutral Judge）
 uv run python -m evals --mode memory --model deepseek --workers 3 --output /tmp/eval-memory.json
 
-# LongMemEval_oracle 35 题抽样评测（独立固定 deepseek-chat 作为 Judge）
+# LongMemEval_oracle 抽样评测（按上文下载配置为 70 题；不传 limit 默认 35 题）
 uv run python -m evals --mode memory \
   --cases evals/public/longmemeval_scenarios.jsonl \
   --model reasoner \
@@ -140,7 +140,7 @@ uv run python -m evals --mode memory \
 | --- | --- | --- | --- | --- |
 | [evals/memory_scenarios.jsonl](evals/memory_scenarios.jsonl) | 仓库内回归集（6 类，16 场景，短词边界校验 + `deepseek-chat` 自评） | `15/16`（`93.8%`，CI `[71.7%, 98.9%]`），服务端 KV 命中 `81.3%`，前缀复用 `92.9%` | `f039de1`：`15/16`（`93.8%`），KV 命中 `82.4%` | 5/6 类全过；唯一未过项 `chained-three-step-update` 磁盘文件检查残留旧词 `PostgreSQL` |
 | LoCoMo Memory（ACL 2024，`conv-26`） | 单段 19 会话长对话 `shared_setup`（100 道 QA，`deepseek-chat` 自评） | `80/100`（`80.0%`，CI `[71.1%, 86.7%]`），`adversarial` 与 `single-hop` 各 `19/22`（`86.4%`） | `dba72a3`（含具名提示泄漏）：`84/100`（`84.0%`，CI `[75.6%, 89.9%]`） | 移除测试集人物示例后下降 `4` 题，未过项集中于 `open-domain`（`9/13`）与跨会话细节合并 |
-| `LongMemEval_oracle`（ICLR 2025） | 官方证据会话子集分层抽样（`70/500` 题，每类 10 题，`deepseek-chat` 自评） | `63/70`（`90.0%`，CI `[80.8%, 95.1%]`），`abstention` / `single-session-user` / `assistant` 均 `10/10` | `16ebd78`（`35/500` 子集，固定 `deepseek-chat` Judge）：`deepseek-chat` `30/35`（`85.7%`），`deepseek-reasoner` `34/35`（`97.1%`，输出 Token 约 `4.2×`） | 仅含证据会话（不含噪声检索）；7 例失败中 3 例来自跨会话天数换算（`temporal-reasoning` `7/10`）、2 例来自多金额/地点更新（`knowledge-update` `8/10`） |
+| `LongMemEval_oracle`（ICLR 2025） | 官方证据会话子集分层抽样（`70/500` 题，每类 10 题，`deepseek-chat` 自评） | `63/70`（`90.0%`，CI `[80.8%, 95.1%]`），`abstention` / `single-session-user` / `assistant` 均 `10/10` | `16ebd78`（`35/500` 子集，固定 `deepseek-chat` Judge）：`deepseek-chat` `30/35`（`85.7%`），`deepseek-reasoner` `34/35`（`97.1%`，输出 Token 约 `4.2×`） | 仅含证据会话（不含噪声检索）；7 例失败中 3 例来自时序先后与日期换算（`temporal-reasoning` `7/10`）、2 例来自多金额/地点更新（`knowledge-update` `8/10`） |
 
 ---
 

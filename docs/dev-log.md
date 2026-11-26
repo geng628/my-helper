@@ -10,7 +10,7 @@
 1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`urllib`、`http.client`、`sqlite3`、`threading`、`http.server`、`shlex`、`ipaddress`、`unicodedata` 等）；`pytest` 仅作开发测试依赖。
 2. **三层单向依赖漏斗（`ai ← agent ← assistant`）**：
    - `personal_assistant/ai/`（Layer 1）：零内部依赖的 LLM 传输底座（`OpenAIChatClient`）、流式事件、模型配置档案与按会话隔离的有界 `CacheMonitor`；
-   - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/` 的 32 行单层 ReAct 循环（`iter_react` / `run_react`）、工具递进类型（`Tool(ToolSchema)`，自动推断默认可选参数并支持执行期 `tool_context`）与五大插件主板插槽（`Plugin(ABC)` + `PluginContext`），零业务路径或插件名硬编码；
+   - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/` 的 30 余行单层 ReAct 核心循环（`iter_react` / `run_react`）、工具递进类型（`Tool(ToolSchema)`，自动推断默认可选参数并支持执行期 `tool_context`）与五大插件主板插槽（`Plugin(ABC)` + `PluginContext`），零业务路径或插件名硬编码；
    - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零依赖分词与路径安全底座（`text_search.py` / `files_policy.py`）、SQLite 会话存储（`db.py`）、外层回合预算与编排（`app.py`）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
    - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
@@ -30,7 +30,7 @@
 
 ## 二、关键架构决策与工程权衡（ADRs & Trade-offs）
 
-### ADR-1：保持 32 行单层 `react.py` 纯净，将安全预算下放至 Layer 3 `_GuardedTurnLLM`
+### ADR-1：保持 30 余行单层 `react.py` 核心循环纯净，将安全预算下放至 Layer 3 `_GuardedTurnLLM`
 - **背景**：移除早期硬编码 `MAX_TOOL_ROUNDS = 4` 与 `tools=None` 强行总结后，内核回归自然终止，但在工具持续报错或参数被 `max_tokens` 截断时存在无限重试消耗费用与锁死会话的风险。
 - **决策**：不在 Layer 2 `agent/react.py` 重新塞回业务计数器或中文降级文案，而是在 Layer 3 `AssistantApp._run_stream_turn` 外层用 `_GuardedTurnLLM` 包装 `LLMClient.stream`，实施单轮步数（`24`）、累计 Token（`250,000`）、墙钟（`180s`）、连续等价工具调用（`3` 次）与 `finish_reason == "length"` 截断工具调用五项熔断。
 - **权衡**：通用内核保持零侵入；直接绕过 `AssistantApp` 调用底层 `run_react()` 的外部调用方则需自行负责超时控制。
@@ -42,12 +42,12 @@
 
 ### ADR-3：成对原子落库、单锁上下文快照与分层回滚语义
 - **背景**：流式输出中途断网若残留单条 `user` 消息会引发后续推理模型连续同角色 HTTP 400；而分两次查询 `session_compactions` 与 `active_messages` 在后台压缩并发提交时会出现窗口断层。
-- **决策**：`StateStore.append_turn` 在单事务内成对写入问答消息（只追不删）；`get_context_snapshot` 在单把锁内原子读取摘要、活跃消息与快照上界。
-- **权衡与边界**：回合异常中断时，未完成的问答对不会入库，`remember_fact` 的 `(turn#<tag>)` 暂存行会自动回滚清理；但回合内已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件写入，不做跨文件事务回滚（覆盖模式依赖 `data/workspace/.backups/` 时间戳备份恢复）。
+- **决策**：`StateStore.append_turn` 在单事务内成对写入问答消息（只追不删）；`get_context_snapshot` 在单把锁内原子读取 `(compaction, active_messages)` 二元组（快照上界由 `max_message_id()` 提供）。
+- **权衡与边界**：回合异常中断时，未完成的问答对不会入库，`remember_fact` 的 `(turn#<tag>)` 暂存行会在流生成器的 `finally` 分支自动回滚清理；但回合内已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件写入，不做跨文件事务回滚（覆盖模式依赖 `data/workspace/.backups/` 时间戳备份恢复）。
 
 ### ADR-4：前后台双模型分槽、自适应滑窗与沉淀指数退避
 - **背景**：推理模型（如 `deepseek-reasoner`）在复杂多步推理上准确率更高，但后台输出 JSON 摘要与记忆操作时消耗大量思维链输出 Token；此外后台沉淀若遇上游故障，固定 `20` 条历史截断会导致超出窗口的未压缩消息从上下文中暂时不可见。
-- **决策**：`models.dsl` 支持 `consolidator` 独立轻量模型槽位；当未压缩活跃消息因沉淀繁忙或失败退避超过 `20` 条时，`_select_adaptive_history` 在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩历史（对齐首条 `user` 边界）；`BackgroundConsolidator` 按会话实施 `30s -> 300s` 指数退避，单批上限 `max_batch_messages=24`，并在写锁内过滤会触碰在途 `(turn#...)` 事实的修改操作。
+- **决策**：`models.dsl` 支持 `consolidator` 独立轻量模型槽位；当未压缩活跃消息因沉淀繁忙或失败退避超过 `20` 条时，`_select_adaptive_history` 在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩历史（对齐首条 `user` 边界）；`BackgroundConsolidator` 按会话实施 `2s -> 4s -> ... -> 256s`（上限封顶 `300s`）指数退避，单批上限 `max_batch_messages=24`，并在写锁内过滤会触碰在途 `(turn#...)` 事实的修改操作。
 
 ### ADR-5：零依赖词面检索（SQLite FTS5 + BM25）优先，保留 `RetrieverProtocol` 扩展口
 - **决策**：主线采用零依赖中英双语分词 + SQLite FTS5 BM25，不内置重型本地向量模型依赖。
@@ -133,16 +133,16 @@
      - [../personal_assistant/assistant/files_policy.py](../personal_assistant/assistant/files_policy.py) 统一实现 `Cf` 格式符剥离 + `NFKC + casefold()` 与受保护目录有界递归 `(st_dev, st_ino)` 采集，彻底拦截 macOS APFS `ſ -> s` 折叠与硬链接绕过；
      - [../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py) 实装逐子命令只读 `git` 白名单（封堵 `git branch -D/-m/--edit-description`、`git log -p` 及 `git show`/`diff` 裸 `<blob>`/`<tree>`/空树 SHA，自动为 `git diff` 注入 `:(exclude,glob,icase)` 敏感路径排除），启用隔离空 `HOME`、1 MB 流式管道上限与 `os.killpg` 整组强杀（含父进程秒退后残留持管道孙进程回收）；
      - [../plugins/tools/web_tools.py](../plugins/tools/web_tools.py) 实装 `_PinnedHTTPConnection` / `_PinnedHTTPSConnection` 直连已校验 IP 消除 DNS Rebinding、`ProxyHandler({})` 禁系统代理、`allow_fake_ip` 默认关闭、NAT64/6to4/Teredo 私网拦截与单调总截止时间；
-     - [../personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py) 与 [../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py) 增加 `<untrusted_tool_output>` 围栏与 `save_rule` 双重门控（同轮运行过 `risk="network"` 工具即硬拒，且校验显式长期规则设定意图）；[../scripts/web_chat.py](../scripts/web_chat.py) 补齐安全响应头、SSE `closing()` 与常量时间 UTF-8 Bearer 鉴权。
+     - [../personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py) 与 [../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py) 增加 `rules/` 注入非越权边界声明与 `save_rule` 双重门控（同轮运行过 `risk="network"` 工具即硬拒，且校验显式长期规则设定意图）；[../scripts/web_chat.py](../scripts/web_chat.py) 补齐安全响应头、SSE `closing()` 与 `--auth-token` / `MY_HELPER_WEB_TOKEN` 常量时间 UTF-8 Bearer 鉴权。
   3. **外层回合预算、原子上下文快照与沉淀退避（Issue `#73` / PR `#76`，`1b421d2`）**：
-     - [../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py) 新增 `_GuardedTurnLLM` 五维预算熔断、沉淀滞后自适应历史滑窗（`20 -> 60` 条 / `24,000` 字符，首条对齐 `user`）、`BaseException` 流中断 `turn_tag` 回滚、`untrusted_tool_seen` 联动注入、`_llm_lock` 串行热重载与 `close()` 插件 `terminate_all()`；
-     - [../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py) 新增 `get_context_snapshot()` 单锁原子读取；[../personal_assistant/assistant/consolidator.py](../personal_assistant/assistant/consolidator.py) 新增 `max_batch_messages=24`、按会话指数退避冷却与写锁内 `_filter_safe_operations` 在途 `(turn#...)` 事实保护；
-     - [../personal_assistant/ai/client.py](../personal_assistant/ai/client.py) 与 [../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py) 补齐无 `index` SSE 工具流切槽、外发剥离 `finish_reason`、HTTP 错误体保留与按 `session_key` 隔离的缓存统计。
+     - [../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py) 新增 `_GuardedTurnLLM` 五维预算熔断、沉淀滞后自适应历史滑窗（`20 -> 60` 条 / `24,000` 字符，首条对齐 `user`）、`finally` 分支（覆盖 `GeneratorExit` 等 `BaseException`）流中断 `turn_tag` 回滚、`untrusted_tool_seen` 联动注入、`_llm_lock` 串行热重载与 `close()` 插件 `terminate_all()`；
+     - [../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py) 新增 `get_context_snapshot()` 单锁原子读取二元组；[../personal_assistant/assistant/consolidator.py](../personal_assistant/assistant/consolidator.py) 新增 `max_batch_messages=24`、按会话指数退避冷却（默认 `2s` 起步至 `256s`）与写锁内 `_filter_safe_operations` 在途 `(turn#...)` 事实保护；
+     - [../personal_assistant/ai/client.py](../personal_assistant/ai/client.py) 与 [../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py) 补齐无 `index` SSE 工具流切槽、外发剥离 `finish_reason`、`HTTPError` 脱敏错误体保留与按 `session_key` 隔离的缓存统计。
   4. **诚实文档改写与去泄漏复测**：修订 [../README.md](../README.md)、[mvp-design.md](mvp-design.md) 与本文件，去除夸大措辞，明确披露 `sample_cases.jsonl` 开发集属性、`LongMemEval_oracle` 证据会话子集属性、`LoCoMo conv-26` 单段 19 会话结构、置信区间及跨轮剥离工具观察/非事务写文件边界。
 - **验证与复测对比（`f039de1` → `1b421d2`）**：
   - 确定性单元测试：`179 passed → 198 passed`（在 `tests/conftest.py` 宿主隔离下全绿，`react.py` 0 行改动），AST 中文 `#` 注释缺失为 `0`；
   - 离线检索基准（`fts5_bm25`）：40 题 `38/40 (95.0%)`，LoCoMo Search 200 题 `105/200 (52.5%)`（零退步）；
-  - 去泄漏 `v2-neutral` 实模复测（`1b421d2`，`prompt_sha256="08e7c0adcb56"`）：16 场景开发集 `15/16 (93.8%)`（KV 命中 `81.31%`，唯一未过项 `chained-three-step-update` 磁盘旧词检查残留 `PostgreSQL`）；`LoCoMo conv-26` 100 题 `80/100 (80.0%)`（95% CI `[71.1%, 86.7%]`，较含具名提示泄漏的旧 `v1` 回落 `4` 题）；`LongMemEval_oracle` 70 题扩充抽样 `63/70 (90.0%)`（95% CI `[80.8%, 95.1%]`，`abstention` 拒答类在零具名示例下 `10/10` 全过，未过项主要为跨会话天数算术 `temporal-reasoning` `7/10`）。
+  - 去泄漏 `v2-neutral` 实模复测（`1b421d2`，`prompt_sha256="08e7c0adcb56"`）：16 场景开发集 `15/16 (93.8%)`（KV 命中 `81.31%`，唯一未过项 `chained-three-step-update` 磁盘旧词检查残留 `PostgreSQL`）；`LoCoMo conv-26` 100 题 `80/100 (80.0%)`（95% CI `[71.1%, 86.7%]`，较含具名提示泄漏的旧 `v1` 回落 `4` 题）；`LongMemEval_oracle` 70 题扩充抽样 `63/70 (90.0%)`（95% CI `[80.8%, 95.1%]`，`abstention` 拒答类在零具名示例下 `10/10` 全过，未过项主要为时序先后与日期换算 `temporal-reasoning` `7/10`）。
 - **下一步**：当前安全边界、运行期有界性、测试隔离与评测口径均已收敛完备；后续仅在真实伴读场景遇到跨主题零词面重叠召回瓶颈时，按需通过 `RetrieverProtocol` 扩展可选混合检索插件。
 
 ---
