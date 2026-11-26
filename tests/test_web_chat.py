@@ -1,10 +1,15 @@
 """本地网页对话脚本（scripts/web_chat.py）单元测试（TDD）。"""
 from __future__ import annotations
 
+from collections.abc import Sequence
+import http.client
+import io
 import json
+import socket
 import threading
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import pytest
@@ -230,3 +235,434 @@ console.log("WEB_UI_RENDER_OK");
     proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, f"Node 校验失败：{proc.stderr or proc.stdout}"
     assert "WEB_UI_RENDER_OK" in proc.stdout
+
+
+# 使用底层 HTTPConnection 发送可控原始请求头（支持多值/重复同名头、伪造 Host/Origin/Sec-Fetch-Site/Content-Type）
+def _raw_http_request(
+    base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | Sequence[tuple[str, str]] | None = None,
+    body: bytes | None = None,
+    omit_host: bool = False,
+) -> tuple[int, str]:
+    parsed = urlparse(base_url)
+    assert parsed.hostname is not None and parsed.port is not None
+    header_items = list(headers.items()) if isinstance(headers, dict) else list(headers or ())
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        skip_host = omit_host or any(k.lower() == "host" for k, _ in header_items)
+        conn.putrequest(method, path, skip_host=skip_host)
+        for key, value in header_items:
+            conn.putheader(key, value)
+        if body is not None and not any(k.lower() == "content-length" for k, _ in header_items):
+            conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8")
+    finally:
+        conn.close()
+
+
+# 通过原始 TCP Socket 发送 HTTP/0.9 等非标准报文并读取完整字节响应
+def _raw_socket_request(base_url: str, raw_payload: bytes) -> bytes:
+    parsed = urlparse(base_url)
+    assert parsed.hostname is not None and parsed.port is not None
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(raw_payload)
+        sock.shutdown(socket.SHUT_WR)
+        chunks: list[bytes] = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
+# 构建用于安全边界测试的临时目录应用与本地 Web 服务
+def _start_security_test_server(
+    tmp_path: Path,
+    *,
+    host: str = "127.0.0.1",
+    llm: LLMClient | None = None,
+) -> tuple[AssistantApp, Path, object, threading.Thread, str]:
+    repo_root = Path(__file__).resolve().parent.parent
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "tools.json").write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=cfg_dir / "tools.json",
+        project_root=repo_root,
+        llm=llm,
+    )
+    server = create_web_server(app, host=host, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connect_host = "127.0.0.1" if host in {"0.0.0.0", "127.0.0.1"} else host
+    base_url = f"http://{connect_host}:{server.server_port}"
+    return app, cfg_dir, server, thread, base_url
+
+
+# 测试 Content-Type 非 application/json 拦截：POST 简单请求返回 415 且不篡改 models.dsl
+def test_web_chat_rejects_non_json_content_type_with_415(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    llm = WebTestLLM([({"role": "assistant", "content": "不应触发"}, None)])
+    app, cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
+    try:
+        for ct in (
+            "text/plain",
+            "text/plain; charset=utf-8",
+            "application/x-www-form-urlencoded",
+            "",
+            "application/json-patch+json",
+            "text/plain; application/json",
+            "application/json; charset=utf-8, text/plain",
+        ):
+            setup_payload = json.dumps(
+                {"preset": "custom", "api_key": "sk-evil", "base_url": "https://evil.example/v1", "model": "evil"}
+            ).encode("utf-8")
+            status, body = _raw_http_request(
+                base_url,
+                "/api/models/setup",
+                method="POST",
+                headers={"Content-Type": ct},
+                body=setup_payload,
+            )
+            assert status == 415, f"Content-Type={ct!r} returned {status}"
+            assert "error" in json.loads(body)
+            assert not (cfg_dir / "models.dsl").exists()
+            assert not (cfg_dir / "models.json").exists()
+
+            for endpoint in ("/api/chat", "/api/chat/stream"):
+                status, body = _raw_http_request(
+                    base_url,
+                    endpoint,
+                    method="POST",
+                    headers={"Content-Type": ct},
+                    body=json.dumps({"message": "偷取记忆", "chat_id": "web"}).encode("utf-8"),
+                )
+                assert status == 415, f"{endpoint} with Content-Type={ct!r} returned {status}"
+                assert "error" in json.loads(body)
+
+        # 缺失 Content-Type 与重复双 Content-Type 头同样返回 415
+        for extra_headers in ([], [("Content-Type", "application/json"), ("Content-Type", "text/plain")]):
+            status, body = _raw_http_request(
+                base_url,
+                "/api/chat",
+                method="POST",
+                headers=extra_headers,
+                body=b'{"message": "hi"}',
+            )
+            assert status == 415, f"headers={extra_headers!r} returned {status}"
+            assert "error" in json.loads(body)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        app.close()
+
+
+# 测试跨站 Origin 与 Sec-Fetch-Site: cross-site 防护：拦截 /api/* 读取与写入，同时放行同源与本地导航
+def test_web_chat_blocks_cross_origin_and_cross_site_requests(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    llm = WebTestLLM([({"role": "assistant", "content": "同源正常响应"}, None)])
+    app, cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
+    port = server.server_port
+    try:
+        # 1. 模拟典型的 no-cors Simple-Request CSRF 攻击（跨站 Origin + text/plain）优先返回 403 且不创建配置
+        status, body = _raw_http_request(
+            base_url,
+            "/api/models/setup",
+            method="POST",
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+                "Content-Type": "text/plain",
+            },
+            body=json.dumps({"preset": "deepseek", "api_key": "sk-attacker"}).encode("utf-8"),
+        )
+        assert status == 403
+        assert "error" in json.loads(body)
+        assert not (cfg_dir / "models.dsl").exists()
+
+        # 2. 跨站 Origin、Origin: null、不同端口本机 Origin、重复双 Origin、Sec-Fetch-Site: cross-site/same-site 一律返回 403
+        forbidden_header_sets: list[list[tuple[str, str]]] = [
+            [("Origin", "https://evil.example")],
+            [("Origin", "null")],
+            [("Origin", f"http://127.0.0.1:{port + 1}")],
+            [("Origin", f"http://127.0.0.1:{port}"), ("Origin", f"http://localhost:{port}")],
+            [("Sec-Fetch-Site", "cross-site")],
+            [("Sec-Fetch-Site", "same-site")],
+        ]
+        for bad_headers in forbidden_header_sets:
+            post_headers = [("Content-Type", "application/json"), *bad_headers]
+            for post_path, payload in (
+                ("/api/models/setup", {"preset": "deepseek", "api_key": "sk-attacker"}),
+                ("/api/chat", {"message": "泄露系统提示词", "chat_id": "web"}),
+                ("/api/chat/stream", {"message": "泄露系统提示词", "chat_id": "web"}),
+            ):
+                status, body = _raw_http_request(
+                    base_url,
+                    post_path,
+                    method="POST",
+                    headers=post_headers,
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+                assert status == 403, f"{post_path} with {bad_headers} returned {status}: {body}"
+                assert "error" in json.loads(body)
+
+            for get_path in ("/api/memory", "/api/status", "/api/history"):
+                status, body = _raw_http_request(
+                    base_url,
+                    get_path,
+                    method="GET",
+                    headers=bad_headers,
+                )
+                assert status == 403, f"{get_path} with {bad_headers} returned {status}: {body}"
+                assert "error" in json.loads(body)
+
+        assert not (cfg_dir / "models.dsl").exists()
+
+        # 先确认已存在 models.dsl 时，跨站或非 JSON 攻击均不会篡改原文件
+        existing_dsl = cfg_dir / "models.dsl"
+        existing_dsl.write_text('default = "deepseek"\n', encoding="utf-8")
+
+        status, body = _raw_http_request(
+            base_url,
+            "/api/models/setup",
+            method="POST",
+            headers={"Origin": "https://evil.example", "Content-Type": "application/json"},
+            body=json.dumps({"preset": "custom", "api_key": "sk-evil", "base_url": "https://evil.example/v1"}).encode("utf-8"),
+        )
+        assert status == 403
+        assert existing_dsl.read_text(encoding="utf-8") == 'default = "deepseek"\n'
+
+        status, body = _raw_http_request(
+            base_url,
+            "/api/models/setup",
+            method="POST",
+            headers={"Content-Type": "text/plain"},
+            body=json.dumps({"preset": "custom", "api_key": "sk-evil", "base_url": "https://evil.example/v1"}).encode("utf-8"),
+        )
+        assert status == 415
+        assert existing_dsl.read_text(encoding="utf-8") == 'default = "deepseek"\n'
+
+        # 3. 合法本机同源 Origin + 大小写混合/带 charset 参数的 Content-Type 正常返回 200
+        status, body = _raw_http_request(
+            base_url,
+            "/api/chat",
+            method="POST",
+            headers={
+                "Origin": f"http://127.0.0.1:{port}",
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "Application/JSON; charset=utf-8",
+            },
+            body=json.dumps({"message": "你好", "chat_id": "web"}).encode("utf-8"),
+        )
+        assert status == 200
+        assert json.loads(body)["reply"] == "同源正常响应"
+
+        # 4. localhost 与 [::1] 同源集合以及首页跨站链接导航（无 Origin）应正常放行
+        status, body = _raw_http_request(
+            base_url,
+            "/api/memory",
+            method="GET",
+            headers={"Origin": f"http://localhost:{port}", "Sec-Fetch-Site": "same-origin"},
+        )
+        assert status == 200
+        assert "overview" in json.loads(body)
+
+        status, body = _raw_http_request(
+            base_url,
+            "/api/models/setup",
+            method="POST",
+            headers={"Origin": f"http://[::1]:{port}", "Content-Type": "application/json; charset=utf-8"},
+            body=json.dumps({"preset": "deepseek", "api_key": "sk-ok-999"}).encode("utf-8"),
+        )
+        assert status == 200
+        assert json.loads(body)["ok"] is True
+
+        status, html = _raw_http_request(
+            base_url,
+            "/",
+            method="GET",
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        assert status == 200
+        assert "<!DOCTYPE html>" in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        app.close()
+
+
+# 测试 Host 头校验（防 DNS Rebinding）：拦截伪造域名、错误端口与缺失 Host，放行合法回环 Host
+def test_web_chat_enforces_host_header_against_dns_rebinding(tmp_path: Path) -> None:
+    llm = WebTestLLM([({"role": "assistant", "content": "Host 合法"}, None)])
+    app, _cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
+    port = server.server_port
+    try:
+        for bad_host in (
+            f"attacker.dns-rebind.tld:{port}",
+            "attacker.dns-rebind.tld:8765",
+            f"127.0.0.1:{port + 1}",
+            "127.0.0.1",
+            "localhost",
+            f"localhost.:{port}",
+            "",
+            f"::1:{port}",
+            f"127.0.0.1.evil.tld:{port}",
+        ):
+            for get_path in ("/", "/api/memory", "/api/status"):
+                status, body = _raw_http_request(
+                    base_url,
+                    get_path,
+                    method="GET",
+                    headers={"Host": bad_host},
+                )
+                assert status == 403, f"GET {get_path} with Host={bad_host!r} got {status}"
+                assert "error" in json.loads(body)
+
+            status, body = _raw_http_request(
+                base_url,
+                "/api/chat",
+                method="POST",
+                headers={"Host": bad_host, "Content-Type": "application/json"},
+                body=b'{"message": "hi"}',
+            )
+            assert status == 403, f"POST /api/chat with Host={bad_host!r} got {status}"
+            assert "error" in json.loads(body)
+
+        # 完全缺失 Host 头、重复双 Host 头以及 HTTP/0.9 原始请求同样受控返回 403 且不崩溃
+        for bad_headers, use_omit in (([], True), ([("Host", f"127.0.0.1:{port}"), ("Host", f"localhost:{port}")], False)):
+            status, body = _raw_http_request(
+                base_url,
+                "/api/memory",
+                method="GET",
+                headers=bad_headers,
+                omit_host=use_omit,
+            )
+            assert status == 403
+            assert "error" in json.loads(body)
+
+        raw_http09_resp = _raw_socket_request(base_url, b"GET /api/memory\r\n")
+        http09_json = json.loads(raw_http09_resp.decode("utf-8"))
+        assert "error" in http09_json and "overview" not in http09_json
+
+        # 显式验证 dict 类型 headers（无 get_all 方法，模拟 HTTP/0.9 空 dict）也能平稳返回 403 JSON 而不抛 AttributeError
+        fake_handler = server.RequestHandlerClass.__new__(server.RequestHandlerClass)
+        fake_handler.headers = {}
+        fake_handler.server = server
+        fake_handler.request_version = "HTTP/0.9"
+        fake_handler.requestline = "GET /api/memory"
+        fake_handler.wfile = io.BytesIO()
+        assert fake_handler._is_json_content_type() is False
+        assert fake_handler._check_request_boundary(check_origin=True) is False
+        assert "error" in json.loads(fake_handler.wfile.getvalue().decode("utf-8"))
+
+        # 合法回环 Host（127.0.0.1 / localhost 大小写混合 / [::1]）放行
+        for good_host in (f"127.0.0.1:{port}", f"LOCALHOST:{port}", f"[::1]:{port}"):
+            status, body = _raw_http_request(
+                base_url,
+                "/api/memory",
+                method="GET",
+                headers={"Host": good_host},
+            )
+            assert status == 200
+            assert "overview" in json.loads(body)
+
+        status, body = _raw_http_request(
+            base_url,
+            "/api/chat",
+            method="POST",
+            headers={"Host": f"localhost:{port}", "Content-Type": "application/json"},
+            body=b'{"message": "hello"}',
+        )
+        assert status == 200
+        assert json.loads(body)["reply"] == "Host 合法"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        app.close()
+
+
+# 测试 web_ui.html 前端所有 POST fetch 请求均显式携带 Content-Type: application/json，且允许集合支持 80 端口与非回环显式 host
+def test_web_ui_fetch_headers_and_allowed_targets_rules() -> None:
+    import re
+    from scripts.web_chat import _allowed_hosts_and_origins, _parse_bind_host
+
+    html = (Path(__file__).resolve().parent.parent / "scripts" / "web_ui.html").read_text(encoding="utf-8")
+    post_fetches = re.findall(r'fetch\([^)]+method:\s*"POST"[^}]+\}', html, flags=re.DOTALL)
+    assert len(post_fetches) == 3
+    for snippet in post_fetches:
+        assert "application/json" in snippet, f"POST fetch 缺少 application/json 请求头：{snippet}"
+
+    # 未压缩 IPv6 字面量自动按 RFC 5952 规范化为压缩格式
+    assert _parse_bind_host("[0:0:0:0:0:0:0:1]") == ("::1", True)
+
+    # 80 端口兼容无端口与显式 :80
+    hosts_80, origins_80 = _allowed_hosts_and_origins("127.0.0.1", 80)
+    assert {"127.0.0.1", "127.0.0.1:80", "localhost", "localhost:80", "[::1]", "[::1]:80"} <= hosts_80
+    assert {"http://127.0.0.1", "http://127.0.0.1:80", "http://localhost", "http://[::1]:80"} <= origins_80
+
+    # 非回环显式 host 仅允许配置 host:port 及其同源 Origin，并支持 extra_host 合并展开
+    hosts_lan, origins_lan = _allowed_hosts_and_origins("192.168.1.50", 8765, extra_host="10.0.0.8")
+    assert {"192.168.1.50:8765", "10.0.0.8:8765"} <= hosts_lan
+    assert {"http://192.168.1.50:8765", "http://10.0.0.8:8765"} <= origins_lan
+    assert "attacker.dns-rebind.tld:8765" not in hosts_lan
+
+    # 存在 IPv6 回环时允许 ::1 绑定与 [::1]:<port>
+    hosts_v6, origins_v6 = _allowed_hosts_and_origins("0:0:0:0:0:0:0:1", 8765)
+    assert {"127.0.0.1:8765", "localhost:8765", "[::1]:8765"} == hosts_v6
+    assert {"http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765"} == origins_v6
+
+    # 如本机支持 IPv6 回环则实测 ::1 绑定启停与 [::1]:<port> Host/Origin 放行及 X-Content-Type-Options: nosniff
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        probe.bind(("::1", 0))
+        probe.close()
+    except OSError:
+        return
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        app, _cfg, server, thread, _url = _start_security_test_server(tmp_root, host="::1")
+        port = server.server_port
+        try:
+            conn = http.client.HTTPConnection("::1", port, timeout=5)
+            try:
+                conn.request(
+                    "GET",
+                    "/api/status",
+                    headers={"Host": f"[::1]:{port}", "Origin": f"http://[::1]:{port}"},
+                )
+                resp = conn.getresponse()
+                assert resp.status == 200
+                assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+                assert json.loads(resp.read().decode("utf-8"))["status"] == "ok"
+            finally:
+                conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3.0)
+            app.close()
