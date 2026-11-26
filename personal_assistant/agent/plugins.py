@@ -119,6 +119,9 @@ class PluginContext:
     raw_config: Mapping[str, object] = field(default_factory=dict)
     extra_bindings: Mapping[str, object] = field(default_factory=dict)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+    tool_specs: list[tuple[Tool, str | None, ToolMetadata | None, ToolDocument | None]] = field(
+        default_factory=list
+    )
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
@@ -154,16 +157,24 @@ class PluginContext:
         document: ToolDocument | None = None,
     ) -> None:
         raw_tool = extract_tool(item)
-        if source_name is not None or not isinstance(item, Tool):
+        src: str | None = None
+        if (
+            source_name is not None
+            or not isinstance(item, Tool)
+            or (type(item) is Tool and item.handler is not None)
+        ):
             src = source_name or getattr(getattr(raw_tool, "__tool_document__", None), "source_name", "plugin")
             normalized = _normalize_plugin_tool(
                 raw_tool,
                 source_name=src,
                 context=self.tool_bindings(),
+                metadata=metadata,
+                document=document,
             )
         else:
             normalized = raw_tool
         self.tool_registry.register(normalized, metadata=metadata, document=document)
+        self.tool_specs.append((raw_tool, src, metadata, document))
 
     # 插槽 2：向主板注册检索引擎子协议实现（支持传入 RetrieverProtocol 实例或工厂函数）
     def register_retriever(
@@ -334,8 +345,10 @@ def _normalize_plugin_tool(
     source_name: str,
     *,
     context: Mapping[str, object] | None = None,
+    metadata: ToolMetadata | None = None,
+    document: ToolDocument | None = None,
 ) -> Tool:
-    meta = getattr(item, "__tool_metadata__", None) or ToolMetadata()
+    meta = metadata or getattr(item, "__tool_metadata__", None) or ToolMetadata()
     raw_fn = getattr(item, "_raw_fn", None) or item.handler or item.run
     return build_tool(
         raw_fn,
@@ -345,8 +358,8 @@ def _normalize_plugin_tool(
         param_enums=item.param_enums,
         risk=meta.risk,
         always_on=meta.always_on,
-        source_type="plugin",
-        source_name=source_name,
+        source_type=document.source_type if document is not None else "plugin",
+        source_name=document.source_name if document is not None else source_name,
         context=context,
     )
 
@@ -400,6 +413,8 @@ class PluginManager(ToolsetProvider):
     compilers: dict[str, ConfigCompilerProtocol]
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
     plugins: tuple[Plugin, ...] = ()
+    tool_specs: tuple[tuple[Tool, str | None, ToolMetadata | None, ToolDocument | None], ...] = ()
+    project_root: Path | None = None
     source_type: str = "plugin"
     source_name: str = "plugins"
 
@@ -428,6 +443,8 @@ class PluginManager(ToolsetProvider):
             compilers=dict(ctx.compilers),
             observers=dict(ctx.observers),
             plugins=tuple(active_plugins),
+            tool_specs=tuple(ctx.tool_specs),
+            project_root=root,
         )
 
     # 将外部传入的上下文字典组装为强类型 PluginContext
@@ -465,15 +482,34 @@ class PluginManager(ToolsetProvider):
     def tools(self) -> list[Tool]:
         return list(self.default_tools)
 
-    # 按给定运行时上下文构造 PluginContext 并执行全部 Plugin.initialize()，产出绑定好实例资源的 Tool 列表
+    # 按给定运行时上下文基于缓存的原始工具定义重新绑定实例资源，不再重跑全部 Plugin.initialize()
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         if context is None:
             return list(self.default_tools)
+        if not self.tool_specs:
+            return list(self.default_tools)
         raw_proj = context.get("project_root")
-        proj = Path(str(raw_proj)).resolve() if isinstance(raw_proj, (str, Path)) else Path.cwd()
-        ctx = self._build_plugin_context(proj, context)
-        _initialize_modules(self.modules, ctx)
-        return list(ctx.tool_registry)
+        proj = (
+            Path(str(raw_proj)).resolve()
+            if isinstance(raw_proj, (str, Path))
+            else (self.project_root or Path.cwd())
+        )
+        bindings = self._build_plugin_context(proj, context).tool_bindings()
+        tools: list[Tool] = []
+        for raw_tool, source_name, metadata, document in self.tool_specs:
+            if source_name is not None:
+                tools.append(
+                    _normalize_plugin_tool(
+                        raw_tool,
+                        source_name=source_name,
+                        context=bindings,
+                        metadata=metadata,
+                        document=document,
+                    )
+                )
+            else:
+                tools.append(raw_tool)
+        return tools
 
     # 统一触发全部已加载 Plugin 实例的 terminate() 停止清理钩子
     def terminate_all(self) -> None:

@@ -381,3 +381,165 @@ class MemObserverPlugin(Plugin):
         ctx.register_observer("obs1", obs_list_b[0])
     with pytest.raises((TypeError, ValueError)):
         ctx.register_observer("bad", 123)  # type: ignore[arg-type]
+
+
+# 测试自定义 Plugin 与非工具插件在多次 build_tools/app.chat 中仅 initialize() 一次，且工具每轮拿到最新动态上下文
+def test_plugin_initialize_runs_once_while_tools_rebind_dynamic_context(tmp_path: Path) -> None:
+    from personal_assistant.assistant.app import AssistantApp
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "counter_plugins.py").write_text(
+        """
+from pathlib import Path
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool, ToolDocument, ToolMetadata, tool
+
+TOOL_INIT_CALLS = 0
+OBSERVER_INIT_CALLS = 0
+
+
+# 记录运行期动态注入参数的插件工具
+@tool(description="返回当前注入的 before_msg_id 与 db 路径", parameters={"tag": "标签"})
+def peek_turn_ctx(
+    tag: str,
+    *,
+    before_msg_id: int | None = None,
+    history_db_path: Path | None = None,
+) -> str:
+    return f"{tag}:{before_msg_id}:{Path(history_db_path).name if history_db_path else 'none'}"
+
+
+# 测试用工具插件：统计 initialize() 调用次数并注册 @tool 与显式 Tool 两种工具
+class CounterToolPlugin(Plugin):
+    plugin_id = "counter_tools"
+
+    # 首次初始化时累加计数并向主板注册工具
+    def initialize(self) -> None:
+        global TOOL_INIT_CALLS
+        TOOL_INIT_CALLS += 1
+        self.context.register_tool(peek_turn_ctx, source_name="counter_plugins")
+        self.context.register_tool(
+            Tool(
+                name="peek_explicit_tool",
+                description="显式 Tool 上下文探针",
+                parameters={},
+                handler=lambda before_msg_id=None: f"explicit:{before_msg_id}",
+            ),
+            source_name="counter_plugins",
+            metadata=ToolMetadata(risk="read", always_on=True),
+            document=ToolDocument(source_type="plugin", source_name="custom_doc"),
+        )
+
+
+# 测试用非工具观测插件：验证每轮 build_tools 绝不再重新实例化并执行 initialize()
+class CounterObserver:
+    name = "counter_obs"
+
+    # 忽略事件广播
+    def on_event(self, session_key: str, event: object) -> None:
+        return None
+
+    # 返回观测插件自身初始化计数
+    def snapshot(self, *, session_key: str | None = None) -> dict[str, object]:
+        return {"observer_init_calls": OBSERVER_INIT_CALLS}
+
+
+# 测试用非工具插件子类
+class CounterObserverPlugin(Plugin):
+    plugin_id = "counter_obs"
+
+    # 注册观测器工厂并统计初始化次数
+    def initialize(self) -> None:
+        global OBSERVER_INIT_CALLS
+        OBSERVER_INIT_CALLS += 1
+        self.context.register_observer("counter_obs", lambda _cfg: CounterObserver())
+""",
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "config" / "tools.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["peek_turn_ctx"],
+                "plugins": ["plugins"],
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = ToolsConfig.load(cfg_path, project_root=tmp_path)
+    mod = cfg.plugin_manager.modules[0][1]
+    assert mod.TOOL_INIT_CALLS == 1
+    assert mod.OBSERVER_INIT_CALLS == 1
+
+    # 1. 多次 build_tools(ctx) 绝不再触发 initialize()，且每轮动态上下文与元数据完整生效
+    reg1 = cfg.build_registry(data_root=tmp_path / "data", tool_context={"before_msg_id": 10})
+    reg2 = cfg.build_registry(data_root=tmp_path / "data", tool_context={"before_msg_id": 25})
+    assert mod.TOOL_INIT_CALLS == 1
+    assert mod.OBSERVER_INIT_CALLS == 1
+    assert reg1.execute("peek_turn_ctx", '{"tag": "t1"}') == "t1:10:none"
+    assert reg2.execute("peek_turn_ctx", '{"tag": "t2"}') == "t2:25:none"
+    assert reg1.execute("peek_explicit_tool", "{}") == "explicit:10"
+    assert reg2.execute("peek_explicit_tool", "{}") == "explicit:25"
+    assert reg2.document("peek_explicit_tool").source_name == "custom_doc"  # type: ignore[union-attr]
+    assert reg2.metadata("peek_explicit_tool").always_on is True  # type: ignore[union-attr]
+
+    # 2. 跨多轮 AssistantApp.chat() 与 status()：initialize() 仍严格保持 1 次，before_msg_id 逐轮递增
+    llm = ScriptedLLM(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r1"}'}}
+                ],
+            },
+            {"role": "assistant", "content": "第1轮完成"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c2", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r2"}'}}
+                ],
+            },
+            {"role": "assistant", "content": "第2轮完成"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c3", "type": "function", "function": {"name": "peek_explicit_tool", "arguments": "{}"}}
+                ],
+            },
+            {"role": "assistant", "content": "第3轮完成"},
+        ]
+    )
+    app = AssistantApp(data_root=tmp_path / "app_data", config_path=cfg_path, project_root=tmp_path, llm=llm)
+    try:
+        app_mod = app.tools_config.plugin_manager.modules[0][1]  # type: ignore[union-attr]
+        # 新建 AssistantApp 时再次执行 ToolsConfig.load 初始化 1 次（累计 2 次），后续每轮对话不得再递增
+        assert app_mod.TOOL_INIT_CALLS == 2
+        assert app_mod.OBSERVER_INIT_CALLS == 2
+
+        t1 = app.chat("第一句", chat_id="s1")
+        t2 = app.chat("第二句", chat_id="s1")
+        t3 = app.chat("第三句", chat_id="s1")
+        _ = app.status()
+
+        assert app_mod.TOOL_INIT_CALLS == 2
+        assert app_mod.OBSERVER_INIT_CALLS == 2
+        assert t1["tool_calls"][0]["observation"] == "r1:1:chat_history.sqlite3"
+        assert t2["tool_calls"][0]["observation"] == "r2:3:chat_history.sqlite3"
+        assert t3["tool_calls"][0]["observation"] == "explicit:5"
+    finally:
+        app.close()
+
+    # 3. 验证项目自带 5 个真实插件在真实 config/tools.json 下多轮调用同样只初始化一次
+    real_cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
+    for msg_id in (1, 3, 5):
+        reg = real_cfg.build_registry(data_root=tmp_path / "real", tool_context={"before_msg_id": msg_id})
+        assert "search_chat_history" in reg.names

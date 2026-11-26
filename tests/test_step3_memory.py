@@ -188,3 +188,153 @@ def test_memory_tools_and_react_integration(tmp_path: Path) -> None:
     assert "回答前先查证已有记录" in memory.read_rules_summary()
     assert (memory.workspace_dir / "summary.md").read_text(encoding="utf-8") == "命令必须设置 shell=False"
     assert len(memory.audit_entries()) == 3
+
+
+# 测试 MemoryStore 并发写锁：多线程交错调用 remember_user_statement、apply_memory_operations、save_rule 与 record_audit 零丢失
+def test_memory_store_concurrent_writes_have_zero_lost_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import threading
+    import time
+    from datetime import date
+
+    import personal_assistant.assistant.memory as memory_mod
+
+    # 1. 确定性竞态测试：在第一次写入 facts.md 时停顿 50ms，验证并发第二写不会在无锁时覆盖丢失第一条事实
+    race_mem = MemoryStore(tmp_path / "race_data")
+    assert hasattr(race_mem, "_write_lock")
+    orig_atomic_write = memory_mod._atomic_write
+    first_entered = threading.Event()
+
+    # 在首次写 facts.md 时制造并发窗口以暴露无锁覆盖丢失
+    def delayed_atomic_write(target: Path, content: str) -> None:
+        if target == race_mem.facts_file and not first_entered.is_set():
+            first_entered.set()
+            time.sleep(0.05)
+        orig_atomic_write(target, content)
+
+    monkeypatch.setattr(memory_mod, "_atomic_write", delayed_atomic_write)
+
+    errors: list[BaseException] = []
+
+    # 在子线程写入第一条事实
+    def write_first() -> None:
+        try:
+            race_mem.remember_user_statement("并发第一条关键事实", message_id=1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    # 等待第一条进入写窗口后再并发写入第二条事实
+    def write_second() -> None:
+        try:
+            assert first_entered.wait(timeout=2.0)
+            race_mem.remember_user_statement("并发第二条关键事实", message_id=2)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=write_first)
+    t2 = threading.Thread(target=write_second)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    assert not errors
+    facts_content = race_mem.facts_file.read_text(encoding="utf-8")
+    assert "并发第一条关键事实" in facts_content
+    assert "并发第二条关键事实" in facts_content
+
+    monkeypatch.setattr(memory_mod, "_atomic_write", orig_atomic_write)
+
+    # 2. 高并发多线程压测：混合写入 facts.md / 主题文件 / rules / audit.jsonl，校验零丢行且 JSONL 全部合法
+    stress_mem = MemoryStore(tmp_path / "stress_data")
+    barrier = threading.Barrier(8)
+    stress_errors: list[BaseException] = []
+
+    # 并发写入事实备忘
+    def facts_worker(worker_id: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for idx in range(15):
+                stress_mem.remember_user_statement(
+                    f"线程{worker_id}事实{idx}", message_id=worker_id * 100 + idx
+                )
+        except BaseException as exc:  # noqa: BLE001
+            stress_errors.append(exc)
+
+    # 并发读写改写同一主题 Markdown 与 MEMORY.md 索引
+    def topic_worker(worker_id: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for idx in range(15):
+                stress_mem.apply_memory_operations(
+                    "concurrent_topic",
+                    "并发主题",
+                    "并发测试主题索引",
+                    [{"op": "add", "text": f"主题记录-{worker_id}-{idx}"}],
+                    today=date(2026, 11, 26),
+                )
+        except BaseException as exc:  # noqa: BLE001
+            stress_errors.append(exc)
+
+    # 并发落盘规则文件
+    def rule_worker(worker_id: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for idx in range(10):
+                stress_mem.save_rule(f"并发规则-{worker_id}-{idx}", source="agent")
+        except BaseException as exc:  # noqa: BLE001
+            stress_errors.append(exc)
+
+    # 并发追加审计日志
+    def audit_worker(worker_id: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for idx in range(20):
+                stress_mem.record_audit(
+                    action="custom_audit",
+                    actor=f"w{worker_id}",
+                    target="data/memory/facts.md",
+                    old_value=None,
+                    new_value=f"item-{worker_id}-{idx}",
+                )
+        except BaseException as exc:  # noqa: BLE001
+            stress_errors.append(exc)
+
+    threads = [
+        threading.Thread(target=facts_worker, args=(0,)),
+        threading.Thread(target=facts_worker, args=(1,)),
+        threading.Thread(target=topic_worker, args=(2,)),
+        threading.Thread(target=topic_worker, args=(3,)),
+        threading.Thread(target=rule_worker, args=(4,)),
+        threading.Thread(target=rule_worker, args=(5,)),
+        threading.Thread(target=audit_worker, args=(6,)),
+        threading.Thread(target=audit_worker, args=(7,)),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=15.0)
+
+    assert not stress_errors
+    all_facts = stress_mem.facts_file.read_text(encoding="utf-8")
+    for w in (0, 1):
+        for idx in range(15):
+            assert f"线程{w}事实{idx}" in all_facts
+
+    topic_body = (stress_mem.memory_dir / "concurrent_topic.md").read_text(encoding="utf-8")
+    for w in (2, 3):
+        for idx in range(15):
+            assert f"主题记录-{w}-{idx}" in topic_body
+
+    index_body = stress_mem.memory_file.read_text(encoding="utf-8")
+    assert index_body.count("data/memory/facts.md") == 1
+    assert index_body.count("data/memory/concurrent_topic.md") == 1
+    assert len(list(stress_mem.rules_dir.glob("*.md"))) == 20
+
+    raw_audit_lines = [
+        ln for ln in stress_mem.audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert len(raw_audit_lines) == 30 + 30 + 20 + 40
+    parsed_entries = [json.loads(ln) for ln in raw_audit_lines]
+    assert len(parsed_entries) == 120
