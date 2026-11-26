@@ -796,3 +796,23 @@
   - 单元测试 (`uv run pytest -v`)：**156 passed → 162 passed**（`personal_assistant/` `0` 行改动，含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：合入 Issue `#63`（流式思维链 `ThinkingDelta`/`ToolStart` 教学视图、前后台双模型 `consolidator` 分槽与 `get_current_time` 逻辑日期对齐）及 Issue `#65`（文档全景升级），并执行同口径实模回归验收。
+
+
+---
+
+### [2026-11-26] 贯通流式思维链 `ThinkingDelta` / `ToolStart` 教学视图、前后台双模型分槽与 `get_current_time` 逻辑时钟对齐（Issue `#63`）
+- **背景与目标**：
+  1. **流式教学推导可见性**：将 Issue `#54` 在 Layer 1/2 产出的 `ThinkingDelta` 与 `ToolStart` 事件贯通至 Layer 3 `AssistantApp._run_stream_turn`、终端 `cli.py` 与网页端 `scripts/web_ui.html`，让学习者在推导数学、算法或源码问题时实时查看可折叠的「💭 推导思路」与慢工具启动指示，同时保持 `StateStore` 持久化对话历史纯净（绝不混入思维链）。
+  2. **前后台双模型性价比分槽**：针对 `deepseek-reasoner` 在 LongMemEval 取得 `97.14%` 但后台 JSON 沉淀消耗约 `4.2×` 输出 Token 的实测结论，支持独立配置后台沉淀专用模型槽位 `consolidator`（未配置时 100% 原样共享主对话模型）。
+  3. **逻辑时钟对齐闭环**：修复 `7e64db0` 实模评测在 `relative-date-resolution` 中暴露的 `get_current_time()` 忽略 `AssistantApp(today_fn=...)` 逻辑日期问题。
+- **改动文件（初版 `36ccb22` → 二审收敛 `3f1b2fc`）**：
+  - [personal_assistant/ai/types.py](personal_assistant/ai/types.py)、[plugins/models_dsl.py](plugins/models_dsl.py)、[config/models.example.dsl](config/models.example.dsl)：`ModelsConfig` 新增可选 `consolidator` 槽位与脱敏展示；`models_dsl` 支持顶层 `consolidator <模型名或预设别名>` 指令及精确行列报错。
+  - [personal_assistant/assistant/commands.py](personal_assistant/assistant/commands.py)、[personal_assistant/assistant/app.py](personal_assistant/assistant/app.py)、[personal_assistant/assistant/cli.py](personal_assistant/assistant/cli.py)、[scripts/web_chat.py](scripts/web_chat.py)、[scripts/web_ui.html](scripts/web_ui.html)：`ToolsConfig.build_consolidator_llm()` 按五级优先级装配；`reload_llm()` 先校验构造再原子提交，`configure_model()` 重写单模型时自动清空残留覆盖，且显式注入 Mock `llm` 时严格隔离宿主配置；`_run_stream_turn` 透传 `thinking_delta` 与 `tool_start`；`cli.py` 三态打印并在工具步重置流式标记防吞行；`web_ui.html` 新增 XSS 安全 `details.thinking` 自动折叠面板、跨步分段与 `tool_start -> tool_step` 就地状态升级。
+  - [plugins/tools/custom_tools.py](plugins/tools/custom_tools.py)：`AssistantApp.build_tools` 向 `extra_bindings` 注入 `"today": self._today()`，`get_current_time(*, today=None)` 自动对齐逻辑日期并保持对 LLM 零参数无感。
+  - [tests/test_streaming.py](tests/test_streaming.py)、[tests/test_models_dsl.py](tests/test_models_dsl.py)、[tests/test_web_chat.py](tests/test_web_chat.py)、[tests/test_step4_app.py](tests/test_step4_app.py)：新增全链路流式推导/XSS 防护、双模型原子热重载与 Mock 隔离、逻辑时钟对齐单测。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`36ccb22`）→ `Request Changes`**（检出 `configure_model` 残留旧槽位与非原子 `reload_llm`、Mock `llm` 穿透读宿主配置、`cli.py` 多步工具后未重置 `streamed_text` 共 3 项 Blocker 与 2 项跨步分段 Nit）；
+  - **Round 2（`3f1b2fc`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径确定性验证对比（改前 `main` `f23e288` → 改后 `3f1b2fc`）**：
+  - 单元测试 (`uv run pytest -v`)：**162 passed → 167 passed**（含三层依赖守卫与 Node.js 前端流式/XSS 单测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。

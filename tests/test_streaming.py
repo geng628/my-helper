@@ -300,9 +300,28 @@ def test_telemetry_and_app_handle_thinking_delta_and_tool_start(tmp_path: Path) 
 
     assert any(isinstance(ev, ThinkingDelta) for ev in seen_events)
     assert any(isinstance(ev, ToolStart) and ev.tool == "get_current_time" and ev.call_id == "tc_1" for ev in seen_events)
-    assert [f["type"] for f in frames] == ["tool_step", "text_delta", "done"]
+    assert [f["type"] for f in frames] == [
+        "thinking_delta",
+        "tool_start",
+        "tool_step",
+        "thinking_delta",
+        "text_delta",
+        "done",
+    ]
+    assert frames[0] == {"type": "thinking_delta", "text": "先看当前时间"}
+    assert frames[1] == {
+        "type": "tool_start",
+        "tool": "get_current_time",
+        "arguments": "{}",
+        "call_id": "tc_1",
+    }
+    assert frames[2]["tool"] == "get_current_time" and frames[2]["call_id"] == "tc_1"
+    assert frames[3] == {"type": "thinking_delta", "text": "整理答复"}
+    assert frames[4] == {"type": "text_delta", "text": "你好！"}
     done_frame = frames[-1]
     assert done_frame["reply"] == "你好！"
+    assert done_frame["thinking"] == "先看当前时间整理答复"
+    assert done_frame["tool_calls"][0]["call_id"] == "tc_1"
     last_turn = done_frame["telemetry"]["telemetry"]["last_turn"]  # type: ignore[index]
     assert last_turn["llm_calls"] == 2
     assert last_turn["tool_calls"] == 1
@@ -402,9 +421,16 @@ def test_web_chat_sse_stream_endpoint_end_to_end(tmp_path: Path) -> None:
         with urlopen(req, timeout=10) as resp:
             assert resp.status == 200 and "text/event-stream" in (resp.headers.get("Content-Type") or "")
             evs = [json.loads(ln.decode("utf-8").strip()[5:].strip()) for ln in resp if ln.decode("utf-8").strip().startswith("data:")]
-        assert [ev["type"] for ev in evs] == ["tool_step", "text_delta", "text_delta", "done"]
-        assert evs[0]["tool"] == "list_files" and float(evs[0]["duration_ms"]) >= 0.0
-        assert [ev["text"] for ev in evs[1:3]] == ["目录", "正常"] and evs[3]["reply"] == "目录正常"
+        assert [ev["type"] for ev in evs] == ["tool_start", "tool_step", "text_delta", "text_delta", "done"]
+        assert evs[0] == {
+            "type": "tool_start",
+            "tool": "list_files",
+            "arguments": '{"root": "data/memory"}',
+            "call_id": "w1",
+        }
+        assert evs[1]["tool"] == "list_files" and evs[1]["call_id"] == "w1" and float(evs[1]["duration_ms"]) >= 0.0
+        assert [ev["text"] for ev in evs[2:4]] == ["目录", "正常"]
+        assert evs[4]["reply"] == "目录正常" and evs[4]["thinking"] == ""
     finally:
         srv.shutdown()
         srv.server_close()
@@ -548,3 +574,149 @@ def test_openai_chat_client_base_and_delta_field_extension() -> None:
     t1.join(timeout=3.0)
     t2.join(timeout=3.0)
     assert results == {"t1": 111, "t2": 222}
+
+
+# 测试终端 _stream_printer 三态切换（idle / thinking / text）、ToolStart 实时提示与无流式文本兜底打印
+def test_cli_stream_printer_three_state_thinking_tool_start_and_fallback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from personal_assistant.assistant.cli import _stream_printer
+
+    # 1. 完整推导 -> 工具开始 -> 工具完成 -> 再推导 -> 正文流式 -> finish
+    on_event, finish = _stream_printer()
+    on_event(ThinkingDelta(text=""))
+    on_event(ThinkingDelta(text="先分析"))
+    on_event(ThinkingDelta(text="条件"))
+    on_event(ToolStart(tool="calc", arguments='{"a":1}', call_id="c1"))
+    on_event(ToolStep(tool="calc", arguments='{"a":1}', observation="2", duration_ms=3.5, call_id="c1"))
+    on_event(ThinkingDelta(text="核对结果"))
+    on_event(TextDelta(text=""))
+    on_event(TextDelta(text="答案"))
+    on_event(TextDelta(text="是 2"))
+    finish("答案是 2")
+    out1 = capsys.readouterr().out
+    assert out1 == (
+        "  [推导] 先分析条件\n"
+        '  [调用] calc({"a":1}) ...\n'
+        '  [Act] calc({"a":1}) (3.5ms)\n'
+        "  [Observe] 2\n"
+        "  [推导] 核对结果\n"
+        "助手> 答案是 2\n"
+    )
+
+    # 2. 仅输出思维链后直接进入 finish（未流式产出 TextDelta）时需先换行再输出兜底答复
+    on_event2, finish2 = _stream_printer()
+    on_event2(ThinkingDelta(text="仅推导"))
+    finish2("兜底答复")
+    assert capsys.readouterr().out == "  [推导] 仅推导\n助手> 兜底答复\n"
+
+    # 3. 无任何流式正文事件时 finish 直接打印完整回复
+    _, finish3 = _stream_printer()
+    finish3("同步答复")
+    assert capsys.readouterr().out == "助手> 同步答复\n"
+
+    # 4. 正文与思维链交替时（text -> thinking -> text）自动补齐换行与前缀
+    on_event4, finish4 = _stream_printer()
+    on_event4(TextDelta(text="前"))
+    on_event4(ThinkingDelta(text="想"))
+    on_event4(TextDelta(text="后"))
+    finish4("前后")
+    assert capsys.readouterr().out == "助手> 前\n  [推导] 想\n助手> 后\n"
+
+    # 5. 过渡正文后调工具再直接走 finish(reply) 时（第二步无 TextDelta），绝不能吞掉最终答复
+    on_event5, finish5 = _stream_printer()
+    on_event5(TextDelta(text="我先查一下"))
+    on_event5(ToolStart(tool="calc", arguments="{}", call_id="c5"))
+    on_event5(ToolStep(tool="calc", arguments="{}", observation="2", duration_ms=1.0, call_id="c5"))
+    finish5("最终答复")
+    assert capsys.readouterr().out == (
+        "助手> 我先查一下\n"
+        "  [调用] calc({}) ...\n"
+        "  [Act] calc({}) (1.0ms)\n"
+        "  [Observe] 2\n"
+        "助手> 最终答复\n"
+    )
+
+
+# 测试 AssistantApp.build_tools 将逻辑日期 today 注入 tool_ctx，按签名自动绑定插件且不影响未声明插件
+def test_assistant_app_build_tools_injects_logical_today_into_plugins(tmp_path: Path) -> None:
+    from datetime import date
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "clock_probe.py").write_text(
+        """
+from datetime import date
+from personal_assistant.agent.tools import tool
+
+
+# 声明 today 逻辑时钟参数的测试工具
+@tool(description="返回主题与注入逻辑日期", parameters={"topic": "主题"})
+def peek_logical_today(topic: str, *, today: date | None = None) -> str:
+    return f"{topic}@{today.isoformat() if today is not None else 'none'}"
+
+
+# 未声明 today 参数的常规工具（绝不应因注入而报错）
+@tool(description="原样回显文本", parameters={"text": "文本"})
+def plain_echo(text: str) -> str:
+    return text
+""",
+        encoding="utf-8",
+    )
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    tools_json = cfg_dir / "tools.json"
+    tools_json.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["peek_logical_today", "plain_echo"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    current_day = date(2026, 5, 1)
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=tools_json,
+        project_root=tmp_path,
+        llm=NoopLLMClient(),
+        today_fn=lambda: current_day,
+    )
+    try:
+        reg1 = app.build_tools()
+        assert reg1.execute("peek_logical_today", '{"topic": "math"}') == "math@2026-05-01"
+        assert reg1.execute("plain_echo", '{"text": "ok"}') == "ok"
+
+        current_day = date(2026, 5, 2)
+        reg2 = app.build_tools()
+        assert reg2.execute("peek_logical_today", '{"topic": "math"}') == "math@2026-05-02"
+    finally:
+        app.close()
+
+    # 验证真实插件 get_current_time 在注入 today_fn 时自动对齐逻辑日期且保持对模型零参数
+    repo_root = Path(__file__).resolve().parent.parent
+    real_app = AssistantApp(
+        data_root=tmp_path / "real_data",
+        config_path=repo_root / "config" / "tools.json",
+        project_root=repo_root,
+        llm=NoopLLMClient(),
+        today_fn=lambda: date(2026, 11, 16),
+    )
+    try:
+        real_reg = real_app.build_tools()
+        time_res = real_reg.execute("get_current_time", "{}")
+        assert time_res.startswith("2026-11-16 ") and "(Asia/Shanghai)" in time_res
+        time_schema = next(d for d in real_reg.definitions() if d["function"]["name"] == "get_current_time")
+        assert time_schema["function"]["parameters"]["properties"] == {}
+    finally:
+        real_app.close()
+
+    # 兼容直接传入 str ISO 日期及非法字符串回退宿主当天
+    from plugins.tools.custom_tools import get_current_time
+
+    assert get_current_time(today="2026-11-16").startswith("2026-11-16 ")
+    assert "(Asia/Shanghai)" in get_current_time(today="not-a-date")

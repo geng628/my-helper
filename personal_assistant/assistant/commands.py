@@ -487,6 +487,29 @@ class ToolsConfig:
             merged["LLM_MODEL"] = clean_name
         return from_env(merged)
 
+    # 按「显式参数 > models.dsl/json 的 consolidator 槽位 > 纯环境变量模式下 LLM_CONSOLIDATOR_MODEL > 复用 fallback_llm」构造后台沉淀模型
+    def build_consolidator_llm(
+        self,
+        config_dir: Path,
+        *,
+        fallback_llm: LLMClient,
+        model_name: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> LLMClient:
+        clean_name = (model_name or "").strip() or None
+        source_env = os.environ if env is None else env
+        if clean_name is not None:
+            return self.build_llm(config_dir, model_name=clean_name, env=source_env)
+        models_cfg = self.load_models_config(config_dir)
+        if models_cfg is not None:
+            if models_cfg.consolidator:
+                return from_model_profile(models_cfg.get_profile(models_cfg.consolidator), env=source_env)
+            return fallback_llm
+        env_val = str(source_env.get("LLM_CONSOLIDATOR_MODEL") or "").strip()
+        if env_val:
+            return self.build_llm(config_dir, model_name=env_val, env=source_env)
+        return fallback_llm
+
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
     def build_retriever(self, override_name: str | None = None) -> object | None:
         raw_name = override_name if override_name is not None else self.retrieval.get("plugin")

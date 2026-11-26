@@ -338,3 +338,320 @@ def test_cli_setup_wizard_generates_config_for_non_programmers(tmp_path: Path) -
     assert (cfg_dir / "models.json").is_file()
     # 输出文案绝不回显明文密钥
     assert "sk-wizard-key-999" not in "\n".join(messages)
+
+
+# 测试 ModelsConfig 与 models_dsl 编译/渲染对 consolidator 双模型分槽与别名解析的支持
+def test_models_config_and_dsl_support_consolidator_slot() -> None:
+    compiler = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers["models_dsl"]
+
+    # 1. DSL 顶层 consolidator 支持预设别名（如 ds -> deepseek）与显式 default 别名解析
+    dsl = """
+    use reasoner sk-r1-secret
+    add deepseek sk-ds-secret
+    consolidator ds
+    """
+    compiled = compiler.compile(dsl, "dual.dsl")
+    assert compiled["default"] == "deepseek_reasoner"
+    assert compiled["consolidator"] == "deepseek"
+
+    cfg = ModelsConfig.from_dict(compiled)
+    assert cfg.consolidator == "deepseek"
+    redacted = cfg.redacted_dict()
+    assert redacted["consolidator"] == "deepseek"
+    assert "sk-r1-secret" not in json.dumps(redacted, ensure_ascii=False)
+    assert "sk-ds-secret" not in json.dumps(redacted, ensure_ascii=False)
+
+    # 显式 default + add 别名匹配
+    compiled_alias_def = compiler.compile(
+        "default reasoner\nconsolidator ds\nadd reasoner sk-r1\nadd deepseek sk-ds\n",
+        "alias.dsl",
+    )
+    assert compiled_alias_def["default"] == "deepseek_reasoner"
+    assert compiled_alias_def["consolidator"] == "deepseek"
+
+    # 未配置 consolidator 时 ModelsConfig.consolidator 为 None 且不破坏既有脱敏结构
+    single_cfg = ModelsConfig.from_dict(compiler.compile("use deepseek sk-only", "single.dsl"))
+    assert single_cfg.consolidator is None
+    assert "consolidator" not in single_cfg.redacted_dict()
+
+    # 2. 非法校验：ModelsConfig 悬空 consolidator、DSL 重复声明/悬空 consolidator 报精确错
+    with pytest.raises(ValueError, match="ghost"):
+        ModelsConfig.from_dict(
+            {
+                "default": "a",
+                "consolidator": "ghost",
+                "models": {"a": {"base_url": "https://x.com/v1", "model": "m", "api_key": "sk-1"}},
+            }
+        )
+    with pytest.raises(ValueError, match="重复"):
+        compiler.compile("use deepseek sk-1\nconsolidator deepseek\nconsolidator deepseek\n", "dup.dsl")
+    with pytest.raises(ValueError, match="第 2 行"):
+        compiler.compile("use deepseek sk-1\nconsolidator missing_slot\n", "dangling.dsl")
+
+    # 3. render_models_dsl / compiler.render 支持可选 consolidator 并防注入校验
+    rendered = compiler.render(preset="deepseek", api_key="sk-render", consolidator="deepseek")
+    assert "consolidator deepseek" in rendered
+    assert compiler.compile(rendered, "rendered.dsl")["consolidator"] == "deepseek"
+
+    rendered_custom = compiler.render(
+        preset="custom",
+        name="r1",
+        base_url="https://api.example.com/v1",
+        model="r1-model",
+        api_key="sk-c",
+        consolidator="r1",
+    )
+    assert "consolidator r1" in rendered_custom
+    assert compiler.compile(rendered_custom, "rendered_custom.dsl")["consolidator"] == "r1"
+
+    with pytest.raises(ValueError, match="模型名称"):
+        compiler.render(preset="deepseek", api_key="sk-1", consolidator="bad\nuse ollama")
+
+    # 4. 示例配置文件包含推荐双模型分槽注释
+    example_text = (REPO_ROOT / "config" / "models.example.dsl").read_text(encoding="utf-8")
+    assert "use reasoner" in example_text
+    assert "consolidator deepseek" in example_text
+
+
+# 测试 ToolsConfig.build_consolidator_llm、AssistantApp 热重载与 CLI/Web --consolidator-model 优先级全链路
+def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from personal_assistant.assistant import cli as cli_mod
+    from personal_assistant.assistant.app import AssistantApp
+    from scripts import web_chat as web_mod
+
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_CONSOLIDATOR_MODEL", raising=False)
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    tools_json = cfg_dir / "tools.json"
+    tools_json.write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["list_files"],
+                "plugins": ["plugins"],
+                "files": {"read_roots": ["data/memory"], "write_root": "data/workspace"},
+                "commands": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    dsl_path = cfg_dir / "models.dsl"
+    dsl_path.write_text(
+        "use deepseek sk-main-1\n",
+        encoding="utf-8",
+    )
+
+    tcfg = ToolsConfig.load(tools_json, project_root=REPO_ROOT)
+
+    # 1. 未配置任何双模型槽位或环境变量时，必须原样复用主模型实例（app.consolidator.llm is app.llm）
+    app_single = build_app(data_root=tmp_path / "d1", config_root=cfg_dir, project_root=REPO_ROOT)
+    try:
+        assert app_single.consolidator.llm is app_single.llm
+        fallback = app_single.llm
+        assert tcfg.build_consolidator_llm(cfg_dir, fallback_llm=fallback) is fallback
+    finally:
+        app_single.close()
+
+    # 2. 存在单模型 models.dsl（未配置 consolidator）时，绝不被残留环境变量 LLM_CONSOLIDATOR_MODEL 炸崩
+    dsl_path.write_text(
+        "use reasoner sk-r1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "nonexistent_env_slot")
+    app_isolated = build_app(data_root=tmp_path / "d2a", config_root=cfg_dir, project_root=REPO_ROOT)
+    try:
+        assert type(app_isolated.llm).__name__ == "OpenAIReasoningLLM"
+        assert app_isolated.consolidator.llm is app_isolated.llm
+    finally:
+        app_isolated.close()
+
+    # 无 models.dsl / models.json 的纯环境变量模式下，LLM_CONSOLIDATOR_MODEL 正常生效
+    env_only_cfg_dir = tmp_path / "env_only_config"
+    env_only_cfg_dir.mkdir()
+    (env_only_cfg_dir / "tools.json").write_text(tools_json.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("LLM_MODE", "on")
+    monkeypatch.setenv("LLM_API_KEY", "sk-env-shared")
+    monkeypatch.setenv("LLM_PROVIDER", "openai_reasoning")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-reasoner")
+    monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "qwen")
+    app_env = build_app(data_root=tmp_path / "d2b", config_root=env_only_cfg_dir, project_root=REPO_ROOT)
+    try:
+        assert type(app_env.llm).__name__ == "OpenAIReasoningLLM"
+        assert isinstance(app_env.consolidator.llm, OpenAICompatibleLLM)
+        assert app_env.consolidator.llm.model == "qwen-plus"
+    finally:
+        app_env.close()
+    monkeypatch.delenv("LLM_MODE", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_CONSOLIDATOR_MODEL", raising=False)
+
+    # 3. models.dsl 显式声明 consolidator 优先级高于环境变量 LLM_CONSOLIDATOR_MODEL
+    dsl_path.write_text(
+        "use reasoner sk-r1\n"
+        "add deepseek sk-ds\n"
+        "add qwen sk-qwen\n"
+        "consolidator deepseek\n",
+        encoding="utf-8",
+    )
+    app_dsl = build_app(data_root=tmp_path / "d3", config_root=cfg_dir, project_root=REPO_ROOT)
+    try:
+        assert app_dsl.llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
+        assert app_dsl.consolidator.llm is not app_dsl.llm
+        assert isinstance(app_dsl.consolidator.llm, OpenAICompatibleLLM)
+        assert app_dsl.consolidator.llm.model == "deepseek-chat"
+
+        # 4. reload_llm 热重载时同步刷新主模型与后台沉淀模型，且失败时保持原运行实例零污染
+        dsl_path.write_text(
+            "use reasoner sk-r1\n"
+            "add deepseek sk-ds\n"
+            "add qwen sk-qwen\n"
+            "consolidator qwen\n",
+            encoding="utf-8",
+        )
+        app_dsl.reload_llm()
+        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+
+        prev_llm = app_dsl.llm
+        prev_cons_llm = app_dsl.consolidator.llm
+        with pytest.raises(ValueError, match="missing_bad_cons"):
+            app_dsl.reload_llm(model_name="deepseek", consolidator_model="missing_bad_cons")
+        assert app_dsl.llm is prev_llm
+        assert app_dsl.consolidator.llm is prev_cons_llm
+        assert app_dsl._consolidator_model is None
+
+        app_dsl.reload_llm(model_name="deepseek", consolidator_model="qwen")
+        assert app_dsl.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
+        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+
+        # reload_llm(consolidator_model="") 可清空显式覆盖；configure_model() 切单模型时同样必须清空残留槽位
+        app_dsl.reload_llm(consolidator_model="")
+        assert app_dsl._consolidator_model is None
+        app_dsl.reload_llm(consolidator_model="qwen")
+        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+        app_dsl.configure_model(preset="deepseek", api_key="sk-single-reset")
+        assert app_dsl._consolidator_model is None
+        assert app_dsl.consolidator.llm is app_dsl.llm
+    finally:
+        app_dsl.close()
+
+    # 恢复 dsl_path 为双模型，继续测试显式参数覆盖与 Mock llm= 隔离
+    dsl_path.write_text(
+        "use reasoner sk-r1\n"
+        "add deepseek sk-ds\n"
+        "add qwen sk-qwen\n"
+        "consolidator qwen\n",
+        encoding="utf-8",
+    )
+
+    # 5. 显式传入 consolidator_model 参数优先级最高（高于 models.dsl 与环境变量）
+    app_override = build_app(
+        data_root=tmp_path / "d4",
+        config_root=cfg_dir,
+        project_root=REPO_ROOT,
+        consolidator_model="deepseek",
+    )
+    try:
+        assert app_override.consolidator.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
+    finally:
+        app_override.close()
+
+    # 6. 显式注入 llm= Mock（且未传 consolidator_model）时，绝不穿透读取宿主 models.dsl 或 LLM_CONSOLIDATOR_MODEL
+    # 占位测试模型，验证热重载与 Mock 隔离
+    class _FixedLLM(LLMClient):
+        # 返回固定应答
+        def respond(self, messages, tools=None):
+            return {"role": "assistant", "content": "fixed"}
+
+    fixed_main = _FixedLLM()
+    monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "deepseek")
+    app_mock_iso = AssistantApp(
+        data_root=tmp_path / "d5a",
+        config_path=tools_json,
+        project_root=REPO_ROOT,
+        llm=fixed_main,
+    )
+    try:
+        assert app_mock_iso.llm is fixed_main
+        assert app_mock_iso.consolidator.llm is fixed_main
+    finally:
+        app_mock_iso.close()
+    monkeypatch.delenv("LLM_CONSOLIDATOR_MODEL", raising=False)
+
+    # 显式注入 consolidator_llm 对象时，reload_llm 绝不覆写自定义沉淀模型
+    fixed_cons = _FixedLLM()
+    app_fixed = AssistantApp(
+        data_root=tmp_path / "d5b",
+        config_path=tools_json,
+        project_root=REPO_ROOT,
+        consolidator_llm=fixed_cons,
+    )
+    try:
+        app_fixed.reload_llm()
+        assert app_fixed.consolidator.llm is fixed_cons
+    finally:
+        app_fixed.close()
+
+    # 7. 无 tools_config 时仍支持通过 LLM_CONSOLIDATOR_MODEL 环境变量装配后台沉淀模型
+    monkeypatch.setenv("LLM_MODE", "on")
+    monkeypatch.setenv("LLM_API_KEY", "sk-env-only")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-reasoner")
+    monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "deepseek-chat")
+    app_no_cfg = AssistantApp(data_root=tmp_path / "d6")
+    try:
+        assert app_no_cfg.llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
+        assert app_no_cfg.consolidator.llm is not app_no_cfg.llm
+        assert app_no_cfg.consolidator.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
+    finally:
+        app_no_cfg.close()
+
+    # 8. CLI 与 Web 入口 --consolidator-model 参数正确透传给 build_app
+    captured_cli: dict[str, object] = {}
+
+    # 捕获 CLI 调用 build_app 的参数
+    def fake_cli_build_app(**kwargs):
+        captured_cli.update(kwargs)
+        return app_override
+
+    monkeypatch.setattr(cli_mod, "build_app", fake_cli_build_app)
+    monkeypatch.setattr(cli_mod, "run_repl", lambda _app: None)
+    cli_mod.main(["--config", str(cfg_dir), "--model", "reasoner", "--consolidator-model", "deepseek", "chat"])
+    assert captured_cli["model_name"] == "reasoner"
+    assert captured_cli["consolidator_model"] == "deepseek"
+
+    captured_web: dict[str, object] = {}
+
+    # 构造空转 Web 服务桩，避免真实阻塞监听
+    class _DummyServer:
+        server_port = 8765
+
+        # 空转退出
+        def serve_forever(self):
+            return None
+
+        # 空关闭
+        def server_close(self):
+            return None
+
+    # 捕获 Web 启动调用 build_app 的参数
+    def fake_web_build_app(**kwargs):
+        captured_web.update(kwargs)
+
+        # 仅含 close 空方法的轻量应用替身
+        class _DummyApp:
+            # 清理占位
+            def close(self):
+                return None
+
+        return _DummyApp()
+
+    monkeypatch.setattr(web_mod, "build_app", fake_web_build_app)
+    monkeypatch.setattr(web_mod, "create_web_server", lambda _app, host="127.0.0.1", port=8765: _DummyServer())
+    web_mod.main(["--model", "reasoner", "--consolidator-model", "qwen"])
+    assert captured_web["model_name"] == "reasoner"
+    assert captured_web["consolidator_model"] == "qwen"

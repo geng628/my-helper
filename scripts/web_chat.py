@@ -338,10 +338,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     parser.add_argument("--model", default=None, help="指定 config/models.dsl 或 models.json 中的模型名称")
+    parser.add_argument("--consolidator-model", default=None, help="指定后台记忆沉淀专用模型名称")
     parser.add_argument("--open", action="store_true", help="启动后自动打开系统默认浏览器")
     args = parser.parse_args(argv)
 
-    app = build_app(model_name=args.model)
+    app = build_app(model_name=args.model, consolidator_model=args.consolidator_model)
     server = create_web_server(app, host=args.host, port=args.port)
     clean_host, is_ipv6 = _parse_bind_host(args.host)
     url_host = f"[{clean_host}]" if is_ipv6 else (clean_host or args.host)
