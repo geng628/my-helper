@@ -71,6 +71,7 @@ def test_shell_plugin_blocks_disallowed_executables_and_shell_metachars(tmp_path
     for cmd in disallowed:
         out = execute_safe_command(cmd, policy)
         assert out.startswith("错误："), f"应被拦截但未拦截：{cmd!r} -> {out!r}"
+        assert "找不到可执行程序" not in out
 
 
 # 测试拦截敏感路径（含软链接逃逸与绝对路径）、目录穿越以及 git/find 危险子命令或参数
@@ -109,6 +110,7 @@ def test_shell_plugin_blocks_sensitive_paths_traversal_and_dangerous_flags(tmp_p
     for cmd in blocked_cases:
         out = execute_safe_command(cmd, policy)
         assert out.startswith("错误："), f"应被拦截但未拦截：{cmd!r} -> {out!r}"
+        assert "找不到可执行程序" not in out, f"不能因缺少命令假绿：{cmd!r} -> {out!r}"
         assert "SECRET=123" not in out
 
     # grep 递归搜索当前目录时自动排除 .env，绝不泄漏密钥但可搜到正常文件
@@ -244,21 +246,30 @@ def test_shell_plugin_finds_pytest_inside_symlinked_venv(
         allowed_executables=("pytest",),
         offload_dir=tmp_path / "workspace" / "tool_outputs",
     )
+    # 缺少真实 tests/ 目录时，除 --version/-V 外任何 pytest 调用都必须被拦截
+    no_tests_out = execute_safe_command("pytest", policy)
+    assert no_tests_out.startswith("错误：")
+    assert "找不到可执行程序" not in no_tests_out
+
+    (tmp_path / "tests").mkdir()
     with monkeypatch.context() as mp:
         mp.setattr(sys, "executable", str(fake_python))
         out_fake = execute_safe_command("pytest", policy)
     assert "退出码：0" in out_fake
     assert "fake-venv-pytest-ok" in out_fake
 
-    # 2. 真实当前 .venv 环境下也能直接定位并运行 pytest --version
-    out_real = execute_safe_command("pytest --version", policy)
-    assert "退出码：0" in out_real
-    assert "pytest" in out_real.lower()
+    # 2. 真实当前 .venv 环境下也能直接定位并运行 pytest --version / -V
+    for ver_cmd in ("pytest --version", "pytest -V"):
+        out_real = execute_safe_command(ver_cmd, policy)
+        assert "退出码：0" in out_real
+        assert "pytest" in out_real.lower()
 
 
 # 测试 run_command 执行使用 tmp_path 的 pytest 时，TMPDIR 不会指向工作区根目录、不遗留 pytest-of-* 脏目录
 def test_shell_plugin_pytest_tmpdir_does_not_pollute_cwd(tmp_path: Path) -> None:
-    sub_test = tmp_path / "test_mini_tmp.py"
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    sub_test = tests_dir / "test_mini_tmp.py"
     sub_test.write_text(
         "def test_uses_tmp_path(tmp_path):\n"
         "    p = tmp_path / 'a.txt'\n"
@@ -272,7 +283,283 @@ def test_shell_plugin_pytest_tmpdir_does_not_pollute_cwd(tmp_path: Path) -> None
         allowed_executables=("pytest",),
         offload_dir=tmp_path / "workspace" / "tool_outputs",
     )
-    out = execute_safe_command("pytest -q test_mini_tmp.py", policy)
+    out = execute_safe_command("pytest -q tests/test_mini_tmp.py", policy)
     assert "退出码：0" in out
     leftover = [p.name for p in tmp_path.iterdir() if p.name.startswith("pytest-of-")]
     assert leftover == [], f"pytest 临时目录污染了工作区 cwd：{leftover}"
+
+
+# 测试阻断 write_file + pytest 两步 RCE 链：限制 pytest 目标位于 tests/、注入 --ignore=data/offload 并拦截高危参数
+def test_shell_plugin_blocks_pytest_rce_chain_and_dangerous_flags(tmp_path: Path) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_ok.py").write_text(
+        "def test_pass():\n"
+        "    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    workspace_dir = tmp_path / "data" / "workspace"
+    workspace_dir.mkdir(parents=True)
+    custom_workspace = tmp_path / "workspace"
+    custom_workspace.mkdir(parents=True)
+    pwn_marker = tmp_path / "pwned.txt"
+    for target_dir in (workspace_dir, custom_workspace):
+        (target_dir / "test_poc.py").write_text(
+            f"from pathlib import Path\n"
+            f"Path({str(pwn_marker)!r}).write_text('pwned', encoding='utf-8')\n"
+            f"def test_evil():\n"
+            f"    assert True\n",
+            encoding="utf-8",
+        )
+        (target_dir / "conftest.py").write_text(
+            f"from pathlib import Path\n"
+            f"Path({str(pwn_marker)!r}).write_text('conftest_pwned', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    (tmp_path / "other_test.py").write_text("def test_other(): assert True\n", encoding="utf-8")
+
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("pytest",),
+        offload_dir=custom_workspace / "tool_outputs",
+    )
+
+    blocked_cmds = [
+        "pytest data/workspace/test_poc.py",
+        "pytest data/workspace/test_poc.py::test_evil",
+        "pytest ./data/workspace/test_poc.py",
+        "pytest tests/../data/workspace/test_poc.py",
+        "pytest workspace/test_poc.py",
+        "pytest other_test.py",
+        "pytest .",
+        "pytest -p my_plugin",
+        "pytest -pno:cacheprovider",
+        "pytest -vp evil",
+        "pytest -o cache_dir=data/workspace",
+        "pytest -ocache_dir=data/workspace",
+        "pytest --override-ini=python_files=*.py",
+        "pytest -c data/workspace/evil.ini",
+        "pytest -cevil.ini",
+        "pytest --config-file=evil.ini",
+        "pytest --rootdir=data/workspace",
+        "pytest --rootdir data/workspace",
+        "pytest --confcutdir=data/workspace",
+        "pytest --import-mode=importlib",
+        "pytest --basetemp=data/workspace/bt",
+        "pytest --noconftest",
+        "pytest --pyargs os",
+        "pytest --fixtures",
+        "pytest --funcargs",
+        "pytest --markers",
+        "pytest --help",
+        "pytest -h",
+        "pytest -r a",
+        "pytest -V tests/",
+        "pytest -- data/workspace/test_poc.py",
+    ]
+    for cmd in blocked_cmds:
+        out = execute_safe_command(cmd, policy)
+        assert out.startswith("错误："), f"应拦截高危 pytest 命令：{cmd!r} -> {out!r}"
+        assert "找不到可执行程序" not in out
+    assert not pwn_marker.exists()
+
+    # 无参 pytest 自动注入 --ignore=data、--ignore=workspace 并收敛到 tests/
+    bare_out = execute_safe_command("pytest -q", policy)
+    assert "退出码：0" in bare_out
+    assert "1 passed" in bare_out
+    assert not pwn_marker.exists()
+
+    # 合法只读参数与 tests/ 内 ::nodeid 路径正常放行
+    node_out = execute_safe_command("pytest -q tests/test_ok.py::test_pass", policy)
+    assert "退出码：0" in node_out
+    assert "1 passed" in node_out
+
+    opts_out = execute_safe_command(
+        "pytest -vl -k 'test_pass' -s --ff --verbose --quiet --co --no-summary --disable-warnings --tb=short --maxfail=1 --durations=5 tests/",
+        policy,
+    )
+    assert "退出码：0" in opts_out
+
+    # 缺失 tests/ 或 tests 为软链时，除 --version/-V 外一律拒绝
+    no_tests_root = tmp_path / "no_tests"
+    no_tests_root.mkdir()
+    (no_tests_root / "test_leak.py").write_text("def test_x(): assert True\n", encoding="utf-8")
+    no_tests_policy = ShellPolicy(project_root=no_tests_root, cwd=no_tests_root, allowed_executables=("pytest",))
+    assert execute_safe_command("pytest", no_tests_policy).startswith("错误：")
+    assert "退出码：0" in execute_safe_command("pytest --version", no_tests_policy)
+
+    sym_root = tmp_path / "sym_tests_root"
+    sym_root.mkdir()
+    (sym_root / "data").mkdir()
+    os.symlink(sym_root / "data", sym_root / "tests")
+    sym_policy = ShellPolicy(project_root=sym_root, cwd=sym_root, allowed_executables=("pytest",))
+    assert execute_safe_command("pytest -q", sym_policy).startswith("错误：")
+
+
+# 测试阻断短选项连写、git 全局选项走私与 pathspec 绕过、grep --include/-R、大小写绕过、rg glob 与正则模式不误伤
+def test_shell_plugin_blocks_attached_short_flags_git_colon_refs_and_env_variants(
+    tmp_path: Path,
+) -> None:
+    from plugins.tools.shell_tools import _augment_safe_argv
+
+    (tmp_path / ".env").write_text("SECRET=root_secret\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("SECRET=local_secret\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("SECRET=prod_secret\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("EXAMPLE_KEY=demo_value\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n\tbare = false\n", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "models.json").write_text('{"api_key":"json_secret"}\n', encoding="utf-8")
+    (tmp_path / "config" / "models.dsl").write_text("api_key dsl_secret\n", encoding="utf-8")
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    (tmp_path / "data" / "state" / "db.txt").write_text("STATE_SECRET\n", encoding="utf-8")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "id_rsa").write_text("SSH_SECRET\n", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("endpoint /api/chat and ../AGENTS.md\n", encoding="utf-8")
+    (tmp_path / "ok.py").write_text("SECRET = 'safe_code'\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("hello .env world\n", encoding="utf-8")
+    os.symlink(tmp_path / ".env.local", tmp_path / "sneaky_local.txt")
+
+    policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("cat", "ls", "grep", "rg", "git", "date"),
+    )
+
+    blocked_cmds = [
+        "git -C/tmp status",
+        "git -C /tmp status",
+        "git -Cstate status",
+        "git -c core.sshCommand=id status",
+        "git -ccore.sshCommand=id status",
+        "git --namespace status config core.fsmonitor evil",
+        "git --git-dir=.git status",
+        "git diff --no-index .env README.md",
+        "git diff --ext-diff",
+        "git show --textconv HEAD:README.md",
+        "git log -p ':(glob).env'",
+        "git log -p '.g*/config'",
+        "git diff HEAD -- 'data/s*/db.txt'",
+        "git diff HEAD -- ':^*.env'",
+        "git diff HEAD -- ':!README.md'",
+        "git diff HEAD -- '.e*'",
+        "git diff HEAD -- '*env*'",
+        "git diff HEAD -- '.[e]nv'",
+        "git show HEAD:.env",
+        "git show HEAD:.env.local",
+        "git show :0:.env",
+        "git show HEAD:.git/config",
+        "git diff HEAD -- .env",
+        "grep /etc/passwd -e root",
+        "grep .env -e SECRET",
+        "grep -f.env README.md",
+        "grep -nf.env README.md",
+        "grep -f .env README.md",
+        "grep --file=.env README.md",
+        "grep --file .env README.md",
+        "grep --exclude-from=.env README.md",
+        "grep -R SECRET .",
+        "grep --dereference-recursive SECRET .",
+        "grep -r --include='*env*' SECRET .",
+        "grep -r --include='*.json' SECRET .",
+        "grep -e '/api/chat' ../secret.txt",
+        "rg /etc --files",
+        "rg -f.env",
+        "rg -nf.env",
+        "rg -f .env",
+        "rg --file=.env",
+        "rg -n. SECRET .",
+        "rg -nu SECRET .",
+        "rg -g .env SECRET .",
+        "rg -g '.*' SECRET .",
+        "rg -g './.env' SECRET .",
+        "rg -g '*env*' SECRET .",
+        "rg --glob='*.env' SECRET .",
+        "rg --files .env",
+        "cat .git/config",
+        "cat .GIT/config",
+        "ls .git",
+        "cat .env.local",
+        "cat .ENV",
+        "cat .ENV.local",
+        "cat .env.production",
+        "cat config/MODELS.JSON",
+        "cat config/MODELS.DSL",
+        "cat data/STATE/db.txt",
+        "cat .SSH/id_rsa",
+        "cat sneaky_local.txt",
+        "date -f.env",
+        "date -uf .env",
+        "cat -f.env",
+    ]
+    for cmd in blocked_cmds:
+        out = execute_safe_command(cmd, policy)
+        assert out.startswith("错误："), f"应拦截绕过命令：{cmd!r} -> {out!r}"
+        assert "找不到可执行程序" not in out, f"不能因缺少命令假绿：{cmd!r} -> {out!r}"
+        for secret in ("root_secret", "local_secret", "prod_secret", "json_secret", "dsl_secret", "STATE_SECRET", "SSH_SECRET"):
+            assert secret not in out
+
+    # grep 递归检索时排除置后且自动过滤 .env.* 与 .git，安全 --include='*.py' 正常放行
+    grep_secret = execute_safe_command("grep -r SECRET .", policy)
+    assert "root_secret" not in grep_secret
+    assert "local_secret" not in grep_secret
+    assert "prod_secret" not in grep_secret
+
+    grep_py = execute_safe_command("grep -r --include='*.py' safe_code .", policy)
+    assert "退出码：0" in grep_py
+    assert "ok.py" in grep_py
+
+    # grep 未用 -e 时第 1 个位置参数是搜索模式而非路径，不应误杀包含 / 或 .. 的正则模式
+    grep_pat_slash = execute_safe_command("grep -rn '/api/chat' docs/", policy)
+    assert "退出码：0" in grep_pat_slash
+    assert "guide.md" in grep_pat_slash
+
+    grep_pat_dotdot = execute_safe_command("grep -rn '../AGENTS.md' docs/", policy)
+    assert "退出码：0" in grep_pat_dotdot
+    assert "guide.md" in grep_pat_dotdot
+
+    # .env.example 必须正常可读，grep -e 模式与 git --no-pager 正常放行
+    cat_example = execute_safe_command("cat .env.example", policy)
+    assert "退出码：0" in cat_example
+    assert "EXAMPLE_KEY=demo_value" in cat_example
+
+    grep_example = execute_safe_command("grep EXAMPLE_KEY .env.example", policy)
+    assert "退出码：0" in grep_example
+    assert "EXAMPLE_KEY=demo_value" in grep_example
+
+    grep_pattern = execute_safe_command("grep -e .env README.md", policy)
+    assert "退出码：0" in grep_pattern
+    assert "hello .env world" in grep_pattern
+
+    # 验证 _augment_safe_argv 为 grep 与 rg 在所有用户选项及后置参数后（或 -- 前）追加排除规则
+    aug_grep = _augment_safe_argv(["grep", "-r", "--include=*.py", "safe_code", "."], policy)
+    assert aug_grep.index("--include=*.py") < aug_grep.index("safe_code") < aug_grep.index("--exclude=.env.*")
+
+    aug_grep_post = _augment_safe_argv(["grep", "-r", "safe_code", ".", "--include=*.py"], policy)
+    assert aug_grep_post.index("--include=*.py") < aug_grep_post.index("--exclude=.env.*")
+
+    aug_grep_dd = _augment_safe_argv(["grep", "-r", "--include=*.py", "--", "safe_code", "."], policy)
+    assert aug_grep_dd.index("--include=*.py") < aug_grep_dd.index("--exclude=.env.*") < aug_grep_dd.index("--")
+
+    aug_rg = _augment_safe_argv(["rg", "-n", "foo", "."], policy)
+    assert aug_rg.index("-n") < aug_rg.index("foo") < aug_rg.index("--glob=!.env.*")
+    assert "--glob=!.git" in aug_rg
+    assert "--glob=!**/.git/**" in aug_rg
+
+    # 验证 wc --files0-from 与安全路径通配符 tests/*.py 行为
+    wc_policy = ShellPolicy(project_root=tmp_path, cwd=tmp_path, allowed_executables=("wc",))
+    wc_out = execute_safe_command("wc --files0-from .env", wc_policy)
+    assert wc_out.startswith("错误：") and "找不到可执行程序" not in wc_out
+
+    # 验证 config/tools.json 的 shell.reject_segments 已同步包含 .git，且合法 git --no-pager / 安全通配符放行
+    repo_root = Path(__file__).resolve().parent.parent
+    raw_tools = json.loads((repo_root / "config" / "tools.json").read_text(encoding="utf-8"))
+    assert ".git" in raw_tools["shell"]["reject_segments"]
+
+    repo_policy = ShellPolicy.from_config(repo_root / "config" / "tools.json")
+    no_pager_out = execute_safe_command("git --no-pager status --short", repo_policy)
+    assert "退出码：0" in no_pager_out
+    safe_glob_out = execute_safe_command("git diff HEAD -- '*.py'", repo_policy)
+    assert "退出码：0" in safe_glob_out

@@ -49,7 +49,7 @@
     "cwd": ".",
     "timeout": 10,
     "max_output_bytes": 8192,
-    "reject_segments": [".env", ".ssh", "state", "uploads", "models.dsl", "models.json"]
+    "reject_segments": [".env", ".git", ".ssh", "state", "uploads", "models.dsl", "models.json"]
   },
   "files": {
     "read_roots": ["data/memory", "data/workspace", "docs"],
