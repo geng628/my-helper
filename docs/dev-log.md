@@ -777,3 +777,22 @@
   - 单元测试 (`uv run pytest -v`)：**147 passed → 156 passed**（含三层依赖守卫与并发压测）；AST 中文 `#` 注释校验：**0 缺失**。
   - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
 - **下一步**：合入学习助手知识卡片与间隔复习插件（Issue `#62` / PR `#64`），并推进流式思维链教学视图与主对话/后台沉淀双模型分槽（Issue `#63`）。
+
+
+---
+
+### [2026-11-26] 新增零微内核改动学习助手知识卡片与间隔复习插件 `plugins/tools/study_tools.py`（Issue `#62`）
+- **定位与架构验证（洋葱模型外层产品叠加）**：
+  - 围绕 `my_helper_v2` 作为**个人学习助手**的产品定位，在不修改 `personal_assistant/` 微内核任何一行代码（`0` 行 diff）的前提下，通过统一插件主板 `ToolsPlugin` 外挂纯 Markdown 原生可读的学习卡片沉淀与间隔重复（Spaced Repetition）复习能力。
+  - 卡片直接存储于已受白名单管控的 `data/workspace/study/<slug>.md`，天然被 `MemoryStore.search_markdown(..., root="data/workspace")` 的 `fts5_bm25` 检索引擎与 `read_markdown` 覆盖，学习者亦可随时用外部编辑器直接查阅。
+- **改动文件（初版 `c2abda8` → 二审收敛 `76ccc95`）**：
+  - [plugins/tools/study_tools.py](plugins/tools/study_tools.py)（`259` 行，零第三方依赖）：提供两个正交 `@tool`——`save_study_card(topic, concept, summary, grade)`（按规范化 `(topic, concept)` 原位幂等更新，支持 `again/hard/good/easy` 四档单调递增间隔演进与 `extra_bindings["today"]` 逻辑日期注入）与 `list_due_reviews(scope)`（支持 `'due'` 逾期优先队列、`'all'` 全局掌握度分布及单专题筛选）；统一规范化全量 Unicode 行分隔符（含 `\u2028`/`\u2029`/`\x85`/`\f`）与 2 空格缩进确保多行代码块及标题无损往返，配合父链与目标符号链接拦截、非卡片文件防误覆盖、`threading.Lock` 与临时文件原子替换。
+  - [config/tools.json](config/tools.json)：在 `enabled_tools` 默认开启 `save_study_card` 与 `list_due_reviews`（工具描述显式划清与日常 `remember_fact` 边界）。
+  - [tests/test_study_plugin.py](tests/test_study_plugin.py)、[tests/test_step2_tools.py](tests/test_step2_tools.py)：新增覆盖白名单门控、全档位间隔演进单调性、Unicode 分隔符防伪造卡片注入、`fts5_bm25` 联动检索、符号链接逃逸拦截与 8 线程并发写入的确定性单测。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`c2abda8`）→ `Request Changes`**（检出 `.split("\n")` 与 `splitlines()` 行分隔符差异致 `\u2028` 缩进绕过、以及银行家舍入下 `good -> easy` 间隔倒挂 2 项 Blocker 与 4 项 Nit）；
+  - **Round 2（`76ccc95`）→ `Pass`**（`0 Blockers`）。
+- **同口径验证对比（改前 `main` `7e64db0` → 改后 `76ccc95`）**：
+  - 单元测试 (`uv run pytest -v`)：**156 passed → 162 passed**（`personal_assistant/` `0` 行改动，含三层依赖守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：合入 Issue `#63`（流式思维链 `ThinkingDelta`/`ToolStart` 教学视图、前后台双模型 `consolidator` 分槽与 `get_current_time` 逻辑日期对齐）及 Issue `#65`（文档全景升级），并执行同口径实模回归验收。
