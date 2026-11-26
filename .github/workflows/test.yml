@@ -9,6 +9,7 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -17,7 +18,7 @@ jobs:
       - name: Run unit & architecture tests
         run: uv run pytest -v
       - name: Run offline retrieval benchmark smoke check
-        run: uv run python -m evals --mode search --retriever fts5_bm25
+        run: uv run python -m evals --mode search --retriever fts5_bm25 --fail-under 0.90
       - name: Verify Chinese comments above functions and classes
         run: |
           uv run python - <<'EOF'

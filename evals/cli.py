@@ -90,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=1, help="memory 模式并发场景数（默认 1 串行；>1 并发执行各独立场景）")
     parser.add_argument("--config", default=None, help="tools.json 路径（默认 config/tools.json）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
+    parser.add_argument("--fail-under", type=float, default=None, help="search/memory 模式最低通过率阈值（0.0~1.0），低于则返回退出码 1")
     # 以下参数专用于 --mode download 下载并转换公开学术基准（默认落盘到 evals/public）
     parser.add_argument("--dataset", choices=["longmemeval", "locomo", "all"], default="all", help="download 模式目标公开集")
     parser.add_argument("--out-dir", default="evals/public", help="download 模式输出目录（默认 evals/public，已由 .gitignore 忽略）")
@@ -103,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.workers < 1:
         raise ValueError("--workers 必须 >= 1。")
+    if args.fail_under is not None and not (0.0 <= args.fail_under <= 1.0):
+        raise ValueError("--fail-under 必须在 0.0 到 1.0 之间。")
 
     if args.mode == "download":
         summary = prepare_public_datasets(
@@ -187,4 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         for item in report["failures"]:
             cat = f"[{item['category']}] " if item.get("category") else ""
             print(f"  - {cat}{item['id']}: {item['reason']}")
+    if args.fail_under is not None and args.mode in {"search", "memory"}:
+        summary_obj = report.get("summary")
+        pass_rate = summary_obj.get("pass_rate") if isinstance(summary_obj, dict) else None
+        if not isinstance(pass_rate, (int, float)) or float(pass_rate) < args.fail_under:
+            print(
+                f"FAIL: pass_rate={pass_rate} 低于阈值 --fail-under={args.fail_under}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
