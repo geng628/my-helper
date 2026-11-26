@@ -17,8 +17,9 @@ from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlsplit
 
 from personal_assistant.agent.tools import tool
 from personal_assistant.assistant.common import DEFAULT_SOFT_WRAP_CHARS, truncate_or_offload, truncate_utf8
@@ -236,23 +237,25 @@ def _read_body_with_deadline(resp: object, max_bytes: int, deadline: float) -> b
     return b"".join(chunks)
 
 
-# 直连已校验的 pinned_ip 套接字并构造 HTTP/HTTPS 连接（忽略系统代理且消除二次 DNS 解析）
+# 直连已校验的 pinned_ip 套接字并构造 HTTP/HTTPS 连接（忽略系统代理、消除二次 DNS 解析并复用 TLS 上下文）
 def _connect_pinned(
-    scheme: str, host: str, port: int, pinned_ip: str, timeout: float, ssl_context: object = None
+    scheme: str, host: str, port: int, pinned_ip: str, timeout: float, ssl_context: Any = None
 ) -> http.client.HTTPConnection:
     sock = socket.create_connection((pinned_ip, port), timeout=timeout)
-    if scheme == "https":
-        try:
+    try:
+        if scheme == "https":
             ctx = ssl_context if ssl_context is not None else ssl.create_default_context()
-            sock = getattr(ctx, "wrap_socket")(sock, server_hostname=host)
-        except BaseException:
-            sock.close()
-            raise
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=timeout)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-    conn.sock = sock
-    return conn
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=ctx if isinstance(ctx, ssl.SSLContext) else None
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.sock = sock
+        return conn
+    except BaseException:
+        sock.close()
+        raise
 
 
 # 基于 http.client 直连钉住 IP 发起安全 GET 请求（逐跳校验重定向且跨源自动剥离敏感头）
@@ -264,7 +267,7 @@ def _default_http_get(
     *,
     resolve_dns: DnsResolver = socket.getaddrinfo,
     allow_fake_ip: bool = False,
-    ssl_context: object = None,
+    ssl_context: Any = None,
 ) -> tuple[str, str, bytes]:
     deadline = time.monotonic() + timeout
     req_headers = {"User-Agent": DEFAULT_USER_AGENT, **headers}
@@ -278,15 +281,16 @@ def _default_http_get(
         clean_url, host, port, pinned_ip = resolve_and_validate_public_url(
             current_url, resolve_dns=resolve_dns, allow_fake_ip=allow_fake_ip
         )
-        parsed = urlparse(clean_url)
-        scheme = parsed.scheme.lower()
+        parts = urlsplit(clean_url)
+        scheme = parts.scheme.lower()
         origin = (scheme, host, port)
         if prev_origin is not None and origin != prev_origin:
             req_headers = {k: v for k, v in req_headers.items() if k.lower() not in SENSITIVE_REDIRECT_HEADERS}
         prev_origin = origin
 
-        target_path = f"{parsed.path or '/'}?{parsed.query}" if parsed.query else (parsed.path or "/")
+        target_path = f"{parts.path or '/'}?{parts.query}" if parts.query else (parts.path or "/")
         conn = _connect_pinned(scheme, host, port, pinned_ip, step_timeout, ssl_context=ssl_context)
+        resp: http.client.HTTPResponse | None = None
         try:
             conn.request("GET", target_path, headers=req_headers)
             resp = conn.getresponse()
@@ -302,6 +306,8 @@ def _default_http_get(
                 raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
             return clean_url, resp.getheader("Content-Type") or "text/plain", _read_body_with_deadline(resp, max_bytes, deadline)
         finally:
+            if resp is not None:
+                resp.close()
             conn.close()
     raise ValueError(f"重定向次数超过上限（{MAX_REDIRECTS}）。")
 
@@ -332,9 +338,10 @@ def _default_http_post_json(
     clean_url, host, port, pinned_ip = resolve_and_validate_public_url(
         url, resolve_dns=resolve_dns, allow_fake_ip=allow_fake_ip
     )
-    parsed = urlparse(clean_url)
-    target_path = f"{parsed.path or '/'}?{parsed.query}" if parsed.query else (parsed.path or "/")
-    conn = _connect_pinned(parsed.scheme.lower(), host, port, pinned_ip, max(0.001, deadline - time.monotonic()))
+    parts = urlsplit(clean_url)
+    target_path = f"{parts.path or '/'}?{parts.query}" if parts.query else (parts.path or "/")
+    conn = _connect_pinned(parts.scheme.lower(), host, port, pinned_ip, max(0.001, deadline - time.monotonic()))
+    resp: http.client.HTTPResponse | None = None
     try:
         conn.request(
             "POST",
@@ -347,6 +354,8 @@ def _default_http_post_json(
             raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
         raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline)
     finally:
+        if resp is not None:
+            resp.close()
         conn.close()
     return json.loads(raw_bytes[:max_bytes].decode("utf-8", errors="replace"))
 
@@ -375,7 +384,7 @@ def execute_fetch_webpage(
         )
     except HTTPError as error:
         return f"错误：网页请求失败（HTTP {error.code} {error.reason}）。"
-    except (URLError, TimeoutError, OSError, ValueError) as error:
+    except (URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as error:
         return f"错误：网页抓取失败（{error}）。"
 
     mime = content_type.split(";", 1)[0].strip().lower()
@@ -518,7 +527,7 @@ def execute_web_search(
             ddg_items = parse_duckduckgo_html(ddg_raw.decode("utf-8", errors="replace"), limit=policy.max_results)
             if ddg_items:
                 return _format_search_results(clean_query, "duckduckgo", ddg_items, policy.max_output_bytes)
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        except (HTTPError, URLError, http.client.HTTPException, TimeoutError, OSError, ValueError):
             pass
 
         rss_url = f"https://www.bing.com/search?format=rss&q={quote(clean_query)}"
@@ -527,7 +536,7 @@ def execute_web_search(
         return _format_search_results(clean_query, "bing_rss", items, policy.max_output_bytes)
     except HTTPError as error:
         return f"错误：联网搜索请求失败（HTTP {error.code} {error.reason}）。"
-    except (URLError, TimeoutError, OSError, ET.ParseError, json.JSONDecodeError, ValueError) as error:
+    except (URLError, http.client.HTTPException, TimeoutError, OSError, ET.ParseError, json.JSONDecodeError, ValueError) as error:
         return f"错误：联网搜索失败（{error}）。"
 
 

@@ -310,9 +310,13 @@ def _validate_git_branch_pattern(arg: str, policy: ShellPolicy) -> None:
 
 
 # 校验 git 位置参数：禁止冒号对象引用、解引用、pathspec 魔法、敏感路径及裸哈希对象
-def _validate_git_pathspec(arg: str, policy: ShellPolicy, *, sub: str, protected_ctx: ProtectedCtx) -> None:
+def _validate_git_pathspec(
+    arg: str, policy: ShellPolicy, *, sub: str, after_dd: bool, protected_ctx: ProtectedCtx
+) -> None:
     if ":" in arg or "^{" in arg or "@{" in arg:
         raise ValueError(f"git 禁止使用冒号对象引用、解引用或 pathspec 魔法语法：{arg}")
+    if sub in {"show", "diff"} and not after_dd and any(ch in arg for ch in "*?["):
+        raise ValueError(f"git {sub} 通配符路径必须位于 -- 之后：{arg}")
     _validate_path_candidate(arg, policy, protected_ctx=protected_ctx)
     if _matches_sensitive_glob(arg, policy.reject_segments):
         raise ValueError(f"git 禁止通配符匹配受保护路径：{arg}")
@@ -321,7 +325,7 @@ def _validate_git_pathspec(arg: str, policy: ShellPolicy, *, sub: str, protected
             _validate_path_candidate(ep, policy, protected_ctx=protected_ctx)
             if _matches_sensitive_glob(ep, policy.reject_segments):
                 raise ValueError(f"git 禁止通配符匹配受保护路径：{ep}")
-            if sub in {"show", "diff"} and re.fullmatch(r"[0-9a-fA-F]{7,64}(?:[~^].*)?", ep):
+            if sub in {"show", "diff"} and re.fullmatch(r"(?:.*-\d+-g)?[0-9a-fA-F]{4,64}(?:[~^].*)?", ep):
                 raise ValueError(f"git {sub} 禁止直接传入裸对象哈希引用：{arg}")
 
 
@@ -350,7 +354,7 @@ def _parse_git_command(args: list[str], policy: ShellPolicy) -> tuple[str, list[
             if sub == "branch":
                 _validate_git_branch_pattern(arg, policy)
             else:
-                _validate_git_pathspec(arg, policy, sub=sub, protected_ctx=protected_ctx)
+                _validate_git_pathspec(arg, policy, sub=sub, after_dd=after_dd, protected_ctx=protected_ctx)
             positionals.append(arg)
             idx += 1
         elif sub in GIT_SIMPLE_FLAGS:
@@ -519,9 +523,15 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             return [exe, *args[:insert_pos], "--stat", *args[insert_pos:]]
         if sub == "diff" and not any(tok in GIT_DIFF_SUMMARY_FLAGS for tok in before_dd):
             after_dd = rest[rest.index("--") + 1 :] if "--" in rest else []
-            explicit_files = after_dd or [t for t in before_dd if not t.startswith("-") and (policy.cwd / t).is_file()]
+            explicit_files = (
+                after_dd if "--" in rest else [t for t in before_dd if not t.startswith("-") and (policy.cwd / t).is_file()]
+            )
             if not explicit_files or any((policy.cwd / p).is_dir() for p in explicit_files):
                 return [exe, *args[:insert_pos], "--stat", *args[insert_pos:]]
+            if any(not (policy.cwd / p).is_file() for p in explicit_files):
+                pats = (s for s in (*policy.reject_segments, ".env.*", ".tmp-models-*") if s != ".git")
+                neg = [f":(exclude,glob,icase){p}" for s in pats for p in (s, f"**/{s}", f"**/{s}/**")]
+                return [*argv, *neg]
         return argv
 
     _validate_generic_args(exe, args, policy)

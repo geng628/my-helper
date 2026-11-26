@@ -451,7 +451,7 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
                 self.send_response(404, "Not Found")
                 self.end_headers()
                 return
-            body = b'{"ok": true}'
+            body = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -505,10 +505,20 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
             resolve_dns=rebinding_dns,
         )
         assert final_url.endswith("/ok")
-        assert json.loads(raw_data.decode("utf-8")) == {"ok": True}
+        assert json.loads(raw_data.decode("utf-8")) == {"ok": True, "path": "/ok"}
         assert dns_calls["count"] == 1
         assert captured_targets[0][0] == ("93.184.216.34", srv.server_port)
         assert received_headers[0]["host"] == f"rebind.example:{srv.server_port}"
+
+        # 验证路径中的 ;params 参数被完整保留，不因 urlparse 拆包丢失
+        _, _, semi_raw = wt._default_http_get(
+            f"http://rebind.example:{srv.server_port}/matrix;v=1.2?k=v",
+            {},
+            5.0,
+            4096,
+            resolve_dns=make_resolver("93.184.216.34"),
+        )
+        assert json.loads(semi_raw.decode("utf-8"))["path"] == "/matrix;v=1.2?k=v"
 
         # 3b. 跨域重定向时剥离 Authorization 与 X-Subscription-Token
         received_headers.clear()
@@ -568,7 +578,7 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
             ssl_context=_FakeSSLContext(),
         )
         assert tls_url.endswith("/ok")
-        assert json.loads(tls_raw.decode("utf-8")) == {"ok": True}
+        assert json.loads(tls_raw.decode("utf-8")) == {"ok": True, "path": "/ok"}
         assert fake_sni == ["tls.example"]
         assert captured_targets[-1][0] == ("93.184.216.34", srv.server_port)
 

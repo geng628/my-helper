@@ -277,10 +277,11 @@ class FilesPolicy:
         write_resolved = self.write_root.resolve()
         write_display, write_alias = self.root_labels(self.write_root, data_root)
         d_parts = Path(write_display).parts
+        a_parts = Path(write_alias).parts if write_alias else ()
         if parts[: len(d_parts)] == d_parts:
             sub = Path(*parts[len(d_parts) :])
-        elif write_alias and parts[0] == write_alias:
-            sub = Path(*parts[1:])
+        elif a_parts and parts[: len(a_parts)] == a_parts:
+            sub = Path(*parts[len(a_parts) :])
         elif parts and (
             parts[0] == "data"
             or any(
@@ -291,6 +292,8 @@ class FilesPolicy:
             raise ValueError(f"只能写入 {write_display} 目录。")
         else:
             sub = rel
+        if not sub.parts:
+            raise ValueError("写入路径必须指定具体文件。")
 
         unresolved = self.write_root / sub
         cur = self.write_root

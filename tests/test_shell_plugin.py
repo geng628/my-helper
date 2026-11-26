@@ -592,7 +592,7 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         [git_bin, "init"],
         [git_bin, "config", "user.email", "test@example.com"],
         [git_bin, "config", "user.name", "Test User"],
-        [git_bin, "add", "README.md", "config/models.json"],
+        [git_bin, "add", "README.md", "config/models.json", "data/state/db.txt"],
         [git_bin, "commit", "-m", "init commit"],
     ):
         subprocess.run(git_cmd, cwd=tmp_path, check=True, capture_output=True)
@@ -672,6 +672,9 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         "git diff --no-index README.md .env",
         "git status --ignored",
         f"git show {blob_sha}",
+        f"git show {blob_sha[:4]}",
+        f"git show {blob_sha[:6]}",
+        f"git show v1-0-g{blob_sha}",
         f"git show --stat {blob_sha}",
         f"git show -s {blob_sha}",
         f"git show {config_tree_sha}:models.json",
@@ -687,8 +690,9 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         assert out.startswith("错误："), f"高危 git 命令应拦截：{cmd!r} -> {out!r}"
         assert "MODEL_JSON_SECRET" not in out
 
-    # 合法只读 git 命令放行；裸 git show / diff 自动补 --stat 不泄露敏感正文，显式安全路径正常查看 diff
+    # 合法只读 git 命令放行；裸 git show / diff 与空 -- 自动补 --stat，跨目录通配符自动排除敏感路径
     (tmp_path / "config" / "models.json").write_text('{"api_key":"UPDATED_MODEL_JSON_SECRET"}\n', encoding="utf-8")
+    (tmp_path / "data" / "state" / "db.txt").write_text("UPDATED_STATE_DB_SECRET\n", encoding="utf-8")
     (tmp_path / "README.md").write_text("hello world\nsafe readme diff line\n", encoding="utf-8")
     for ok_cmd in (
         "git status -s -b --porcelain",
@@ -710,9 +714,12 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     assert "退出码：0" in show_head_out
     assert "MODEL_JSON_SECRET" not in show_head_out
 
-    bare_diff_out = execute_safe_command("git diff", policy)
-    assert "退出码：0" in bare_diff_out
-    assert "UPDATED_MODEL_JSON_SECRET" not in bare_diff_out
+    (tmp_path / "HEAD").write_text("dummy\n", encoding="utf-8")
+    for safe_diff_cmd in ("git diff", "git diff HEAD --", "git diff -- 'conf*'", "git diff -- '*.txt'"):
+        diff_out = execute_safe_command(safe_diff_cmd, policy)
+        assert "退出码：0" in diff_out, f"安全 git diff 不应报错：{safe_diff_cmd!r} -> {diff_out!r}"
+        for secret in ("MODEL_JSON_SECRET", "UPDATED_MODEL_JSON_SECRET", "STATE_DB_SECRET", "UPDATED_STATE_DB_SECRET"):
+            assert secret not in diff_out
 
     readme_diff_out = execute_safe_command("git diff HEAD -- README.md", policy)
     assert "退出码：0" in readme_diff_out
