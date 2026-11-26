@@ -17,7 +17,8 @@ from personal_assistant.ai import (
 )
 from personal_assistant.assistant.app import build_app
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.assistant.memory import FilesPolicy, MemoryStore
+from personal_assistant.assistant.files_policy import FilesPolicy
+from personal_assistant.assistant.memory import MemoryStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

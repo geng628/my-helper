@@ -12,17 +12,15 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from personal_assistant.assistant.builtin_tools import BuiltinTool, MemoryToolsetProvider
 from personal_assistant.assistant.common import truncate_utf8
 from personal_assistant.assistant.files_policy import (
-    DEFAULT_REJECT_SEGMENTS,
     FilesPolicy,
     _atomic_write,
 )
 from personal_assistant.assistant.memory_lifecycle import (
     apply_topic_operations,
     archive_expired_topics,
-    is_line_expired,
+    is_line_expired as _is_line_expired,
     prune_raw_facts_for_batch,
     read_topic_snapshots as _read_topic_snapshots,
     today_shanghai as _today_shanghai,
@@ -30,14 +28,9 @@ from personal_assistant.assistant.memory_lifecycle import (
 
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
 __all__ = [
-    "BuiltinTool",
-    "DEFAULT_REJECT_SEGMENTS",
-    "FilesPolicy",
     "MAX_SEARCH_FILE_BYTES",
     "MemoryStore",
-    "MemoryToolsetProvider",
     "SearchHit",
-    "_atomic_write",
 ]
 
 
@@ -114,12 +107,8 @@ class MemoryStore:
                 directory.mkdir(parents=True, exist_ok=True)
         self._roots = self.policy.build_roots(self.data_root)
 
-    # 将磁盘绝对路径转换为统一的相对展示路径（供外部模块如 eval 调用）
+    # 将磁盘绝对路径按允许根目录转换为统一的相对展示路径
     def display_path(self, resolved: Path) -> str:
-        return self._to_display_path(resolved)
-
-    # 内部路径格式化：按允许根目录把真实路径转回统一的相对展示路径
-    def _to_display_path(self, resolved: Path) -> str:
         return self.policy.to_display_path(resolved, self.data_root, roots=self._roots)
 
     # 安全解析相对路径：委托 FilesPolicy 校验读写白名单、拒绝 .. 穿越、敏感目录与越权软链接
@@ -222,7 +211,7 @@ class MemoryStore:
             p for p in self._safe_files(target, iterator)
             if listing_archive or not p.is_relative_to(archive_resolved)
         ]
-        found = [self._to_display_path(p) for p in candidates[: self.policy.max_results]]
+        found = [self.display_path(p) for p in candidates[: self.policy.max_results]]
         if not found:
             return "没有匹配的文件。"
         suffix = f"\n（仅展示前 {self.policy.max_results} 个文件）" if len(found) >= self.policy.max_results else ""
@@ -278,7 +267,7 @@ class MemoryStore:
                 except OSError:
                     continue
                 is_memory = not searching_archive and resolved.is_relative_to(memory_resolved)
-                files.append((resolved, self._to_display_path(resolved), is_memory))
+                files.append((resolved, self.display_path(resolved), is_memory))
 
         files.sort(key=lambda item: item[1])
         return files, searching_archive
@@ -336,7 +325,7 @@ class MemoryStore:
         if not lines:
             return []
         expired_flags = [
-            skip_expired_today is not None and is_line_expired(line, today=skip_expired_today)
+            skip_expired_today is not None and _is_line_expired(line, today=skip_expired_today)
             for line in lines
         ]
         path_bonus = sum(4.0 for t in primary if t in display_path.lower())
@@ -395,7 +384,7 @@ class MemoryStore:
             lines = target.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError as error:
             raise ValueError("目标文件不是有效的 UTF-8 文本。") from error
-        display_path, total = self._to_display_path(target), len(lines)
+        display_path, total = self.display_path(target), len(lines)
         if total == 0:
             return f"文件：{display_path}（空文件，共 0 行）"
         if start_line > total:
@@ -434,9 +423,9 @@ class MemoryStore:
                     counter += 1
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
-                backup_rel = self._to_display_path(backup)
+                backup_rel = self.display_path(backup)
             _atomic_write(target, content)
-            rel_path = self._to_display_path(target)
+            rel_path = self.display_path(target)
             self.record_audit(
                 action="write_file", actor="agent", target=rel_path,
                 old_value=backup_rel, new_value=f"{len(content)} chars ({mode})",

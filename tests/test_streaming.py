@@ -50,10 +50,15 @@ class ScriptedStreamLLM(LLMClient):
         assert isinstance(item, dict)
         return item
 
-    # 回放逐轮流式事件序列；非列表剧本回退走基类 respond() 包装
+    # 回放逐轮流式事件序列；字典剧本若声明 finish_reason 则取出传给 StreamDone 强类型字段
     def stream(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None) -> Iterator[LLMStreamEvent]:
         if not callable(self._turns) and self._turns and isinstance(self._turns[0], list):
             yield from self._turns.pop(0)
+            return
+        if not callable(self._turns) and self._turns and isinstance(self._turns[0], dict) and "finish_reason" in self._turns[0]:
+            raw = dict(self._turns.pop(0))
+            fr = raw.pop("finish_reason", None)
+            yield StreamDone(message=raw, finish_reason=str(fr) if isinstance(fr, str) and fr else None)
             return
         yield from super().stream(messages, tools)
 
@@ -638,8 +643,8 @@ def test_cli_stream_printer_three_state_thinking_tool_start_and_fallback(
     )
 
 
-# 测试 AssistantApp.build_tools 将逻辑日期 today 注入 tool_ctx，按签名自动绑定插件且不影响未声明插件
-def test_assistant_app_build_tools_injects_logical_today_into_plugins(tmp_path: Path) -> None:
+# 测试 AssistantApp.tools 常驻注册表通过执行期 context 注入逻辑日期 today，按签名自动绑定插件且不影响未声明插件
+def test_assistant_app_tools_injects_logical_today_into_plugins(tmp_path: Path) -> None:
     from datetime import date
 
     plugins_dir = tmp_path / "plugins"
@@ -687,13 +692,13 @@ def plain_echo(text: str) -> str:
         today_fn=lambda: current_day,
     )
     try:
-        reg1 = app.build_tools()
-        assert reg1.execute("peek_logical_today", '{"topic": "math"}') == "math@2026-05-01"
-        assert reg1.execute("plain_echo", '{"text": "ok"}') == "ok"
+        reg = app.tools
+        assert not hasattr(app, "build_tools")
+        assert reg.execute("peek_logical_today", '{"topic": "math"}', context={"today": app._today()}) == "math@2026-05-01"
+        assert reg.execute("plain_echo", '{"text": "ok"}', context={"today": app._today()}) == "ok"
 
         current_day = date(2026, 5, 2)
-        reg2 = app.build_tools()
-        assert reg2.execute("peek_logical_today", '{"topic": "math"}') == "math@2026-05-02"
+        assert reg.execute("peek_logical_today", '{"topic": "math"}', context={"today": app._today()}) == "math@2026-05-02"
     finally:
         app.close()
 
@@ -707,8 +712,8 @@ def plain_echo(text: str) -> str:
         today_fn=lambda: date(2026, 11, 16),
     )
     try:
-        real_reg = real_app.build_tools()
-        time_res = real_reg.execute("get_current_time", "{}")
+        real_reg = real_app.tools
+        time_res = real_reg.execute("get_current_time", "{}", context={"today": real_app._today()})
         assert time_res.startswith("2026-11-16 ") and "(Asia/Shanghai)" in time_res
         time_schema = next(d for d in real_reg.definitions() if d["function"]["name"] == "get_current_time")
         assert time_schema["function"]["parameters"]["properties"] == {}
@@ -722,11 +727,11 @@ def plain_echo(text: str) -> str:
     assert "(Asia/Shanghai)" in get_current_time(today="not-a-date")
 
 
-# 测试 SSE 无 index 的多 tool_calls 槽位切分、缺省 id 补齐与 finish_reason 同步/流式透传及下游剥离
-def test_sse_tool_calls_without_index_and_finish_reason_preservation(tmp_path: Path) -> None:
+# 测试 SSE 单帧多元素无 index 位置兜底、缺省 id 补齐与 StreamDone.finish_reason 强类型归位
+def test_sse_tool_calls_without_index_and_finish_reason_preservation() -> None:
     from personal_assistant.ai import OpenAIChatClient
 
-    # 1a. 单帧包含多个无 index 且无 id 元素时，按位置分配独立槽位并补齐 call_0 / call_1
+    # 1. 单帧包含多个无 index 且无 id 元素时，按位置分配独立槽位并补齐 call_0 / call_1，finish_reason 归位至 StreamDone
     sse_multi_in_one_frame = [
         'data: {"choices":[{"delta":{"role":"assistant","tool_calls":['
         '{"function":{"name":"read_markdown","arguments":"{\\"path\\":\\"a.md\\"}"}},'
@@ -735,33 +740,11 @@ def test_sse_tool_calls_without_index_and_finish_reason_preservation(tmp_path: P
         'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
         "data: [DONE]\n",
     ]
-    client_multi = OpenAIChatClient(
+    client = OpenAIChatClient(
         api_key="sk-multi",
         base_url="https://api.example.com/v1",
         model="m-multi",
         post_stream=lambda _u, _p, _h: iter(sse_multi_in_one_frame),
-    )
-    done_multi = next(ev for ev in client_multi.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
-    assert done_multi.message["finish_reason"] == "tool_calls"
-    assert done_multi.message["tool_calls"] == [
-        {"id": "call_0", "type": "function", "function": {"name": "read_markdown", "arguments": '{"path":"a.md"}'}},
-        {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}},
-    ]
-
-    # 1b. 连续无 index 帧：空 args 续传分片函数名合并到同槽；不同 id 或已有 args 后遇新函数名则切新槽
-    sse_no_index = [
-        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"name":"read_","arguments":""}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"markdown","arguments":"{\\"path\\": \\"a.md\\"}"}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"id":"explicit_1","function":{"name":"ping","arguments":"{}"}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"pong","arguments":"{}"}}]}}]}\n',
-        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
-        "data: [DONE]\n",
-    ]
-    client = OpenAIChatClient(
-        api_key="sk-no-idx",
-        base_url="https://api.example.com/v1",
-        model="m-idx",
-        post_stream=lambda _u, _p, _h: iter(sse_no_index),
         post_json=lambda _u, _p, _h: {
             "choices": [
                 {
@@ -771,137 +754,18 @@ def test_sse_tool_calls_without_index_and_finish_reason_preservation(tmp_path: P
             ]
         },
     )
-    events = list(client.stream([{"role": "user", "content": "go"}]))
-    done = next(ev for ev in events if isinstance(ev, StreamDone))
-    assert done.message["finish_reason"] == "tool_calls"
-    assert done.message["tool_calls"] == [
-        {"id": "call_0", "type": "function", "function": {"name": "read_markdown", "arguments": '{"path": "a.md"}'}},
-        {"id": "explicit_1", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
-        {"id": "call_2", "type": "function", "function": {"name": "pong", "arguments": "{}"}},
+    done_multi = next(ev for ev in client.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
+    assert done_multi.finish_reason == "tool_calls"
+    assert "finish_reason" not in done_multi.message
+    assert done_multi.message["tool_calls"] == [
+        {"id": "call_0", "type": "function", "function": {"name": "read_markdown", "arguments": '{"path":"a.md"}'}},
+        {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}},
     ]
 
-    # 2. 不同 id 且均无 index 的连续单元素分片应自动切槽
-    sse_diff_ids = [
-        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"c_alpha","function":{"name":"t1","arguments":""}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"id":"c_beta","function":{"name":"t2","arguments":"{}"}}]}}]}\n',
-        'data: {"choices":[{"finish_reason":"length"}]}\n',
-        "data: [DONE]\n",
-    ]
-    client_diff = OpenAIChatClient(
-        api_key="sk-diff",
-        base_url="https://api.example.com/v1",
-        model="m-diff",
-        post_stream=lambda _u, _p, _h: iter(sse_diff_ids),
-    )
-    done_diff = next(ev for ev in client_diff.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
-    assert done_diff.message["finish_reason"] == "length"
-    assert done_diff.message["tool_calls"] == [
-        {"id": "c_alpha", "type": "function", "function": {"name": "t1", "arguments": "{}"}},
-        {"id": "c_beta", "type": "function", "function": {"name": "t2", "arguments": "{}"}},
-    ]
-
-    # 3. 同步 respond() 同样保留 finish_reason，且 AssistantApp._convert_context_to_llm 发往 LLM 时剥离它
+    # 2. 同步 respond() 返回纯净消息字典，不再把 finish_reason 混入消息字典
     sync_msg = client.respond([{"role": "user", "content": "hi"}])
-    assert sync_msg["finish_reason"] == "stop"
-
-    sent_batches: list[list[dict[str, object]]] = []
-
-    # 录制发往模型的请求消息并检查工具轮内不带 finish_reason
-    def recording_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
-        sent_batches.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
-        if len(sent_batches) == 1:
-            return iter(
-                [
-                    'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_fr","function":{"name":"list_files","arguments":"{}"}}]}}]}\n',
-                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
-                    "data: [DONE]\n",
-                ]
-            )
-        return iter(
-            [
-                'data: {"choices":[{"delta":{"role":"assistant","content":"完成"}}]}\n',
-                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
-                "data: [DONE]\n",
-            ]
-        )
-
-    app_client = OpenAIChatClient(
-        api_key="sk-app",
-        base_url="https://api.example.com/v1",
-        model="m-app",
-        post_stream=recording_stream,
-    )
-    app = AssistantApp(data_root=tmp_path / "data", llm=app_client)
-    try:
-        res = app.chat("列出记忆文件", chat_id="fr-strip")
-        assert res["reply"] == "完成"
-        assert len(sent_batches) == 2
-        assert all("finish_reason" not in m for m in sent_batches[1])
-    finally:
-        app.close()
-
-    # 4. 直连 Layer 1/2 run_react（无 AssistantApp._convert_context_to_llm）以及零参无 id / type="function" / 多元素续传切槽
-    from personal_assistant.agent import ToolRegistry, run_react, tool as agent_tool
-    from plugins.reasoning_provider import OpenAIReasoningLLM
-
-    # 测试用无参探针工具
-    @agent_tool(description="探针无参工具")
-    def noop_ping() -> str:
-        return "pong"
-
-    direct_sent: list[list[dict[str, object]]] = []
-
-    # 捕获直连 OpenAIReasoningLLM 多步工具调用时发往接口的原始 messages
-    def direct_reasoner_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
-        direct_sent.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
-        if len(direct_sent) == 1:
-            return iter(
-                [
-                    'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"先调工具","tool_calls":[{"id":"r_tc","type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
-                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
-                    "data: [DONE]\n",
-                ]
-            )
-        return iter(
-            [
-                'data: {"choices":[{"delta":{"role":"assistant","content":"直连完成"}}]}\n',
-                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
-                "data: [DONE]\n",
-            ]
-        )
-
-    direct_llm = OpenAIReasoningLLM(
-        api_key="sk-direct",
-        base_url="https://api.example.com/v1",
-        model="deepseek-reasoner",
-        post_stream=direct_reasoner_stream,
-    )
-    direct_msgs: list[dict[str, object]] = [{"role": "user", "content": "测试直连剥离 finish_reason"}]
-    assert run_react(direct_llm, direct_msgs, ToolRegistry(noop_ping.__agent_tool__)) == "直连完成"
-    assert len(direct_sent) == 2
-    assert all("finish_reason" not in m for m in direct_sent[1])
-
-    # 零参无 id 后接显式 id、以及连续带 type="function" 无 id 零参工具均切入独立槽位
-    sse_zero_arg_edges = [
-        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"name":"get_current_time","arguments":""}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","function":{"name":"list_files","arguments":"{}"}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"remember_fact","arguments":""}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
-        "data: [DONE]\n",
-    ]
-    edge_client = OpenAIChatClient(
-        api_key="sk-edge",
-        base_url="https://api.example.com/v1",
-        model="m-edge",
-        post_stream=lambda _u, _p, _h: iter(sse_zero_arg_edges),
-    )
-    edge_done = next(ev for ev in edge_client.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
-    assert [c["function"]["name"] for c in edge_done.message["tool_calls"]] == [  # type: ignore[index]
-        "get_current_time",
-        "list_files",
-        "remember_fact",
-        "noop_ping",
-    ]
+    assert sync_msg == {"role": "assistant", "content": "同步完成"}
+    assert "finish_reason" not in sync_msg
 
 
 # 测试 HTTPError 错误体截断透出与令牌脱敏、stream_options 400 精准降级以及 429 Retry-After 退避

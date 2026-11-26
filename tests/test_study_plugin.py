@@ -462,7 +462,7 @@ def test_assistant_app_integrates_study_plugin_end_to_end(tmp_path: Path) -> Non
         today_fn=lambda: date(2026, 11, 26),
     )
     try:
-        registry = app.build_tools("帮我记录今天刚学的二分查找边界，我已经掌握了")
+        registry = app.tools
         assert {"save_study_card", "list_due_reviews"}.issubset(set(registry.names))
         result = app.chat("帮我记录今天刚学的二分查找边界，我已经掌握了", chat_id="s1")
         assert "二分查找边界" in str(result["reply"])

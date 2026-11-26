@@ -17,7 +17,6 @@ from personal_assistant.ai.types import TokenUsage
 from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.assistant.memory_lifecycle import clean_memory_body
 
 CONSOLIDATION_SYSTEM_PROMPT = (
     "你是个人助手的后台记忆整理器。你会收到当前日期、已有主题记忆内容、MEMORY.md 索引、前情摘要，以及一段即将从活跃窗口移除的历史对话。\n"
@@ -168,38 +167,6 @@ class MemoryConsolidator:
         existing_summary = str(compaction.get("summary") or "")
         return existing_summary, active[:cutoff]
 
-    # 在记忆写锁内过滤会误命中 facts.md 前台在途 (turn#...) 暂存行的修改/删除操作
-    def _filter_safe_operations(
-        self,
-        topic: str,
-        raw_ops: object,
-    ) -> list[dict[str, object]]:
-        if not isinstance(raw_ops, list):
-            return []
-        slug = re.sub(r"[^a-z0-9_-]+", "-", topic.lower()).strip("-_")[:40]
-        inflight_lines: list[str] = []
-        if slug == "facts" and self.memory.facts_file.is_file():
-            inflight_lines = [
-                ln.lower()
-                for ln in self.memory.facts_file.read_text(encoding="utf-8", errors="replace").splitlines()
-                if "(turn#" in ln
-            ]
-        safe_ops: list[dict[str, object]] = []
-        for op in raw_ops:
-            if not isinstance(op, dict):
-                continue
-            op_name = str(op.get("op") or "add").strip().lower()
-            raw_old = str(op.get("old") or "").strip()
-            raw_rem = str(op.get("text") or "").strip() if op_name == "remove" else ""
-            if "(turn#" in raw_old.lower() or "(turn#" in raw_rem.lower():
-                continue
-            if inflight_lines and op_name in {"merge", "replace", "remove"}:
-                needle = clean_memory_body(raw_old or raw_rem).lower()
-                if needle and any(needle in ln for ln in inflight_lines):
-                    continue
-            safe_ops.append(op)
-        return safe_ops
-
     # 对指定会话执行一次完整沉淀：归档过期记忆、读旧改旧消冲突、生成滚动摘要并原子推进游标
     def consolidate_once(
         self,
@@ -267,13 +234,14 @@ class MemoryConsolidator:
                 if not topic:
                     continue
 
-                # 在记忆可重入写锁临界区内原子过滤在途 (turn#...) 冲突并执行记忆变更，彻底消除并发误删竞态
                 raw_ops = entry.get("operations")
+                if not isinstance(raw_ops, list):
+                    continue
+                ops = [op for op in raw_ops if isinstance(op, dict)]
+                if not ops:
+                    continue
                 try:
                     with self.memory._write_lock:
-                        ops = self._filter_safe_operations(topic, raw_ops)
-                        if not ops:
-                            continue
                         saved = self.memory.apply_memory_operations(
                             topic, title, index_summary, ops, today=ref_day
                         )

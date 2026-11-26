@@ -642,9 +642,9 @@ def test_chat_turn_lock_interrupt_during_acquire_does_not_leak_refs(
         app.close()
 
 
-# 测试 AssistantApp 启动时单次构建常驻 _tool_registry，跨多轮对话零重建并通过 tool_context 注入动态上下文及生效可选默认参数
+# 测试 AssistantApp 启动时单次构建常驻 _tool_registry，暴露只读 tools 属性且不再保留 build_tools，跨多轮对话零重建并通过 tool_context 注入动态上下文
 def test_assistant_app_reuses_single_tool_registry_with_turn_context_and_optional_defaults(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     from datetime import date
 
@@ -694,12 +694,8 @@ def test_assistant_app_reuses_single_tool_registry_with_turn_context_and_optiona
     )
     try:
         initial_reg = app._tool_registry
-        # 封死 build_tools，证明 chat / stream_chat / status 全程零每轮重建注册表
-        monkeypatch.setattr(
-            app,
-            "build_tools",
-            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("禁止每轮重建 ToolRegistry")),
-        )
+        assert app.tools is initial_reg
+        assert not hasattr(app, "build_tools")
 
         # 验证导出给大模型的 Schema 已将默认参数精简为非必填
         defs = {d["function"]["name"]: d["function"]["parameters"]["required"] for d in initial_reg.definitions()}
@@ -952,9 +948,9 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
                     message={
                         "role": "assistant",
                         "content": None,
-                        "finish_reason": "length",
                         "tool_calls": [{"id": "tc_bad", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "a.md", "content": "half'}}],
-                    }
+                    },
+                    finish_reason="length",
                 )
             ],
             [StreamDone(message={"role": "assistant", "content": "不应重试残缺工具调用"})],

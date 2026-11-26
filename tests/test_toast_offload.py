@@ -234,7 +234,7 @@ def test_assistant_app_custom_data_root_binds_toast_offload_without_env_var(
         project_root=REPO_ROOT,
     )
     try:
-        reg = app.build_tools()
+        reg = app.tools
         obs = reg.execute("run_command", '{"command": "cat personal_assistant/assistant/memory.py"}')
         match = re.search(r"(data/workspace/tool_outputs/[A-Za-z0-9_.-]+\.txt)", obs)
         assert match is not None, f"未触发 TOAST 落盘：{obs[:200]}"

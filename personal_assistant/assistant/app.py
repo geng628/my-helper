@@ -211,8 +211,6 @@ class _GuardedTurnLLM(LLMClient):
         self.last_usage = None
         msg = self._inner.respond(messages, tools)
         self._record_usage(getattr(self._inner, "last_usage", None))
-        if msg.get("finish_reason") == "length" and _has_truncated_tool_call_json(msg):
-            self.truncated_tool_call = True
         return msg
 
     # 流式调用前执行预算核查，触发熔断时吐出降级文本与无 tool_calls 的 StreamDone 使循环自然退出
@@ -240,7 +238,7 @@ class _GuardedTurnLLM(LLMClient):
                     else getattr(self._inner, "last_usage", None)
                 )
                 self._record_usage(usage)
-                if event.message.get("finish_reason") == "length" and _has_truncated_tool_call_json(event.message):
+                if event.finish_reason == "length" and _has_truncated_tool_call_json(event.message):
                     self.truncated_tool_call = True
             yield event
 
@@ -519,40 +517,10 @@ class AssistantApp:
         registry.register_provider(provider)
         return registry
 
-    # 构建隔离的工具注册表快照（供外部调用方或单测独立使用；主对话循环直接复用 self._tool_registry）
-    def build_tools(
-        self,
-        user_text: str = "",
-        message_id: int | None = None,
-        *,
-        before_msg_id: int | None = None,
-        turn_tag: str | None = None,
-        on_remember: Callable[[], None] | None = None,
-    ) -> ToolRegistry:
-        getter = (lambda: (user_text, message_id)) if user_text else None
-        provider = MemoryToolsetProvider(
-            self.memory,
-            get_user_message=getter,
-            get_today=self._today,
-            turn_tag=turn_tag,
-            on_remember=on_remember,
-        )
-        effective_before = before_msg_id if before_msg_id is not None else message_id
-        if self.tools_config is not None:
-            tool_ctx: dict[str, object] = {
-                "history_db_path": self.state.db_path,
-                "today": self._today(),
-            }
-            if effective_before is not None:
-                tool_ctx["before_msg_id"] = effective_before
-            return self.tools_config.build_registry(
-                providers=[provider],
-                data_root=self.data_root,
-                tool_context=tool_ctx,
-            )
-        registry = ToolRegistry()
-        registry.register_provider(provider)
-        return registry
+    # 返回应用常驻白名单工具注册表
+    @property
+    def tools(self) -> ToolRegistry:
+        return self._tool_registry
 
     # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用
     def build_system_prompt(self, registry: ToolRegistry) -> str:
@@ -660,12 +628,7 @@ class AssistantApp:
                     )
                 continue
             if role in {"user", "assistant"}:
-                cleaned = (
-                    {k: v for k, v in msg.items() if k != "finish_reason"}
-                    if "finish_reason" in msg
-                    else msg
-                )
-                _append_alternating_message(converted, cleaned)
+                _append_alternating_message(converted, msg)
                 continue
             converted.append(msg)
         return converted
