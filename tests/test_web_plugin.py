@@ -442,6 +442,15 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
                 self.send_header("Location", f"http://rebind.example:{self.server.server_port}/secret")
                 self.end_headers()
                 return
+            if self.path == "/redirect-loop":
+                self.send_response(302)
+                self.send_header("Location", f"http://origin.example:{self.server.server_port}/redirect-loop")
+                self.end_headers()
+                return
+            if self.path == "/status-404":
+                self.send_response(404, "Not Found")
+                self.end_headers()
+                return
             body = b'{"ok": true}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -540,7 +549,7 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
         assert post_res == {"echo": "pinned-post", "host": f"rebind.example:{srv.server_port}"}
         assert dns_calls["count"] == 1
 
-        # 验证 _PinnedHTTPSConnection 保留原始域名用于 TLS SNI / 证书校验
+        # 验证 HTTPS 直连 pinned_ip 时仍保留原始域名用于 TLS SNI 与证书主机名校验
         fake_sni: list[str] = []
 
         # 仅记录 wrap_socket 传入的 server_hostname 而不真正执行 TLS 握手
@@ -550,17 +559,39 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
                 fake_sni.append(server_hostname)
                 return sock
 
-        https_conn = wt._PinnedHTTPSConnection(
-            "tls.example",
-            port=srv.server_port,
-            pinned_ip="93.184.216.34",
-            context=_FakeSSLContext(),
-            timeout=3.0,
+        tls_url, _, tls_raw = wt._default_http_get(
+            f"https://tls.example:{srv.server_port}/ok",
+            {},
+            3.0,
+            4096,
+            resolve_dns=make_resolver("93.184.216.34"),
+            ssl_context=_FakeSSLContext(),
         )
-        https_conn.connect()
-        https_conn.close()
+        assert tls_url.endswith("/ok")
+        assert json.loads(tls_raw.decode("utf-8")) == {"ok": True}
         assert fake_sni == ["tls.example"]
         assert captured_targets[-1][0] == ("93.184.216.34", srv.server_port)
+
+        # 验证重定向跳数上限与 HTTP 4xx 错误抛出
+        from urllib.error import HTTPError
+
+        with pytest.raises(ValueError, match="重定向次数"):
+            wt._default_http_get(
+                f"http://origin.example:{srv.server_port}/redirect-loop",
+                {},
+                5.0,
+                4096,
+                resolve_dns=make_resolver("93.184.216.34"),
+            )
+        with pytest.raises(HTTPError) as http_exc:
+            wt._default_http_get(
+                f"http://origin.example:{srv.server_port}/status-404",
+                {},
+                5.0,
+                4096,
+                resolve_dns=make_resolver("93.184.216.34"),
+            )
+        assert http_exc.value.code == 404
     finally:
         srv.shutdown()
         srv.server_close()

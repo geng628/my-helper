@@ -677,7 +677,8 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         f"git show {config_tree_sha}:models.json",
         f"git diff {readme_blob_sha} {blob_sha}",
         f"git diff {readme_blob_sha}..{blob_sha}",
-        "git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD",
+        f"git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD",
+        "git show HEAD^{tree}",
         "git show HEAD:config/models.json",
         "git rev-parse --git-dir",
     ]
@@ -686,7 +687,9 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         assert out.startswith("错误："), f"高危 git 命令应拦截：{cmd!r} -> {out!r}"
         assert "MODEL_JSON_SECRET" not in out
 
-    # 合法只读 git 命令放行；裸 git show HEAD 自动补 --stat 不泄露敏感正文
+    # 合法只读 git 命令放行；裸 git show / diff 自动补 --stat 不泄露敏感正文，显式安全路径正常查看 diff
+    (tmp_path / "config" / "models.json").write_text('{"api_key":"UPDATED_MODEL_JSON_SECRET"}\n', encoding="utf-8")
+    (tmp_path / "README.md").write_text("hello world\nsafe readme diff line\n", encoding="utf-8")
     for ok_cmd in (
         "git status -s -b --porcelain",
         "git branch",
@@ -706,6 +709,15 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     show_head_out = execute_safe_command("git show HEAD", policy)
     assert "退出码：0" in show_head_out
     assert "MODEL_JSON_SECRET" not in show_head_out
+
+    bare_diff_out = execute_safe_command("git diff", policy)
+    assert "退出码：0" in bare_diff_out
+    assert "UPDATED_MODEL_JSON_SECRET" not in bare_diff_out
+
+    readme_diff_out = execute_safe_command("git diff HEAD -- README.md", policy)
+    assert "退出码：0" in readme_diff_out
+    assert "+safe readme diff line" in readme_diff_out
+    assert "UPDATED_MODEL_JSON_SECRET" not in readme_diff_out
 
     # 3. 隔离 HOME 与 Git 环境变量：不指向 cwd、不触发 .gitconfig 恶意配置
     env_out = execute_safe_command("env", policy)
