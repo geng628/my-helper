@@ -1006,6 +1006,15 @@ def test_web_chat_security_headers_sse_closing_non_loopback_warn_and_bearer_auth
             with pytest.raises(HTTPError) as bad_tok_err:
                 urlopen(Request(f"{auth_base}{path}", headers={"Authorization": "Bearer wrong"}), timeout=5)
             assert bad_tok_err.value.code == 401
+            # 含非 ASCII 字节（0x80..0xFF）的 Authorization 头必须优雅返回 401 JSON 而绝不抛 TypeError 断连
+            non_ascii_status, non_ascii_body = _raw_http_request(
+                auth_base,
+                path,
+                method="GET",
+                headers={"Authorization": "Bearer \x80\xff"},
+            )
+            assert non_ascii_status == 401
+            assert "error" in json.loads(non_ascii_body)
             with urlopen(
                 Request(f"{auth_base}{path}", headers={"Authorization": "Bearer env-secret-token"}),
                 timeout=5,

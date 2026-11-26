@@ -81,13 +81,24 @@ def collect_protected_inodes(
                         continue
                     entry_path = Path(entry.path)
                     _record_path_inodes(entry_path, inodes)
-                    # 对敏感目录（如 state/.ssh/.git/uploads）补充一层常规子项 inode，阻断硬链接绕过
+                    # 对敏感目录（如 state/.ssh/.git/uploads）有界递归收集常规子项 inode，阻断多层硬链接绕过
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            with os.scandir(entry_path) as sub_it:
-                                for sub in sub_it:
-                                    if not sub.is_symlink():
-                                        _record_path_inodes(Path(sub.path), inodes, follow_symlinks=False)
+                            budget = 512
+                            stack = [entry_path]
+                            while stack and budget > 0:
+                                cur_dir = stack.pop()
+                                with os.scandir(cur_dir) as sub_it:
+                                    for sub in sub_it:
+                                        if sub.is_symlink():
+                                            continue
+                                        sub_path = Path(sub.path)
+                                        _record_path_inodes(sub_path, inodes, follow_symlinks=False)
+                                        budget -= 1
+                                        if budget <= 0:
+                                            break
+                                        if sub.is_dir(follow_symlinks=False):
+                                            stack.append(sub_path)
                     except OSError:
                         pass
         except OSError:

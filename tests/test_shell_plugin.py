@@ -599,6 +599,12 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     blob_sha = subprocess.check_output(
         [git_bin, "rev-parse", "HEAD:config/models.json"], cwd=tmp_path, text=True
     ).strip()
+    readme_blob_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD:README.md"], cwd=tmp_path, text=True
+    ).strip()
+    config_tree_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD:config"], cwd=tmp_path, text=True
+    ).strip()
 
     # 在 cwd 放置恶意 .gitconfig，验证隔离 HOME + GIT_CONFIG_GLOBAL 彻底免疫
     poison_marker = tmp_path / "pwned_gitconfig.txt"
@@ -668,6 +674,10 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         f"git show {blob_sha}",
         f"git show --stat {blob_sha}",
         f"git show -s {blob_sha}",
+        f"git show {config_tree_sha}:models.json",
+        f"git diff {readme_blob_sha} {blob_sha}",
+        f"git diff {readme_blob_sha}..{blob_sha}",
+        "git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD",
         "git show HEAD:config/models.json",
         "git rev-parse --git-dir",
     ]
@@ -712,8 +722,18 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     assert "退出码：0" in bin_out
     assert "ok" in bin_out
 
-    # 5. 流式字节上限与 os.killpg 快速清理（yes 不必等待 timeout 全满即被终止）
+    # 5. 流式字节上限与 os.killpg 快速清理（含主进程秒退但孙进程仍持有管道、以及快速超限退出竞态）
     yes_out = execute_safe_command("yes", policy)
     assert yes_out.startswith("错误：") and ("上限" in yes_out or "超时" in yes_out)
     assert hasattr(shell_mod, "_MAX_CAPTURE_BYTES")
+
+    import time
+
+    t_spawn = time.monotonic()
+    orphan_out = execute_safe_command("sh -c 'sleep 10 >/dev/stdout 2>&1 & echo parent_done'", policy)
+    assert time.monotonic() - t_spawn < 1.3
+    assert "parent_done" in orphan_out
+
+    fast_overflow = execute_safe_command("sh -c 'head -c 1100000 /dev/zero'", policy)
+    assert fast_overflow.startswith("错误：") and "上限" in fast_overflow
 

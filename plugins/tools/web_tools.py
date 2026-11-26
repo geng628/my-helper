@@ -11,6 +11,7 @@ import socket
 import ssl
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -113,7 +114,7 @@ def _is_public_ip(
             return True
         return ip_obj.is_global
 
-    if ip_obj.is_multicast or not ip_obj.is_global:
+    if ip_obj.is_multicast or ip_obj.is_reserved or not ip_obj.is_global:
         return False
     if ip_obj in NAT64_WELL_KNOWN_NETWORK or ip_obj in NAT64_LOCAL_NETWORK:
         return False
@@ -149,7 +150,7 @@ def resolve_and_validate_public_url(
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise ValueError(f"只允许 http 或 https 协议，已拒绝：{parsed.scheme or '空协议'}")
-    host = (parsed.hostname or "").strip().lower()
+    host = unicodedata.normalize("NFKC", (parsed.hostname or "").strip()).lower()
     if not host:
         raise ValueError("URL 缺少有效主机名。")
     clean_host = host.rstrip(".")
@@ -262,7 +263,7 @@ def _lookup_pinned_ip(
     default_port: int,
 ) -> str:
     parsed = urlparse(req.full_url)
-    host = (parsed.hostname or "").strip().lower()
+    host = unicodedata.normalize("NFKC", (parsed.hostname or "").strip()).lower()
     port = parsed.port or default_port
     pinned_ip = pinned_targets.get((host, port))
     if not pinned_ip:
@@ -550,17 +551,19 @@ def execute_fetch_webpage(
     resolve_dns: DnsResolver = socket.getaddrinfo,
     http_get: HttpGetFn | None = None,
 ) -> str:
-    try:
-        safe_url = validate_public_url(
-            url,
-            resolve_dns=resolve_dns,
-            allow_fake_ip=policy.allow_fake_ip,
-        )
-    except ValueError as error:
-        return f"错误：{error}"
-
-    getter = http_get or (
-        lambda u, h, t, m: _default_http_get(
+    if http_get is not None:
+        try:
+            safe_url = validate_public_url(
+                url,
+                resolve_dns=resolve_dns,
+                allow_fake_ip=policy.allow_fake_ip,
+            )
+        except ValueError as error:
+            return f"错误：{error}"
+        getter = http_get
+    else:
+        safe_url = (url or "").strip()
+        getter = lambda u, h, t, m: _default_http_get(
             u,
             h,
             t,
@@ -568,7 +571,6 @@ def execute_fetch_webpage(
             resolve_dns=resolve_dns,
             allow_fake_ip=policy.allow_fake_ip,
         )
-    )
     try:
         final_url, content_type, raw_bytes = getter(
             safe_url,

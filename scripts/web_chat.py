@@ -202,7 +202,9 @@ def create_web_server(
                 )
                 return False
             scheme, _, token_val = auth_headers[0].strip().partition(" ")
-            if scheme.lower() != "bearer" or not hmac.compare_digest(token_val.strip(), effective_token):
+            provided_bytes = token_val.strip().encode("utf-8", errors="surrogateescape")
+            expected_bytes = effective_token.encode("utf-8", errors="surrogateescape")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(provided_bytes, expected_bytes):
                 self._send_json(
                     HTTPStatus.UNAUTHORIZED,
                     {"error": "无效的 Bearer Token。"},

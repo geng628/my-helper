@@ -572,7 +572,7 @@ def _rel_to_cwd(path: Path, cwd: Path) -> str:
     return str(path.relative_to(cwd)) if path.is_relative_to(cwd) else str(path)
 
 
-# 为 grep/rg 注入敏感排除项，为 pytest 注入 --ignore 与 tests 目标，为裸 git show 补齐 --stat
+# 为 grep/rg 注入敏感排除项，为 pytest 注入 --ignore 与 tests 目标，为 git show/diff 补齐安全限制与负向排除
 def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
     exe, args = argv[0], argv[1:]
     if exe in SEARCH_SPECS:
@@ -582,6 +582,7 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             *policy.reject_segments,
             *((".git",) if ".git" not in policy.reject_segments else ()),
             *((".env.*",) if add_env else ()),
+            ".tmp-models-*",
         )
         fmts = ("--exclude={}", "--exclude-dir={}") if exe == "grep" else ("--glob=!{}", "--glob=!**/{}/**")
         excludes = [fmt.format(seg) for seg in pats for fmt in fmts]
@@ -607,6 +608,35 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             if not any(tok in GIT_SHOW_SUMMARY_FLAGS for tok in before_dd):
                 sub_pos = args.index("show") + 1
                 return [exe, *args[:sub_pos], "--stat", *args[sub_pos:]]
+        if sub == "diff":
+            diff_pats = (*policy.reject_segments, ".env.*", ".tmp-models-*")
+            neg_specs: list[str] = []
+            for seg in diff_pats:
+                if seg == ".git":
+                    continue
+                neg_specs.extend(
+                    (
+                        f":(exclude,glob,icase){seg}",
+                        f":(exclude,glob,icase)**/{seg}",
+                        f":(exclude,glob,icase)**/{seg}/**",
+                    )
+                )
+            if "--" in args:
+                dd_pos = args.index("--")
+                has_pos_path = dd_pos + 1 < len(args)
+                return [exe, *args, *(() if has_pos_path else (".",)), *neg_specs]
+            # 区分无 -- 时的修订号与工作区文件路径，确保不把文件名塞到 -- 左侧报 bad revision
+            sub_pos = args.index("diff") + 1
+            rev_part: list[str] = []
+            path_part: list[str] = []
+            in_paths = False
+            for tok in args[sub_pos:]:
+                if not in_paths and (tok.startswith("-") or not (policy.cwd / tok).exists() or tok == "HEAD"):
+                    rev_part.append(tok)
+                else:
+                    in_paths = True
+                    path_part.append(tok)
+            return [exe, *args[:sub_pos], *rev_part, "--", *(path_part or ["."]), *neg_specs]
 
     return argv
 
@@ -745,24 +775,53 @@ def _run_subprocess_limited(
         t_wait.join(timeout=1.0)
         return -1, "", "", f"错误：命令执行超时（>{timeout:g}s）。"
 
-    if overflow.is_set():
+    t_wait.join(timeout=0.5)
+    t_out.join(timeout=0.5)
+    t_err.join(timeout=0.5)
+    if t_out.is_alive() or t_err.is_alive() or proc.poll() is None:
         _kill_process_group(proc)
         t_out.join(timeout=1.0)
         t_err.join(timeout=1.0)
         t_wait.join(timeout=1.0)
+
+    if overflow.is_set():
         return -1, "", "", f"错误：命令输出超过单流硬上限（>{max_capture_bytes} 字节），已强制终止。"
 
-    t_wait.join(timeout=1.0)
-    t_out.join(timeout=1.0)
-    t_err.join(timeout=1.0)
     stdout_text = b"".join(out_chunks).decode("utf-8", errors="replace")
     stderr_text = b"".join(err_chunks).decode("utf-8", errors="replace")
     return proc.returncode if proc.returncode is not None else 0, stdout_text, stderr_text, None
 
 
-# 在执行 git show 前核验所有无冒号路径的裸对象，严禁直接倾泻 blob 或 tree 原始文件内容
+# 核验单个 git 修订引用（及其解引用 ^{}）是否指向裸 blob 或 tree 对象
+def _check_git_rev_not_blob_or_tree(
+    executable: str,
+    rev: str,
+    *,
+    sub: str,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
+) -> str | None:
+    for probe in (rev, f"{rev}^{{}}"):
+        code, obj_type, _, err_msg = _run_subprocess_limited(
+            (executable, "cat-file", "-t", probe),
+            cwd=cwd,
+            timeout=min(timeout, 3.0),
+            env=env,
+            max_capture_bytes=4096,
+        )
+        if err_msg is not None:
+            return err_msg
+        kind = obj_type.strip()
+        if code == 0 and kind in {"blob", "tree"}:
+            return f"错误：git {sub} 禁止直接读取 {kind} 对象（{rev}），仅允许基于 commit 摘要或安全路径查看。"
+    return None
+
+
+# 在执行 git show / diff 前核验范围端点与冒号左侧引用，严禁利用裸 blob 或 tree SHA 绕过敏感路径过滤
 def _reject_bare_git_blob_or_tree(
     executable: str,
+    sub: str,
     git_args: list[str],
     *,
     cwd: Path,
@@ -773,19 +832,27 @@ def _reject_bare_git_blob_or_tree(
     rest = git_args[sub_idx + 1 :]
     before_dd = rest[: rest.index("--")] if "--" in rest else rest
     for tok in before_dd:
-        if tok.startswith("-") or ":" in tok:
+        if tok.startswith("-"):
             continue
-        code, obj_type, _, err_msg = _run_subprocess_limited(
-            (executable, "cat-file", "-t", tok),
-            cwd=cwd,
-            timeout=min(timeout, 3.0),
-            env=env,
-            max_capture_bytes=4096,
-        )
-        if err_msg is not None:
-            return err_msg
-        if code == 0 and obj_type.strip() in {"blob", "tree"}:
-            return f"错误：git show 禁止直接读取裸 {obj_type.strip()} 对象（{tok}），仅允许查看 commit 或安全路径。"
+        for ep in re.split(r"\.{2,3}", tok):
+            clean_ep = re.sub(r"\^[!@]$", "", ep.strip())
+            if not clean_ep:
+                continue
+            if ":" in clean_ep:
+                lhs, _ = clean_ep.split(":", 1)
+                if not lhs or lhs in {"0", "1", "2", "3"}:
+                    continue
+                err = _check_git_rev_not_blob_or_tree(
+                    executable, lhs, sub=sub, cwd=cwd, timeout=timeout, env=env
+                )
+                if err is not None:
+                    return err
+                continue
+            err = _check_git_rev_not_blob_or_tree(
+                executable, clean_ep, sub=sub, cwd=cwd, timeout=timeout, env=env
+            )
+            if err is not None:
+                return err
     return None
 
 
@@ -802,6 +869,7 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     except ValueError as error:
         return f"错误：{error}"
 
+    orig_git_sub = _parse_git_command(argv[1:], policy)[0] if argv[0] == "git" else ""
     final_argv = _augment_safe_argv(argv, policy)
     # 使用 absolute() 而非 resolve()，保留 .venv/bin/python 软链所在目录以便定位 .venv/bin/pytest
     venv_bin = str(Path(sys.executable).absolute().parent)
@@ -813,18 +881,17 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
     with tempfile.TemporaryDirectory(prefix="my_helper_home_") as isolated_home:
         env = _build_isolated_env(safe_path, isolated_home)
         try:
-            if final_argv[0] == "git":
-                sub, _ = _parse_git_command(final_argv[1:], policy)
-                if sub == "show":
-                    err_msg = _reject_bare_git_blob_or_tree(
-                        executable,
-                        final_argv[1:],
-                        cwd=policy.cwd,
-                        timeout=policy.timeout,
-                        env=env,
-                    )
-                    if err_msg is not None:
-                        return err_msg
+            if orig_git_sub in {"show", "diff"}:
+                err_msg = _reject_bare_git_blob_or_tree(
+                    executable,
+                    orig_git_sub,
+                    argv[1:],
+                    cwd=policy.cwd,
+                    timeout=policy.timeout,
+                    env=env,
+                )
+                if err_msg is not None:
+                    return err_msg
 
             returncode, stdout_text, stderr_text, run_err = _run_subprocess_limited(
                 (executable, *final_argv[1:]),

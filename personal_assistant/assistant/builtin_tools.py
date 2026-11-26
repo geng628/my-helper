@@ -10,7 +10,7 @@ from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
 
 RULE_INTENT_KEYWORDS = (
     "记住", "规则", "以后", "每次", "必须", "不要", "禁止", "默认", "优先",
-    "一律", "习惯", "偏好", "请用", "始终", "回复", "回答", "风格",
+    "一律", "习惯", "偏好", "请用", "始终", "以后回复", "以后回答", "回复风格", "回答风格", "风格",
     "always", "never", "rule", "prefer", "must", "default",
 )
 MAX_RULE_STATEMENT_CHARS = 300
