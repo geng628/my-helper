@@ -40,10 +40,10 @@ AgentEvent = TextDelta | StreamDone | ToolStep | TurnEnd
 RuntimeEvent = AgentEvent | TaskEvent
 
 
-# 从模型返回的消息字典中提取纯文本回复，为空时使用兜底文案
-def _extract_reply(message: dict[str, object], fallback: str = "模型没有返回回复，请重试。") -> str:
+# 从模型返回的消息字典中提取纯文本回复，为空时使用默认提示文案
+def _extract_reply(message: dict[str, object]) -> str:
     content = str(message.get("content") or "").strip()
-    return content or fallback
+    return content or "模型没有返回回复，请重试。"
 
 
 # 透传单轮 LLM 流式事件并返回本轮完整 assistant 消息

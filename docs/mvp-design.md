@@ -174,7 +174,7 @@ data/
 ### 3.3 对话循环与核心编排（`react.py` + `app.py`）
 
 - **`iter_react()` / `run_react()`**：纯正 `while True` ReAct 循环（Reason -> Act & Observe），全程保持 `tools` 定义恒定，以模型未返回 `tool_calls` 作为唯一自然终止信号。
-- **`AssistantApp`**：统一串联对话历史、系统提示词拼装、工具白名单装配与 `run_react()` 执行。
+- **`AssistantApp`**：统一串联对话历史、系统提示词拼装、工具白名单装配与 `iter_react()` 执行。
 
 ---
 
