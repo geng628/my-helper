@@ -660,12 +660,18 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     assert captured_web["model_name"] == "reasoner"
     assert captured_web["consolidator_model"] == "qwen"
 
-    # 9. 确认 ModelsDSLCompiler.render 与 ConfigCompilerProtocol.render 均为显式强类型具名参数
+    # 9. 确认 ConfigCompilerProtocol.render 保持零业务名泄漏，ModelsDSLCompiler.render 以可选默认参数兼容协议并对齐底层函数
     import inspect
     from personal_assistant.agent.plugins import ConfigCompilerProtocol
     from plugins.models_dsl import ModelsDSLCompiler, render_models_dsl
 
-    proto_params = list(inspect.signature(ConfigCompilerProtocol.render).parameters)[1:]
-    impl_params = list(inspect.signature(ModelsDSLCompiler.render).parameters)[1:]
+    proto_sig = inspect.signature(ConfigCompilerProtocol.render)
+    impl_sig = inspect.signature(ModelsDSLCompiler.render)
+    proto_params = list(proto_sig.parameters)[1:]
+    impl_params = list(impl_sig.parameters)[1:]
     fn_params = list(inspect.signature(render_models_dsl).parameters)
-    assert proto_params == impl_params == fn_params
+    assert "consolidator" not in proto_params
+    assert impl_params[: len(proto_params)] == proto_params
+    assert impl_params == fn_params
+    for extra_name in impl_params[len(proto_params) :]:
+        assert impl_sig.parameters[extra_name].default is not inspect.Parameter.empty

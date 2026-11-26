@@ -29,7 +29,7 @@
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
   2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`）外挂双语 BM25 索引，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
-  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ModelsDSLCompiler.render` 与协议共享显式强类型具名参数签名。
+  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`，不向 Layer 2 泄漏业务角色名）。
   4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），经 `ModelProfile` 直通工厂（`from_model_profile`）构造客户端，处理轮内 `reasoning_content` 续传与跨轮剥离。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件。
 - `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。

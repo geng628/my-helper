@@ -126,7 +126,7 @@ data/
 │   ├── MEMORY.md                      # 限长记忆目录索引（前 100 行 / 4000 字符，会话内按自然日冻结）
 │   ├── facts.md                       # remember_fact 追加的原始事实（流式轮内 turn# 暂存 -> 提交后升级 msg#）
 │   ├── <topic>.md                     # 后台沉淀按主题组织的长期记忆（支持 add/merge/replace/remove）
-│   ├── rules/                         # 行为规则（每条一个 .md，摘要注入系统前缀；受规则意图与外部工具污染守卫保护）
+│   ├── rules/                         # 行为规则（每条一个 .md，摘要注入系统前缀；受外部网络工具污染锁死与非越权提示守卫保护）
 │   ├── archive/                       # 过期日程与 replace/remove 软退休替代链（YYYY-MM.md，默认热检索隔离）
 │   └── audit.jsonl                    # 记忆与文件写入审计日志
 ├── workspace/                         # write_file 与 study_tools 唯一允许写入的工作目录
@@ -145,7 +145,7 @@ data/
 
 1. **原子契约（[../personal_assistant/ai/types.py](../personal_assistant/ai/types.py)）**：
    - `ToolSchema`：定义工具签名（`name`、`description`、`parameters`、`param_enums`、`required`），按精确必填参数集导出 OpenAI Function Calling JSON Schema。
-   - `ToolCall` 与 `extract_tool_calls()`：将 OpenAI wire 字典或扁平工具调用解析为强类型 `ToolCall(id, name, arguments)`，空参数保底 `"{}"`。
+   - `ToolCall` 与 `extract_tool_calls()`：将标准 OpenAI wire 字典解析为强类型 `ToolCall(id, name, arguments)`，空参数保底 `"{}"`。
    - 流式与用量模型：`TextDelta`、`ThinkingDelta`、`StreamDone(message, usage, ttft_ms, latency_ms, finish_reason)`、`TokenUsage`、`ModelProfile` 与 `ModelsConfig`（通过通用命名角色表 `roles: dict[str, str]` 承载 `consolidator` 等角色路由，无硬编码业务字段，并提供 `redacted_dict()` 密钥脱敏）。
 2. **传输底座、直通工厂与流式解析（[../personal_assistant/ai/client.py](../personal_assistant/ai/client.py)）**：
    - `OpenAIChatClient(LLMClient)` 提供 `_prepare_messages`、`_extra_payload`、`_thinking_delta_fields` 与 `_normalize_response_message` 四个受保护钩子，统一支撑标准 `OpenAICompatibleLLM` 与外围推理模型插件；`from_model_profile(profile)` 直接向已注册的 `ProviderFactory`（`Callable[[ModelProfile], LLMClient]`）透传 `ModelProfile` 值对象，消除零散参数拆包。
@@ -165,7 +165,7 @@ data/
    - `iter_react()` / `run_react()` 进入循环前固定 `tool_defs`，每步经可选 `_prepare_llm_messages(messages, convert_to_llm)` 浅拷贝管道调用 `llm.stream()`，透传 `TextDelta`、`ThinkingDelta`、`StreamDone`；
    - 当 `extract_tool_calls(assistant_msg)` 为空时产出 `TurnEnd` 自然结束；否则依次发出 `ToolStart`、执行工具并产出 `ToolStep`、追加 `role="tool"` 观察消息继续下一轮。
 3. **统一插件主板（[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)）**：
-   - `PluginManager` 显式扫描配置入口模块并按 `Plugin(ABC)` 子类收集实例化，向零业务字段的 `PluginContext`（仅含 `project_root`、`config`、`bindings` 与五大强类型插槽 `tool_specs` / `retrievers` / `compilers` / `providers` / `observers`）注册扩展；`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 对齐为显式强类型具名参数；
+   - `PluginManager` 显式扫描配置入口模块并按 `Plugin(ABC)` 子类收集实例化，向零业务字段的 `PluginContext`（仅含 `project_root`、`config`、`bindings` 与五大强类型插槽 `tool_specs` / `retrievers` / `compilers` / `providers` / `observers`）注册扩展；`ConfigCompilerProtocol.render` 采用纯通用显式强类型具名参数（插件实现 `ModelsDSLCompiler.render` 可按需以带默认值可选参数扩展 `consolidator`，不向 Layer 2 协议泄漏业务名）；
    - 业务侧运行时对象与模块配置段（如 `shell_config`、`web_config`、`data_root`、`offload_dir`）由 Layer 3 `commands.py._build_plugin_bindings()` 单轨注入 `PluginContext.bindings`，Layer 2 零业务目录或配置段知识；`PluginManager` 仅在加载期执行一次 `initialize()`，并在关闭期经 `terminate_all()` 逐个触发 `terminate()`。
 
 ---

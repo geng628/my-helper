@@ -463,9 +463,10 @@ def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
         "extra_bindings",
         "active_plugin_id",
         "tool_registry",
+        "consolidator",
     ):
         assert forbidden_field not in plugins_src, (
-            f"agent/plugins.py 严禁泄漏业务字段 {forbidden_field!r}"
+            f"agent/plugins.py 严禁泄漏业务字段或角色名 {forbidden_field!r}"
         )
 
     ctx_fields = {f.name for f in fields(PluginContext)}

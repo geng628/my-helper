@@ -116,13 +116,9 @@ def resolve_eval_paths(config_path: Path | None) -> tuple[Path, Path]:
 def resolve_eval_tools_config(
     config_path: Path | None,
     tools_config: ToolsConfig | None = None,
-) -> tuple[Path, Path, ToolsConfig | None, bool]:
+) -> tuple[Path | None, Path, ToolsConfig | None, bool]:
     if tools_config is not None:
-        cfg_path = (
-            config_path.resolve()
-            if config_path is not None
-            else (tools_config.config_path or (REPO_ROOT / "config" / "tools.json"))
-        )
+        cfg_path = config_path.resolve() if config_path is not None else tools_config.config_path
         return cfg_path, tools_config.project_root, tools_config, False
     cfg_path, project_root = resolve_eval_paths(config_path)
     if cfg_path.is_file():

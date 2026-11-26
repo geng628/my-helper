@@ -16,7 +16,7 @@
 3. **五大主板插件插槽与生命周期**：
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
    - Slot 2 `RetrieverProtocol`（`plugins/fts5_retriever.py`，未挂载时由 `LinearRetriever` 兜底）；
-   - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，`render` 具名强类型签名与协议严格对齐）；
+   - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，`render` 采用显式强类型具名参数，核心参数对齐纯通用协议、业务角色参数收敛于插件侧）；
    - Slot 4 `LLMProviderProtocol`（`plugins/reasoning_provider.py`，经 `ModelProfile` 直通工厂装配）；
    - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本）；
    - 所有插件在启动期仅执行一次 `initialize()`，零跨插件横向导入，并在 `AssistantApp.close()` 时经 `terminate_all()` 统一释放资源。
@@ -170,7 +170,7 @@
      - Layer 2 `agent/`：`Tool(ToolSchema)` 回归纯值对象并提炼 `bind_tool_context()`；`react.py` 删除未使用的 `transform_context`，仅保留单步 `convert_to_llm`；`PluginContext` 清零业务字段与 `tool_bindings()`，由 Layer 3 `commands.py._build_plugin_bindings()` 注入运行时绑定；
      - Layer 3 `assistant/`：`MemoryStore` 抽出内置零索引 `LinearRetriever` 兜底；`common.py` 沉淀 `today_shanghai`、`parse_iso_date`、`require_positive_int`、`atomic_write_text`；`assistant/__init__.py` 改为按需懒加载导出；`personal_assistant/` 全目录清零 `# type: ignore`。
   2. **阶段二：外围插件单轨化、评测统一装配与四树零 `# type: ignore` 收官（Issue `#84`，本次提交）**：
-     - **外围插件 `plugins/`**：`shell_tools.py` 与 `web_tools.py` 移除 `from_config` 与 `config_path` 回退，统一单轨消费主板注入配置字典；`study_tools.py` 复用 `common.py` 原子写盘与日期工具，移除冗余 `project_root` 与隐式 CWD `Path("data")` 兜底（缺省显式报错）；`fts5_retriever.py` 与 `history_tools.py` 复用 `text_search.py` 新增的 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，删除 `_HistoryThresholdConfig` 鸭子协议与未使用分词重导出；`ModelsDSLCompiler.render` 与 `ConfigCompilerProtocol.render` 对齐为显式强类型具名参数；`telemetry.py` 移除 `getattr`/`setattr` 反射累加及 0 生产调用的 `recent_turns`/`recent_tasks`（`config/tools.json` 同步切换为 `max_sessions`）；删除冗余 `plugins/tools/__init__.py`；
+     - **外围插件 `plugins/`**：`shell_tools.py` 与 `web_tools.py` 移除 `from_config` 与 `config_path` 回退，统一单轨消费主板注入配置字典；`study_tools.py` 复用 `common.py` 原子写盘与日期工具，移除冗余 `project_root` 与隐式 CWD `Path("data")` 兜底（缺省显式报错）；`fts5_retriever.py` 与 `history_tools.py` 复用 `text_search.py` 新增的 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，删除 `_HistoryThresholdConfig` 鸭子协议与未使用分词重导出；`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 改为显式强类型具名参数（Layer 2 协议零 `consolidator` 业务名泄漏，具体插件以带默认值可选参数扩展）；`telemetry.py` 移除 `getattr`/`setattr` 反射累加及 0 生产调用的 `recent_turns`/`recent_tasks`（`config/tools.json` 同步切换为 `max_sessions`）；删除冗余 `plugins/tools/__init__.py`；
      - **评测统一装配 `evals/`**：`AssistantApp` 支持接收外部预加载 `tools_config`（按所有权释放）与 `auto_consolidate=False`；`evals/agent_eval.py` 改为基于 `AssistantApp(..., auto_consolidate=False, today_fn=...)` 执行并透传每题 `case["today"]` 修复 2026-11-30 时效到期隐患；`evals/memory_eval.py` 与 `evals/public_benchmarks.py` 移除 `setup_step_count` 旧格式双轨（统一 `shared_setup`）、通过 `AssistantApp` + `app.consolidator` 使双模型沉淀真实生效，并将 `_contains_keyword` 升级为无长度魔法阈值的全长度纯 ASCII 字母数字边界匹配；`evals/cli.py` 单次加载 `ToolsConfig` 向下透传、支持 `--consolidator-model` 并清理未使用导入；
      - **入口脚本与静态守卫**：`scripts/web_chat.py` 移除迁就旧测试桩的 `auth_token` 三元分支，复用 `_is_loopback_host` 与 `StateStore.get_context_snapshot(chat_id, limit=40)`；`scripts/demo.py` 的 `run_live_ask` 对齐 `ToolsConfig` 加载；`tests/test_architecture.py` 将 `0` 处 `# type: ignore` 静态硬守卫扩大覆盖 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 全部四棵目录树。
 - **验证与同口径说明（`1b421d2` → 本次提交）**：
