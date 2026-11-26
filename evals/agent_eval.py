@@ -20,7 +20,7 @@ from personal_assistant.assistant.memory import (
     MemoryToolsetProvider,
 )
 from personal_assistant.assistant.prompts import format_system_prompt
-from evals.common import current_git_commit, normalize_expected_sources
+from evals.common import current_git_commit, normalize_expected_sources, resolve_eval_paths
 
 
 # 将原始数据目录的 memory/ 与 workspace/ 复制到临时目录，确保评测过程绝不改写生产数据
@@ -51,8 +51,7 @@ def evaluate_agent(
     config_path: Path | None = None,
     git_commit: str | None = None,
 ) -> dict[str, object]:
-    cfg_path = (config_path or (REPO_ROOT / "config" / "tools.json")).resolve()
-    project_root = cfg_path.parent.parent if cfg_path.is_file() else REPO_ROOT
+    cfg_path, project_root = resolve_eval_paths(config_path)
     cfg = ToolsConfig.load(cfg_path, project_root=project_root) if cfg_path.is_file() else None
 
     per_case: list[dict[str, object]] = []

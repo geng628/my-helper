@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-from personal_assistant.ai.client import from_env
+from personal_assistant.ai.client import LLMClient, from_env
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
 from personal_assistant.assistant.memory import MemoryStore
 from evals.agent_eval import evaluate_agent
-from evals.common import load_cases, safe_write_report
+from evals.common import load_cases, resolve_eval_paths, safe_write_report
 from evals.memory_eval import evaluate_memory, load_scenarios
 from evals.public_benchmarks import prepare_public_datasets
 from evals.search_eval import evaluate_search
@@ -41,6 +42,30 @@ def _filter_items(
     return filtered
 
 
+# 按 --config 或默认 config/tools.json 解析路径并加载工具与主板插件
+def _load_tools_config(cfg_path: Path | None) -> tuple[Path, ToolsConfig | None]:
+    tools_cfg_path, project_root = resolve_eval_paths(cfg_path)
+    if not tools_cfg_path.is_file():
+        return tools_cfg_path, None
+    return tools_cfg_path, ToolsConfig.load(tools_cfg_path, project_root=project_root)
+
+
+# 统一通过 ToolsConfig.build_llm 构造评测模型（支持 models.dsl 档案、内置预设与环境变量）
+def _build_eval_llm(
+    loaded_cfg: ToolsConfig | None,
+    tools_cfg_path: Path,
+    model_name: str | None = None,
+) -> LLMClient:
+    clean_name = (model_name or "").strip() or None
+    if loaded_cfg is not None:
+        return loaded_cfg.build_llm(tools_cfg_path.parent, model_name=clean_name)
+    if clean_name is None:
+        return from_env()
+    env = dict(os.environ)
+    env["LLM_MODEL"] = clean_name
+    return from_env(env)
+
+
 # 解析命令行参数、执行对应模式评测或公开数据集下载，输出汇总并按需保存 JSON 报告
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(REPO_ROOT / ".env")
@@ -60,8 +85,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
+    parser.add_argument("--model", default=None, help="agent/memory 模式指定待测模型（models.dsl 档案名、预设名如 reasoner 或模型 ID）")
+    parser.add_argument("--judge-model", default=None, help="memory 模式指定独立 Judge 模型（同上；未指定时默认复用待测模型）")
     parser.add_argument("--workers", type=int, default=1, help="memory 模式并发场景数（默认 1 串行；>1 并发执行各独立场景）")
-    parser.add_argument("--config", default=None, help="tools.json 路径（agent/memory 模式使用）")
+    parser.add_argument("--config", default=None, help="tools.json 路径（默认 config/tools.json）")
     parser.add_argument("--output", default=None, help="保存完整 JSON 评测报告的路径")
     # 以下参数专用于 --mode download 下载并转换公开学术基准（默认落盘到 evals/public）
     parser.add_argument("--dataset", choices=["longmemeval", "locomo", "all"], default="all", help="download 模式目标公开集")
@@ -101,10 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
         retriever = None
         if args.retriever != "linear":
-            tools_cfg_path = (cfg_path or (REPO_ROOT / "config" / "tools.json")).resolve()
-            if tools_cfg_path.is_file():
-                proj = tools_cfg_path.parent.parent
-                loaded_cfg = ToolsConfig.load(tools_cfg_path, project_root=proj)
+            tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
+            if loaded_cfg is not None:
                 override = None if args.retriever == "auto" else args.retriever
                 retriever = loaded_cfg.build_retriever(override_name=override)
             elif args.retriever != "auto":
@@ -113,11 +138,20 @@ def main(argv: list[str] | None = None) -> int:
         report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
     elif args.mode == "agent":
         cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
-        report = evaluate_agent(from_env(), data_dir, cases, config_path=cfg_path)
+        tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
+        llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
+        report = evaluate_agent(llm, data_dir, cases, config_path=cfg_path)
     else:
         scenarios = _filter_items(load_scenarios(cases_path), category=args.category, max_cases=args.max_cases)
-        llm = from_env()
-        judge = None if args.no_judge else llm
+        tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
+        llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
+        judge_name = (args.judge_model or "").strip() or None
+        if args.no_judge:
+            judge: LLMClient | None = None
+        elif judge_name is not None:
+            judge = _build_eval_llm(loaded_cfg, tools_cfg_path, judge_name)
+        else:
+            judge = llm
 
         # 向 stderr 输出共享长对话沉淀完成进度
         def _report_setup_done(setup_rep: dict[str, object]) -> None:

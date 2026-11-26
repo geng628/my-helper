@@ -435,17 +435,57 @@ class ToolsConfig:
         _atomic_write_private_json(cfg_dir / "models.json", compiled)
         return models_cfg
 
-    # 基于 models.dsl / models.json 构造 LLMClient；若均不存在则回退到环境变量 from_env()
+    # 按预设 ID、别名或默认模型名查找已加载编译插件暴露的厂商预设
+    def _match_preset(self, raw_name: str) -> dict[str, object] | None:
+        key = raw_name.strip().lower()
+        if not key:
+            return None
+        for preset in self.model_presets():
+            raw_aliases = preset.get("aliases")
+            aliases = (
+                {str(a).strip().lower() for a in raw_aliases if str(a).strip()}
+                if isinstance(raw_aliases, (list, tuple))
+                else set()
+            )
+            preset_id = str(preset.get("id") or "").strip().lower()
+            default_model = str(preset.get("default_model") or "").strip().lower()
+            if key in {preset_id, default_model} - {""} or key in aliases:
+                return preset
+        return None
+
+    # 基于 models.dsl / models.json、内置预设或环境变量统一构造 LLMClient
     def build_llm(
         self,
         config_dir: Path,
         *,
         model_name: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> LLMClient:
+        clean_name = (model_name or "").strip() or None
+        source_env = os.environ if env is None else env
         models_cfg = self.load_models_config(config_dir)
         if models_cfg is not None:
-            return from_model_profile(models_cfg.get_profile(model_name))
-        return from_env()
+            target = clean_name
+            if target is not None and target not in models_cfg.models:
+                preset = self._match_preset(target)
+                preset_id = str(preset.get("id") or "").strip() if preset is not None else ""
+                if preset_id and preset_id in models_cfg.models:
+                    target = preset_id
+            return from_model_profile(models_cfg.get_profile(target), env=source_env)
+        if clean_name is None:
+            return from_env(source_env)
+        merged = dict(source_env)
+        preset = self._match_preset(clean_name)
+        if preset is not None:
+            merged["LLM_PROVIDER"] = str(preset.get("provider") or "openai_compatible")
+            merged["LLM_MODEL"] = str(preset.get("default_model") or clean_name)
+            if not merged.get("LLM_BASE_URL", "").strip() and preset.get("base_url"):
+                merged["LLM_BASE_URL"] = str(preset["base_url"])
+            if preset.get("needs_key") is False and not merged.get("LLM_API_KEY", "").strip():
+                merged["LLM_API_KEY"] = str(preset.get("id") or "local")
+        else:
+            merged["LLM_MODEL"] = clean_name
+        return from_env(merged)
 
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
     def build_retriever(self, override_name: str | None = None) -> object | None:
