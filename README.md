@@ -30,9 +30,9 @@
 - 外层统一基类 `Plugin(ABC)`（`__init_subclass__` 自动发现、`initialize()` / `terminate()` 生命周期）向主板 `PluginContext` 注册五大强类型子协议（核心运行时只认子协议，不感知实现是否来自插件）：
   1. **工具插槽 `Tool(ToolSchema)`**：由 [plugins/tools/plugin.py](plugins/tools/plugin.py)（`ToolsPlugin`）扫描 `plugins/tools/*.py` 中的 `@tool` 函数；在 [plugins/tools/custom_tools.py](plugins/tools/custom_tools.py) 声明并入 `config/tools.json` 白名单即可热插拔。
   2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`），内置英文不规则词形还原/词干、中文虚词切分 + Bigram、SQL 级过期过滤、增量 mtime/size 同步与 `os.scandir` 遍历优化。
-  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)（`models_dsl`），手写 Lexer + 递归下降 AST + 精确行列报错，支持 8 大厂商预设、`use`/`add` 一行语法、`model { ... }` 块语法与 `consolidator` 双模型分槽指令。
+  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)（`models_dsl`），手写 Lexer + 递归下降 AST + 精确行列报错，支持 8 项内置模型预设、`use`/`add` 一行语法、`default`/`consolidator` 顶层指令与 `model <name> { ... }` 块语法。
   4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），复用 Layer 1 `OpenAIChatClient` 传输底座，声明 `reasoning_content` 流式 `ThinkingDelta`、轮内工具续传保留与跨轮安全剥离。
-  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)（`telemetry`），无锁外侵收集 `total_ms` / `ttft_ms` / `llm_ms` / `tool_ms` / `overhead_ms` 分阶段耗时拆解及后台 `TaskEvent` 账本，配合有界环形窗口与 MRU 会话淘汰。
+  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)（`telemetry`），线程安全、零微内核侵入收集 `total_ms` / `ttft_ms` / `llm_ms` / `tool_ms` / `overhead_ms` 分阶段耗时拆解及后台 `TaskEvent` 账本，配合有界环形窗口与 MRU 会话淘汰。
 - **单次初始化解耦**：`PluginManager.from_entries()` 仅在装配期执行一次 `Plugin.initialize()` 并缓存工具规格；每轮 `build_tools(context)` 只按函数签名重绑运行时上下文并克隆自定义 `Tool` 子类，不再重跑初始化。
 - **有界观测与传输加固**：`CacheMonitor(max_records=2000, max_sessions=256)` 配合单调 `snapshot_index()` 与 $O(1)$ 累计账本；`default_post_json` / `default_post_stream` 支持瞬时网络/TLS 异常（`IncompleteRead`、`SSLError`、`429`/`5xx`）指数退避重试；大输出通过 [personal_assistant/assistant/common.py](personal_assistant/assistant/common.py) `truncate_or_offload()` 分级卸载至 `data/workspace/tool_outputs/`（`head` / `head_tail` 预览 + `read_markdown` 续读）。
 
@@ -43,9 +43,9 @@
 - **成对原子落库与只读跨会话回溯**：`StateStore.append_turn()` 在单个 SQLite WAL 事务内成对原子写入 `user` + `assistant`（守住 `messages` 100% 只追不删与问答成对不变量）；`BackgroundConsolidator` 达阈值（16 条或 8000 字符）在后台线程沉淀记忆并单调推进 `session_compactions.compacted_until_id`；[plugins/tools/history_tools.py](plugins/tools/history_tools.py) 提供 `search_chat_history`，以 `?mode=ro` 只读 URI 增量同步内存 FTS5 索引并按 `before_msg_id` 严格隔离当前未完成回合。
 
 ### 3. 个人学习助手专属叠加（零微内核侵入）
-- **实时流式思维链折叠面板**（同波次特性）：`AssistantApp.stream_chat`、`cli.py` 与 `scripts/web_ui.html` 全链路透传并渲染 `thinking_delta` 与 `tool_start`，在推导数学、算法或源码问题时可按需展开/折叠思考过程，主对话历史保持纯净。
-- **前后台双模型分槽**（同波次特性）：在 `config/models.dsl` 中通过 `consolidator <模型名>` 为后台 `MemoryConsolidator` 指定独立轻量模型，兼顾 `deepseek-reasoner` 的复杂推导精度与 `deepseek-chat` 的低成本结构化沉淀。
-- **纯 Markdown 知识卡片与间隔复习**（同波次特性，PR `#64`）：`plugins/tools/study_tools.py` 提供 `save_study_card`（在 `data/workspace/study/<slug>.md` 创建或幂等更新结构化学习卡片，并按 Leitner/SM-2 精简调度计算下次复习日）与 `list_due_reviews`（查询到期复习队列与掌握进度）。
+- **实时流式思维链折叠面板**：`AssistantApp.stream_chat`、`cli.py` 与 `scripts/web_ui.html` 全链路透传并渲染 `thinking_delta` 与 `tool_start`，在推导数学、算法或源码问题时可按需展开/折叠思考过程，主对话历史保持纯净。
+- **前后台双模型分槽**：在 `config/models.dsl` 中通过 `consolidator <模型名>` 为后台 `MemoryConsolidator` 指定独立轻量模型，兼顾 `deepseek-reasoner` 的复杂推导精度与 `deepseek-chat` 的低成本结构化沉淀。
+- **纯 Markdown 知识卡片与间隔复习**：`plugins/tools/study_tools.py` 提供 `save_study_card`（在 `data/workspace/study/<slug>.md` 创建或幂等更新结构化学习卡片，并按 Leitner/SM-2 精简调度计算下次复习日）与 `list_due_reviews`（查询到期复习队列与掌握进度）。
 
 ### 4. 纵深防御安全边界
 - **文件读写隔离**：`FilesPolicy` 严格限制 `read_roots`（`data/memory`、`data/workspace`、`docs`）与唯一 `write_root = data/workspace`（覆盖前自动备份到 `.backups/`），逐段拒绝 `..`、符号链接与敏感路径段（`.env`、`.git`、`.ssh`、`state`、`uploads`、`models.dsl`、`models.json`）；禁止 LLM 无人工审批修改 `personal_assistant/` 与 `plugins/`。
@@ -92,11 +92,11 @@ uv run python scripts/demo.py --show-messages
 支持三种配置入口，均默认启用 `.gitignore`、`0600` 权限与双沙箱屏蔽：
 
 ```bash
-# 方式 A：终端交互向导（选厂商 + 贴密钥，自动生成 config/models.dsl 与 models.json）
+# 方式 A：终端交互向导（选厂商 + 贴密钥，自动生成 config/models.dsl 与 models.json；支持 --model / --consolidator-model）
 uv run python -m personal_assistant setup
 uv run python -m personal_assistant chat
 
-# 方式 B：零依赖本地网页端（支持流式推导思维链折叠与右上角「模型设置」热切换）
+# 方式 B：零依赖本地网页端（支持流式推导思维链折叠、--model / --consolidator-model 与右上角「模型设置」热切换）
 uv run python scripts/web_chat.py --open
 ```
 
@@ -154,7 +154,7 @@ uv run python -m evals --mode memory \
 | --- | --- | --- | --- | --- |
 | [evals/memory_scenarios.jsonl](evals/memory_scenarios.jsonl) | 6 分类多轮记忆生命周期（16 场景） | `cffbf26`：**81.25%**（13/16），KV 命中 60.4% / 前缀复用 90.4% | 移除 `MAX_TOOL_ROUNDS` 回归纯 ReAct（`b7b14b5`）：**100%**（**16/16**），KV 命中 **75.2%** / 前缀复用 **91.4%** | 6 大分类全 1.0，零死循环；`deepseek-reasoner`（`16ebd78`）为 **93.75%**（15/16，KV 69.3%，`temp-fact-expiry` 多调 `save_rule` 残留 1 条但最终答对） |
 | LongMemEval（ICLR 2025） | 公开 7 分类分层抽样（35 题，固定 `deepseek-chat` Judge） | `deepseek-chat`（`0a6cf70` / `16ebd78`）：**85.71%**（30/35），KV 命中 55.1% | `deepseek-reasoner`（`16ebd78`, `workers=5`）：**97.14%**（**34/35**，**6/7 分类 100%**，仅 `lme-9ea5eabc` 1 题未过） | **+11.43 pp**（+4 / 0 退步）；`completion_tokens` 增至 **4.2×**（36,730 → 154,655），直接催生前后台 `consolidator` 双模型分槽 |
-| LoCoMo Memory（ACL 2024） | 全会话共享沉淀 `shared_setup`（100 题，19–32 会话） | — | `deepseek-chat`（`dba72a3`, `workers=5`）：**84.00%**（**84/100**，`temporal` **19/21**，墙钟 `300.65s`） | 前 50 题 `43/50`、后 50 题 `41/50`，不放宽防幻觉拒答红线 |
+| LoCoMo Memory（ACL 2024） | 全会话共享沉淀 `shared_setup`（100 题，完整 19 会话；适配器支持全集 19–32 会话） | — | `deepseek-chat`（`dba72a3`, `workers=5`）：**84.00%**（**84/100**，`temporal` **19/21**，墙钟 `300.65s`） | 前 50 题 `43/50`、后 50 题 `41/50`，不放宽防幻觉拒答红线 |
 
 > 该实测同时验证：当前 `MEMORY.md` 索引 + `fts5_bm25` + `search_chat_history` 架构在 LongMemEval 35 题的召回上限已达 **97.14%**，因此主线保持**零向量库依赖**，把工程重心放在推导可读性与双模型性价比优化。
 
@@ -175,7 +175,7 @@ my_helper_v2/
 │   │   ├── shell_tools.py             # 受控白名单 Shell 插件（run_command + 防两步 RCE/选项走私沙箱）
 │   │   ├── web_tools.py               # 联网搜索与防 SSRF 抓网页插件（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 SQLite FTS5 跨会话历史检索（search_chat_history）
-│   │   └── study_tools.py             # 学习助手卡片与间隔复习插件（save_study_card / list_due_reviews，PR #64）
+│   │   └── study_tools.py             # 学习助手卡片与间隔复习插件（save_study_card / list_due_reviews）
 │   ├── fts5_retriever.py              # RetrieverProtocol 插件：SQLite FTS5 + BM25 双语检索
 │   ├── models_dsl.py                  # ConfigCompilerProtocol 插件：手写 Lexer + 递归下降 AST DSL 编译器
 │   ├── reasoning_provider.py          # LLMProviderProtocol 插件：DeepSeek Reasoner / R1 等 reasoning_content 协议
@@ -233,7 +233,7 @@ my_helper_v2/
 │   ├── test_telemetry_plugin.py       # Slot-5 运行期遥测插件、有界窗口与并发单测
 │   ├── test_shell_plugin.py           # 受控白名单 Shell 插件与 38 条红队绕过向量单测
 │   ├── test_web_plugin.py             # 联网搜索与防 SSRF 抓网页插件单测
-│   ├── test_study_plugin.py           # 学习助手知识卡片与间隔重复调度插件单测（PR #64）
+│   ├── test_study_plugin.py           # 学习助手知识卡片与间隔重复调度插件单测
 │   ├── test_step3_memory.py           # Markdown 记忆、write_lock、turn_tag 提交/回滚与目录边界单测
 │   ├── test_step4_app.py              # SQLite 成对原子 append_turn、断流防护、前缀冻结与编排单测
 │   ├── test_streaming.py              # SSE 流式管道、ThinkingDelta/ToolStart 事件与 /api/chat/stream 单测

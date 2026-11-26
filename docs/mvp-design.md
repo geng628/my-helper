@@ -92,7 +92,7 @@ my_helper_v2/
 │   │   ├── shell_tools.py             # 受控白名单 Shell 插件（run_command）
 │   │   ├── web_tools.py               # 联网搜索与防 SSRF 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 FTS5 跨会话历史检索（search_chat_history）
-│   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews，PR #64）
+│   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
 │   ├── fts5_retriever.py              # SQLite FTS5 + BM25 双语检索插件（RetrieverProtocol）
 │   ├── models_dsl.py                  # 极简模型 DSL 编译器插件（ConfigCompilerProtocol）
 │   ├── reasoning_provider.py          # 推理模型协议插件（LLMProviderProtocol：openai_reasoning）
@@ -109,7 +109,7 @@ my_helper_v2/
 │   ├── web_chat.py                    # 零依赖本地 HTTP/SSE 服务（ThreadingHTTPServer）
 │   └── web_ui.html                    # 纯 HTML/JS 流式推导与交互页面
 ├── evals/                             # 顶层统一评测包（search_eval / agent_eval / memory_eval / public_benchmarks）
-├── tests/                             # 确定性单元测试与架构守卫（含 test_architecture.py 与 PR #64 test_study_plugin.py）
+├── tests/                             # 确定性单元测试与架构守卫（含 test_architecture.py 与 test_study_plugin.py）
 ├── docs/
 │   ├── mvp-design.md                  # 本架构设计文档
 │   └── dev-log.md                     # 工程演进、排坑根因与 Benchmark 总账
@@ -220,14 +220,14 @@ CREATE TABLE IF NOT EXISTS session_compactions (
      - **只读快照边界与单调压缩游标**：`max_message_id()` 为同轮跨会话检索锁定上界；`save_compaction()` 单调推进 `compacted_until_id`，`active_messages()` 仅读取 `id > compacted_until_id` 的活跃消息，旧原文完整保留供冷检索回溯。
 4. **后台记忆沉淀与双模型分槽（`consolidator.py` + `commands.py` + `app.py`）**：
    - `ConsolidationPolicy` 默认当活跃消息达到 `16` 条或 `8000` 字符时（且待压缩批至少 `4` 条，保留最近 `6` 条），由 `BackgroundConsolidator` 拉起同 `chat_id` 互斥的 daemon `threading.Thread` 执行 `MemoryConsolidator.consolidate_once()`，并用 `json.JSONDecoder().raw_decode()` 稳健提取结构化 JSON；完成后通过 `on_event` 单点发出 `TaskEvent(kind="consolidation", ...)` 并回调刷新会话冻结提示词。
-   - `AssistantApp` 支持独立注入 `consolidator_llm`（优先读取配置中顶层 `consolidator <模型名>`，未配置时回退共享主对话 `llm`），实现前台 `deepseek-reasoner` 深度推导 + 后台 `deepseek-chat` 低成本整理笔记的无缝分槽；同时通过有界会话级互斥锁 `_chat_turn_lock` 保障同 `chat_id` 串行执行、`stream_chat()` 单一主流程（`chat()` 经 `contextlib.closing` 消费）与 `_convert_context_to_llm`（接入 Layer 2 `convert_to_llm` 钩子将 `compaction_summary` 转为标准 `user/assistant` 承接对并安全合并历史异常连续同角色消息）。
+   - `AssistantApp` 支持独立配置后台沉淀模型（优先级：显式注入 `consolidator_llm` > CLI/Web `--consolidator-model` 参数 > `models.dsl`/`models.json` 顶层 `consolidator <模型名>` 槽位 > 纯环境变量模式下的 `LLM_CONSOLIDATOR_MODEL` > 回退共享主对话 `llm`），实现前台 `deepseek-reasoner` 深度推导 + 后台 `deepseek-chat` 低成本整理笔记的无缝分槽；同时通过有界会话级互斥锁 `_chat_turn_lock` 保障同 `chat_id` 串行执行、`stream_chat()` 单一主流程（`chat()` 经 `contextlib.closing` 消费）与 `_convert_context_to_llm`（接入 Layer 2 `convert_to_llm` 钩子将 `compaction_summary` 转为标准 `user/assistant` 承接对并安全合并历史异常连续同角色消息）。
 
 ---
 
 ### 3.4 外围插件与个人学习助手叠加层（`plugins/` 与 `scripts/`）
 
 - **检索插件（[../plugins/fts5_retriever.py](../plugins/fts5_retriever.py)）**：SQLite FTS5 + BM25，英文不规则词还原 + 中文虚词切分 + Bigram，大语料（`>= 10` 块）启用 `min_bm25_score` 过滤（规避小语料 SQLite 原生 IDF=0 漏召回），窗口去重 `<= 2` 与高置信放行（命中 `>= 3` 词且 BM25 `>= 10`）。
-- **配置 DSL 编译插件（[../plugins/models_dsl.py](../plugins/models_dsl.py)）**：手写词法与递归下降解析器，内置 8 大厂商预设（含 `deepseek_reasoner`），支持一行 `use`/`add`、块状 `model { ... }` 与顶层 `consolidator <模型名>` 双模型分槽指令。
+- **配置 DSL 编译插件（[../plugins/models_dsl.py](../plugins/models_dsl.py)）**：手写词法与递归下降解析器，提供 8 项内置模型预设（含 `deepseek_reasoner`），支持一行 `use`/`add`、顶层 `default`/`consolidator` 指令与块状 `model <name> { ... }` 语法。
 - **推理协议插件（[../plugins/reasoning_provider.py](../plugins/reasoning_provider.py)）**：`OpenAIReasoningLLM(OpenAIChatClient)` 声明 `_thinking_delta_fields() -> ("reasoning_content",)`，在 `_prepare_messages` 中仅剥离最后一条 `user` 之前的历史思维链，保留当前轮多步工具调用的 `reasoning_content`。
 - **遥测插件（[../plugins/telemetry.py](../plugins/telemetry.py)）**：`TelemetryObserver` 维护 `deque(maxlen=window_size)` 与有界 MRU 会话账本，拆解 `total_ms` / `ttft_ms` / `llm_ms` / `tool_ms` / `overhead_ms` 与后台沉淀统计，接入 `/status` 与前端展示。
 - **扩展工具（`plugins/tools/`）**：
@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS session_compactions (
   - `shell_tools.py`：`run_command`（只读/受控命令沙箱 + Head+Tail TOAST）；
   - `web_tools.py`：`web_search`（Tavily / Brave / DuckDuckGo HTML / Bing RSS）与 `fetch_webpage`（防 SSRF + 2 MB 下载上限 + Head TOAST）；
   - `history_tools.py`：`search_chat_history`（只读 `?mode=ro` 增量内存 FTS5 跨会话原文检索，`id < before_msg_id` 隔离当前轮）；
-  - `study_tools.py` *(同波次 PR `#64`)*：零微内核侵入学习助手插件，提供 `save_study_card`（在 `data/workspace/study/<slug>.md` 创建或幂等更新结构化 Markdown 知识卡片并推进 Leitner/SM-2 精简间隔复习计划）与 `list_due_reviews`（查询到期复习队列与全局学习进度）。
+  - `study_tools.py`：零微内核侵入学习助手插件，提供 `save_study_card`（在 `data/workspace/study/<slug>.md` 创建或幂等更新结构化 Markdown 知识卡片并推进 Leitner/SM-2 精简间隔复习计划）与 `list_due_reviews`（查询到期复习队列与全局学习进度）。
 - **本地流式 Web/SSE 服务（[../scripts/web_chat.py](../scripts/web_chat.py) & [../scripts/web_ui.html](../scripts/web_ui.html)）**：
   - 标准库 `ThreadingHTTPServer` 暴露 `GET /`、`/api/status`、`/api/memory`、`/api/models`、`/api/history` 及 `POST /api/chat`、`/api/chat/stream`（SSE `Connection: close`）、`/api/refresh`、`/api/models/setup`；
   - 前端使用纯原生 JS `ReadableStream` 消费 SSE 帧（含 `thinking_delta` 可折叠思维链教学面板、`tool_start` 慢工具状态提示、`tool_step`、`text_delta`、`done`）、XSS 安全 Markdown 渲染器及模型设置弹窗。
