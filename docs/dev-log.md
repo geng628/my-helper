@@ -687,3 +687,19 @@
   - **真机 CLI 端到端冒烟（测于等价主路径 `e103e2b`，`uv run python -m evals --mode memory --cases evals/public/longmemeval_scenarios.jsonl --max-cases 1 --model reasoner --judge-model deepseek`）**：**`[1/1] PASS lme-15745da0_abs (104.2s)`**，服务端 KV 命中 `85.54%`、本地前缀复用 `73.34%`。
 - **退步与未验证项**：无退步；因检索算法、提示词与记忆写入逻辑零改动，本次未重跑全量 Memory 16 / LongMemEval 35 / LoCoMo 100。
 - **下一步**：待 Issue `#48` 对应 PR `#49` 经 CI 验收与确认合并后，按需推进「主对话 / 后台沉淀双模型分槽（兼顾 `reasoner` 精度与 `chat` 成本）」、Issue `#13`（活跃窗口与 `MAX_TOOL_ROUNDS` 调优）或克制版 Issue `#32`（显式 `event_date`）；暂不引入向量检索。
+
+
+---
+
+### [2026-11-26] 为本地网页端 `web_chat.py` 补齐 `Host` / `Origin` / `Sec-Fetch-Site` / `Content-Type` 安全边界（Issue `#53`）
+- **背景与安全隐患**：本地网页服务 `scripts/web_chat.py` 默认监听 `127.0.0.1:8765`，但此前未校验 `Host` 请求头、同源 `Origin` / `Sec-Fetch-Site` 与 `POST` 的 `Content-Type: application/json`，导致浏览器访问恶意第三方页面时可通过免预检 Simple Request（`text/plain`）跨站调用 `POST /api/models/setup` 篡改 `base_url` 并窃取系统提示词与记忆摘要，或通过 DNS Rebinding / 同机跨端口读取 `/api/memory` 与 `/api/history`。
+- **改动文件（代码提交 `638a0f3` → 审查收敛 `2752ad2`）**：
+  - [scripts/web_chat.py](scripts/web_chat.py)：全路由校验 `Host` 白名单（回环绑定严格匹配 `127.0.0.1` / `localhost` / `[::1]` 对应端口，支持 IPv6 RFC 5952 压缩规范化与通配地址本机连接落地 IP）；对全部 `POST` 与 `/api/*` `GET` 校验同源 `Origin` 与 `Sec-Fetch-Site in {"same-origin", "none"}`（显式拒绝跨端口 `same-site` 与 `cross-site`）；强制 `POST` 单一非逗号折叠 `Content-Type: application/json`（否则返回 `415`）；兼容 HTTP/0.9 空字典请求头不崩溃并附加 `X-Content-Type-Options: nosniff`。
+  - [tests/test_web_chat.py](tests/test_web_chat.py)：新增覆盖 Simple-Request CSRF、跨站/跨端口 `Origin` 与 `Sec-Fetch-Site: same-site`、DNS Rebinding 伪造/重复 `Host`、逗号折叠/重复 `Content-Type`、IPv6 回环与原始 TCP HTTP/0.9 请求的确定性回归测试。
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`638a0f3`）→ `Request Changes`**（检出 `same-site` 跨端口非 CORS GET 绕过、HTTP/0.9 `get_all` 异常、逗号折叠 `Content-Type` 3 项 Blocker 与 3 项去重规范化 Nit）；
+  - **Round 2（`2752ad2`）→ `Pass`**（`0 Blockers / 0 Nits`）。
+- **同口径验证对比（改前 `main` `520722e` → 改后 `2752ad2`）**：
+  - 单元测试 (`uv run pytest -v`)：**135 passed → 139 passed**（含三层依赖守卫与 Web SSE 流式单测）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：继续验收合入并行推进的 Issue `#54`（极简内核 `ToolCall` / `ThinkingDelta` / 两层消息边界）与 Issue `#52`（`shell_tools.py` 沙箱加固）。
