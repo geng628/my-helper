@@ -277,7 +277,7 @@ def test_assistant_app_react_uses_search_chat_history_with_turn_isolation(tmp_pa
         obs = str(calls[0]["observation"])
         assert "The Anarchist's Tool Chest" in obs
         assert current_question not in obs
-        hist_tool = next(t for t in app.build_tools() if t.name == "search_chat_history")
+        hist_tool = next(t for t in app.tools if t.name == "search_chat_history")
         assert "data/memory/" in hist_tool.description
     finally:
         app.close()

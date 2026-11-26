@@ -11,7 +11,8 @@ from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.consolidator import ConsolidationPolicy, MemoryConsolidator
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.ai import LLMClient
-from personal_assistant.assistant.memory import MemoryStore, is_line_expired
+from personal_assistant.assistant.memory import MemoryStore
+from personal_assistant.assistant.memory_lifecycle import is_line_expired
 
 
 # 录制每次请求的预设回复模型，用于验证沉淀器传给模型的上下文内容

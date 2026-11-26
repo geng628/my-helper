@@ -43,13 +43,14 @@ class ThinkingDelta:
     text: str
 
 
-# 单次大模型流式响应结束事件（携带完整 assistant 消息、Token 统计与首字/总耗时）
+# 单次大模型流式响应结束事件（携带完整 assistant 消息、Token 统计、首字/总耗时与结束原因）
 @dataclass(frozen=True)
 class StreamDone:
     message: dict[str, object]
     usage: TokenUsage | None = None
     ttft_ms: float | None = None
     latency_ms: float = 0.0
+    finish_reason: str | None = None
 
 
 LLMStreamEvent = TextDelta | ThinkingDelta | StreamDone

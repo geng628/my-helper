@@ -304,9 +304,9 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
 ) -> None:
     from personal_assistant.agent.tools import ToolDocument, ToolMetadata, tool
     from personal_assistant.assistant.app import AssistantApp
+    from personal_assistant.assistant.builtin_tools import BuiltinTool
     from personal_assistant.assistant.commands import CommandToolWrapper
     from personal_assistant.assistant.common import REPO_ROOT
-    from personal_assistant.assistant.memory import BuiltinTool
 
     app = AssistantApp(
         data_root=tmp_path / "data",
@@ -314,7 +314,7 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
         project_root=REPO_ROOT,
     )
     try:
-        registry = app.build_tools()
+        registry = app.tools
 
         # 1. 内核内置工具 (MemoryToolsetProvider) ──▶ BuiltinTool(Tool) 子类
         read_tool = registry._tools["read_markdown"]

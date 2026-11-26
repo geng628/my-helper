@@ -9,21 +9,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.plugins import PluginManager
-from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep, run_react
+from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai import TextDelta, ThinkingDelta
 from personal_assistant.ai.cache import format_cache_summary
-from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient, from_env
+from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient
 from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
-from personal_assistant.assistant.memory import (
-    FilesPolicy,
-    MemoryStore,
-    MemoryToolsetProvider,
-)
-from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
 # 从可编辑插件目录加载演示用时间工具（不硬编码工具实现）
@@ -32,37 +26,13 @@ def build_demo_tools() -> ToolRegistry:
     return ToolRegistry(*plugin_tools, allowed_names=["get_current_time"])
 
 
-# 根据 config/tools.json 装配白名单工具注册表与 Markdown 记忆库
-def build_repl_tools(
-    config_path: Path | None = None,
-    data_root: Path | None = None,
-    get_user_message=None,
-) -> tuple[ToolRegistry, MemoryStore]:
-    cfg_path = config_path or Path(os.getenv("MY_HELPER_CONFIG", "config")) / "tools.json"
-    data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
-    project_root = cfg_path.resolve().parent.parent if cfg_path.is_file() else data_dir.parent
-
-    if cfg_path.is_file():
-        cfg = ToolsConfig.load(cfg_path, project_root=project_root)
-        policy = FilesPolicy.from_dict(cfg.files, project_root=project_root, data_root=data_dir)
-        memory = MemoryStore(data_dir, policy=policy, retriever=cfg.build_retriever())
-        provider = MemoryToolsetProvider(memory, get_user_message=get_user_message)
-        registry = cfg.build_registry(providers=[provider], data_root=data_dir)
-        return registry, memory
-
-    memory = MemoryStore(data_dir)
-    registry = ToolRegistry()
-    registry.register_provider(MemoryToolsetProvider(memory, get_user_message=get_user_message))
-    return registry, memory
-
-
 # 打印单步工具执行日志与耗时
 def _print_tool_step(step: ToolStep) -> None:
     print(f"  [Act] {step.tool}({step.arguments}) ({step.duration_ms:.1f}ms)")
     print(f"  [Observe] {step.observation}")
 
 
-# 创建终端流式打印器：返回实时事件回调与回合收尾函数（直连工具模式与 AssistantApp 模式共用）
+# 创建终端流式打印器：返回实时事件回调与回合收尾函数
 def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], None]]:
     mode = "idle"
     streamed_text = False
@@ -128,43 +98,17 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     return None
 
 
-# 启动交互式终端对话循环：默认基于 AssistantApp 持久化历史与实时流式输出
+# 启动交互式终端对话循环：基于 AssistantApp 持久化历史与实时流式输出
 def run_repl(
     app: AssistantApp | None = None,
     *,
     llm: LLMClient | None = None,
-    tools: ToolRegistry | None = None,
     chat_id: str = "cli",
 ) -> None:
-    if tools is not None:
-        client = llm or from_env()
-        messages: list[dict[str, object]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        print(f"My Helper v2 ReAct REPL（可用工具：{', '.join(tools.names)}；输入 exit/quit 退出）")
-        while True:
-            try:
-                user_text = input("\n你> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not user_text:
-                continue
-            if user_text.lower() in {"exit", "quit", "/quit"}:
-                break
-            messages.append({"role": "user", "content": user_text})
-            on_event, finish = _stream_printer()
-            try:
-                reply = run_react(client, messages, tools, on_event=on_event)
-            except LLMNotConfigured as error:
-                messages.pop()
-                print(f"助手> {error}")
-                continue
-            finish(reply)
-        return
-
     owned = app is None
     active_app = app or build_app(llm=llm)
     try:
-        tool_names = ", ".join(active_app.build_tools().names)
+        tool_names = ", ".join(active_app.tools.names)
         print(f"My Helper REPL（可用工具：{tool_names}；命令：/status /memory /search /refresh；exit 退出）")
         while True:
             try:

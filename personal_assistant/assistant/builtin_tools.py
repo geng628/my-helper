@@ -8,13 +8,6 @@ from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
 
-RULE_INTENT_KEYWORDS = (
-    "记住", "规则", "以后", "每次", "必须", "不要", "禁止", "默认", "优先",
-    "一律", "习惯", "偏好", "请用", "始终", "以后回复", "以后回答", "回复风格", "回答风格", "风格",
-    "always", "never", "rule", "prefer", "must", "default",
-)
-MAX_RULE_STATEMENT_CHARS = 300
-
 
 # 将可选日期参数（date / datetime / ISO 字符串）安全归一化为标准 date 对象
 def _coerce_date(raw: date | str | None) -> date | None:
@@ -40,37 +33,22 @@ class MemoryToolsetProvider(ToolsetProvider):
     source_type = "builtin"
     source_name = "memory"
 
-    # 绑定当前实例的 MemoryStore、用户消息回调、逻辑时钟回调与流式回合暂存标记
-    def __init__(
-        self,
-        memory: Any,
-        get_user_message: Callable[[], tuple[str, int | None]] | None = None,
-        get_today: Callable[[], date] | None = None,
-        *,
-        turn_tag: str | None = None,
-        on_remember: Callable[[], None] | None = None,
-    ) -> None:
+    # 绑定当前实例的 MemoryStore
+    def __init__(self, memory: Any) -> None:
         self.memory = memory
-        self.get_user_message = get_user_message
-        self.get_today = get_today
-        self.turn_tag = turn_tag
-        self.on_remember = on_remember
 
     # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
     def tools(self) -> list[Tool]:
         memory = self.memory
-        get_user_message = self.get_user_message
-        get_today = self.get_today
 
-        # 适配 search_markdown 工具：优先取执行期 today 参数，缺省回退构造期时钟回调并归一化为 date
+        # 适配 search_markdown 工具：将执行期可选注入的 today 参数归一化为标准 date 对象
         def search_markdown(
             query: str,
             root: str = "data/memory",
             *,
             today: date | str | None = None,
         ) -> str:
-            raw_day = today if today is not None else (get_today() if get_today is not None else None)
-            return memory.search_markdown(query, root=root, today=_coerce_date(raw_day))
+            return memory.search_markdown(query, root=root, today=_coerce_date(today))
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:
@@ -87,7 +65,7 @@ class MemoryToolsetProvider(ToolsetProvider):
             saved = memory.write_workspace_file(path, content, mode=mode)
             return f"已写入：{saved}"
 
-        # 适配 remember_fact 工具：优先使用执行期注入的非空用户原话与消息号，缺省回退构造期上下文
+        # 适配 remember_fact 工具：严格通过执行期 tool_context 读取当前用户原话与消息/回合标识
         def remember_fact(
             *,
             user_text: str = "",
@@ -95,35 +73,22 @@ class MemoryToolsetProvider(ToolsetProvider):
             turn_tag: str | None = None,
             on_remember: Callable[[], None] | None = None,
         ) -> str:
-            if isinstance(user_text, str) and user_text.strip():
-                resolved_text = user_text
-                resolved_msg_id = message_id
-            else:
-                if get_user_message is None:
-                    raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
-                ctor_text, ctor_msg_id = get_user_message()
-                resolved_text = ctor_text
-                resolved_msg_id = message_id if message_id is not None else ctor_msg_id
-            effective_tag = (
-                None
-                if resolved_msg_id is not None
-                else (turn_tag if turn_tag is not None else self.turn_tag)
-            )
-            effective_cb = on_remember if on_remember is not None else self.on_remember
+            if not isinstance(user_text, str) or not user_text.strip():
+                raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
+            effective_tag = None if message_id is not None else turn_tag
             target = memory.remember_user_statement(
-                resolved_text,
-                message_id=resolved_msg_id,
+                user_text,
+                message_id=message_id,
                 turn_tag=effective_tag,
             )
-            if effective_cb is not None:
-                effective_cb()
+            if on_remember is not None:
+                on_remember()
             return f"已记录用户原话到 {target}"
 
-        # 适配 save_rule 工具：先阻断外部不可信工具污染轮并校验用户规则意图，再落盘到 data/memory/rules/
+        # 适配 save_rule 工具：阻断已接触外部不可信网络工具的污染轮，其余直接落盘到 data/memory/rules/
         def save_rule(
             statement: str,
             *,
-            user_text: str = "",
             untrusted_tool_seen: Callable[[], bool] | bool = False,
         ) -> str:
             seen_untrusted = (
@@ -133,16 +98,6 @@ class MemoryToolsetProvider(ToolsetProvider):
             )
             if seen_untrusted:
                 raise PermissionError("安全拦截：本轮已读取外部网页或搜索结果，禁止自动写入全局行为规则。")
-            raw_user = user_text.strip() if isinstance(user_text, str) and user_text.strip() else ""
-            if not raw_user and get_user_message is not None:
-                ctor_text, _ = get_user_message()
-                if isinstance(ctor_text, str):
-                    raw_user = ctor_text.strip()
-            if raw_user:
-                lower_user = raw_user.lower()
-                has_intent = any(kw in lower_user for kw in RULE_INTENT_KEYWORDS)
-                if not has_intent or len(statement.strip()) > MAX_RULE_STATEMENT_CHARS:
-                    raise PermissionError("安全拦截：当前用户消息未表达设定长期规则的意图，已拒绝写入 rules/。")
             path = memory.save_rule(statement, source="agent")
             return f"已保存行为规则：data/memory/rules/{path.name}"
 

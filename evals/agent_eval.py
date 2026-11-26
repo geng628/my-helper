@@ -66,14 +66,11 @@ def evaluate_agent(
         with tempfile.TemporaryDirectory(prefix=f"my-helper-eval-{safe_id}-") as tmp:
             memory = _prepare_isolated_memory(data_dir, Path(tmp), cfg, project_root)
             expected = normalize_expected_sources(memory, case.get("expected_sources"))
-            current_user: tuple[str, int | None] = (query, idx)
-            # 绑定独立闭包默认值避免循环引用串台，并在启用配置时同步注入执行期 tool_context
-            provider = MemoryToolsetProvider(memory, get_user_message=lambda u=current_user: u)
+            provider = MemoryToolsetProvider(memory)
             if cfg is not None:
                 registry = cfg.build_registry(
                     providers=[provider],
                     data_root=memory.data_root,
-                    tool_context={"user_text": query, "before_msg_id": idx},
                 )
             else:
                 registry = ToolRegistry()
@@ -101,7 +98,13 @@ def evaluate_agent(
 
             start_idx = monitor.snapshot_index()
             t0 = perf_counter()
-            reply = run_react(tracked_llm, messages, registry, on_event=on_event)
+            reply = run_react(
+                tracked_llm,
+                messages,
+                registry,
+                on_event=on_event,
+                tool_context={"user_text": query, "message_id": idx, "before_msg_id": idx},
+            )
             elapsed_ms = round((perf_counter() - t0) * 1000, 3)
 
         latencies.append(elapsed_ms)

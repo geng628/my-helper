@@ -66,16 +66,33 @@ def format_memory_bullet(text: str, stamp_day: date, until_day: date | None = No
     return f"- [{stamp_day.isoformat()}] {body}"
 
 
-# 按关键词定位主题文件中匹配的列表条目行号
+# 判断文本或列表行是否包含尚未提交的 (turn#...) 流式暂存标记
+def _is_inflight_turn_line(line: str) -> bool:
+    return "(turn#" in line.lower()
+
+
+# 按关键词定位主题文件中匹配的已提交列表条目行号（跳过在途未提交的 turn# 暂存行）
 def _find_matching_indices(lines: list[str], old_key: str) -> list[int]:
-    if not old_key:
+    if not old_key or _is_inflight_turn_line(old_key):
         return []
     lowered = old_key.lower()
     return [
         idx
         for idx, line in enumerate(lines)
-        if line.lstrip().startswith("- ") and lowered in line.lower()
+        if line.lstrip().startswith("- ") and not _is_inflight_turn_line(line) and lowered in line.lower()
     ]
+
+
+# 判断操作关键词是否命中尚未提交的 (turn#...) 暂存行，避免后台沉淀误改或触发回退新增
+def _targets_inflight_turn(lines: list[str], old_key: str) -> bool:
+    lowered = old_key.lower()
+    return bool(lowered) and (
+        _is_inflight_turn_line(lowered)
+        or any(
+            line.lstrip().startswith("- ") and _is_inflight_turn_line(line) and lowered in line.lower()
+            for line in lines
+        )
+    )
 
 
 # 判断已有记忆行正文是否已包含目标补充子句（兼容多次 merge 剥离尾部标点，同时避免子串边界误判）
@@ -115,7 +132,7 @@ def _merge_memory_bullet(
     return f"{base}{sep}{clean_addition}"
 
 
-# 读取全部活跃主题记忆文件快照（排除 MEMORY.md 与 archive/），供沉淀器读旧改旧消冲突
+# 读取全部活跃主题记忆文件快照（排除 MEMORY.md、archive/ 与未提交的 turn# 暂存行），供沉淀器读旧改旧消冲突
 def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
     if not memory_dir.is_dir():
         return ""
@@ -125,11 +142,13 @@ def read_topic_snapshots(memory_dir: Path, max_total_chars: int = 6000) -> str:
         if path.name == "MEMORY.md" or path.name.startswith(".") or not path.is_file():
             continue
         try:
-            content = path.read_text(encoding="utf-8").strip()
+            raw_text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if not content:
+        visible_lines = [ln for ln in raw_text.splitlines() if not _is_inflight_turn_line(ln)]
+        if not any(ln.strip() and not ln.lstrip().startswith("#") for ln in visible_lines):
             continue
+        content = "\n".join(visible_lines).strip()
         block = f"### data/memory/{path.name}\n{content}"
         if used + len(block) > max_total_chars:
             remain = max_total_chars - used
@@ -183,6 +202,7 @@ def apply_topic_operations(
     audit_fn: AuditFn,
     archive_dir: Path | None = None,
     today: date | None = None,
+    applied_texts: list[str] | None = None,
 ) -> str | None:
     slug = re.sub(r"[^a-z0-9_-]+", "-", topic.strip().lower()).strip("-_")[:40]
     if not slug or slug in RESERVED_MEMORY_TOPICS:
@@ -214,11 +234,11 @@ def apply_topic_operations(
 
         if op == "add":
             body = clean_memory_body(str(op_entry.get("text") or op_entry.get("new") or ""))
-            if not body:
+            if not body or _is_inflight_turn_line(body):
                 continue
             if until_day is not None and until_day < ref_day:
                 continue
-            if any(body in existing_line for existing_line in lines):
+            if any(not _is_inflight_turn_line(existing_line) and body in existing_line for existing_line in lines):
                 continue
             lines.append(format_memory_bullet(body, ref_day, until_day))
             added_log.append(body)
@@ -227,7 +247,7 @@ def apply_topic_operations(
         elif op == "merge":
             old_key = clean_memory_body(str(op_entry.get("old") or ""))
             addition = clean_memory_body(str(op_entry.get("text") or op_entry.get("new") or ""))
-            if not addition:
+            if not addition or _is_inflight_turn_line(addition):
                 continue
             if until_day is not None and until_day < ref_day:
                 continue
@@ -242,8 +262,11 @@ def apply_topic_operations(
                 )
                 added_log.append(addition)
                 changed = True
+            elif _targets_inflight_turn(lines, old_key):
+                continue
             elif not any(
                 existing_line.lstrip().startswith("- ")
+                and not _is_inflight_turn_line(existing_line)
                 and _bullet_contains_clause(existing_line, addition)
                 for existing_line in lines
             ):
@@ -254,7 +277,7 @@ def apply_topic_operations(
         elif op == "replace":
             old_key = clean_memory_body(str(op_entry.get("old") or ""))
             new_body = clean_memory_body(str(op_entry.get("new") or op_entry.get("text") or ""))
-            if not new_body:
+            if not new_body or _is_inflight_turn_line(new_body):
                 continue
             if until_day is not None and until_day < ref_day:
                 continue
@@ -270,18 +293,24 @@ def apply_topic_operations(
                     lines.pop(idx)
                 added_log.append(new_body)
                 changed = True
-            elif not any(new_body in existing_line for existing_line in lines):
+            elif _targets_inflight_turn(lines, old_key):
+                continue
+            elif not any(
+                not _is_inflight_turn_line(existing_line) and new_body in existing_line
+                for existing_line in lines
+            ):
                 lines.append(formatted)
                 added_log.append(new_body)
                 changed = True
 
         elif op == "remove":
             old_key = clean_memory_body(str(op_entry.get("old") or op_entry.get("text") or ""))
-            if not old_key:
+            matched_set = set(_find_matching_indices(lines, old_key))
+            if not matched_set:
                 continue
             kept: list[str] = []
-            for line in lines:
-                if line.lstrip().startswith("- ") and old_key.lower() in line.lower():
+            for idx, line in enumerate(lines):
+                if idx in matched_set:
                     removed_log.append(line)
                     superseded_records.append((line, "(removed)"))
                     changed = True
@@ -293,6 +322,8 @@ def apply_topic_operations(
         return None
 
     write_fn(target, "\n".join(lines).rstrip() + "\n")
+    if applied_texts is not None:
+        applied_texts.extend(added_log)
     summary_line = " ".join(index_summary.split()) or f"自动沉淀的 {clean_title} 记录，请按需检索"
     ensure_index_fn(rel_path, f"- [{clean_title}]({rel_path}) — {summary_line}")
     if archive_dir is not None and superseded_records:
@@ -344,7 +375,7 @@ def archive_expired_topics(
         active_lines: list[str] = []
         expired_lines: list[str] = []
         for line in lines:
-            if line.lstrip().startswith("- ") and is_line_expired(line, today=ref_day):
+            if line.lstrip().startswith("- ") and not _is_inflight_turn_line(line) and is_line_expired(line, today=ref_day):
                 expired_lines.append(line)
             else:
                 active_lines.append(line)
@@ -411,6 +442,9 @@ def prune_raw_facts_for_batch(
     kept: list[str] = []
     removed: list[str] = []
     for line in lines:
+        if _is_inflight_turn_line(line):
+            kept.append(line)
+            continue
         match = MSG_TAG_PATTERN.search(line)
         if not match or int(match.group(1)) not in batch_msg_ids:
             kept.append(line)
