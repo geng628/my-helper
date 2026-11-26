@@ -55,6 +55,8 @@ def test_load_real_project_tools_config() -> None:
         "get_current_time",
         "search_chat_history",
         "run_command",
+        "save_study_card",
+        "list_due_reviews",
         "web_search",
         "fetch_webpage",
         "cmd_git_status",

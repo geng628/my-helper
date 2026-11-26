@@ -8,6 +8,8 @@
     "remember_fact",
     "save_rule",
     "get_current_time",
+    "save_study_card",
+    "list_due_reviews",
     "run_command",
     "web_search",
     "fetch_webpage"
