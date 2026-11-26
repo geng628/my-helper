@@ -649,3 +649,17 @@
   - **16 场景真实模型多轮记忆评测（`deepseek-chat`, `workers=4`，测于核心提交 `b7b14b5`）**：**`16/16 (100%)`** 全过（6 大分类全部 `1.0`，零死循环），`llm_calls=129`，服务端 KV Cache 命中率 **`75.16%`**（`191,232 / 254,439`），本地前缀复用率 **`91.37%`**。
 - **退步与未验证项**：无退步；未重跑公开集 LongMemEval 35 / LoCoMo 100 长跑。
 - **下一步**：待开放 PR `#49`（评测 CLI Slot-4 与独立 Judge）及 PR `#47`（网页端安全 Markdown 渲染）rebase 最新 `main` 合入后，继续评估活跃上下文压缩窗口（Issue `#13` 剩余部分）或主对话/后台沉淀双模型分槽。
+
+
+---
+
+### [2026-11-26] 网页端零依赖 XSS 安全完整 Markdown 流式渲染（Issue `#46`）
+- **目标与思路**：保持 `personal_assistant/` 微内核 `0` 行改动与零第三方前端依赖，将 [scripts/web_ui.html](scripts/web_ui.html) 的轻量渲染器升级为完整结构化 Markdown 流式渲染，同时严格守住 XSS 安全边界。
+- **改动文件（代码提交 `d969928`）**：
+  - [scripts/web_ui.html](scripts/web_ui.html)：先经 `escapeHtml`（含单引号 `&#39;`）转义再解析标题、表格、有序/无序列表、引用块、分割线、闭合及流式未闭合代码块、行内代码、粗体与严格限制 `^https?:\/\/[^\s)]+$` 的安全外链（`rel="noopener noreferrer"`）。
+  - [tests/test_web_chat.py](tests/test_web_chat.py)：新增 `test_web_ui_markdown_renderer_and_xss_safety()`，通过 Node.js 实跑验证标题/表格/列表/流式未闭合代码块与 `<script>` / `<img onerror>` / `javascript:` 注入拦截。
+- **Layer 2 独立只读审查 trace**：`Pass`（`0 Blockers / 0 Nits`）。
+- **同口径验证对比（改前 `main` `13a9388` → 改后合流提交）**：
+  - 单元测试 (`uv run pytest -v`)：**133 passed → 134 passed**（含 Node 前端渲染与 XSS 单测、三层架构守卫）；AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25` 40 题）：保持 **38/40 (95.0%)**（`MRR=0.9483`），零退步。
+- **下一步**：继续合入 PR `#49`（Issue `#48` 统一 `ToolsConfig.build_llm` 与评测 CLI `--model` / `--judge-model`），并启动安全沙箱加固与 `pi-agent-core` 架构优雅化演进。

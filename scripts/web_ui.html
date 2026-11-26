@@ -142,10 +142,16 @@
       padding: 11px 14px;
       border-radius: 12px;
       line-height: 1.65;
-      white-space: pre-wrap;
       word-break: break-word;
       border: 1px solid var(--border);
       background: var(--panel);
+    }
+    .msg.user .bubble,
+    .msg.assistant.error .bubble {
+      white-space: pre-wrap;
+    }
+    .msg.assistant .bubble {
+      white-space: normal;
     }
     .msg.user .bubble {
       background: var(--user-bg);
@@ -155,6 +161,22 @@
       border-color: var(--err);
       color: #ffc2c2;
     }
+    .bubble h2, .bubble h3, .bubble h4, .bubble h5 {
+      margin: 10px 0 6px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+    .bubble h2:first-child, .bubble h3:first-child, .bubble h4:first-child, .bubble p:first-child { margin-top: 0; }
+    .bubble p { margin: 6px 0; }
+    .bubble p:last-child { margin-bottom: 0; }
+    .bubble ul, .bubble ol { margin: 6px 0; padding-left: 20px; }
+    .bubble li { margin: 3px 0; }
+    .bubble table { border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 13px; }
+    .bubble th, .bubble td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+    .bubble th { background: var(--panel-2); }
+    .bubble blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--accent); color: var(--muted); }
+    .bubble hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+    .bubble a { color: #8cb4ff; text-decoration: underline; }
     .bubble code {
       background: rgba(255, 255, 255, 0.08);
       padding: 1px 5px;
@@ -340,17 +362,128 @@
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function formatBold(text) {
+      return text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    }
+
+    function renderInlineMarkdown(escapedLine) {
+      return escapedLine
+        .split(/(`[^`\n]+`|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g)
+        .map((seg) => {
+          if (seg.length >= 2 && seg.startsWith("`") && seg.endsWith("`")) return `<code>${seg.slice(1, -1)}</code>`;
+          const link = seg.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+          if (link) return `<a href="${link[2]}" target="_blank" rel="noopener noreferrer">${formatBold(link[1])}</a>`;
+          return formatBold(seg);
+        })
+        .join("");
+    }
+
+    function splitPipeRow(line) {
+      const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+      return trimmed.split("|").map((cell) => renderInlineMarkdown(escapeHtml(cell.trim())));
+    }
+
+    function renderMarkdownBlock(blockText) {
+      const lines = blockText.split("\n");
+      const out = [];
+      let i = 0;
+      const para = [];
+      const flushPara = () => {
+        if (para.length === 0) return;
+        out.push(`<p>${para.map((l) => renderInlineMarkdown(escapeHtml(l))).join("<br/>")}</p>`);
+        para.length = 0;
+      };
+      const sepRe = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+      while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed) {
+          flushPara();
+          i += 1;
+          continue;
+        }
+        const hMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+        if (hMatch) {
+          flushPara();
+          const lvl = Math.min(5, hMatch[1].length + 1);
+          out.push(`<h${lvl}>${renderInlineMarkdown(escapeHtml(hMatch[2]))}</h${lvl}>`);
+          i += 1;
+          continue;
+        }
+        if (/^[-*_]{3,}$/.test(trimmed)) {
+          flushPara();
+          out.push("<hr/>");
+          i += 1;
+          continue;
+        }
+        if (/^>\s?/.test(trimmed)) {
+          flushPara();
+          const quotes = [];
+          while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+            quotes.push(renderInlineMarkdown(escapeHtml(lines[i].trim().replace(/^>\s?/, ""))));
+            i += 1;
+          }
+          out.push(`<blockquote>${quotes.join("<br/>")}</blockquote>`);
+          continue;
+        }
+        if (trimmed.includes("|") && i + 1 < lines.length && sepRe.test(lines[i + 1])) {
+          flushPara();
+          const headers = splitPipeRow(trimmed);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].trim().includes("|")) {
+            rows.push(splitPipeRow(lines[i]));
+            i += 1;
+          }
+          const thHtml = headers.map((h) => `<th>${h}</th>`).join("");
+          const bodyHtml = rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("");
+          out.push(`<table><thead><tr>${thHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`);
+          continue;
+        }
+        if (/^[-*+]\s+/.test(trimmed)) {
+          flushPara();
+          const items = [];
+          while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+            items.push(`<li>${renderInlineMarkdown(escapeHtml(lines[i].trim().replace(/^[-*+]\s+/, "")))}</li>`);
+            i += 1;
+          }
+          out.push(`<ul>${items.join("")}</ul>`);
+          continue;
+        }
+        if (/^\d+\.\s+/.test(trimmed)) {
+          flushPara();
+          const items = [];
+          while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+            items.push(`<li>${renderInlineMarkdown(escapeHtml(lines[i].trim().replace(/^\d+\.\s+/, "")))}</li>`);
+            i += 1;
+          }
+          out.push(`<ol>${items.join("")}</ol>`);
+          continue;
+        }
+        para.push(line);
+        i += 1;
+      }
+      flushPara();
+      return out.join("");
     }
 
     function renderMarkdownLite(text) {
-      const escaped = escapeHtml(text);
-      const withBlocks = escaped.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, (_, code) => {
-        return `<pre><code>${code}</code></pre>`;
-      });
-      return withBlocks
-        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+      const norm = String(text || "").replace(/\r\n/g, "\n");
+      const fenceRe = /```[^\n`]*\n([\s\S]*?)(?:```|$)/g;
+      const chunks = [];
+      let cursor = 0;
+      let match;
+      while ((match = fenceRe.exec(norm)) !== null) {
+        if (match.index > cursor) chunks.push(renderMarkdownBlock(norm.slice(cursor, match.index)));
+        chunks.push(`<pre><code>${escapeHtml(match[1].replace(/\n$/, ""))}</code></pre>`);
+        cursor = fenceRe.lastIndex;
+      }
+      if (cursor < norm.length) chunks.push(renderMarkdownBlock(norm.slice(cursor)));
+      return chunks.join("");
     }
 
     function formatCacheLine(cache) {
