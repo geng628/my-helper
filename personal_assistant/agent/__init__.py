@@ -11,7 +11,6 @@ from personal_assistant.agent.plugins import (
     RetrieverProtocol,
 )
 from personal_assistant.agent.react import (
-    MAX_TOOL_ROUNDS,
     AgentEvent,
     RuntimeEvent,
     TaskEvent,
@@ -34,7 +33,6 @@ __all__ = [
     "AgentEvent",
     "ConfigCompilerProtocol",
     "LLMProviderProtocol",
-    "MAX_TOOL_ROUNDS",
     "ObserverFactory",
     "ObserverProtocol",
     "Plugin",

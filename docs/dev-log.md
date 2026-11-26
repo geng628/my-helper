@@ -629,3 +629,23 @@
     - **Turn 2**（跨轮追问，触发 `get_current_time`）：跨轮剥离旧思维链无 HTTP 400，`total_ms=9487.951`, `ttft_ms=3066.208`, `llm_ms=9487.072`, `tool_ms=0.043`, `cached_tokens=3712/4021 (92.32%)`。
 - **退步与未验证项**：无退步；`deepseek-reasoner` 真机双轮冒烟跑于早期提交 `8f5a412`，本次去补丁与声明式收口重构（`cf85539`）已重跑全部 `133` 项确定性单测、`fts5_bm25` 40 题与 AST 校验，未重跑真机实模冒烟及多轮长记忆全集（Memory 16 / LongMemEval 35 / LoCoMo 100）。
 - **下一步**：待 PR `#45`（`reasoning_provider` + 通用底座重构）与 PR `#47`（网页端零依赖 XSS 安全 Markdown 渲染）经用户确认并合入后，推进混合检索插件 `plugins/hybrid_retriever.py`（向量嵌入 + SQLite BLOB 缓存 + RRF）。
+
+
+---
+
+### [2026-11-26] 移除 `MAX_TOOL_ROUNDS` 与 `tools=None` 强行总结兜底，回归纯 ReAct 循环（Issue `#50`）
+- **背景与设计动机**：
+  - 原 `personal_assistant/agent/react.py` 硬编码了 `MAX_TOOL_ROUNDS = 4`，并在跑满轮次后原地改写最后一条 `role: "tool"` 消息追加中文提示词，再传 `tools=None` 发起第 5 次模型调用强行总结——不仅瞬间 100% 击穿整轮服务端 KV Cache 前缀、污染工具观察原文并违背 Layer 2 微内核业务无关原则，还会在多跳检索未完成时诱导模型半途猜测，以及在携带 `tool_calls` 历史的推理模型下制造协议不一致风险。
+  - 对标 `pi-agent-core` 标准事件循环，彻底移除 `MAX_TOOL_ROUNDS`、`max_rounds` 参数、`_extract_reply` 冗余 `fallback` 形参及 `tools=None` 强行总结分支：`iter_react()` / `run_react()` 改为纯粹 `while True` 循环，进入循环前一次性固定 `tool_defs`，全程只追加消息不篡改，仅以模型未返回 `tool_calls`（`not tool_calls`）作为唯一自然终止条件。
+- **改动文件（代码提交 `b7b14b5` → 精简收口 `ee36ba3`）**：
+  - 核心与外围：[personal_assistant/agent/react.py](personal_assistant/agent/react.py)、[personal_assistant/agent/__init__.py](personal_assistant/agent/__init__.py)、[personal_assistant/assistant/app.py](personal_assistant/assistant/app.py)、[evals/agent_eval.py](evals/agent_eval.py)、[docs/mvp-design.md](docs/mvp-design.md)
+  - 单测：[tests/test_step1_react.py](tests/test_step1_react.py)（替换为 `test_unbounded_react_loop_stops_only_when_no_tool_calls`，验证移除 `MAX_TOOL_ROUNDS`、5 处入口拒绝 `max_rounds`、连续 6 轮工具调用 + 第 7 轮自然收束且 `tools` 定义恒定、`role="tool"` 消息零篡改）
+- **Layer 2 独立只读审查 trace**：
+  - **Round 1（`b7b14b5`）→ `Pass`**（`0 Blocker / 3 Nits`）；
+  - **收口清理（`ee36ba3`）**：内联移除 `_extract_reply` 残留 `fallback` 形参并对齐 `docs/mvp-design.md` 的 `iter_react()` 表述。
+- **同口径验证对比（改前 `main` `16ebd78` → 改后 `b7b14b5` / `ee36ba3`）**：
+  - 单元测试 (`uv run pytest -v`)：**133 passed → 133 passed**（`5.5s`，含 `tests/test_architecture.py` 三层依赖漏斗与子进程独立运行测试）；CI AST 中文 `#` 注释校验：**0 缺失**。
+  - 离线检索（`fts5_bm25`）：40 题保持 **38/40 (95.0%)**（`MRR=0.9483`，失败题维持 `para-search-fallback`、`multi-honest-eval-discipline`），LoCoMo 200 题保持 **105/200 (52.5%)**（`Recall=0.6851, MRR=0.6221`），零退步。
+  - **16 场景真实模型多轮记忆评测（`deepseek-chat`, `workers=4`，测于核心提交 `b7b14b5`）**：**`16/16 (100%)`** 全过（6 大分类全部 `1.0`，零死循环），`llm_calls=129`，服务端 KV Cache 命中率 **`75.16%`**（`191,232 / 254,439`），本地前缀复用率 **`91.37%`**。
+- **退步与未验证项**：无退步；未重跑公开集 LongMemEval 35 / LoCoMo 100 长跑。
+- **下一步**：待开放 PR `#49`（评测 CLI Slot-4 与独立 Judge）及 PR `#47`（网页端安全 Markdown 渲染）rebase 最新 `main` 合入后，继续评估活跃上下文压缩窗口（Issue `#13` 剩余部分）或主对话/后台沉淀双模型分槽。

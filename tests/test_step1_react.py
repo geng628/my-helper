@@ -196,8 +196,17 @@ def test_tool_error_as_observation_self_healing() -> None:
     assert steps[2].observation == "42"
 
 
-# 测试工具调用达到最大轮数上限时自动收束总结
-def test_max_rounds_limit_enforced() -> None:
+# 测试纯 ReAct 循环移除轮次上限与 tools=None 兜底，仅在无 tool_calls 时自然终止且全程保持 tools 前缀恒定
+def test_unbounded_react_loop_stops_only_when_no_tool_calls(tmp_path) -> None:
+    import personal_assistant.agent as agent_pkg
+    import personal_assistant.agent.react as react_mod
+    from evals.agent_eval import evaluate_agent
+    from personal_assistant.agent.react import iter_react
+    from personal_assistant.assistant.app import AssistantApp
+
+    assert not hasattr(react_mod, "MAX_TOOL_ROUNDS")
+    assert not hasattr(agent_pkg, "MAX_TOOL_ROUNDS")
+
     steps: list[ToolStep] = []
     tools = ToolRegistry(
         Tool(
@@ -207,33 +216,47 @@ def test_max_rounds_limit_enforced() -> None:
             handler=lambda: "pong",
         )
     )
+    expected_defs = tools.definitions()
     llm = ScriptedLLM(
         [
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c1", "ping", "{}")]},
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c2", "ping", "{}")]},
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c3", "ping", "{}")]},
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c4", "ping", "{}")]},
-            {"role": "assistant", "content": "已完成 4 轮探测，总结如下。"},
+            {"role": "assistant", "content": None, "tool_calls": [_tool_call(f"c{i}", "ping", "{}")]}
+            for i in range(1, 7)
         ]
+        + [{"role": "assistant", "content": "已完成 6 轮连续探测。"}]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "一直探测"}]
+    messages: list[dict[str, object]] = [{"role": "user", "content": "连续探测直到完成"}]
+
+    with pytest.raises(TypeError):
+        iter_react(llm, messages, tools, max_rounds=4)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        run_react(llm, messages, tools, max_rounds=4)  # type: ignore[call-arg]
+
+    app = AssistantApp(data_root=tmp_path / "app_data", llm=llm)
+    try:
+        with pytest.raises(TypeError):
+            app.chat("你好", max_rounds=4)  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            app.stream_chat("你好", max_rounds=4)  # type: ignore[call-arg]
+    finally:
+        app.close()
+
+    with pytest.raises(TypeError):
+        evaluate_agent(llm, tmp_path / "eval_data", [], max_rounds=4)  # type: ignore[call-arg]
 
     reply = run_react(
         llm,
         messages,
         tools,
-        max_rounds=4,
         on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
 
-    assert reply == "已完成 4 轮探测，总结如下。"
-    assert len(steps) == 4
-    assert len(llm.requests) == 5
-    assert all(llm.requests[i][1] is not None for i in range(4))
-    assert llm.requests[4][1] is None
-    last_tool_msg = llm.requests[4][0][-1]
-    assert last_tool_msg["role"] == "tool"
-    assert "已达到工具调用轮次上限" in str(last_tool_msg["content"])
+    assert reply == "已完成 6 轮连续探测。"
+    assert len(steps) == 6
+    assert len(llm.requests) == 7
+    assert all(req_tools == expected_defs for _, req_tools in llm.requests)
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 6
+    assert all(m["content"] == "pong" for m in tool_msgs)
 
 
 # 测试从环境变量构造客户端及 OpenAI 请求负载格式

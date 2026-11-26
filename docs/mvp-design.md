@@ -29,7 +29,7 @@ flowchart TD
     Entry --> App["核心编排 AssistantApp (app.py)"]
     App --> State["会话历史 StateStore (db.py)\nchat_history.sqlite3\n- messages (对话历史)"]
     App --> Mem["Markdown 记忆与文件 MemoryStore (memory.py)\n- 读写 data/memory/ (MEMORY.md, rules/)\n- 搜索/按行读取允许目录 .md 文件\n- 安全写入 data/workspace/"]
-    App --> Loop["ReAct 核心循环 (react.py)\nrun_react (最多 4 轮)"]
+    App --> Loop["ReAct 核心循环 (react.py)\nrun_react / iter_react"]
     Loop --> LLM["LLM 接口 (llm.py)\nOpenAI 兼容 Chat Completions"]
     Loop --> Tools["白名单工具注册表 ToolRegistry (tools.py)\nconfig/tools.json 驱动\n- 内置记忆/文件工具 (目录白名单)\n- 用户插件工具 (plugins/*.py)\n- 固定命令模板 cmd_* (argv 白名单)"]
 ```
@@ -53,7 +53,7 @@ my-helper/
 │   ├── __main__.py                # 启动入口
 │   ├── cli.py                     # 命令行入口：chat (终端交互)
 │   ├── app.py                     # AssistantApp：装配、上下文与会话历史
-│   ├── react.py                   # 极简 ReAct 核心循环（最多 4 轮原生工具调用）
+│   ├── react.py                   # 极简 ReAct 核心循环（原生工具调用，无 tool_calls 时自然终止）
 │   ├── llm.py                     # OpenAI 兼容 Chat Completions 客户端（标准库 urllib + usage 解析）
 │   ├── cache_metrics.py           # KV 缓存观测（服务端 cached_tokens 命中率 + 本地前缀复用率）
 │   ├── memory.py                  # 核心内置 Markdown 记忆与安全文件读写工具
@@ -173,8 +173,8 @@ data/
 
 ### 3.3 对话循环与核心编排（`react.py` + `app.py`）
 
-- **`run_react()`**：标准 3 段式循环（Reason -> Act & Observe -> 达上限后 `tools=None` 总结），默认最多 `MAX_TOOL_ROUNDS = 4` 轮。
-- **`AssistantApp`**：统一串联对话历史、系统提示词拼装、工具白名单装配与 `run_react()` 执行。
+- **`iter_react()` / `run_react()`**：纯正 `while True` ReAct 循环（Reason -> Act & Observe），全程保持 `tools` 定义恒定，以模型未返回 `tool_calls` 作为唯一自然终止信号。
+- **`AssistantApp`**：统一串联对话历史、系统提示词拼装、工具白名单装配与 `iter_react()` 执行。
 
 ---
 

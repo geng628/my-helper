@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 from personal_assistant.agent.plugins import ObserverProtocol
 from personal_assistant.agent.react import (
-    MAX_TOOL_ROUNDS,
     AgentEvent,
     RuntimeEvent,
     ToolStep,
@@ -274,7 +273,6 @@ class AssistantApp:
         text: str,
         chat_id: str = "default",
         *,
-        max_rounds: int = MAX_TOOL_ROUNDS,
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> Iterator[dict[str, object]]:
         clean_text = text.strip()
@@ -285,7 +283,6 @@ class AssistantApp:
         return self._run_stream_turn(
             clean_text,
             chat_id,
-            max_rounds=max_rounds,
             on_event=on_event,
         )
 
@@ -295,7 +292,6 @@ class AssistantApp:
         clean_text: str,
         chat_id: str,
         *,
-        max_rounds: int,
         on_event: Callable[[AgentEvent], None] | None,
     ) -> Iterator[dict[str, object]]:
         self._maybe_archive_expired()
@@ -326,7 +322,6 @@ class AssistantApp:
             tracked_llm,
             messages,
             registry,
-            max_rounds=max_rounds,
         ):
             self._emit_event(chat_id, event)
             if on_event is not None:
@@ -370,14 +365,12 @@ class AssistantApp:
         text: str,
         chat_id: str = "default",
         *,
-        max_rounds: int = MAX_TOOL_ROUNDS,
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> dict[str, object]:
         result: dict[str, object] = {}
         for frame in self.stream_chat(
             text,
             chat_id=chat_id,
-            max_rounds=max_rounds,
             on_event=on_event,
         ):
             if frame.get("type") == "done":

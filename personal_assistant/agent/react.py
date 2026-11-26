@@ -9,8 +9,6 @@ from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.client import LLMClient
 from personal_assistant.ai.types import StreamDone, TextDelta, TokenUsage
 
-MAX_TOOL_ROUNDS = 4
-
 
 # 单步工具执行完成事件：携带工具名、参数、观察结果与执行耗时
 @dataclass(frozen=True)
@@ -42,10 +40,10 @@ AgentEvent = TextDelta | StreamDone | ToolStep | TurnEnd
 RuntimeEvent = AgentEvent | TaskEvent
 
 
-# 从模型返回的消息字典中提取纯文本回复，为空时使用兜底文案
-def _extract_reply(message: dict[str, object], fallback: str = "模型没有返回回复，请重试。") -> str:
+# 从模型返回的消息字典中提取纯文本回复，为空时使用默认提示文案
+def _extract_reply(message: dict[str, object]) -> str:
     content = str(message.get("content") or "").strip()
-    return content or fallback
+    return content or "模型没有返回回复，请重试。"
 
 
 # 透传单轮 LLM 流式事件并返回本轮完整 assistant 消息
@@ -62,18 +60,16 @@ def _stream_llm_round(
     return done.message if done is not None else {"role": "assistant", "content": ""}
 
 
-# 执行流式通用 ReAct 主循环：透传模型流式增量与 StreamDone，产出 ToolStep / TurnEnd 并更新上下文
+# 执行流式通用 ReAct 主循环：透传模型流式增量与 StreamDone，产出 ToolStep / TurnEnd 并仅在无 tool_calls 时自然终止
 def iter_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
-    *,
-    max_rounds: int = MAX_TOOL_ROUNDS,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
     tool_defs = tools.definitions() if tools.names else None
 
-    for _ in range(max_rounds):
+    while True:
         # 1. Reason：流式调用模型，实时吐字或请求工具调用
         assistant_msg = yield from _stream_llm_round(llm, messages, tool_defs)
         tool_calls = assistant_msg.get("tool_calls") or []
@@ -101,29 +97,17 @@ def iter_react(
                 }
             )
 
-    # 3. 达到工具调用轮次上限：不再提供工具，强制模型基于已有观察总结作答
-    if messages and messages[-1].get("role") == "tool":
-        messages[-1]["content"] = (
-            str(messages[-1]["content"])
-            + "\n\n【系统提示：已达到工具调用轮次上限，请直接基于以上观察结果给出完整回答。】"
-        )
-    final_msg = yield from _stream_llm_round(llm, messages, None)
-    reply = _extract_reply(final_msg, fallback="本轮工具调用已达到上限，请缩小问题范围后再试。")
-    messages.append({"role": "assistant", "content": reply})
-    yield TurnEnd(reply=reply, total_ms=round((perf_counter() - t_turn) * 1000, 3))
 
-
-# 执行有轮次上限的通用 ReAct 主循环：可选订阅强类型 AgentEvent，并返回最终自然语言回答
+# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent，并在模型停止调用工具时返回最终自然语言回答
 def run_react(
     llm: LLMClient,
     messages: list[dict[str, object]],
     tools: ToolRegistry,
     *,
-    max_rounds: int = MAX_TOOL_ROUNDS,
     on_event: Callable[[AgentEvent], None] | None = None,
 ) -> str:
     reply = ""
-    for event in iter_react(llm, messages, tools, max_rounds=max_rounds):
+    for event in iter_react(llm, messages, tools):
         if on_event is not None:
             on_event(event)
         if isinstance(event, TurnEnd):
