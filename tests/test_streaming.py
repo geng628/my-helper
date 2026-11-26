@@ -720,3 +720,313 @@ def plain_echo(text: str) -> str:
 
     assert get_current_time(today="2026-11-16").startswith("2026-11-16 ")
     assert "(Asia/Shanghai)" in get_current_time(today="not-a-date")
+
+
+# 测试 SSE 无 index 的多 tool_calls 槽位切分、缺省 id 补齐与 finish_reason 同步/流式透传及下游剥离
+def test_sse_tool_calls_without_index_and_finish_reason_preservation(tmp_path: Path) -> None:
+    from personal_assistant.ai import OpenAIChatClient
+
+    # 1a. 单帧包含多个无 index 且无 id 元素时，按位置分配独立槽位并补齐 call_0 / call_1
+    sse_multi_in_one_frame = [
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":['
+        '{"function":{"name":"read_markdown","arguments":"{\\"path\\":\\"a.md\\"}"}},'
+        '{"function":{"name":"list_files","arguments":"{}"}}'
+        ']}}]}\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+        "data: [DONE]\n",
+    ]
+    client_multi = OpenAIChatClient(
+        api_key="sk-multi",
+        base_url="https://api.example.com/v1",
+        model="m-multi",
+        post_stream=lambda _u, _p, _h: iter(sse_multi_in_one_frame),
+    )
+    done_multi = next(ev for ev in client_multi.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
+    assert done_multi.message["finish_reason"] == "tool_calls"
+    assert done_multi.message["tool_calls"] == [
+        {"id": "call_0", "type": "function", "function": {"name": "read_markdown", "arguments": '{"path":"a.md"}'}},
+        {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}},
+    ]
+
+    # 1b. 连续无 index 帧：空 args 续传分片函数名合并到同槽；不同 id 或已有 args 后遇新函数名则切新槽
+    sse_no_index = [
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"name":"read_","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"markdown","arguments":"{\\"path\\": \\"a.md\\"}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"explicit_1","function":{"name":"ping","arguments":"{}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"pong","arguments":"{}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+        "data: [DONE]\n",
+    ]
+    client = OpenAIChatClient(
+        api_key="sk-no-idx",
+        base_url="https://api.example.com/v1",
+        model="m-idx",
+        post_stream=lambda _u, _p, _h: iter(sse_no_index),
+        post_json=lambda _u, _p, _h: {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "同步完成"},
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    )
+    events = list(client.stream([{"role": "user", "content": "go"}]))
+    done = next(ev for ev in events if isinstance(ev, StreamDone))
+    assert done.message["finish_reason"] == "tool_calls"
+    assert done.message["tool_calls"] == [
+        {"id": "call_0", "type": "function", "function": {"name": "read_markdown", "arguments": '{"path": "a.md"}'}},
+        {"id": "explicit_1", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
+        {"id": "call_2", "type": "function", "function": {"name": "pong", "arguments": "{}"}},
+    ]
+
+    # 2. 不同 id 且均无 index 的连续单元素分片应自动切槽
+    sse_diff_ids = [
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"c_alpha","function":{"name":"t1","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"c_beta","function":{"name":"t2","arguments":"{}"}}]}}]}\n',
+        'data: {"choices":[{"finish_reason":"length"}]}\n',
+        "data: [DONE]\n",
+    ]
+    client_diff = OpenAIChatClient(
+        api_key="sk-diff",
+        base_url="https://api.example.com/v1",
+        model="m-diff",
+        post_stream=lambda _u, _p, _h: iter(sse_diff_ids),
+    )
+    done_diff = next(ev for ev in client_diff.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
+    assert done_diff.message["finish_reason"] == "length"
+    assert done_diff.message["tool_calls"] == [
+        {"id": "c_alpha", "type": "function", "function": {"name": "t1", "arguments": "{}"}},
+        {"id": "c_beta", "type": "function", "function": {"name": "t2", "arguments": "{}"}},
+    ]
+
+    # 3. 同步 respond() 同样保留 finish_reason，且 AssistantApp._convert_context_to_llm 发往 LLM 时剥离它
+    sync_msg = client.respond([{"role": "user", "content": "hi"}])
+    assert sync_msg["finish_reason"] == "stop"
+
+    sent_batches: list[list[dict[str, object]]] = []
+
+    # 录制发往模型的请求消息并检查工具轮内不带 finish_reason
+    def recording_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        sent_batches.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
+        if len(sent_batches) == 1:
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_fr","function":{"name":"list_files","arguments":"{}"}}]}}]}\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+                    "data: [DONE]\n",
+                ]
+            )
+        return iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","content":"完成"}}]}\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                "data: [DONE]\n",
+            ]
+        )
+
+    app_client = OpenAIChatClient(
+        api_key="sk-app",
+        base_url="https://api.example.com/v1",
+        model="m-app",
+        post_stream=recording_stream,
+    )
+    app = AssistantApp(data_root=tmp_path / "data", llm=app_client)
+    try:
+        res = app.chat("列出记忆文件", chat_id="fr-strip")
+        assert res["reply"] == "完成"
+        assert len(sent_batches) == 2
+        assert all("finish_reason" not in m for m in sent_batches[1])
+    finally:
+        app.close()
+
+    # 4. 直连 Layer 1/2 run_react（无 AssistantApp._convert_context_to_llm）以及零参无 id / type="function" / 多元素续传切槽
+    from personal_assistant.agent import ToolRegistry, run_react, tool as agent_tool
+    from plugins.reasoning_provider import OpenAIReasoningLLM
+
+    # 测试用无参探针工具
+    @agent_tool(description="探针无参工具")
+    def noop_ping() -> str:
+        return "pong"
+
+    direct_sent: list[list[dict[str, object]]] = []
+
+    # 捕获直连 OpenAIReasoningLLM 多步工具调用时发往接口的原始 messages
+    def direct_reasoner_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        direct_sent.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
+        if len(direct_sent) == 1:
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"先调工具","tool_calls":[{"id":"r_tc","type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+                    "data: [DONE]\n",
+                ]
+            )
+        return iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","content":"直连完成"}}]}\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                "data: [DONE]\n",
+            ]
+        )
+
+    direct_llm = OpenAIReasoningLLM(
+        api_key="sk-direct",
+        base_url="https://api.example.com/v1",
+        model="deepseek-reasoner",
+        post_stream=direct_reasoner_stream,
+    )
+    direct_msgs: list[dict[str, object]] = [{"role": "user", "content": "测试直连剥离 finish_reason"}]
+    assert run_react(direct_llm, direct_msgs, ToolRegistry(noop_ping.__agent_tool__)) == "直连完成"
+    assert len(direct_sent) == 2
+    assert all("finish_reason" not in m for m in direct_sent[1])
+
+    # 零参无 id 后接显式 id、以及连续带 type="function" 无 id 零参工具均切入独立槽位
+    sse_zero_arg_edges = [
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"name":"get_current_time","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_2","function":{"name":"list_files","arguments":"{}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"remember_fact","arguments":""}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"noop_ping","arguments":""}}]}}]}\n',
+        "data: [DONE]\n",
+    ]
+    edge_client = OpenAIChatClient(
+        api_key="sk-edge",
+        base_url="https://api.example.com/v1",
+        model="m-edge",
+        post_stream=lambda _u, _p, _h: iter(sse_zero_arg_edges),
+    )
+    edge_done = next(ev for ev in edge_client.stream([{"role": "user", "content": "go"}]) if isinstance(ev, StreamDone))
+    assert [c["function"]["name"] for c in edge_done.message["tool_calls"]] == [  # type: ignore[index]
+        "get_current_time",
+        "list_files",
+        "remember_fact",
+        "noop_ping",
+    ]
+
+
+# 测试 HTTPError 错误体截断透出与令牌脱敏、stream_options 400 精准降级以及 429 Retry-After 退避
+def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from personal_assistant.ai import client as llm_mod
+    from personal_assistant.ai import OpenAIChatClient
+
+    # 1. context_length_exceeded 返回 400 时绝不去掉 stream_options 重试，且透出截断并脱敏的错误体
+    stream_calls: list[dict[str, object]] = []
+    secret_body = (
+        b'{"error":{"code":"context_length_exceeded","message":"maximum context length is 8192 tokens, '
+        b'auth=Bearer tok_abc123 key=sk-secret987654"}}'
+    )
+
+    # 模拟上游返回 context_length_exceeded 400 错误
+    def fail_ctx_urlopen(request: Request, timeout: int = 60):
+        stream_calls.append(json.loads((request.data or b"{}").decode("utf-8")))
+        raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(secret_body))
+
+    monkeypatch.setattr(llm_mod, "urlopen", fail_ctx_urlopen)
+    client = OpenAIChatClient(api_key="sk-live", base_url="https://api.example.com/v1", model="m-err")
+    with pytest.raises(HTTPError) as exc_info:
+        list(client.stream([{"role": "user", "content": "x"}]))
+    assert len(stream_calls) == 1
+    err_text = str(exc_info.value)
+    assert "context_length_exceeded" in err_text
+    assert "tok_abc123" not in err_text
+    assert "sk-secret987654" not in err_text
+    assert "Bearer ***" in err_text
+    assert "sk-***" in err_text
+
+    # 2. 非超长且无参数不兼容特征的 400 同样不重发；而 unknown stream_options 400 应降级重试一次
+    unrelated_calls = 0
+
+    # 模拟无关参数的非空 400 错误
+    def fail_unrelated(request: Request, timeout: int = 60):
+        nonlocal unrelated_calls
+        unrelated_calls += 1
+        raise HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":{"message":"invalid image_url payload"}}'),
+        )
+
+    monkeypatch.setattr(llm_mod, "urlopen", fail_unrelated)
+    with pytest.raises(HTTPError, match="invalid image_url payload"):
+        list(client.stream([{"role": "user", "content": "x"}]))
+    assert unrelated_calls == 1
+
+    # 3. 含 unknown parameter: stream_options 的 400 精准降级重试一次；而上下文/token 超长即便带 stream_options 关键词也不重试
+    incompat_payloads: list[dict[str, object]] = []
+
+    # 模拟 stream_options 不兼容返回 400 后去掉参数重试成功
+    def compat_fallback_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+        incompat_payloads.append(dict(payload))
+        if "stream_options" in payload:
+            raise HTTPError(
+                _u,
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(b'{"error":{"message":"Unknown parameter: stream_options"}}'),
+            )
+        return iter(['data: {"choices":[{"delta":{"content":"fallback ok"}}]}\n', "data: [DONE]\n"])
+
+    fb_client = OpenAIChatClient(
+        api_key="sk-fb",
+        base_url="https://api.example.com/v1",
+        model="m-fb",
+        post_stream=compat_fallback_stream,
+    )
+    fb_events = list(fb_client.stream([{"role": "user", "content": "x"}]))
+    assert len(incompat_payloads) == 2
+    assert "stream_options" in incompat_payloads[0] and "stream_options" not in incompat_payloads[1]
+    assert next(ev for ev in fb_events if isinstance(ev, StreamDone)).message["content"] == "fallback ok"
+
+    # 4. 验证 1024 字节截断上限
+    oversized_body = b"A" * 2048
+    sync_calls = 0
+
+    # 模拟同步调用收到超大错误体
+    def fail_oversized(request: Request, timeout: int = 60):
+        nonlocal sync_calls
+        sync_calls += 1
+        raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(oversized_body))
+
+    monkeypatch.setattr(llm_mod, "urlopen", fail_oversized)
+    with pytest.raises(HTTPError) as oversized_exc:
+        client.respond([{"role": "user", "content": "x"}])
+    assert sync_calls == 1
+    assert len(str(oversized_exc.value).encode("utf-8")) < 1200
+
+    # 5. 验证 429 Retry-After 夹紧在 [0.1, 10.0] 秒内优先退避
+    sleeps: list[float] = []
+    monkeypatch.setattr(llm_mod.time, "sleep", sleeps.append)
+    attempt_429 = 0
+
+    # 模拟连续两次 429 分别带 3.5 与超大 60 Retry-After，第三次返回成功 JSON
+    def retry_429_urlopen(request: Request, timeout: int = 60):
+        nonlocal attempt_429
+        attempt_429 += 1
+        if attempt_429 == 1:
+            raise HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "3.5"}, io.BytesIO(b"rate"))
+        if attempt_429 == 2:
+            raise HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "60"}, io.BytesIO(b"rate"))
+
+        # 模拟成功 HTTP 响应上下文管理器
+        class _OkResp(io.BytesIO):
+            # 返回自身
+            def __enter__(self):
+                return self
+
+            # 关闭流
+            def __exit__(self, *args):
+                self.close()
+                return False
+
+        return _OkResp(json.dumps({"choices": [{"message": {"role": "assistant", "content": "recovered"}}]}).encode("utf-8"))
+
+    monkeypatch.setattr(llm_mod, "urlopen", retry_429_urlopen)
+    reply = client.respond([{"role": "user", "content": "retry"}])
+    assert reply["content"] == "recovered"
+    assert sleeps == [3.5, 10.0]

@@ -320,3 +320,49 @@ def test_cache_monitor_bounded_eviction_and_exact_summaries() -> None:
     assert len(bounded._last_serialized) == 3
     assert len(bounded.records) == 5
 
+
+# 测试 CacheMonitor.summary 按 session_key 精确切片隔离并发会话统计，不串台也不破坏全局汇总
+def test_cache_monitor_summary_filters_by_session_key() -> None:
+    monitor = CacheMonitor(max_records=10, max_sessions=10)
+    monitor.record("chat-a", "sys\na1\n", TokenUsage(prompt_tokens=100, cached_tokens=0, completion_tokens=10))
+    monitor.record("chat-b", "sys\nb1\n", TokenUsage(prompt_tokens=900, cached_tokens=500, completion_tokens=90))
+
+    start_idx = monitor.snapshot_index()
+    monitor.record("chat-a", "sys\na1\na2\n", TokenUsage(prompt_tokens=200, cached_tokens=100, completion_tokens=20))
+    monitor.record("chat-b", "sys\nb1\nb2\n", TokenUsage(prompt_tokens=1000, cached_tokens=800, completion_tokens=50))
+    monitor.record("chat-a", "sys\na1\na2\na3\n", TokenUsage(prompt_tokens=300, cached_tokens=240, completion_tokens=30))
+
+    # 1. 不传 session_key 保持既有全局/切片全部记录语义
+    all_global = monitor.summary()
+    assert all_global["llm_calls"] == 5
+    assert all_global["prompt_tokens"] == 2500
+
+    all_slice = monitor.summary(since=start_idx)
+    assert all_slice["llm_calls"] == 3
+    assert all_slice["prompt_tokens"] == 1500
+
+    # 2. 传入 session_key 且 since=0 时仅统计全窗口中目标会话记录
+    only_a_full = monitor.summary(session_key="chat-a")
+    assert only_a_full["llm_calls"] == 3
+    assert only_a_full["prompt_tokens"] == 600
+    assert only_a_full["cached_tokens"] == 340
+    assert only_a_full["completion_tokens"] == 60
+    assert only_a_full["warm_calls"] == 2
+
+    # 3. 传入 session_key 与 since=start_idx 时，绝不混入并发会话 chat-b 的 token
+    only_a_turn = monitor.summary(since=start_idx, session_key="chat-a")
+    assert only_a_turn["llm_calls"] == 2
+    assert only_a_turn["prompt_tokens"] == 500
+    assert only_a_turn["cached_tokens"] == 340
+    assert only_a_turn["completion_tokens"] == 50
+    assert only_a_turn["warm_calls"] == 2
+
+    only_b_turn = monitor.summary(since=start_idx, session_key="chat-b")
+    assert only_b_turn["llm_calls"] == 1
+    assert only_b_turn["prompt_tokens"] == 1000
+
+    # 4. 不存在的会话返回零计数空摘要
+    empty_s = monitor.summary(since=0, session_key="unknown-session")
+    assert empty_s["llm_calls"] == 0
+    assert empty_s["prompt_tokens"] == 0
+

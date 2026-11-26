@@ -1,10 +1,13 @@
 """核心应用编排（AssistantApp）：串联记忆、白名单工具、SQLite 历史与 ReAct 循环。"""
 from __future__ import annotations
 
+import json
+import math
 import os
 import threading
+import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -22,7 +25,14 @@ from personal_assistant.agent.react import (
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.cache import CacheMonitor
 from personal_assistant.ai.client import LLMClient, NoopLLMClient, from_env
-from personal_assistant.ai.types import TextDelta, ThinkingDelta
+from personal_assistant.ai.types import (
+    LLMStreamEvent,
+    StreamDone,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    extract_tool_calls,
+)
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.consolidator import (
@@ -36,9 +46,203 @@ from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.assistant.prompts import format_system_prompt
 
 MAX_HISTORY_MESSAGES = 20
+MAX_ADAPTIVE_HISTORY_MESSAGES = 60
+MAX_ADAPTIVE_HISTORY_CHARS = 24_000
 MAX_HISTORY_ITEM_CHARS = 2000
 MAX_SESSION_PROMPTS = 256
 MAX_SESSION_LOCKS = 256
+
+
+# 单轮推理或工具调用超出运行期安全预算时构造的结构化异常
+class TurnBudgetExceeded(RuntimeError):
+    # 记录熔断类别与人类可读原因说明
+    def __init__(self, kind: str, reason: str) -> None:
+        self.kind = kind
+        self.reason = reason
+        super().__init__(reason)
+
+
+# 校验运行期整数预算配置为正整数（严格拒绝布尔值）
+def _validate_positive_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数。")
+    return value
+
+
+# 校验运行期浮点秒数预算配置为非负有限数（严格拒绝布尔值、NaN 与 Inf）
+def _validate_non_negative_float(value: float, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} 必须是非负有限数字。")
+    return float(value)
+
+
+# 将工具调用原始 JSON 参数规范化为紧凑有序串，便于检测等价参数的死循环重复调用
+def _canonical_tool_args(raw_arguments: str) -> str:
+    text = (raw_arguments or "{}").strip() or "{}"
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return " ".join(text.split())
+    return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+# 检查助手消息的 tool_calls 参数是否为非法/截断 JSON（用于 finish_reason == "length" 熔断判定）
+def _has_truncated_tool_call_json(message: Mapping[str, object]) -> bool:
+    for call in extract_tool_calls(message):
+        try:
+            parsed = json.loads(call.arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return True
+        if not isinstance(parsed, dict):
+            return True
+    return False
+
+
+# 当未压缩活跃消息超出常规滑窗上限时，在字符与条数总预算内自适应保留更早消息，防止沉淀滞后静默丢上下文
+def _select_adaptive_history(
+    active_all: list[dict[str, object]],
+    *,
+    base_messages: int = MAX_HISTORY_MESSAGES,
+    max_messages: int = MAX_ADAPTIVE_HISTORY_MESSAGES,
+    max_chars: int = MAX_ADAPTIVE_HISTORY_CHARS,
+) -> list[dict[str, object]]:
+    if len(active_all) <= base_messages:
+        return active_all
+    selected_rev: list[dict[str, object]] = []
+    used_chars = 0
+    for idx, msg in enumerate(reversed(active_all)):
+        item_len = min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS)
+        if idx >= base_messages and (len(selected_rev) >= max_messages or used_chars + item_len > max_chars):
+            break
+        selected_rev.append(msg)
+        used_chars += item_len
+    while len(selected_rev) > 1 and selected_rev[-1].get("role") == "assistant":
+        selected_rev.pop()
+    selected_rev.reverse()
+    return selected_rev
+
+
+# 外层回合预算护栏包装器：在零改动 Layer 2 微内核的前提下执行步数、Token、墙钟与死循环熔断并优雅收束
+class _GuardedTurnLLM(LLMClient):
+    # 绑定底层 LLMClient、预算上限与单调时钟
+    def __init__(
+        self,
+        inner: LLMClient,
+        *,
+        max_steps: int,
+        max_tokens: int,
+        max_seconds: float,
+        max_repeated_tool_calls: int,
+        clock: Callable[[], float],
+    ) -> None:
+        self._inner = inner
+        self._max_steps = max_steps
+        self._max_tokens = max_tokens
+        self._max_seconds = max_seconds
+        self._max_repeated = max_repeated_tool_calls
+        self._clock = clock
+        self._started_at = clock()
+        self.steps = 0
+        self.total_tokens = 0
+        self.truncated_tool_call = False
+        self.last_tool_sig: tuple[str, str] | None = None
+        self.repeat_streak = 0
+        self.breach: TurnBudgetExceeded | None = None
+        self.last_usage: TokenUsage | None = None
+
+    # 记录每步已执行工具的规范化签名，累计连续相同调用次数
+    def observe_tool_call(self, tool_name: str, raw_arguments: str) -> None:
+        sig = (tool_name, _canonical_tool_args(raw_arguments))
+        if sig == self.last_tool_sig:
+            self.repeat_streak += 1
+        else:
+            self.last_tool_sig = sig
+            self.repeat_streak = 1
+
+    # 进入新一轮模型推理前核查四大预算护栏，命中任一阈值即返回 TurnBudgetExceeded
+    def _check_budget(self) -> TurnBudgetExceeded | None:
+        if self.steps >= self._max_steps:
+            return TurnBudgetExceeded("max_steps", f"推理步数达到上限 {self._max_steps}")
+        elapsed = self._clock() - self._started_at
+        if elapsed > self._max_seconds:
+            return TurnBudgetExceeded("max_seconds", f"单轮耗时超过上限 {self._max_seconds:g}s")
+        if self.total_tokens > self._max_tokens:
+            return TurnBudgetExceeded("max_tokens", f"单轮累计 Token 超过上限 {self._max_tokens}")
+        if self.truncated_tool_call:
+            return TurnBudgetExceeded("truncated_tool_calls", "模型输出因长度上限截断导致工具参数 JSON 不完整")
+        if self.repeat_streak >= self._max_repeated and self.last_tool_sig is not None:
+            return TurnBudgetExceeded(
+                "repeated_tool_calls",
+                f"工具 {self.last_tool_sig[0]} 连续重复相同参数调用 {self.repeat_streak} 次",
+            )
+        return None
+
+    # 构造不带 tool_calls 的优雅降级收束消息，使 iter_react 自然退出并释放会话锁
+    @staticmethod
+    def _fallback_message(breach: TurnBudgetExceeded) -> dict[str, object]:
+        return {
+            "role": "assistant",
+            "content": (
+                f"抱歉，本轮工具调用达到安全预算上限（原因：{breach.reason}），"
+                "已自动停止继续重试。请缩小问题范围或重试。"
+            ),
+        }
+
+    # 累加单次响应 TokenUsage（未触发熔断时同步 last_usage）
+    def _record_usage(self, usage: object) -> None:
+        if isinstance(usage, TokenUsage):
+            self.total_tokens += usage.prompt_tokens + usage.completion_tokens
+            self.last_usage = usage
+        else:
+            self.last_usage = None
+
+    # 同步调用前执行预算核查，触发熔断时不再请求远端并直接返回收束答复
+    def respond(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        breach = self._check_budget()
+        if breach is not None:
+            self.breach = breach
+            self.last_usage = None
+            return self._fallback_message(breach)
+        self.steps += 1
+        self.last_usage = None
+        msg = self._inner.respond(messages, tools)
+        self._record_usage(getattr(self._inner, "last_usage", None))
+        if msg.get("finish_reason") == "length" and _has_truncated_tool_call_json(msg):
+            self.truncated_tool_call = True
+        return msg
+
+    # 流式调用前执行预算核查，触发熔断时吐出降级文本与无 tool_calls 的 StreamDone 使循环自然退出
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        breach = self._check_budget()
+        if breach is not None:
+            self.breach = breach
+            self.last_usage = None
+            fallback_msg = self._fallback_message(breach)
+            fallback_text = str(fallback_msg["content"])
+            yield TextDelta(text=fallback_text)
+            yield StreamDone(message=fallback_msg, usage=None, ttft_ms=None, latency_ms=0.0)
+            return
+        self.steps += 1
+        self.last_usage = None
+        for event in self._inner.stream(messages, tools):
+            if isinstance(event, StreamDone):
+                usage = (
+                    event.usage
+                    if isinstance(event.usage, TokenUsage)
+                    else getattr(self._inner, "last_usage", None)
+                )
+                self._record_usage(usage)
+                if event.message.get("finish_reason") == "length" and _has_truncated_tool_call_json(event.message):
+                    self.truncated_tool_call = True
+            yield event
 
 
 # 向消息列表追加对话消息，遇到连续同角色（不含 tool_calls/reasoning_content）时安全合并以防推理模型报错
@@ -86,7 +290,19 @@ class AssistantApp:
         model_name: str | None = None,
         consolidator_model: str | None = None,
         observers: Iterable[ObserverProtocol] | None = None,
+        max_turn_steps: int = 24,
+        max_turn_tokens: int = 250_000,
+        max_turn_seconds: float = 180.0,
+        max_repeated_tool_calls: int = 3,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        self.max_turn_steps = _validate_positive_int(max_turn_steps, "max_turn_steps")
+        self.max_turn_tokens = _validate_positive_int(max_turn_tokens, "max_turn_tokens")
+        self.max_turn_seconds = _validate_non_negative_float(max_turn_seconds, "max_turn_seconds")
+        self.max_repeated_tool_calls = _validate_positive_int(
+            max_repeated_tool_calls, "max_repeated_tool_calls"
+        )
+        self._clock: Callable[[], float] = clock or time.monotonic
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
         self._today_fn = today_fn
@@ -123,6 +339,7 @@ class AssistantApp:
             self.llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
         else:
             self.llm = from_env()
+        self._llm_lock = threading.RLock()
         self._prompt_lock = threading.Lock()
         self._session_prompts: dict[str, tuple[str, str]] = {}
         self._last_archive_day = ""
@@ -152,6 +369,7 @@ class AssistantApp:
             self.memory,
             resolved_consolidator_llm,
             policy=consolidation_policy,
+            today_fn=self._today,
         )
         self.background_consolidator = BackgroundConsolidator(
             self.consolidator,
@@ -224,24 +442,25 @@ class AssistantApp:
         *,
         consolidator_model: str | None = None,
     ) -> None:
-        next_cons_model = (
-            self._consolidator_model
-            if consolidator_model is None
-            else (consolidator_model.strip() or None)
-        )
-        if self.tools_config is not None and self.config_path is not None:
-            new_llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
-        else:
-            new_llm = from_env()
-        new_cons_llm = (
-            self.consolidator.llm
-            if self._custom_consolidator_llm
-            else self._resolve_consolidator_llm(new_llm, consolidator_model=next_cons_model)
-        )
-        self._consolidator_model = next_cons_model
-        self.llm = new_llm
-        if not self._custom_consolidator_llm:
-            self.consolidator.llm = new_cons_llm
+        with self._llm_lock:
+            next_cons_model = (
+                self._consolidator_model
+                if consolidator_model is None
+                else (consolidator_model.strip() or None)
+            )
+            if self.tools_config is not None and self.config_path is not None:
+                new_llm = self.tools_config.build_llm(self.config_path.parent, model_name=model_name)
+            else:
+                new_llm = from_env()
+            new_cons_llm = (
+                self.consolidator.llm
+                if self._custom_consolidator_llm
+                else self._resolve_consolidator_llm(new_llm, consolidator_model=next_cons_model)
+            )
+            self._consolidator_model = next_cons_model
+            self.llm = new_llm
+            if not self._custom_consolidator_llm:
+                self.consolidator.llm = new_cons_llm
 
     # 零代码自动生成 models.dsl 与 models.json（0600 权限）并立即热生效，返回脱敏摘要
     def configure_model(
@@ -272,10 +491,14 @@ class AssistantApp:
     def wait_for_consolidation(self, timeout: float = 15.0) -> None:
         self.background_consolidator.wait(timeout=timeout)
 
-    # 先等待后台沉淀收尾，再关闭底层状态存储资源
+    # 先等待后台沉淀收尾，再关闭已加载插件生命周期，最后关闭底层状态存储资源
     def close(self) -> None:
-        self.background_consolidator.wait(timeout=15.0)
-        self.state.close()
+        try:
+            self.background_consolidator.wait(timeout=15.0)
+            if self.tools_config is not None:
+                self.tools_config.plugin_manager.terminate_all()
+        finally:
+            self.state.close()
 
     # 返回当前逻辑日期（默认北京时间，评测时可通过 today_fn 注入历史日期）
     def _today(self) -> date:
@@ -437,7 +660,12 @@ class AssistantApp:
                     )
                 continue
             if role in {"user", "assistant"}:
-                _append_alternating_message(converted, msg)
+                cleaned = (
+                    {k: v for k, v in msg.items() if k != "finish_reason"}
+                    if "finish_reason" in msg
+                    else msg
+                )
+                _append_alternating_message(converted, cleaned)
                 continue
             converted.append(msg)
         return converted
@@ -472,8 +700,10 @@ class AssistantApp:
         clean_text = text.strip()
         if not clean_text:
             raise ValueError("消息内容不能为空。")
-        if isinstance(self.llm, NoopLLMClient):
-            self.llm.respond([{"role": "user", "content": clean_text}])
+        with self._llm_lock:
+            active_llm = self.llm
+        if isinstance(active_llm, NoopLLMClient):
+            active_llm.respond([{"role": "user", "content": clean_text}])
         return self._run_stream_turn(
             clean_text,
             chat_id,
@@ -490,16 +720,21 @@ class AssistantApp:
     ) -> Iterator[dict[str, object]]:
         with self._chat_turn_lock(chat_id):
             self._maybe_archive_expired()
-            compaction = self.state.get_compaction(chat_id)
-            history = self.state.active_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
+            compaction, active_all = self.state.get_context_snapshot(chat_id)
+            history = _select_adaptive_history(active_all)
             before_msg_id = self.state.max_message_id() + 1
             turn_tag = uuid.uuid4().hex[:12]
             fact_used = False
+            untrusted_seen = False
 
             # 标记本轮曾调用 remember_fact 写入待提交暂存事实
             def _mark_fact_used() -> None:
                 nonlocal fact_used
                 fact_used = True
+
+            # 返回本轮是否已触发过 network 风险工具（供 #72 等下游护栏读取）
+            def _has_seen_untrusted_tool() -> bool:
+                return untrusted_seen
 
             turn_persisted = False
             try:
@@ -509,6 +744,7 @@ class AssistantApp:
                     "before_msg_id": before_msg_id,
                     "turn_tag": turn_tag,
                     "on_remember": _mark_fact_used,
+                    "untrusted_tool_seen": _has_seen_untrusted_tool,
                     "today": self._today(),
                     "history_db_path": self.state.db_path,
                 }
@@ -522,14 +758,33 @@ class AssistantApp:
                 thinking_parts: list[str] = []
                 reply = ""
                 start_idx = self.cache_monitor.snapshot_index()
-                tracked_llm = self.cache_monitor.wrap(self.llm, session_key=chat_id)
-                for event in iter_react(
+                with self._llm_lock:
+                    active_llm = self.llm
+                tracked_llm = self.cache_monitor.wrap(active_llm, session_key=chat_id)
+                guarded_llm = _GuardedTurnLLM(
                     tracked_llm,
+                    max_steps=self.max_turn_steps,
+                    max_tokens=self.max_turn_tokens,
+                    max_seconds=self.max_turn_seconds,
+                    max_repeated_tool_calls=self.max_repeated_tool_calls,
+                    clock=self._clock,
+                )
+                for event in iter_react(
+                    guarded_llm,
                     messages,
                     registry,
                     convert_to_llm=self._convert_context_to_llm,
                     tool_context=turn_ctx,
                 ):
+                    if isinstance(event, ToolStart):
+                        meta = registry.metadata(event.tool)
+                        if meta is not None and meta.risk == "network":
+                            untrusted_seen = True
+                        guarded_llm.observe_tool_call(event.tool, event.arguments)
+                    elif isinstance(event, ToolStep):
+                        meta = registry.metadata(event.tool)
+                        if meta is not None and meta.risk == "network":
+                            untrusted_seen = True
                     self._emit_event(chat_id, event)
                     if on_event is not None:
                         on_event(event)
@@ -577,9 +832,11 @@ class AssistantApp:
                 "chat_id": chat_id,
                 "message_id": assistant_msg_id,
                 "tool_calls": traces,
-                "cache": self.cache_monitor.summary(since=start_idx),
+                "cache": self.cache_monitor.summary(since=start_idx, session_key=chat_id),
                 "consolidation_scheduled": scheduled,
             }
+            if guarded_llm.breach is not None:
+                done_payload["budget_exceeded"] = guarded_llm.breach.reason
             telemetry = self._collect_telemetry(session_key=chat_id)
             if telemetry:
                 done_payload["telemetry"] = telemetry

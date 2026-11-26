@@ -101,7 +101,7 @@ class StateStore:
                 )
                 assistant_id = int(assistant_cursor.lastrowid)
                 self.conn.commit()
-            except Exception:
+            except BaseException:
                 self.conn.rollback()
                 raise
             return user_id, assistant_id
@@ -170,12 +170,16 @@ class StateStore:
             )
             self.conn.commit()
 
-    # 按时间正序返回指定会话尚未被压缩的活跃消息（id > compacted_until_id）
-    def active_messages(
-        self, chat_id: str, *, limit: int | None = None
-    ) -> list[dict[str, object]]:
+    # 在单个互斥锁临界区内原子读取会话压缩状态与活跃消息列表，避免后台推进游标导致空洞
+    def get_context_snapshot(
+        self,
+        chat_id: str,
+        *,
+        limit: int | None = None,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
         with self._lock:
-            compacted_until = int(self.get_compaction(chat_id)["compacted_until_id"])
+            compaction = self.get_compaction(chat_id)
+            compacted_until = int(compaction["compacted_until_id"])
             if limit is None:
                 rows = self.conn.execute(
                     """
@@ -186,9 +190,9 @@ class StateStore:
                     """,
                     (chat_id, compacted_until),
                 ).fetchall()
-                return [self._row_to_message(row) for row in rows]
+                return compaction, [self._row_to_message(row) for row in rows]
             if limit <= 0:
-                return []
+                return compaction, []
             rows = self.conn.execute(
                 """
                 SELECT id, chat_id, role, content, created_at
@@ -199,7 +203,14 @@ class StateStore:
                 """,
                 (chat_id, compacted_until, limit),
             ).fetchall()
-            return [self._row_to_message(row) for row in reversed(rows)]
+            return compaction, [self._row_to_message(row) for row in reversed(rows)]
+
+    # 按时间正序返回指定会话尚未被压缩的活跃消息（id > compacted_until_id）
+    def active_messages(
+        self, chat_id: str, *, limit: int | None = None
+    ) -> list[dict[str, object]]:
+        _, messages = self.get_context_snapshot(chat_id, limit=limit)
+        return messages
 
     # 统计全部或单个会话已保存的消息总数
     def count_messages(self, chat_id: str | None = None) -> int:
