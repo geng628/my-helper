@@ -83,6 +83,37 @@ class StateStore:
             self.conn.commit()
             return int(cursor.lastrowid)
 
+    # 在同一事务内原子成对写入本轮 user 与 assistant 消息，返回 (user_msg_id, assistant_msg_id)
+    def append_turn(
+        self, chat_id: str, user_content: str, assistant_content: str
+    ) -> tuple[int, int]:
+        created_at = datetime.now(UTC).isoformat()
+        with self._lock:
+            try:
+                user_cursor = self.conn.execute(
+                    "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                    (chat_id, "user", user_content, created_at),
+                )
+                user_id = int(user_cursor.lastrowid)
+                assistant_cursor = self.conn.execute(
+                    "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                    (chat_id, "assistant", assistant_content, created_at),
+                )
+                assistant_id = int(assistant_cursor.lastrowid)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            return user_id, assistant_id
+
+    # 返回当前 messages 表的最大自增编号（空表返回 0），供流前锁定历史检索快照边界
+    def max_message_id(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages"
+            ).fetchone()
+        return int(row["max_id"]) if row is not None else 0
+
     # 按时间正序返回指定会话最近 limit 条对话记录（不区分是否已压缩）
     def recent_messages(self, chat_id: str, limit: int = 12) -> list[dict[str, object]]:
         if limit <= 0:

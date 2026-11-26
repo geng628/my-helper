@@ -543,3 +543,126 @@ class CounterObserverPlugin(Plugin):
     for msg_id in (1, 3, 5):
         reg = real_cfg.build_registry(data_root=tmp_path / "real", tool_context={"before_msg_id": msg_id})
         assert "search_chat_history" in reg.names
+
+
+# 测试自定义 Tool 子类保留子类类型/重写 run/always_on 且不污染 **values，以及省略 source_name 的函数工具重绑与 base_context 合并
+def test_custom_tool_subclass_preserved_and_base_context_merged(tmp_path: Path) -> None:
+    from personal_assistant.agent.tools import Tool, ToolMetadata, ToolRegistry
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "subclass_and_fn_plugin.py").write_text(
+        """
+from collections.abc import Mapping
+from pathlib import Path
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.agent.tools import Tool, ToolMetadata, build_tool
+
+
+# 真正的自定义 Tool 子类（重写 run 且含 **values），绝不能被 build_tool 洗壳或注入上下文参数
+class StrictSubclassTool(Tool):
+    # 直接校验只收到模型声明的 text 参数，绝无 project_root/data_root 混入
+    def run(self, **values: str) -> str:
+        assert set(values) == {"text"}, f"unexpected kwargs: {values!r}"
+        return f"subclass:{self.name}:{values['text']}"
+
+
+# 测试用函数型工具：省略 source_name 注册时也必须能动态绑定 data_root / config_path / web_config
+def probe_omitted_source(
+    tag: str,
+    *,
+    data_root: Path | None = None,
+    config_path: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+    before_msg_id: int | None = None,
+) -> str:
+    data_name = Path(data_root).name if data_root is not None else "none"
+    cfg_name = Path(config_path).name if config_path is not None else "none"
+    timeout_val = web_config.get("timeout") if web_config is not None else "none"
+    return f"{tag}:{data_name}:{cfg_name}:{timeout_val}:{before_msg_id}"
+
+
+FN_BUILT_TOOL = build_tool(
+    probe_omitted_source,
+    description="省略 source_name 的 build_tool 产物",
+    parameters={"tag": "标签"},
+)
+
+
+# 同时注册自定义 Tool 子类（带/不带 source_name）与省略 source_name 的函数型工具
+class MixedCustomPlugin(Plugin):
+    plugin_id = "mixed_custom"
+
+    # 注册三类工具
+    def initialize(self) -> None:
+        self.context.register_tool(
+            StrictSubclassTool(
+                name="sub_with_src",
+                description="带 source_name 的自定义子类",
+                parameters={"text": "文本"},
+            ),
+            source_name="subclass_src",
+            metadata=ToolMetadata(risk="read", always_on=True),
+        )
+        self.context.register_tool(
+            StrictSubclassTool(
+                name="sub_no_src",
+                description="省略 source_name 的自定义子类",
+                parameters={"text": "文本"},
+            ),
+            metadata=ToolMetadata(risk="exec", always_on=True),
+        )
+        self.context.register_tool(FN_BUILT_TOOL)
+""",
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "tools.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+    manager = PluginManager.from_entries(
+        ["plugins/subclass_and_fn_plugin.py"],
+        tmp_path,
+        context={
+            "project_root": tmp_path,
+            "config_path": cfg_path,
+            "raw_config": {"web": {"timeout": 9}},
+        },
+    )
+    mod = manager.modules[0][1]
+
+    # 局部上下文仅传 data_root 与 extra_bindings，必须保留 base_context 中的 config_path 与 web_config
+    reg = ToolRegistry(allowed_names=["probe_omitted_source"])
+    manager.register_into(
+        reg,
+        context={
+            "data_root": tmp_path / "data_turn_a",
+            "extra_bindings": {"before_msg_id": 31},
+        },
+    )
+
+    # 自定义子类保持原子类类型、always_on=True 常驻激活，且 **values 不被上下文参数污染
+    assert set(reg.names) == {"probe_omitted_source", "sub_with_src", "sub_no_src"}
+    sub_a = reg._tools["sub_with_src"]
+    sub_b = reg._tools["sub_no_src"]
+    assert type(sub_a) is mod.StrictSubclassTool
+    assert type(sub_b) is mod.StrictSubclassTool
+    assert reg.metadata("sub_with_src").always_on is True  # type: ignore[union-attr]
+    assert reg.metadata("sub_no_src").risk == "exec"  # type: ignore[union-attr]
+    assert reg.document("sub_with_src").source_name == "subclass_src"  # type: ignore[union-attr]
+    assert reg.document("sub_no_src").source_name == "mixed_custom"  # type: ignore[union-attr]
+    assert reg.execute("sub_with_src", '{"text": "ok"}') == "subclass:sub_with_src:ok"
+    assert reg.execute("sub_no_src", '{"text": "ok"}') == "subclass:sub_no_src:ok"
+
+    # 省略 source_name 的函数型工具同样在 build_tools(ctx) 中拿到动态覆盖 + 初始 base_context
+    assert reg.execute("probe_omitted_source", '{"tag": "t1"}') == "t1:data_turn_a:tools.json:9:31"
+
+    reg2 = ToolRegistry(allowed_names=["probe_omitted_source"])
+    manager.register_into(
+        reg2,
+        context={
+            "data_root": tmp_path / "data_turn_b",
+            "extra_bindings": {"before_msg_id": 45},
+        },
+    )
+    assert reg2.execute("probe_omitted_source", '{"tag": "t2"}') == "t2:data_turn_b:tools.json:9:45"
+    assert reg2._tools["sub_with_src"] is not sub_a

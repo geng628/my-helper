@@ -438,3 +438,203 @@ def test_cross_midnight_today_fn_refreshes_session_prompt_and_freezes_within_sam
         assert "晚上技术分享" not in (app.memory.memory_dir / "schedule.md").read_text(encoding="utf-8")
     finally:
         app.close()
+
+
+# 测试 StateStore.append_turn / max_message_id 原子落库、跨模块 FTS5 零幽灵与 remember_fact 轮内可读及提交/回滚
+def test_atomic_turn_persistence_prevents_fts5_ghost_and_handles_fact_lifecycle(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    from personal_assistant.assistant.common import REPO_ROOT
+
+    # 1. 验证 StateStore.append_turn 原子成对写入与 max_message_id
+    store = StateStore(tmp_path / "atomic.sqlite3")
+    try:
+        assert store.max_message_id() == 0
+        u_id, a_id = store.append_turn("s0", "你好", "你好！")
+        assert (u_id, a_id) == (1, 2)
+        assert store.max_message_id() == 2
+        msgs = store.active_messages("s0")
+        assert [(m["id"], m["role"], m["content"]) for m in msgs] == [
+            (1, "user", "你好"),
+            (2, "assistant", "你好！"),
+        ]
+    finally:
+        store.close()
+
+    # 2. 跨模块回归：流内第 1 步调 search_chat_history（触发 FTS5 sync），第 2 步抛错中断后，第 3 轮绝不出现幽灵命中
+    # 在第 2 轮工具后抛错，随后执行第 3 轮搜索幽灵词、第 4/5/6 轮测试 remember_fact 轮内可读与提交/回滚
+    class ScriptedFailLLM(LLMClient):
+        # 保存预设脚本
+        def __init__(self, steps: list[object]) -> None:
+            self._steps = list(steps)
+
+        # 返回响应或抛出预设异常
+        def respond(
+            self,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            step = self._steps.pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            assert isinstance(step, dict)
+            return step
+
+    app_llm = ScriptedFailLLM(
+        [
+            # 第 1 轮：正常对话入库
+            {"role": "assistant", "content": "第1轮已记录 BaselineSeedToken。"},
+            # 第 2 轮：含特异词 OrchidPhantom99，第 1 步调用 search_chat_history 触发 sync，第 2 步抛错中断
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tc_h1",
+                        "type": "function",
+                        "function": {"name": "search_chat_history", "arguments": '{"query": "BaselineSeedToken"}'},
+                    }
+                ],
+            },
+            RuntimeError("stream interrupted after history search"),
+            # 第 3 轮：再搜 OrchidPhantom99，绝不允许出现第 2 轮幽灵命中
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tc_h2",
+                        "type": "function",
+                        "function": {"name": "search_chat_history", "arguments": '{"query": "OrchidPhantom99"}'},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "未查到幽灵记录。"},
+            # 第 4 轮：remember_fact 轮内立即落盘可被同轮第 2 步 search_markdown 命中，完成后绑定正式 (msg#N)
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "tc_rf_ok", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tc_sm_ok",
+                        "type": "function",
+                        "function": {
+                            "name": "search_markdown",
+                            "arguments": '{"query": "独角兽偏好Token", "root": "data/memory"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "已记住独角兽偏好。"},
+            # 第 5 轮：remember_fact 后抛错中断，facts.md 中的暂存行必须被回滚清理
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "tc_rf_err", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}
+                ],
+            },
+            RuntimeError("upstream error after remember_fact"),
+            # 第 6 轮：remember_fact 后被外部提前 close() 生成器，facts.md 中的暂存行同样被清理
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "tc_rf_close", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}
+                ],
+            },
+            {"role": "assistant", "content": "不应完成的回复"},
+        ]
+    )
+
+    app = AssistantApp(
+        data_root=tmp_path / "data",
+        config_path=REPO_ROOT / "config" / "tools.json",
+        project_root=REPO_ROOT,
+        llm=app_llm,
+    )
+    try:
+        app.chat("请记住基准词 BaselineSeedToken", chat_id="s-ghost")
+        assert app.state.count_messages("s-ghost") == 2
+
+        with pytest.raises(RuntimeError, match="stream interrupted"):
+            app.chat("带特异词 OrchidPhantom99 的中断消息", chat_id="s-ghost")
+        assert app.state.count_messages("s-ghost") == 2
+
+        r3 = app.chat("检索一下幽灵词", chat_id="s-ghost")
+        assert r3["tool_calls"][0]["observation"] == "未找到匹配的历史对话记录。"
+        assert app.state.count_messages("s-ghost") == 4
+
+        r4 = app.chat("记住，我喜欢独角兽偏好Token", chat_id="s-ghost")
+        assert "独角兽偏好Token" in str(r4["tool_calls"][1]["observation"])
+        facts_after_r4 = app.memory.read_recent_facts()
+        assert "(turn#" not in facts_after_r4
+        assert "(msg#5) 记住，我喜欢独角兽偏好Token" in facts_after_r4
+
+        with pytest.raises(RuntimeError, match="upstream error"):
+            app.chat("记住，失败轮不应留下的Alpha偏好", chat_id="s-ghost")
+        assert "不应留下的Alpha偏好" not in app.memory.read_recent_facts()
+        assert "(turn#" not in app.memory.read_recent_facts()
+        assert app.state.count_messages("s-ghost") == 6
+
+        gen = app.stream_chat("记住，提前关闭不应留下的Beta偏好", chat_id="s-ghost")
+        step_frame = next(gen)
+        assert step_frame["type"] == "tool_step"
+        gen.close()
+        facts_final = app.memory.read_recent_facts()
+        assert "不应留下的Beta偏好" not in facts_final
+        assert "(turn#" not in facts_final
+        assert "(msg#5) 记住，我喜欢独角兽偏好Token" in facts_final
+        assert app.state.count_messages("s-ghost") == 6
+    finally:
+        app.close()
+
+
+# 测试 _chat_turn_lock 在 acquire() 阻塞期间收到异常/中断时不泄漏引用计数也不误释放锁
+def test_chat_turn_lock_interrupt_during_acquire_does_not_leak_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import pytest
+
+    app = AssistantApp(data_root=tmp_path / "data", llm=RecordingLLM([{"role": "assistant", "content": "ok"}]))
+    try:
+        # 构造在 acquire() 期间抛出 KeyboardInterrupt 的受控锁对象
+        class InterruptingLock:
+            # 初始化内部状态
+            def __init__(self) -> None:
+                self.released = False
+
+            # 模拟等待锁期间收到中断信号
+            def acquire(self) -> bool:
+                raise KeyboardInterrupt("interrupted while waiting")
+
+            # 记录是否误调用 release()
+            def release(self) -> None:
+                self.released = True
+
+        fake_lock = InterruptingLock()
+        app._chat_locks["lock-err"] = (fake_lock, 0)  # type: ignore[assignment]
+        with pytest.raises(KeyboardInterrupt, match="interrupted while waiting"):
+            with app._chat_turn_lock("lock-err"):
+                pass
+        assert fake_lock.released is False
+        assert app._chat_locks["lock-err"][1] == 0
+
+        # 替换回正常锁后，同 chat_id 仍可正常执行对话而不死锁
+        app._chat_locks["lock-err"] = (threading.Lock(), 0)
+        res = app.chat("恢复调用", chat_id="lock-err")
+        assert res["reply"] == "ok"
+        assert app._chat_locks["lock-err"][1] == 0
+    finally:
+        app.close()

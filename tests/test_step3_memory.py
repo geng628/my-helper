@@ -338,3 +338,50 @@ def test_memory_store_concurrent_writes_have_zero_lost_updates(
     assert len(raw_audit_lines) == 30 + 30 + 20 + 40
     parsed_entries = [json.loads(ln) for ln in raw_audit_lines]
     assert len(parsed_entries) == 120
+
+
+# 测试流内 turn_tag 暂存事实的幂等写入、finalize_turn_fact 提交绑定 (msg#N) 与中断回滚移除
+def test_turn_tag_fact_staging_finalize_and_rollback(tmp_path: Path) -> None:
+    memory = MemoryStore(tmp_path / "data")
+
+    # 1. turn_tag 写入暂存标记且同 turn_tag 幂等去重
+    memory.remember_user_statement("我偏好深色主题", turn_tag="t-commit")
+    memory.remember_user_statement("我偏好深色主题", turn_tag="t-commit")
+    staged = memory.read_recent_facts()
+    assert staged.count("(turn#t-commit)") == 1
+    assert "我偏好深色主题" in staged
+
+    # 2. finalize_turn_fact(message_id=42) 将 (turn#...) 精确升级为 (msg#42)
+    memory.finalize_turn_fact("t-commit", message_id=42)
+    committed = memory.read_recent_facts()
+    assert "(turn#t-commit)" not in committed
+    assert "(msg#42) 我偏好深色主题" in committed
+
+    # 3. 另一轮暂存后因中断调用 finalize_turn_fact(message_id=None) 移除未提交行，同时保留已提交行
+    hook_calls = 0
+
+    # 记录 remember_fact 成功触发次数
+    def _on_remember() -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+
+    provider = MemoryToolsetProvider(
+        memory,
+        get_user_message=lambda: ("不应残留的暂存事实", None),
+        turn_tag="t-abort",
+        on_remember=_on_remember,
+    )
+    tool_map = {t.name: t for t in provider.tools()}
+    tool_map["remember_fact"].run()
+    assert hook_calls == 1
+    assert "(turn#t-abort)" in memory.read_recent_facts()
+
+    memory.finalize_turn_fact("t-abort", message_id=None)
+    after_rollback = memory.read_recent_facts()
+    assert "不应残留的暂存事实" not in after_rollback
+    assert "(turn#t-abort)" not in after_rollback
+    assert "(msg#42) 我偏好深色主题" in after_rollback
+
+    # 不存在的 turn_tag 调用 finalize_turn_fact 应安全幂等返回
+    memory.finalize_turn_fact("non-existent", message_id=None)
+    memory.finalize_turn_fact("non-existent", message_id=99)

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import threading
+import uuid
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -124,7 +124,7 @@ class AssistantApp:
         else:
             self.llm = from_env()
         self._prompt_lock = threading.Lock()
-        self._session_prompts: dict[str, str] = {}
+        self._session_prompts: dict[str, tuple[str, str]] = {}
         self._last_archive_day = ""
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: dict[str, tuple[threading.Lock, int]] = {}
@@ -239,13 +239,24 @@ class AssistantApp:
         self,
         user_text: str = "",
         message_id: int | None = None,
+        *,
+        before_msg_id: int | None = None,
+        turn_tag: str | None = None,
+        on_remember: Callable[[], None] | None = None,
     ) -> ToolRegistry:
         getter = (lambda: (user_text, message_id)) if user_text else None
-        provider = MemoryToolsetProvider(self.memory, get_user_message=getter, get_today=self._today)
+        provider = MemoryToolsetProvider(
+            self.memory,
+            get_user_message=getter,
+            get_today=self._today,
+            turn_tag=turn_tag,
+            on_remember=on_remember,
+        )
+        effective_before = before_msg_id if before_msg_id is not None else message_id
         if self.tools_config is not None:
             tool_ctx: dict[str, object] = {"history_db_path": self.state.db_path}
-            if message_id is not None:
-                tool_ctx["before_msg_id"] = message_id
+            if effective_before is not None:
+                tool_ctx["before_msg_id"] = effective_before
             return self.tools_config.build_registry(
                 providers=[provider],
                 data_root=self.data_root,
@@ -259,15 +270,18 @@ class AssistantApp:
     def build_system_prompt(self, registry: ToolRegistry) -> str:
         return format_system_prompt(self.memory, tool_names=registry.names, today=self._today())
 
-    # 获取指定会话冻结的系统提示词：整场会话复用首次快照（有界 LRU），防止中途改写记忆打穿 KV Cache
+    # 获取指定会话冻结的系统提示词：按自然日与会话键复用首次快照（有界 LRU），跨日自动失效重算
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
+        today_str = self._today().isoformat()
         with self._prompt_lock:
-            prompt = self._session_prompts.pop(chat_id, None)
-            if prompt is None:
+            cached = self._session_prompts.pop(chat_id, None)
+            if cached is not None and cached[0] == today_str:
+                prompt = cached[1]
+            else:
                 prompt = self.build_system_prompt(registry)
             if len(self._session_prompts) >= MAX_SESSION_PROMPTS:
                 self._session_prompts.pop(next(iter(self._session_prompts)))
-            self._session_prompts[chat_id] = prompt
+            self._session_prompts[chat_id] = (today_str, prompt)
             return prompt
 
     # 主动重置指定会话（或全部会话）冻结的系统提示词，用于后台沉淀或手动改文件后刷新
@@ -278,7 +292,7 @@ class AssistantApp:
             else:
                 self._session_prompts.pop(chat_id, None)
 
-    # 为指定 chat_id 获取有界会话级互斥锁，确保同会话并发请求严格串行并在空闲超限时淘汰旧锁
+    # 为指定 chat_id 获取有界会话级互斥锁，确保同会话并发请求严格串行并在空闲或中断时安全清理引用计数
     @contextmanager
     def _chat_turn_lock(self, chat_id: str) -> Iterator[None]:
         with self._chat_locks_guard:
@@ -290,11 +304,13 @@ class AssistantApp:
                     if len(self._chat_locks) <= MAX_SESSION_LOCKS:
                         break
                     self._chat_locks.pop(idle_id, None)
-        lock.acquire()
+        acquired = False
         try:
+            acquired = lock.acquire()
             yield
         finally:
-            lock.release()
+            if acquired:
+                lock.release()
             with self._chat_locks_guard:
                 current = self._chat_locks.get(chat_id)
                 if current is not None and current[0] is lock:
@@ -361,41 +377,24 @@ class AssistantApp:
             converted.append(msg)
         return converted
 
-    # 回滚未配对的本轮 user 消息，避免流式中途异常或断连在 SQLite 中残留孤儿 user 记录
-    def _rollback_unpaired_user_message(self, chat_id: str, message_id: int) -> None:
-        conn = getattr(self.state, "conn", None)
-        if conn is None:
-            return
-        lock = getattr(self.state, "_lock", None)
-        try:
-            if lock is not None:
-                with lock:
-                    conn.execute(
-                        "DELETE FROM messages WHERE id = ? AND chat_id = ? AND role = 'user'",
-                        (message_id, chat_id),
-                    )
-                    conn.commit()
-            else:
-                conn.execute(
-                    "DELETE FROM messages WHERE id = ? AND chat_id = ? AND role = 'user'",
-                    (message_id, chat_id),
-                )
-                conn.commit()
-        except sqlite3.Error:
-            return
-
-    # 每个自然日首次对话时自动扫描归档已过期的临时记忆，并在跨自然日切换时清空冻结会话提示词
+    # 每个自然日首次对话时先执行过期归档，归档成功后再更新日期游标并清理过时会话冻结提示词
     def _maybe_archive_expired(self) -> None:
         today = self._today()
         today_str = today.isoformat()
         with self._prompt_lock:
             if self._last_archive_day == today_str:
                 return
-            prev_day = self._last_archive_day
-            self._last_archive_day = today_str
-            if prev_day and prev_day != today_str:
-                self._session_prompts.clear()
         self.memory.archive_expired_memories(today=today)
+        with self._prompt_lock:
+            if self._last_archive_day != today_str:
+                self._last_archive_day = today_str
+                stale = [
+                    cid
+                    for cid, (day_key, _) in self._session_prompts.items()
+                    if day_key != today_str
+                ]
+                for cid in stale:
+                    self._session_prompts.pop(cid, None)
 
     # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
     def stream_chat(
@@ -416,7 +415,7 @@ class AssistantApp:
             on_event=on_event,
         )
 
-    # 内部生成器：同会话加锁串行执行，异常或提前 close 时回滚未配对 user 消息，完成后持久化并触发沉淀
+    # 内部生成器：同会话加锁串行执行，成功后再原子成对落库 user+assistant 与绑定事实标记，异常/中断零脏写
     def _run_stream_turn(
         self,
         clean_text: str,
@@ -428,10 +427,23 @@ class AssistantApp:
             self._maybe_archive_expired()
             compaction = self.state.get_compaction(chat_id)
             history = self.state.active_messages(chat_id, limit=MAX_HISTORY_MESSAGES)
-            user_msg_id = self.state.append_message(chat_id, "user", clean_text)
+            before_msg_id = self.state.max_message_id() + 1
+            turn_tag = uuid.uuid4().hex[:12]
+            fact_used = False
+
+            # 标记本轮曾调用 remember_fact 写入待提交暂存事实
+            def _mark_fact_used() -> None:
+                nonlocal fact_used
+                fact_used = True
+
             turn_persisted = False
             try:
-                registry = self.build_tools(user_text=clean_text, message_id=user_msg_id)
+                registry = self.build_tools(
+                    user_text=clean_text,
+                    before_msg_id=before_msg_id,
+                    turn_tag=turn_tag,
+                    on_remember=_mark_fact_used,
+                )
                 system_prompt = self.get_session_system_prompt(chat_id, registry)
                 summary_text = str(compaction.get("summary") or "").strip()
                 messages = self._assemble_context_messages(
@@ -465,11 +477,13 @@ class AssistantApp:
                     elif isinstance(event, TurnEnd):
                         reply = event.reply
 
-                assistant_msg_id = self.state.append_message(chat_id, "assistant", reply)
+                user_msg_id, assistant_msg_id = self.state.append_turn(chat_id, clean_text, reply)
                 turn_persisted = True
+                if fact_used:
+                    self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
             finally:
-                if not turn_persisted:
-                    self._rollback_unpaired_user_message(chat_id, user_msg_id)
+                if not turn_persisted and fact_used:
+                    self.memory.finalize_turn_fact(turn_tag, message_id=None)
 
             scheduled = self.background_consolidator.maybe_schedule(
                 chat_id,
@@ -489,7 +503,7 @@ class AssistantApp:
                 done_payload["telemetry"] = telemetry
         yield done_payload
 
-    # 处理一轮完整同步对话：直接消费 stream_chat 单一实现并提取最终 done 结果字典
+    # 处理一轮完整同步对话：直接消费 stream_chat 单一实现并确保异常时确定性关闭生成器
     def chat(
         self,
         text: str,
@@ -498,13 +512,16 @@ class AssistantApp:
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> dict[str, object]:
         result: dict[str, object] = {}
-        for frame in self.stream_chat(
-            text,
-            chat_id=chat_id,
-            on_event=on_event,
-        ):
-            if frame.get("type") == "done":
-                result = {k: v for k, v in frame.items() if k != "type"}
+        with closing(
+            self.stream_chat(
+                text,
+                chat_id=chat_id,
+                on_event=on_event,
+            )
+        ) as frames:
+            for frame in frames:
+                if frame.get("type") == "done":
+                    result = {k: v for k, v in frame.items() if k != "type"}
         return result
 
     # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）

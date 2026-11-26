@@ -682,8 +682,14 @@ class MemoryStore:
             sep = "" if not existing or existing.endswith("\n") else "\n"
             _atomic_write(self.memory_file, f"{existing}{sep}{entry_line}\n")
 
-    # 将用户原话按时间戳与消息编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
-    def remember_user_statement(self, user_text: str, message_id: int | None = None) -> str:
+    # 将用户原话按时间戳与消息/回合编号幂等追加到 data/memory/facts.md，不撑大 MEMORY.md 索引
+    def remember_user_statement(
+        self,
+        user_text: str,
+        message_id: int | None = None,
+        *,
+        turn_tag: str | None = None,
+    ) -> str:
         clean = " ".join(user_text.split())
         if not clean:
             raise ValueError("要记住的内容不能为空。")
@@ -696,8 +702,15 @@ class MemoryStore:
             )
             if message_id is not None and f"(msg#{message_id})" in existing:
                 return "data/memory/facts.md"
+            if turn_tag and f"(turn#{turn_tag})" in existing:
+                return "data/memory/facts.md"
             stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
-            tag = f" (msg#{message_id})" if message_id is not None else ""
+            if message_id is not None:
+                tag = f" (msg#{message_id})"
+            elif turn_tag:
+                tag = f" (turn#{turn_tag})"
+            else:
+                tag = ""
             sep = "" if not existing or existing.endswith("\n") else "\n"
             _atomic_write(self.facts_file, f"{existing}{sep}- [{stamp}]{tag} {clean}\n")
             self._ensure_index_entry(
@@ -706,6 +719,24 @@ class MemoryStore:
             )
             self.record_audit(action="remember_fact", actor="user", target="data/memory/facts.md", old_value=None, new_value=clean)
             return "data/memory/facts.md"
+
+    # 提交或回滚流内暂存的 (turn#...) 事实标记：成功时绑定正式 (msg#<id>)，失败中断时移除未提交行
+    def finalize_turn_fact(self, turn_tag: str, *, message_id: int | None) -> None:
+        if not turn_tag:
+            return
+        marker = f"(turn#{turn_tag})"
+        with self._write_lock:
+            if not self.facts_file.is_file():
+                return
+            content = self.facts_file.read_text(encoding="utf-8")
+            if marker not in content:
+                return
+            if message_id is not None:
+                _atomic_write(self.facts_file, content.replace(marker, f"(msg#{message_id})"))
+                return
+            kept = [line for line in content.splitlines() if marker not in line]
+            rebuilt = "\n".join(kept).rstrip()
+            _atomic_write(self.facts_file, f"{rebuilt}\n" if rebuilt else "")
 
     # 对指定主题记忆文件执行 add / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
@@ -814,22 +845,29 @@ class MemoryToolsetProvider(ToolsetProvider):
     source_type = "builtin"
     source_name = "memory"
 
-    # 绑定当前实例的 MemoryStore、用户消息回调与逻辑时钟回调
+    # 绑定当前实例的 MemoryStore、用户消息回调、逻辑时钟回调与流式回合暂存标记
     def __init__(
         self,
         memory: MemoryStore,
         get_user_message: Callable[[], tuple[str, int | None]] | None = None,
         get_today: Callable[[], date] | None = None,
+        *,
+        turn_tag: str | None = None,
+        on_remember: Callable[[], None] | None = None,
     ) -> None:
         self.memory = memory
         self.get_user_message = get_user_message
         self.get_today = get_today
+        self.turn_tag = turn_tag
+        self.on_remember = on_remember
 
     # 统一通过 build_tool 产出 6 个 BuiltinTool(Tool) 子类实例（带 risk 元数据与 builtin/memory 来源文档）
     def tools(self) -> list[Tool]:
         memory = self.memory
         get_user_message = self.get_user_message
         get_today = self.get_today
+        turn_tag = self.turn_tag
+        on_remember = self.on_remember
 
         # 适配 search_markdown 工具：按可选时钟回调注入当前日期，便于历史日期评测与过期过滤
         def search_markdown(query: str, root: str = "data/memory") -> str:
@@ -854,7 +892,13 @@ class MemoryToolsetProvider(ToolsetProvider):
             if get_user_message is None:
                 raise RuntimeError("缺少当前用户消息上下文，无法记录用户原话。")
             user_text, message_id = get_user_message()
-            target = memory.remember_user_statement(user_text, message_id=message_id)
+            target = memory.remember_user_statement(
+                user_text,
+                message_id=message_id,
+                turn_tag=turn_tag,
+            )
+            if on_remember is not None:
+                on_remember()
             return f"已记录用户原话到 {target}"
 
         # 适配 save_rule 工具：将用户要求遵守的规则落盘到 data/memory/rules/
