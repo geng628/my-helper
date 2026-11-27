@@ -12,7 +12,7 @@
    - **Layer 1 `personal_assistant/ai/`**（零向上依赖，内部遵循 Pi ch04 三层解耦）：
      - **第二层·事件与契约协议层**（[personal_assistant/ai/protocol.py](personal_assistant/ai/protocol.py)）：零内部依赖，定义厂商中立的 `Context` / `Message`（`UserMessage`、`AssistantMessage`、`ToolResultMessage`）/ `ToolSchema` / `ToolCall`、12 种统一流式事件（`StreamStart`、`TextStart/Delta/End`、`ThinkingStart/Delta/End`、`ToolCallStart/Delta/End`、`StreamDone`、`StreamError`）、语义思考级别 `ThinkingLevel` 与缓存保留策略 `CacheRetention`、单一路由键 `api` 的 `ModelProfile`、通用命名角色表 `ModelsConfig.roles`、翻译器入职宪法 `ApiProvider` 与前台句柄协议 `ModelInvoker`。
      - **第一层·统一前台与通讯录**（[personal_assistant/ai/registry.py](personal_assistant/ai/registry.py)）：仅依赖 `protocol.py` 零感知具体翻译器，提供 `stream()` / `stream_simple()` / `complete()` 统一入口、线程安全可隔离拷贝的 `ApiProviderRegistry` 通讯录、`ModelClient` / `NoopModelClient` 与直通工厂 `from_model_profile()` / `from_env()`。
-     - **第三层·原生协议翻译器**（[personal_assistant/ai/providers/](personal_assistant/ai/providers/)）：共享标准库重试/脱敏/通用 SSE 底座 `http.py`，内置三大原生翻译器——`openai_completions.py`（`openai-completions`）、`anthropic_messages.py`（`anthropic-messages`，支持 Prompt Caching 断点与带签名 Extended Thinking）、`google_genai.py`（`google-generative-ai`，支持 `systemInstruction`/`functionDeclarations`/`thinkingConfig`）；接入任意全新模型厂商协议只需编写 **1 个 `ApiProvider` 翻译器 + 注册到通讯录（或 Slot 4 插件）+ 在 `models.dsl` 配 `api`**，上层零改动。
+     - **第三层·原生协议翻译器**（[personal_assistant/ai/providers/](personal_assistant/ai/providers/)）：共享标准库重试/脱敏/通用 SSE 底座 `http.py`，内置四大原生翻译器——`openai_completions.py`（`openai-completions`，覆盖 OpenAI / DeepSeek Chat / 通义千问 / Kimi / GLM / Ollama 并兼容 `prompt_cache_hit_tokens`）、`openai_reasoning.py`（`openai-reasoning`，覆盖 DeepSeek Reasoner / R1 等 `reasoning_content` 推理方言，支持轮内续传与跨轮剥离）、`anthropic_messages.py`（`anthropic-messages`，支持 Prompt Caching 断点与带签名 Extended Thinking）、`google_genai.py`（`google-generative-ai`，支持 `systemInstruction`/`functionDeclarations`/`thinkingConfig`）；接入任意全新模型厂商或私有协议只需编写 **1 个 `ApiProvider` 翻译器 + 注册到通讯录（或 Slot 4 插件）+ 在 `models.dsl` 配 `api`**，上层零改动。
      - **中立 KV Cache 观测**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)）：基于中立 `Context` 序列化（`serialize_context`）与 `TrackingModelClient` 统计服务端真实命中率与本地前缀复用率，跨协议热切换时统计连续无断层。
    - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 协议）。
    - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入），全程面向中立 `Context` / `Message` / `ModelInvoker` 编排。
@@ -34,7 +34,7 @@
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
   2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`）外挂双语 BM25 索引，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
-  4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，[plugins/reasoning_provider.py](plugins/reasoning_provider.py) 注册 `OpenAIReasoningProvider`（`api="openai-reasoning"`），继承 `OpenAICompletionsProvider` 处理轮内 `reasoning_content` 续传与跨轮剥离；`ToolsConfig.build_provider_registry()` 将插件翻译器与内建三大翻译器合并为应用级隔离副本，不污染进程全局注册表。
+  4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，支持外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动接入新厂商（`ToolsConfig.build_provider_registry()` 将插件翻译器与内建四大翻译器合并为应用级隔离副本，不污染进程全局注册表）。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
 - `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 
@@ -179,7 +179,6 @@ my_helper_v2/
 │   │   └── study_tools.py             # 学习卡片与间隔复习插件（save_study_card / list_due_reviews）
 │   ├── fts5_retriever.py              # RetrieverProtocol：SQLite FTS5 + BM25 双语检索
 │   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/reasoning/cache_retention）
-│   ├── reasoning_provider.py          # ApiProvider：openai-reasoning 推理模型协议翻译器
 │   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
 │   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测）：
@@ -187,7 +186,8 @@ my_helper_v2/
 │   │   ├── registry.py                #   第一层·统一前台（stream/stream_simple/complete）与通讯录注册表
 │   │   ├── providers/                 #   第三层·原生协议翻译器：
 │   │   │   ├── http.py                #     共享标准库重试/脱敏/通用 SSE 传输底座
-│   │   │   ├── openai_completions.py  #     openai-completions 翻译器
+│   │   │   ├── openai_completions.py  #     openai-completions 翻译器（OpenAI/DeepSeek Chat 等）
+│   │   │   ├── openai_reasoning.py    #     openai-reasoning 翻译器（DeepSeek Reasoner/R1 等）
 │   │   │   ├── anthropic_messages.py  #     anthropic-messages 原生翻译器（缓存断点/扩展思考）
 │   │   │   └── google_genai.py        #     google-generative-ai 原生翻译器（思考/函数调用）
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）

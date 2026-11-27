@@ -124,6 +124,15 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
                 )
             elif mod == "personal_assistant.ai.providers.http":
                 assert not deps, f"ai/providers/http.py 必须零内部依赖，实际：{deps}"
+            elif mod == "personal_assistant.ai.providers.openai_reasoning":
+                assert deps <= {
+                    "personal_assistant.ai.protocol",
+                    "personal_assistant.ai.providers.http",
+                    "personal_assistant.ai.providers.openai_completions",
+                }, (
+                    f"推理方言翻译器 {mod} 仅允许依赖 protocol / providers.http / "
+                    f"providers.openai_completions，实际：{deps}"
+                )
             elif mod.startswith("personal_assistant.ai.providers."):
                 assert deps <= {
                     "personal_assistant.ai.protocol",
@@ -261,8 +270,15 @@ from personal_assistant.ai import (
     OpenAICompletionsProvider,
     ToolSchema,
     UserMessage,
+    available_api_providers,
 )
 
+assert set(available_api_providers()) >= {
+    "anthropic-messages",
+    "google-generative-ai",
+    "openai-completions",
+    "openai-reasoning",
+}
 schema = ToolSchema(name="echo", description="回显", parameters={"text": "内容"})
 def fake_stream(url, payload, headers):
     last_msg = payload["messages"][-1]["content"]
@@ -277,7 +293,7 @@ monitor = CacheMonitor()
 llm = monitor.wrap(ModelClient(profile=profile, registry=reg), session_key="s1")
 r1 = llm.complete(Context(messages=(UserMessage("hi"),), tools=(schema,)))
 r2 = llm.complete(Context(messages=(UserMessage("hi"), r1, UserMessage("next")), tools=(schema,)))
-leaked = [m for m in sys.modules if m == "evals" or m.startswith(("personal_assistant.agent", "personal_assistant.assistant", "personal_assistant.eval", "evals."))]
+leaked = [m for m in sys.modules if m in {"evals", "plugins"} or m.startswith(("personal_assistant.agent", "personal_assistant.assistant", "personal_assistant.eval", "evals.", "plugins."))]
 print(json.dumps({"reply": r2.text, "cached": monitor.summary()["cached_tokens"], "leaked": leaked}))
 """
     res_ai = subprocess.run(

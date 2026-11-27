@@ -12,7 +12,7 @@
    - `personal_assistant/ai/`（Layer 1，零向上依赖）：
      - **第二层·事件与契约协议层**（`protocol.py`，零内部依赖）：厂商中立的 `Context` / `Message`（`UserMessage`、`AssistantMessage`、`ToolResultMessage`）/ `ToolSchema` / `ToolCall`、12 种规范流式事件（`StreamStart`、`TextStart/Delta/End`、`ThinkingStart/Delta/End`、`ToolCallStart/Delta/End`、`StreamDone`、`StreamError`）、`ThinkingLevel` + `clamp_thinking_level`、`CacheRetention`、`ModelProfile`（单一路由键 `api`，拒绝废弃 `provider`）、`ModelsConfig.roles`、翻译器宪法 `ApiProvider` 与前台句柄协议 `ModelInvoker`；
      - **第一层·统一前台与通讯录**（`registry.py`，仅依 `protocol.py`）：`stream()` / `stream_simple()` / `complete()`、`ApiProviderRegistry`（支持 `copy()`/`snapshot()`/`restore()`）、`ModelClient`（线程局部 `last_usage`）/ `NoopModelClient` 与 `from_model_profile()` / `from_env()`；
-     - **第三层·原生协议翻译器**（`providers/`）：共享 `http.py`（重试、429 `Retry-After`、密钥脱敏、通用 `iter_sse_events`）+ 三大原生翻译器 `openai_completions.py`（`openai-completions`）、`anthropic_messages.py`（`anthropic-messages`）、`google_genai.py`（`google-generative-ai`），导入期自动注册；接入全新模型厂商只需 1 个 `ApiProvider` 翻译器 + 注册 + `models.dsl` 的 `api` 字段；
+     - **第三层·原生协议翻译器**（`providers/`）：共享 `http.py`（重试、429 `Retry-After`、密钥脱敏、通用 `iter_sse_events`）+ 四大原生翻译器 `openai_completions.py`（`openai-completions`）、`openai_reasoning.py`（`openai-reasoning`，DeepSeek Reasoner / R1 推理方言）、`anthropic_messages.py`（`anthropic-messages`）、`google_genai.py`（`google-generative-ai`），导入期自动注册；接入全新模型厂商只需 1 个 `ApiProvider` 翻译器 + 注册 + `models.dsl` 的 `api` 字段；
      - **中立 KV Cache 观测**（`cache.py`）：基于中立 `serialize_context` 与 `TrackingModelClient` 按会话统计本地前缀复用率与服务端缓存命中率，跨厂商热切换统计连续且遇 `StreamError` 不污染指标。
    - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环（`iter_react` / `run_react`，`done.reason != "toolUse" or not assistant_msg.tool_calls` 自然结束、遇 `StreamError` 透传退出，支持单步 `convert_to_llm: ContextTransformer`）、纯值对象工具递进类型（`Tool(ToolSchema)` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 五大插件主板插槽（`Plugin(ABC)`），零业务路径、插件名或配置段硬编码；
    - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆与内置零索引 `LinearRetriever` 兜底（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零内部依赖底座（`common.py` / `text_search.py` / `files_policy.py`）、SQLite 会话存储（`db.py`）、外层回合预算与统一编排（`app.py`，暴露常驻 `app.tools` 并支撑 `evals/` 统一 `AssistantApp(auto_consolidate=False)` 装配）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
@@ -21,7 +21,7 @@
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
    - Slot 2 `RetrieverProtocol`（`plugins/fts5_retriever.py`，未挂载时由 `LinearRetriever` 兜底）；
    - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，支持 `api`/`reasoning`/`max_tokens`/`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设，`render` 采用显式强类型具名参数，核心参数对齐纯通用协议、扩展参数收敛于插件侧）；
-   - Slot 4 `ApiProvider`（直接复用 Layer 1 宪法，`plugins/reasoning_provider.py` 注册 `OpenAIReasoningProvider` `api="openai-reasoning"`，由 `ToolsConfig.build_provider_registry()` 合并为应用级隔离副本）；
+   - Slot 4 `ApiProvider`（直接复用 Layer 1 宪法，供外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动扩展，由 `ToolsConfig.build_provider_registry()` 与内建四大翻译器合并为应用级隔离副本）；
    - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本，遇 `StreamError` 或 `turn_aborted` 自动清理在途态）；
    - 所有插件在启动期仅执行一次 `initialize()`，零跨插件横向导入，并在 `AssistantApp.close()` 时经 `terminate_all()` 统一释放资源。
 4. **纵深安全与测试隔离基线**：
@@ -57,9 +57,9 @@
 - **决策**：主线采用零依赖中英双语分词 + SQLite FTS5 BM25，不内置重型本地向量模型依赖。
 - **权衡**：单跳精确事实与显式时间线检索延迟仅数毫秒且可解释性强；但面对零词面重叠的同义改写与跨会话隐式多跳问题（如 LoCoMo Search 的 `multi-hop` 与 `open-domain` 子类）存在明确词面上限。
 
-### ADR-6：对标 Pi ch04 落地三层模型调用翻译架构，彻底清除上层 OpenAI 字典渗透（`d833400`）
+### ADR-6：对标 Pi ch04 落地三层模型调用翻译架构，彻底清除上层 OpenAI 字典渗透（`d833400`；`#93` 收编第 4 套内建推理翻译器）
 - **背景**：早期 `ai/types.py` 与 `ai/client.py` 将 OpenAI Chat Completions 字典格式（`to_openai_schema`、`to_openai_dict`、`extract_tool_calls`、裸 `dict` 消息列表）直接暴露给 Layer 2 `react.py` 与 Layer 3 `app.py`/`consolidator.py`，导致接入原生 Anthropic Messages（`system` 块、`cache_control`、`tool_use`/`tool_result`、带签名 `thinking`）或原生 Google Gemini（`systemInstruction`/`contents`/`parts`/`functionDeclarations`/`functionResponse`）时阻力极大且无法跨厂商热切换。
-- **决策**：采取**零兼容一次性切换**，按 Pi ch04 将 `personal_assistant/ai/` 拆为 `protocol.py`（中立 `Context`/`Message`/`ToolSchema` + 12 种规范流事件 + `ApiProvider` 宪法）← `registry.py`（`stream`/`stream_simple`/`complete` 统一前台 + `ApiProviderRegistry` 通讯录 + `ModelClient`）← `providers/`（共享 `http.py` + OpenAI / Anthropic / Gemini 三大原生翻译器）；`ModelProfile` 与 `models.dsl` 统一使用单一路由键 `api`，Layer 2 Slot 4 直接复刻 `ApiProvider`。
+- **决策**：采取**零兼容一次性切换**，按 Pi ch04 将 `personal_assistant/ai/` 拆为 `protocol.py`（中立 `Context`/`Message`/`ToolSchema` + 12 种规范流事件 + `ApiProvider` 宪法）← `registry.py`（`stream`/`stream_simple`/`complete` 统一前台 + `ApiProviderRegistry` 通讯录 + `ModelClient`）← `providers/`（共享 `http.py` + OpenAI / DeepSeek 推理 / Anthropic / Gemini 四大原生翻译器）；`ModelProfile` 与 `models.dsl` 统一使用单一路由键 `api`，Layer 2 Slot 4 直接复刻 `ApiProvider`。
 - **收益与权衡**：同一条对话轨迹可在中途跨 4 种异构协议无损热切换，新增第 5 套任意私有协议仅需编写 1 个 `ApiProvider` 翻译器 + 1 行注册 + `models.dsl` 配置，上层 `agent/`、`assistant/`、`cache.py`、`telemetry.py` 均 0 行改动；代价是废弃旧 `provider` 字段与 OpenAI 字典接口（单轨零双轨包袱）。
 
 ---
@@ -192,7 +192,7 @@
 
 ---
 
-### [2026-11-27] Wave 8：封版安全与缺陷修复、Pi ch04 三层模型调用翻译架构重构及跨协议契约测试与文档收官（Issues `#87` / `#89` / `#91`，Commits `19f2595`、`d833400` + 本次提交）
+### [2026-11-27] Wave 8：封版安全与缺陷修复、Pi ch04 三层模型调用翻译架构重构及跨协议契约测试与文档收官（Issues `#87` / `#89` / `#91`，Commits `19f2595`、`d833400`、`065405f`）
 - **背景与目标**：
   1. 封版前清零红队与代码审查发现的高影响安全绕过（`find --`、列举/检索硬链接 Inode）及真实可用性/资源缺陷；
   2. 对标 Pi ch04 对 Layer 1 `personal_assistant/ai/` 实施零兼容三层模型调用翻译架构重构，彻底消除 Layer 2/3 对 OpenAI 字典格式的耦合，原生支持 OpenAI / Anthropic / Google Gemini / DeepSeek Reasoner 四套协议并实现单点扩展；
@@ -206,15 +206,29 @@
   2. **Pi ch04 三层模型调用翻译架构零兼容重构（Issue `#89` / PR `#90`，`d833400`）**：
      - 删除旧版 `ai/types.py` 与 `ai/client.py`，新建 [../personal_assistant/ai/protocol.py](../personal_assistant/ai/protocol.py)（中立 `Context`/`Message`/`ToolSchema` + 12 种规范流事件 + `ThinkingLevel`/`CacheRetention` + `ModelProfile(api=...)` + `ApiProvider`/`ModelInvoker`）、[../personal_assistant/ai/registry.py](../personal_assistant/ai/registry.py)（`stream`/`stream_simple`/`complete`、`ApiProviderRegistry`、`ModelClient`/`NoopModelClient`、`from_model_profile`/`from_env`）与 [../personal_assistant/ai/providers/](../personal_assistant/ai/providers/)（`http.py` + `openai_completions.py` + `anthropic_messages.py` + `google_genai.py`），重写 [../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py) 面向中立 `Context` 计算缓存指标；
      - Layer 2 `agent/tools.py`、`agent/react.py`、`agent/plugins.py` 与 Layer 3 `assistant/` 全面切换至中立 `Context` / `Message` / `ModelInvoker`，彻底清除 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`，Slot 4 直接复刻 `ApiProvider`；
-     - [../plugins/reasoning_provider.py](../plugins/reasoning_provider.py) 升级为 `OpenAIReasoningProvider`（`api="openai-reasoning"`）；[../plugins/models_dsl.py](../plugins/models_dsl.py) 切单一 `api` 路由键，新增 `anthropic`/`gemini` 预设与 `reasoning`/`max_tokens`/`cache_retention` 字段；[../tests/test_architecture.py](../tests/test_architecture.py) 新增 `ai/` 内部三层依赖与上层零 OpenAI 方言符号硬守卫。
-  3. **阶段二收官：跨协议热切换与第 5 协议单点扩展契约测试 + 全套文档同步（Issue `#91`，本次提交）**：
+     - `plugins/reasoning_provider.py`（后于 `#93` 收编为内建 [../personal_assistant/ai/providers/openai_reasoning.py](../personal_assistant/ai/providers/openai_reasoning.py)）升级为 `OpenAIReasoningProvider`（`api="openai-reasoning"`）；[../plugins/models_dsl.py](../plugins/models_dsl.py) 切单一 `api` 路由键，新增 `anthropic`/`gemini` 预设与 `reasoning`/`max_tokens`/`cache_retention` 字段；[../tests/test_architecture.py](../tests/test_architecture.py) 新增 `ai/` 内部三层依赖与上层零 OpenAI 方言符号硬守卫。
+  3. **阶段二收官：跨协议热切换与第 5 协议单点扩展契约测试 + 全套文档同步（Issue `#91` / PR `#92`，`065405f`）**：
      - 在 [../tests/test_providers.py](../tests/test_providers.py) 新增 `test_mid_conversation_cross_protocol_hot_swap_end_to_end`（同一条真实 `iter_react` + `ToolRegistry` + `CacheMonitor` + `TelemetryObserver` 对话轨迹依次热切换 `anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`，逐轮校验线协议载荷与统计准确性）与 `test_new_fifth_protocol_extension_requires_only_one_translator_and_registration`（动态写入第 5 套虚构私有协议 `custom-acme-rpc` Slot 4 插件 + `models.dsl` 装配真实 `AssistantApp`，零核心改动跑通思考流、工具调用、`StreamError` 完整回滚与后续正常恢复）；
      - 全量同步 [../README.md](../README.md)、[mvp-design.md](mvp-design.md)、本文件与 [../AGENTS.md](../AGENTS.md)，清除所有已删除旧文件与旧符号的过时描述并校验全站相对链接 0 断链。
-- **验证与同口径说明（`5c7785c` → 本次提交）**：
+- **验证与同口径说明（`5c7785c` → `065405f`）**：
   - 确定性单元测试：`202 passed → 209 passed`（100% 通过）；
   - 离线检索基准（确定性）：`fts5_bm25` 保持 `38/40 (95.0%)`（Recall `0.9483`，MRR `0.9483`，负例干净度 `100%`）；
   - 离线演示与静态硬守卫：`scripts/demo.py` 离线场景全部通过；AST 全仓（含 `tests/`）中文 `#` 注释缺失 `0`；`personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树 `# type: ignore` 命中 `0`；4 份 Markdown 文档相对链接断链 `0`；
   - 实模评测口径：Wave 8 为封版安全修复、Layer 1 协议翻译架构重构与契约测试收官，未发起新的实模 API 跑分，表四中 Wave 5 `1b421d2` `v2-neutral`（`sha256=08e7c0adcb56`）实模基线保持原样不变（`15/16`、`80/100`、`63/70`）。
+
+---
+
+### [2026-11-27] 将 `OpenAIReasoningProvider`（DeepSeek Reasoner）收编为 Layer 1 内建翻译器（Issue `#93`，本次提交）
+- **背景与目标**：OpenAI、Anthropic、Gemini 均已内建于 `personal_assistant/ai/providers/`，而项目主打的 DeepSeek Reasoner（`api="openai-reasoning"`）仍滞留于 `plugins/reasoning_provider.py`，导致单独使用 Layer 1（不加载 `plugins/`）时无法开箱调用 `openai-reasoning`。本次将其收编为第四大内建原生翻译器，同时保留 Slot 4 供外部/私有协议插件扩展。
+- **核心改动**：
+  - 新增 [../personal_assistant/ai/providers/openai_reasoning.py](../personal_assistant/ai/providers/openai_reasoning.py)（继承 `OpenAICompletionsProvider`，实现 `reasoning_content` 双向翻译与跨轮剥离/轮内续传），并在 [../personal_assistant/ai/providers/__init__.py](../personal_assistant/ai/providers/__init__.py) 与 [../personal_assistant/ai/__init__.py](../personal_assistant/ai/__init__.py) 导出及默认注册；
+  - 删除 `plugins/reasoning_provider.py`（`plugins/` 现保留 `tools` / `fts5_bm25` / `models_dsl` / `telemetry` 4 个仓库插件；Slot 4 外部协议插槽能力由 `tests/test_plugins.py` 动态插件与 `tests/test_providers.py` `custom-acme-rpc` 端到端测试持续守护）；
+  - 更新 [../tests/test_architecture.py](../tests/test_architecture.py)（精确放行 `providers.openai_reasoning -> providers.openai_completions`，并校验独立 Layer 1 子进程开箱注册全部 4 大协议）、`tests/test_reasoning_provider.py`、`tests/test_providers.py`、`tests/test_plugins.py`、`tests/test_history_plugin.py` 与三份主文档。
+- **验证与同口径对比（`065405f` → 本次提交）**：
+  - 单元测试：`209 passed`（100% 通过）；
+  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
+  - 实模评测口径：本次仅为 `OpenAIReasoningProvider` 归属层迁移，未改动线协议行为，沿用表四 `1b421d2` `v2-neutral` 实模基线。
+- **已知边界与下一步**：四大核心协议（`openai-completions` / `openai-reasoning` / `anthropic-messages` / `google-generative-ai`）现均在 Layer 1 开箱可用；后续新增私有或小众模型厂商继续沿 Slot 4 单点扩展即可。
 
 ---
 
