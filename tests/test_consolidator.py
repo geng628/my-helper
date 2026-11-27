@@ -33,7 +33,11 @@ from personal_assistant.assistant.consolidator import (
 )
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.assistant.prompts import SYSTEM_PROMPT, format_system_prompt
+from personal_assistant.assistant.prompts import (
+    SYSTEM_PROMPT,
+    format_system_prompt,
+    format_user_envelope,
+)
 
 
 # 可录制请求并按预设回复（支持门控同步）的假模型（实现 ModelInvoker）
@@ -266,17 +270,25 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
         assert "data/memory/preferences.md" in app.memory.read_memory_index()
         assert app.status()["consolidation"]["last_result"]["compacted_messages"] == 4  # type: ignore[index]
 
-        # 第 4 轮验证上下文已缩减：system 更新了索引并拼入前情摘要 + 仅保留第3轮 2 条原话 + 本轮提问
+        # 第 4 轮验证上下文已缩减：system 更新了索引且不混入摘要，摘要落在 messages 头部 + 仅保留第3轮 2 条原话 + 本轮提问
         r4 = app.chat("第4轮：现在还记得吗？", chat_id="auto-1")
         assert r4["reply"] == "答4"
         turn4_ctx = chat_llm.requests[3]
         assert "data/memory/preferences.md" in turn4_ctx.system_prompt
-        assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in turn4_ctx.system_prompt
+        assert "【本会话已压缩前情摘要】" not in turn4_ctx.system_prompt
         contents = [
             m.content if isinstance(m, UserMessage) else (m.text if isinstance(m, AssistantMessage) else m.content)
             for m in turn4_ctx.messages
         ]
-        assert contents == ["第3轮：继续推进", "答3", "第4轮：现在还记得吗？"]
+        assert len(contents) == 3
+        assert "<system-reminder>" in contents[0]
+        assert "</system-reminder>" in contents[0]
+        assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in contents[0]
+        assert "第3轮：继续推进" in contents[0]
+        assert contents[1] == "答3"
+        assert "第4轮：现在还记得吗？" in contents[2]
+        assert "第1轮" not in "\n".join(contents)
+        assert "第2轮" not in "\n".join(contents)
         # 原始 SQLite 历史仍然完整保留全部 8 条消息
         assert app.state.count_messages("auto-1") == 8
     finally:
@@ -310,8 +322,10 @@ def test_weekday_injected_consistently_in_system_prompt_and_consolidator(tmp_pat
     assert format_date_with_weekday(sunday) == "2026-11-22（星期日，北京时间）"
 
     memory = MemoryStore(tmp_path / "data")
-    prompt = format_system_prompt(memory, today=monday)
-    assert "今天是 2026-11-16（星期一，北京时间）。" in prompt
+    prompt = format_system_prompt(memory)
+    assert "今天是" not in prompt
+    envelope = format_user_envelope("你好", today=monday)
+    assert "[当前日期：2026-11-16（星期一，北京时间）]" in envelope
 
     state = StateStore(tmp_path / "data" / "state" / "chat.sqlite3")
     try:

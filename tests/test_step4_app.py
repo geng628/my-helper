@@ -154,15 +154,17 @@ def test_assistant_app_kv_cache_prefix_and_memory_index(tmp_path: Path) -> None:
         turn2 = app.chat("我刚才说自己在做什么？", chat_id="cli-1")
         assert "my-helper" in str(turn2["reply"])
 
-        # 验证 KV Cache 友好性：第 2 轮 system 与第 1 轮字节级完全相同，历史按中立 User/Assistant 追加
+        # 验证 KV Cache 友好性：第 2 轮 system 与第 1 轮字节级完全相同，历史按中立 User/Assistant 追加且首条日期信封逐字节一致
         turn1_ctx = llm.requests[0]
         turn2_ctx = llm.requests[2]
         assert turn2_ctx.system_prompt == turn1_ctx.system_prompt
-        assert list(turn2_ctx.messages) == [
-            UserMessage("记住，我正在开发 my-helper 项目"),
-            AssistantMessage.from_text("已记下你的项目，并查看了当前时间。"),
-            UserMessage("我刚才说自己在做什么？"),
-        ]
+        assert len(turn2_ctx.messages) == 3
+        assert turn2_ctx.messages[0] == turn1_ctx.messages[0]
+        assert isinstance(turn2_ctx.messages[0], UserMessage)
+        assert turn2_ctx.messages[0].content.endswith("\n记住，我正在开发 my-helper 项目")
+        assert turn2_ctx.messages[1] == AssistantMessage.from_text("已记下你的项目，并查看了当前时间。")
+        assert isinstance(turn2_ctx.messages[2], UserMessage)
+        assert turn2_ctx.messages[2].content.endswith("\n我刚才说自己在做什么？")
 
         # 开启新会话（或 reset_session_prompt 后）：system 加载 MEMORY.md 目录索引，但不灌入具体事实正文
         app.chat("查一下我的项目备忘", chat_id="cli-2")
@@ -328,12 +330,14 @@ def test_stream_failure_and_close_rollback_prevent_consecutive_user_messages(tmp
         app.close()
 
     # 第二道防线：即使 SQLite 中已存在历史遗留的连续孤儿 user 消息，拼装上下文也绝不发连续两条 UserMessage
+    from personal_assistant.assistant.context import build_history_messages
+
     dirty_llm = StrictAlternatingLLM([AssistantMessage.from_text("已合并历史孤儿并正常答复", stop_reason="stop")])
     dirty_app = AssistantApp(data_root=tmp_path / "dirty_data", llm=dirty_llm)
     try:
         dirty_app.state.append_message("s-dirty", "user", "遗留孤儿1")
         dirty_app.state.append_message("s-dirty", "user", "遗留孤儿2")
-        merged_hist = AssistantApp._build_history_messages(
+        merged_hist = build_history_messages(
             dirty_app.state.active_messages("s-dirty")
         )
         assert len(merged_hist) == 1
@@ -360,8 +364,9 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
     import time
 
     import personal_assistant.assistant.app as app_mod
+    import personal_assistant.assistant.context as context_mod
 
-    monkeypatch.setattr(app_mod, "MAX_SESSION_PROMPTS", 4)
+    monkeypatch.setattr(context_mod, "MAX_SESSION_PROMPTS", 4)
     monkeypatch.setattr(app_mod, "MAX_SESSION_LOCKS", 4)
 
     lock = threading.Lock()
@@ -380,7 +385,7 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
             nonlocal active_same, max_active_same
             last = context.messages[-1]
             assert isinstance(last, UserMessage)
-            content = last.content
+            content = last.content.splitlines()[-1]
             if content.startswith("same-"):
                 with lock:
                     active_same += 1
@@ -447,10 +452,10 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
         assert stored[1]["content"] == f"reply:{stored[0]['content']}"
         assert stored[3]["content"] == f"reply:{stored[2]['content']}"
 
-        # 验证跨多个不同 chat_id 后，_session_prompts 与 _chat_locks 均保持在上限以内
+        # 验证跨多个不同 chat_id 后，ContextAssembler._session_prompts 与 _chat_locks 均保持在上限以内
         for i in range(10):
             app.chat(f"ping-{i}", chat_id=f"bounded-{i}")
-        assert len(app._session_prompts) <= 4
+        assert len(app.context_assembler._session_prompts) <= 4
         assert len(app._chat_locks) <= 4
     finally:
         release_same.set()
@@ -488,20 +493,23 @@ def test_cross_midnight_today_fn_refreshes_session_prompt_and_freezes_within_sam
 
         app.chat("今天有什么安排", chat_id="daily-1")
         prompt_day1_turn1 = llm.requests[0].system_prompt
-        assert "今天是 2026-11-26" in prompt_day1_turn1
+        assert "2026-11-26" not in prompt_day1_turn1
+        assert isinstance(llm.requests[0].messages[-1], UserMessage)
+        assert "2026-11-26（星期四，北京时间）" in llm.requests[0].messages[-1].content
 
-        # 同日内新增记忆索引文件后，同日次轮仍保持冻结不变（保护 KV Cache）
+        # 同日内新增记忆索引文件后，热聊期次轮仍保持冻结不变（保护 KV Cache）
         app.memory.remember_user_statement("同日内新增的一条事实", message_id=99)
         app.chat("同一天第二句", chat_id="daily-1")
         prompt_day1_turn2 = llm.requests[1].system_prompt
         assert prompt_day1_turn2 == prompt_day1_turn1
 
-        # 跨自然日切换到 2026-11-27：自动归档过期记忆并清空重建系统提示词
+        # 跨自然日切换到 2026-11-27：自动归档过期日程，因记忆文件发生变更而刷新系统提示词，新日期落在用户消息信封
         current_day = date(2026, 11, 27)
         app.chat("新的一天早上好", chat_id="daily-1")
         prompt_day2 = llm.requests[2].system_prompt
-        assert "今天是 2026-11-27" in prompt_day2
-        assert "今天是 2026-11-26" not in prompt_day2
+        assert "2026-11-27" not in prompt_day2
+        assert isinstance(llm.requests[2].messages[-1], UserMessage)
+        assert "2026-11-27（星期五，北京时间）" in llm.requests[2].messages[-1].content
         assert "data/memory/facts.md" in prompt_day2
         assert "晚上技术分享" not in (app.memory.memory_dir / "schedule.md").read_text(encoding="utf-8")
     finally:
@@ -844,8 +852,9 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
     import threading
     from datetime import date
 
-    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded, _select_adaptive_history
+    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded
     from personal_assistant.assistant.consolidator import ConsolidationPolicy
+    from personal_assistant.assistant.context import select_chunked_history
     from tests.test_streaming import ScriptedStreamLLM
 
     assert issubclass(TurnBudgetExceeded, RuntimeError)
@@ -876,7 +885,7 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
         for i in range(15):
             long_active.append({"id": i * 2 + 1, "role": "user", "content": f"U{i}:" + ("x" * 900)})
             long_active.append({"id": i * 2 + 2, "role": "assistant", "content": f"A{i}:" + ("y" * 900)})
-        sliced = _select_adaptive_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
+        sliced, _ = select_chunked_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
         assert sliced[0]["role"] == "user"
         assert len(sliced) % 2 == 0
     finally:
@@ -1138,7 +1147,7 @@ class ProbeLifecyclePlugin(Plugin):
         def _reply_for(self, context: Context) -> AssistantMessage:
             last = context.messages[-1]
             assert isinstance(last, UserMessage)
-            q = last.content
+            q = last.content.splitlines()[-1]
             barrier.wait()
             tok = 111 if q == "问A" else 999
             usage = TokenUsage(prompt_tokens=tok, cached_tokens=0, completion_tokens=1)
@@ -1181,14 +1190,16 @@ class ProbeLifecyclePlugin(Plugin):
         assert res_map["chat-B"]["cache"]["prompt_tokens"] == 999  # type: ignore[index]
         assert hasattr(app_conc, "_llm_lock")
 
-        # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及自适应滑窗有界上限（60 条 / 24000 字符）
-        big_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
-        capped = _select_adaptive_history(big_active)
-        assert len(capped) == 24  # 24 * 1000 == 24000 字符上限
+        # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及粘性按块裁剪上限（60 条 / 24000 字符）
+        big_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
+        capped, big_floor = select_chunked_history(big_active)
+        assert len(capped) == 12 and capped[0]["role"] == "user" and big_floor == 58
 
-        short_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
-        capped_count = _select_adaptive_history(short_active)
-        assert len(capped_count) == 60
+        short_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
+        within_cap, zero_floor = select_chunked_history(short_active[:60])
+        assert len(within_cap) == 60 and zero_floor == 0
+        capped_count, count_floor = select_chunked_history(short_active)
+        assert len(capped_count) == 20 and capped_count[0]["role"] == "user" and count_floor == 50
 
         stream_guard_llm = ScriptedStreamLLM(
             [

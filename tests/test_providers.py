@@ -1355,21 +1355,21 @@ class AcmeProviderPlugin(Plugin):
             "ACME 协议已恢复正常。",
         ]
 
-        # 验证 Turn 3 传给翻译器的中立 Context 无任何 Turn 2 残留，且 StreamOptions 继承 models.dsl 配置
+        # 验证 Turn 3 传给翻译器的中立 Context 无任何 Turn 2 残留，且 StreamOptions 继承 models.dsl 配置并透传 session_id
         recorded_contexts = getattr(acme_provider, "recorded_contexts")
         recorded_options = getattr(acme_provider, "recorded_options")
         t3_msgs = recorded_contexts[-1].messages
-        assert t3_msgs == (
-            UserMessage("请记住项目代号是北极星"),
-            AssistantMessage.from_text("ACME 已记住项目代号北极星。"),
-            UserMessage("现在恢复正常了吗？"),
-        )
+        assert len(t3_msgs) == 3
+        assert isinstance(t3_msgs[0], UserMessage) and t3_msgs[0].content.endswith("\n请记住项目代号是北极星")
+        assert t3_msgs[1] == AssistantMessage.from_text("ACME 已记住项目代号北极星。")
+        assert isinstance(t3_msgs[2], UserMessage) and t3_msgs[2].content.endswith("\n现在恢复正常了吗？")
+        assert t3_msgs[0] == recorded_contexts[0].messages[0]
         assert recorded_options[-1] == StreamOptions(
             temperature=0.2,
             max_tokens=4096,
             reasoning="medium",
             cache_retention="long",
-            session_id=None,
+            session_id="acme-chat",
         )
 
         # 验证 Turn 3 遥测未被失败 Turn 2 污染，且 CacheMonitor 记录完整 4 次成功调用

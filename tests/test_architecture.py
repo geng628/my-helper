@@ -163,6 +163,11 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
                 assert "commands" not in dep and "cli" not in dep and ".app" not in dep, (
                     f"memory.py 横向/反向依赖违规：{mod} -> {dep}"
                 )
+        elif mod == "personal_assistant.assistant.context":
+            for dep in deps:
+                assert not any(
+                    bad in dep for bad in (".app", ".db", ".consolidator", ".commands", ".cli")
+                ), f"context.py 横向/反向依赖违规：{mod} -> {dep}"
         elif mod.startswith("personal_assistant.assistant.") and mod != "personal_assistant.assistant.cli":
             for dep in deps:
                 assert dep != "personal_assistant.assistant.cli", (
@@ -559,12 +564,13 @@ def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
         "observers",
     }
 
-    # 验证 assistant/__init__.py 按需延迟导出：导入 text_search 时绝不急切拖入 app / db / consolidator
+    # 验证 assistant/__init__.py 按需延迟导出：导入 text_search 时绝不急切拖入 app / context / db / consolidator
     lazy_code = (
         "import json, sys\n"
         "import personal_assistant.assistant.text_search\n"
         "eager = [m for m in sys.modules if m in {"
         "'personal_assistant.assistant.app', "
+        "'personal_assistant.assistant.context', "
         "'personal_assistant.assistant.db', "
         "'personal_assistant.assistant.consolidator'}]\n"
         "print(json.dumps(eager))\n"

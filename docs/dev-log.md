@@ -15,7 +15,7 @@
      - **第三层·原生协议翻译器**（`providers/`）：共享 `http.py`（重试、429 `Retry-After`、密钥脱敏、通用 `iter_sse_events`）+ 四大原生翻译器 `openai_completions.py`（`openai-completions`）、`openai_reasoning.py`（`openai-reasoning`，DeepSeek Reasoner / R1 推理方言）、`anthropic_messages.py`（`anthropic-messages`）、`google_genai.py`（`google-generative-ai`），导入期自动注册；接入全新模型厂商只需 1 个 `ApiProvider` 翻译器 + 注册 + `models.dsl` 的 `api` 字段；
      - **中立 KV Cache 观测**（`cache.py`）：基于中立 `serialize_context` 与 `TrackingModelClient` 按会话统计本地前缀复用率与服务端缓存命中率，跨厂商热切换统计连续且遇 `StreamError` 不污染指标。
    - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环（`iter_react` / `run_react`，`done.reason != "toolUse" or not assistant_msg.tool_calls` 自然结束、遇 `StreamError` 透传退出，支持单步 `convert_to_llm: ContextTransformer`）、纯值对象工具递进类型（`Tool(ToolSchema)` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 五大插件主板插槽（`Plugin(ABC)`），零业务路径、插件名或配置段硬编码；
-   - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆与内置零索引 `LinearRetriever` 兜底（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零内部依赖底座（`common.py` / `text_search.py` / `files_policy.py`）、SQLite 会话存储（`db.py`）、外层回合预算与统一编排（`app.py`，暴露常驻 `app.tools` 并支撑 `evals/` 统一 `AssistantApp(auto_consolidate=False)` 装配）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
+   - `personal_assistant/assistant/`（Layer 3）：Markdown 记忆与内置零索引 `LinearRetriever` 兜底（`memory.py` / `memory_lifecycle.py` / `builtin_tools.py`）、零内部依赖底座（`common.py` / `text_search.py` / `files_policy.py`）、上下文与 KV Cache 装配引擎（`context.py` / `prompts.py`）、SQLite 会话存储（`db.py`）、外层回合预算与统一编排（`app.py`，暴露常驻 `app.tools` 与 `app.context_assembler` 并支撑 `evals/` 统一 `AssistantApp(auto_consolidate=False)` 装配）、后台沉淀（`consolidator.py`）及终端入口（`cli.py`）；
    - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫、`ai/` 内部三层解耦守卫、上层零 OpenAI 方言符号守卫及 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树零 `# type: ignore` 静态硬守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `209 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `219 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -39,19 +39,19 @@
 - **决策**：不在 Layer 2 `agent/react.py` 重新塞回业务计数器或中文降级文案，而是在 Layer 3 `AssistantApp._run_stream_turn` 外层用 `_GuardedTurnLLM`（实现 `ModelInvoker`）包装底层流式调用，实施单轮步数（`24`）、累计 Token（`250,000`）、墙钟（`180s`）、连续等价工具调用（`3` 次）与 `StreamDone.reason == "length"` 截断工具调用五项熔断。
 - **权衡**：通用内核保持零侵入；直接绕过 `AssistantApp` 调用底层 `run_react()` 的外部调用方则需自行负责超时控制。
 
-### ADR-2：会话内冻结 `MEMORY.md` 索引，跨轮仅持久化问答正文（剥离轮内工具轨迹）
-- **背景**：个人伴读场景多轮连续追问频繁，若每轮动态改写 `system` 提示词或把上轮几千字网页/命令原始 `tool` 观察全量重放进历史，会迅速撑爆上下文并破坏服务端 Prefix Caching。
-- **决策**：系统提示词按 `(today_str, chat_id)` 在会话内冻结；`StateStore.messages` 仅保存每轮 `user` 与 `assistant` 最终回复，跨轮剥离中间 `tool_calls` 与 `ToolResultMessage` 观察。
-- **权衡**：实测多轮服务端 KV Cache 命中率稳定在 `65%–82%+`，大幅节省输入 Token；代价是若上一轮工具返回的细枝末节未被助手写进回复正文，下一轮追问该细节时模型需重新调用读取工具。
+### ADR-2：独立 `ContextAssembler` 动静分离冻结前缀，跨轮仅持久化问答正文（剥离轮内工具轨迹）
+- **背景**：个人伴读场景多轮连续追问频繁，若每轮动态改写 `system` 提示词（如混入日期或滚动摘要）或把上轮几千字网页/命令原始 `tool` 观察全量重放进历史，会迅速撑爆上下文并破坏服务端 Prefix Caching。
+- **决策**：由独立模块 `assistant/context.py`（`ContextAssembler`）按变化频率分层组装：纯静态/低频 `system_prompt` 按 5 分钟空闲 TTL 冻结（热聊死锁、空闲免费刷新），日期通过 `format_user_envelope()` 随用户消息定格，前情摘要经 `<system-reminder>` 信源隔离后置于 `messages` 头部；`StateStore.messages` 仅保存每轮 `user` 与 `assistant` 最终回复，跨轮剥离中间 `tool_calls` 与 `ToolResultMessage` 观察。
+- **权衡**：实测多轮服务端 KV Cache 命中率稳定在 `87%–93%+`（`kv-cache-efficiency` 终轮 `93.39%`），大幅节省输入 Token；代价是若上一轮工具返回的细枝末节未被助手写进回复正文，下一轮追问该细节时模型需重新调用读取工具。
 
 ### ADR-3：成对原子落库、单锁上下文快照与分层回滚语义
 - **背景**：流式输出中途断网若残留单条 `user` 消息会引发后续推理模型连续同角色 HTTP 400；而分两次查询 `session_compactions` 与 `active_messages` 在后台压缩并发提交时会出现窗口断层。
 - **决策**：`StateStore.append_turn` 在单事务内成对写入问答消息（只追不删）；`get_context_snapshot` 在单把锁内原子读取 `(compaction, active_messages)` 二元组（快照上界由 `max_message_id()` 提供）。
 - **权衡与边界**：回合遇 `StreamError` 或异常中断时，未完成的问答对不会入库，`remember_fact` 的 `(turn#<tag>)` 暂存行会在流生成器的 `finally` 分支自动回滚清理并广播 `turn_aborted` 清理在途遥测；但回合内已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件写入，不做跨文件事务回滚（覆盖模式依赖 `data/workspace/.backups/` 时间戳备份恢复）。
 
-### ADR-4：前后台双模型分槽、自适应滑窗与沉淀指数退避
-- **背景**：推理模型（如 `deepseek-reasoner`）在复杂多步推理上准确率更高，但后台输出 JSON 摘要与记忆操作时消耗大量思维链输出 Token；此外后台沉淀若遇上游故障，固定 `20` 条历史截断会导致超出窗口的未压缩消息从上下文中暂时不可见。
-- **决策**：`models.dsl` 支持 `consolidator` 独立轻量模型槽位；当未压缩活跃消息因沉淀繁忙或失败退避超过 `20` 条时，`_select_adaptive_history` 在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩历史（对齐首条 `user` 边界）；`BackgroundConsolidator` 按会话实施 `2s -> 4s -> ... -> 256s`（上限封顶 `300s`）指数退避，单批上限 `max_batch_messages=24`，在途 `(turn#...)` 暂存事实在 `memory_lifecycle.py` 存储层通过单点 `_is_inflight_turn_line` 原生隔离。
+### ADR-4：前后台双模型分槽、粘性按块裁剪与沉淀指数退避
+- **背景**：推理模型（如 `deepseek-reasoner`）在复杂多步推理上准确率更高，但后台输出 JSON 摘要与记忆操作时消耗大量思维链输出 Token；此外后台沉淀若遇上游故障，固定 `20` 条历史截断会导致超出窗口的未压缩消息从上下文中暂时不可见，而超窗后逐条滑窗会每轮击穿历史前缀缓存。
+- **决策**：`models.dsl` 支持 `consolidator` 独立轻量模型槽位；`context.py` 的 `select_chunked_history()` 在 `60` 条 / `24,000` 字符上限内保持队头纹丝不动，超限时按会话粘性 `floor_id` 整块切至目标水位（对齐首条 `user` 边界）；`BackgroundConsolidator` 按会话实施 `2s -> 4s -> ... -> 256s`（上限封顶 `300s`）指数退避，单批上限 `max_batch_messages=24`，在途 `(turn#...)` 暂存事实在 `memory_lifecycle.py` 存储层通过单点 `_is_inflight_turn_line` 原生隔离。
 
 ### ADR-5：零依赖词面检索（SQLite FTS5 + BM25）优先，保留 `RetrieverProtocol` 扩展口
 - **决策**：主线采用零依赖中英双语分词 + SQLite FTS5 BM25，不内置重型本地向量模型依赖。
@@ -229,6 +229,19 @@
   - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测口径：本次仅为 `OpenAIReasoningProvider` 归属层迁移，未改动线协议行为，沿用表四 `1b421d2` `v2-neutral` 实模基线。
 - **已知边界与下一步**：四大核心协议（`openai-completions` / `openai-reasoning` / `anthropic-messages` / `google-generative-ai`）现均在 Layer 1 开箱可用；后续新增私有或小众模型厂商继续沿 Slot 4 单点扩展即可。
+
+### [2026-11-27] 全链路 KV Cache 架构升级：动静分离、按块裁剪、空闲 TTL、非破坏性投影与失配归因（Issue `#95`，本次提交）
+- **背景与目标**：消除多轮对话与长工具链中 4 处会主动击穿 Prefix / KV Cache 的结构性问题（日期与摘要混入 `system_prompt`、超窗逐条滑窗、Layer 2 未透传 `StreamOptions` 与未激活 `convert_to_llm`、`CacheMonitor` 缺少失配定位与上下文构成统计），并同步放开 [../AGENTS.md](../AGENTS.md) 中“非必要不动 `react.py`”的硬性约束（保留 Layer 2 零业务耦合与零厂商方言红线）。
+- **核心改动**：
+  - **Layer 1（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)、[../personal_assistant/ai/__init__.py](../personal_assistant/ai/__init__.py)）**：新增 `context_composition(context)` 与段级前缀对比 `_locate_prefix_break`，为 `CallCacheRecord` / `CacheMonitor.summary()` 增量追加 `break_section`（`cold_start` / `append` / `tools` / `system` / `message[i]:role`）、`prefix_breaks`、`last_break_section`、`last_composition`，`TrackingModelClient` 优先消费 `StreamOptions.session_id`；
+  - **Layer 2（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：`iter_react()` / `run_react()` 补齐 `options: StreamOptions | None = None` 全链路透传至 `llm.stream(llm_ctx, options)`；
+  - **Layer 3（[../personal_assistant/assistant/context.py](../personal_assistant/assistant/context.py)、[../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py)、[../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)）**：从 `app.py` 抽离出独立上下文与 KV Cache 装配引擎 `ContextAssembler` + `TurnContextProjector` + `select_chunked_history`（`app.py` 瘦身 `300+` 行）；日期下沉至 `format_user_envelope()`（`StateStore.append_turn` 支持统一 `created_at`，回放逐字节还原且库内存干净原话）；前情摘要经 `format_compaction_summary()` 包裹 `<system-reminder>` 信源与权限隔离围栏（并消毒内嵌闭合标签防逃逸）后置于 `messages` 头部；`get_session_system_prompt()` 升级为 5 分钟空闲 TTL（热聊死锁，跨天无实际过期归档不击穿，空闲超时免费刷新）；粘性按块裁剪 `select_chunked_history()` 与带滞回防抖的轮内非破坏性投影器 `TurnContextProjector`（接入 `convert_to_llm`）；
+  - **测试与文档**：新增 [../tests/test_kv_cache_architecture.py](../tests/test_kv_cache_architecture.py) 覆盖全部验收项、边界回归及独立 `ContextAssembler` + `<system-reminder>` 防逃逸测试，并同步更新 `README.md`、`docs/mvp-design.md`、`AGENTS.md` 与相关旧测试断言。
+- **验证与同口径对比（`eadc201` → 本次提交）**：
+  - 单元测试：`209 passed → 219 passed`（含 10 项全链路 KV Cache 架构、边界回归与 `ContextAssembler` 信源隔离测试及三层依赖守卫全绿）；
+  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
+  - 实模评测（`9a9d000`，即抽离 `context.py` 与追加 `<system-reminder>` 围栏前同机制提交，`evals/memory_scenarios.jsonl` 16 场景，`deepseek-chat`，`v2-neutral` Judge，`--workers 4`）：通过率 **`16/16 (100.0%)`**（较 `1b421d2` `15/16 = 93.8%` 提升，6/6 类别全过），`kv-cache-efficiency` 服务端 KV 命中 **`90.63%`**（终轮 **`93.39%`**，`prefix_breaks=0`，`last_break_section="append"`）、`rolling-multi-compaction` 两次压缩后终轮服务端 KV 命中 **`87.44%`**（本地前缀复用 `87.91%`，`last_break_section="append"`），16 场景并发总口径服务端命中 `72.85%`（4 并发冷启动摊薄）、本地前缀复用 `90.12%`；表四 `1b421d2` 历史实模基线保持原样不篡改。
+- **已知边界与下一步**：紧接着推进 PR 2——在 `tools.py` 与 `react.py` 实现「并行只读工具 + 写工具串行路障 + 按模型原序提交」（借鉴 Akashic ADR `0079`）。
 
 ---
 

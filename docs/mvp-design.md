@@ -36,8 +36,10 @@ flowchart TD
     Entry --> App["应用编排与回合预算层 AssistantApp (assistant/app.py)"]
 
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
-        App --> Prompts["系统提示词与规则边界声明 (assistant/prompts.py)"]
-        App --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        App --> Ctx["上下文与 KV Cache 装配引擎 ContextAssembler (assistant/context.py)"]
+        Ctx --> Prompts["提示词模板与 system-reminder 信源隔离 (assistant/prompts.py)"]
+        Ctx --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        App --> Mem
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与指数退避压缩 (assistant/consolidator.py)"]
         App --> Cfg["总配置与多协议模型装配 ToolsConfig (assistant/commands.py)"]
@@ -119,7 +121,7 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
+│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
@@ -139,7 +141,7 @@ my_helper_v2/
 ```text
 data/
 ├── memory/
-│   ├── MEMORY.md                      # 限长记忆目录索引（前 100 行 / 4000 字符，会话内按自然日冻结）
+│   ├── MEMORY.md                      # 限长记忆目录索引（前 100 行 / 4000 字符，会话内按 5 分钟空闲 TTL 冻结）
 │   ├── facts.md                       # remember_fact 追加的原始事实（流式轮内 turn# 暂存 -> 提交后升级 msg#）
 │   ├── <topic>.md                     # 后台沉淀按主题组织的长期记忆（支持 add/merge/replace/remove）
 │   ├── rules/                         # 行为规则（每条一个 .md，摘要注入系统前缀；受外部网络工具污染锁死与非越权提示守卫保护）
@@ -177,8 +179,8 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - **`AnthropicMessagesProvider`（`providers/anthropic_messages.py`，`api="anthropic-messages"`）**：原生对接 `/v1/messages` SSE（`message_start` / `content_block_*` / `message_delta` / `message_stop`），按 `CacheRetention` 在 `system`、末尾工具与末尾 `user`/`tool_result` 打 Prompt Caching 断点，支持 Extended Thinking 预算与 `signature` 保留（跨协议无签名 `ThinkingBlock` 自动跳过且绝不发空文本块），并在 `message_delta.usage` 含 `null` 时保留 `message_start` 的输入与缓存计数。
    - **`GoogleGenAIProvider`（`providers/google_genai.py`，`api="google-generative-ai"`）**：原生对接 `:streamGenerateContent?alt=sse`（支持 `/v1beta`/`/v1`/`/v1alpha` 与 `models/` 归一化、`x-goog-api-key` 鉴权头），双向翻译 `systemInstruction`、`contents`（`role="model"` + `parts` + `functionCall` + `functionResponse`）、`functionDeclarations`（零参数工具省略空 `OBJECT.properties` 防 HTTP 400）与 `thinkingConfig`（`includeThoughts` + `thinkingBudget`）。
    - **单点扩展机制**：`personal_assistant/ai/__init__.py` 导入时自动调用 `register_builtin_providers(default_registry())` 注册上述四大原生翻译器（即使不加载 `plugins/`，Layer 1 也可开箱驱动 OpenAI / DeepSeek Chat / DeepSeek Reasoner / Anthropic / Gemini）；新增任意第 5 套私有或第三方协议只需实现 `ApiProvider.stream()` 并注册到 `ApiProviderRegistry` / Slot 4 `PluginContext.register_provider()`，再在 `models.dsl` 中配置 `api` 字段即可全链路生效。
-4. **有界 KV 缓存观测（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)）**：
-   - `serialize_context(context)` 将厂商中立的 `Context` 序列化为逐行稳定规范文本；`CacheMonitor(max_records=2000, max_sessions=256)` 维护线程安全的有界滑动窗口、MRU 会话前缀表、单调游标 `snapshot_index()` 与 $O(1)$ 全局累计账本；`TrackingModelClient`（实现 `ModelInvoker`）在 `StreamDone` 时记录本地前缀复用率与服务端 `TokenUsage`，遇 `StreamError` 不污染统计，且在同一会话内跨厂商热切换时前缀统计保持连续准确。
+4. **有界 KV 缓存观测与失配归因（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)）**：
+   - `serialize_context(context)` 与 `context_composition(context)` 将厂商中立的 `Context` 拆解为带段标签的规范行与各段字符构成（`tools / system / user / assistant / tool_results`）；`CacheMonitor(max_records=2000, max_sessions=256)` 维护线程安全的有界滑动窗口、MRU 会话前缀表、单调游标 `snapshot_index()` 与 $O(1)$ 全局累计账本，自动定位每次调用的 `break_section`（`cold_start` / `append` / `tools` / `system` / `message[i]:role`）并统计非预期断档次数 `prefix_breaks`；`TrackingModelClient`（实现 `ModelInvoker`）优先遵循 `StreamOptions.session_id` 路由会话，在 `StreamDone` 时记录指标，遇 `StreamError` 不污染统计。
 
 ---
 
@@ -188,7 +190,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - `Tool(ToolSchema)` 保持纯值对象（以 `kw_only=True` 承载 `handler`、`metadata`、`accepted_context_keys` 与 `always_on`），通过 `bind_tool_context()` 显式绑定动态执行上下文；`build_tool()` 在构造期解析一次函数签名，自动根据 Python 默认参数收窄 `ToolSchema.required` 并登记可接受的执行期上下文键，不使用动态 `type()` 造类或 `object.__setattr__`；
    - `ToolRegistry` 维护全集 `_all_tools` 与激活视图 `_tools`（受白名单 `allowed_names` 或 `always_on` 控制），`schemas()` 仅导出中立 `ToolSchema` 元组（零厂商格式字典），经 `execute(..., context=...)` 注入当前回合上下文，并将参数校验或运行异常统一转化为 `"错误：..."` 观察回传模型。
 2. **单层 ReAct 循环（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：
-   - `iter_react()` / `run_react()` 进入循环前固定中立 `active_tools = tuple(context.tools) if context.tools else tools.schemas()`，每步组装不可变 `Context` 并按需经 `convert_to_llm: ContextTransformer` 纯函数变换后调用 `llm.stream(llm_ctx)`，透传全部 12 种 `AssistantMessageEvent`；
+   - `iter_react()` / `run_react()` 进入循环前固定中立 `active_tools = tuple(context.tools) if context.tools else tools.schemas()`，每步组装不可变 `Context` 并按需经 `convert_to_llm: ContextTransformer` 非破坏性投影后透传可选 `options: StreamOptions` 调用 `llm.stream(llm_ctx, options)`，透传全部 12 种 `AssistantMessageEvent`；
    - 遇 `StreamError` 立即收敛退出（`run_react` 转抛 `RuntimeError`）；当 `done.reason != "toolUse" or not assistant_msg.tool_calls` 时产出 `TurnEnd(reply, total_ms, messages)` 自然结束；否则依次发出 `ToolStart`、执行强类型 `ToolCall` 并产出 `ToolStep`、追加中立 `ToolResultMessage(tool_call_id, tool_name, content, is_error)` 继续下一轮。
 3. **统一插件主板（[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)）**：
    - `PluginManager` 显式扫描配置入口模块并按 `Plugin(ABC)` 子类收集实例化，向零业务字段的 `PluginContext`（仅含 `project_root`、`config`、`bindings` 与五大强类型插槽 `tool_specs` / `retrievers` / `compilers` / `providers` / `observers`）注册扩展；
@@ -211,10 +213,10 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - `StateStore` 基于 SQLite WAL 与 `RLock` 管理 `messages` 与 `session_compactions`：
      - `append_turn(chat_id, user_content, assistant_content)` 在同一事务中成对写入问答消息；
      - `get_context_snapshot(chat_id)` 在同一把锁内原子返回二元组 `(compaction, active_messages)`，消除前情摘要与活跃历史错配导致的消息漏读或重复注入（快照上界由独立的 `max_message_id()` 获取），同时被 `scripts/web_chat.py` 的 `/api/history` 复用。
-4. **外层回合预算、多协议装配、自适应滑窗与后台沉淀韧性（`app.py`、`commands.py`、`consolidator.py`）**：
+4. **上下文与 KV Cache 装配引擎、外层回合预算与后台沉淀韧性（`context.py`、`prompts.py`、`app.py`、`commands.py`、`consolidator.py`）**：
    - `ToolsConfig.build_provider_registry()` 合并 `default_registry().copy()` 与 `plugin_manager.providers` 形成应用级隔离翻译器通讯录，`build_llm()` / `build_consolidator_llm()` 经 `from_model_profile(..., registry=registry)` 构造 `ModelInvoker`；
    - `_GuardedTurnLLM`（实现 `ModelInvoker`）在 `AssistantApp._run_stream_turn` 外层实施五项安全预算：单轮最大步数 `max_turn_steps=24`、累计 Token 上限 `max_turn_tokens=250_000`、单调墙钟上限 `max_turn_seconds=180.0`、完全相同工具与归一化 JSON 参数连续重复上限 `max_repeated_tool_calls=3`，以及 `StreamDone.reason == "length"` 且含工具调用时的截断熔断收束；遇 `StreamError` 立即上抛，并在 `finally` 广播 `TaskEvent(kind="turn_aborted")` 清理在途遥测与回滚未提交 `turn_tag` 暂存事实；
-   - 自适应活跃历史滑窗 `_select_adaptive_history`：常态保留最近 `20` 条活跃消息；当后台沉淀仍在运行或处于失败退避导致未压缩消息超过 `20` 条时，在 `60` 条且 `24,000` 字符上限内自动拓宽保留未压缩历史，并强制窗口首条对齐 `user` 角色，防止旧消息在未进入摘要前从上下文静默丢失；
+   - 独立上下文装配引擎（[../personal_assistant/assistant/context.py](../personal_assistant/assistant/context.py) 的 `ContextAssembler` + `TurnContextProjector` 与 [../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py)）：将动静分离、空闲 TTL 冻结、每日过期归档失效、粘性按块历史裁剪与轮内高水位投影从 `AssistantApp` 彻底解耦——日期通过 `format_user_envelope()` 随每条用户消息定格（库内存干净原话，回放按 `created_at` 逐字节还原），前情摘要经 `format_compaction_summary()` 套 `<system-reminder>` 信源隔离围栏（消毒内嵌标签防逃逸）后置于 `messages` 头部，热聊期（默认 5 分钟 `prompt_cache_ttl_seconds=300`）死锁 `system_prompt` 并在空闲超时后免费刷新；`select_chunked_history()` 按会话粘性 `floor_id` 在 `60` 条 / `24,000` 字符上限内保持队头稳定，超限时整块切至目标水位对齐 `user` 边界；轮内 `TurnContextProjector` 接入 `convert_to_llm`，低水位（`<= 48,000` 字符）零改动，超水位按滞回阈值一次性折叠前半批大 `ToolResultMessage`（保留有界 `read_markdown` 回读指针与完整 `TurnEnd.messages` 原文）并锁定边界；
    - `MemoryConsolidator` 与 `BackgroundConsolidator`：统一通过 `ModelInvoker.complete(Context(...))` 调用沉淀模型；单批最多截取 `ConsolidationPolicy.max_batch_messages=24` 条偶数成对消息以防超长积压撑爆单次沉淀上下文；仅按真实落盘生效的 `applied_texts` 清理已吸收原始事实；后台沉淀失败后按 `chat_id` 记录指数退避冷却（默认 `2s -> 4s -> ... -> 256s`，上限封顶 `300s`），避免每轮对话重复打爆故障接口；
    - `AssistantApp` 支持接收外部预加载的共享 `tools_config`（按所有权决定是否在 `close()` 时回收 `plugin_manager`）与 `auto_consolidate=False`（供评测隔离复用），同时绑定 `consolidator` 的逻辑时钟 `today_fn`、在 `reload_llm()` / `configure_model()` 中通过 `_llm_lock` 串行化热切换。
 
@@ -258,7 +260,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `209 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `219 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 零内部依赖）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

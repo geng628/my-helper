@@ -13,12 +13,12 @@
      - **第二层·事件与契约协议层**（[personal_assistant/ai/protocol.py](personal_assistant/ai/protocol.py)）：零内部依赖，定义厂商中立的 `Context` / `Message`（`UserMessage`、`AssistantMessage`、`ToolResultMessage`）/ `ToolSchema` / `ToolCall`、12 种统一流式事件（`StreamStart`、`TextStart/Delta/End`、`ThinkingStart/Delta/End`、`ToolCallStart/Delta/End`、`StreamDone`、`StreamError`）、语义思考级别 `ThinkingLevel` 与缓存保留策略 `CacheRetention`、单一路由键 `api` 的 `ModelProfile`、通用命名角色表 `ModelsConfig.roles`、翻译器入职宪法 `ApiProvider` 与前台句柄协议 `ModelInvoker`。
      - **第一层·统一前台与通讯录**（[personal_assistant/ai/registry.py](personal_assistant/ai/registry.py)）：仅依赖 `protocol.py` 零感知具体翻译器，提供 `stream()` / `stream_simple()` / `complete()` 统一入口、线程安全可隔离拷贝的 `ApiProviderRegistry` 通讯录、`ModelClient` / `NoopModelClient` 与直通工厂 `from_model_profile()` / `from_env()`。
      - **第三层·原生协议翻译器**（[personal_assistant/ai/providers/](personal_assistant/ai/providers/)）：共享标准库重试/脱敏/通用 SSE 底座 `http.py`，内置四大原生翻译器——`openai_completions.py`（`openai-completions`，覆盖 OpenAI / DeepSeek Chat / 通义千问 / Kimi / GLM / Ollama 并兼容 `prompt_cache_hit_tokens`）、`openai_reasoning.py`（`openai-reasoning`，覆盖 DeepSeek Reasoner / R1 等 `reasoning_content` 推理方言，支持轮内续传与跨轮剥离）、`anthropic_messages.py`（`anthropic-messages`，支持 Prompt Caching 断点与带签名 Extended Thinking）、`google_genai.py`（`google-generative-ai`，支持 `systemInstruction`/`functionDeclarations`/`thinkingConfig`）；接入任意全新模型厂商或私有协议只需编写 **1 个 `ApiProvider` 翻译器 + 注册到通讯录（或 Slot 4 插件）+ 在 `models.dsl` 配 `api`**，上层零改动。
-     - **中立 KV Cache 观测**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)）：基于中立 `Context` 序列化（`serialize_context`）与 `TrackingModelClient` 统计服务端真实命中率与本地前缀复用率，跨协议热切换时统计连续无断层。
+     - **中立 KV Cache 观测**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)）：基于中立 `Context` 序列化（`serialize_context` / `context_composition`）与 `TrackingModelClient` 统计服务端真实命中率、本地前缀复用率、失配段归因（`cold_start` / `append` / `tools` / `system` / `message[i]:role`）与上下文各段字符构成，跨协议热切换时统计连续无断层。
    - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 协议）。
    - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入），全程面向中立 `Context` / `Message` / `ModelInvoker` 编排。
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言符号扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
 2. **极简单层 ReAct 内核 + 外层安全预算**：
-   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为极简单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `done.reason != "toolUse" or not assistant_msg.tool_calls` 作为自然终止信号，遇 `StreamError` 透传退出（`run_react()` 转抛 `RuntimeError`），并提供单步 `convert_to_llm: ContextTransformer` 边界转换钩子与执行期 `tool_context` 注入。
+   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为极简单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `done.reason != "toolUse" or not assistant_msg.tool_calls` 作为自然终止信号，遇 `StreamError` 透传退出（`run_react()` 转抛 `RuntimeError`），并支持单步 `convert_to_llm: ContextTransformer` 非破坏性上下文投影、执行期 `tool_context` 注入与 `StreamOptions` 全链路透传。
    - 防死循环与成本控制由 Layer 3 `AssistantApp` 的 `_GuardedTurnLLM`（实现 `ModelInvoker`）在外层实施（默认单轮上限 `24` 步、`250,000` Token、`180s` 墙钟、连续 `3` 次等价工具调用熔断及 `StreamDone.reason == "length"` 截断工具调用熔断），兼顾内核简洁性与运行期有界性。
 3. **学习助手叠加能力（零微内核侵入）**：
    - **流式推导视图与跨协议热切换**：通过 12 种规范流事件（含 `ThinkingDelta`、`TextDelta`）与 `ToolStart` 事件，在 CLI 与本地网页端实时展示可折叠的推理过程与慢工具执行状态；同一条中立对话轨迹支持跨 `anthropic-messages` / `openai-completions` / `google-generative-ai` / `openai-reasoning` 无缝热切换，落库历史始终仅含纯净问答正文。
@@ -38,10 +38,10 @@
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
 - `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 
-### 2. KV Cache 友好的 Markdown 记忆、原子会话快照与沉淀韧性
-- **前缀冻结**：`data/memory/MEMORY.md` 限制为前 100 行 / 4000 字符索引，与 `rules/` 摘要按 `(today_str, chat_id)` 在会话内冻结于 `system` 前缀，跨自然日自动刷新。
+### 2. 全链路 KV Cache 友好的 Markdown 记忆、按块裁剪与非破坏性投影
+- **动静分离与空闲 TTL 刷新**：由独立上下文装配引擎 [personal_assistant/assistant/context.py](personal_assistant/assistant/context.py)（`ContextAssembler`）统一收口：`system_prompt` 仅包含静态指令、白名单工具、规则摘要与 `MEMORY.md` 索引（前 100 行 / 4000 字符），不含逐日日期与滚动前情摘要；当前逻辑日期通过 `format_user_envelope()` 下沉至每条用户消息头（库内仍存干净原话，回放按 `created_at` 逐字节还原），前情摘要经 `format_compaction_summary()` 包裹 `<system-reminder>` 信源隔离围栏后置于 `messages` 头部。热聊期内（默认 5 分钟 `prompt_cache_ttl_seconds=300`）死锁 `system` 前缀，跨自然日若无过期记忆归档亦零击穿缓存，空闲超时后零代价刷新最新索引。
 - **记忆生命周期与轮内暂存**：`remember_fact` 轮内先写入 `(turn#<tag>)` 暂存行，回合成功落库后升级为 `(msg#<id>)`，流中断或 `StreamError` 时自动回滚；后台沉淀支持 `add` / `merge` / `replace` / `remove`，被替换或删除的旧事实软退休至 `data/memory/archive/YYYY-MM.md`（热检索默认隔离归档目录）。
-- **成对原子落库与自适应滑窗**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；当后台沉淀繁忙或处于指数退避（默认 `2s` 起步至 `256s`，上限 `300s`）导致未压缩消息超过 `20` 条时，活跃窗口在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩上下文，单次沉淀批次上限 `24` 条并在写锁内保护前台在途 `(turn#...)` 事实不被覆盖。
+- **成对原子落库、粘性按块裁剪与轮内高水位投影**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；超限时通过 `select_chunked_history()` 按会话粘性 `floor_id` 整块切至目标水位（避免逐条滑窗每轮击穿历史缓存）；单轮长工具链经 `TurnContextProjector` 接入 `convert_to_llm`，低水位（`<= 48,000` 字符）零改写吃满轮内缓存，超水位一次性折叠前半批大 `ToolResultMessage`（保留 `read_markdown` 回读指针与完整 `TurnEnd.messages` 原文）并按滞回水位锁定折叠下标使后续步骤恢复纯追加。
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（209 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（219 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -193,7 +193,7 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
+│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本
