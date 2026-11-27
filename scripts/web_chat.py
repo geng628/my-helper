@@ -209,7 +209,7 @@ def create_web_server(
             return True
 
         # 校验 Host、可选 Bearer 令牌及同源 Origin / Sec-Fetch-Site，拦截 DNS Rebinding、未授权访问与 CSRF
-        def _check_request_boundary(self, *, check_origin: bool) -> bool:
+        def _check_request_boundary(self, *, check_origin: bool, check_auth: bool = True) -> bool:
             sock_host = self._socket_local_host() if is_wildcard_bind else None
             allowed_hosts, allowed_origins = _allowed_hosts_and_origins(
                 host, self.server.server_port, extra_host=sock_host
@@ -220,7 +220,7 @@ def create_web_server(
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "非法的 Host 请求头。"})
                 return False
 
-            if not self._check_bearer_auth():
+            if check_auth and not self._check_bearer_auth():
                 return False
 
             if not check_origin:
@@ -269,10 +269,11 @@ def create_web_server(
         # 处理页面加载与只读查询接口（/、/api/status、/api/history、/api/memory）
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            is_static_shell = parsed.path in {"/", "/index.html"}
             is_api = parsed.path == "/api" or parsed.path.startswith("/api/")
-            if not self._check_request_boundary(check_origin=is_api):
+            if not self._check_request_boundary(check_origin=is_api, check_auth=not is_static_shell):
                 return
-            if parsed.path in {"/", "/index.html"}:
+            if is_static_shell:
                 data = ui_html.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")

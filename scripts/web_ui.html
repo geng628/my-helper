@@ -740,10 +740,40 @@
       return wrap;
     }
 
+    let activeAbortController = null;
+
+    async function auth_fetch(url, options = {}) {
+      const buildInit = (token) => {
+        const headers = { ...(options.headers || {}) };
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        return { ...options, headers };
+      };
+      let token = sessionStorage.getItem("my_helper_web_token") || "";
+      let res = await fetch(url, buildInit(token));
+      if (res.status === 401) {
+        const latest = sessionStorage.getItem("my_helper_web_token") || "";
+        if (latest && latest !== token) {
+          res = await fetch(url, buildInit(latest));
+        } else {
+          const entered = window.prompt("服务端已启用访问口令，请输入 Bearer Token：");
+          if (entered && entered.trim()) {
+            token = entered.trim();
+            sessionStorage.setItem("my_helper_web_token", token);
+            res = await fetch(url, buildInit(token));
+            if (res.status === 401) {
+              sessionStorage.removeItem("my_helper_web_token");
+            }
+          }
+        }
+      }
+      return res;
+    }
+
     async function refreshStatus() {
       sessionPill.textContent = `会话: ${chatId}`;
       try {
-        const res = await fetch("/api/status");
+        const res = await auth_fetch("/api/status");
+        if (!res.ok) return;
         const data = await res.json();
         statusDot.classList.toggle("ok", Boolean(data.llm_configured));
         statusDot.title = data.llm_configured ? "LLM 已就绪" : "LLM 未配置";
@@ -767,7 +797,8 @@
       chatEl.appendChild(emptyEl);
       emptyEl.style.display = "block";
       try {
-        const res = await fetch(`/api/history?chat_id=${encodeURIComponent(chatId)}`);
+        const res = await auth_fetch(`/api/history?chat_id=${encodeURIComponent(chatId)}`);
+        if (!res.ok) return;
         const data = await res.json();
         if (data.summary) {
           appendMessage("assistant", `【前情摘要】\n${data.summary}`);
@@ -797,24 +828,29 @@
         replyText: "",
         textStepBreak: false,
       };
+      let streamClosedCleanly = false;
+      const controller = new AbortController();
+      activeAbortController = controller;
 
       function handleSseBlock(block) {
         for (const rawLine of block.split("\n")) {
           const line = rawLine.trim();
           if (!line.startsWith("data:")) continue;
           const ev = JSON.parse(line.slice(5).trim());
+          if (ev.type === "done" || ev.type === "error") streamClosedCleanly = true;
           applyStreamEvent(streamCtx, ev);
         }
       }
 
       try {
-        const res = await fetch("/api/chat/stream", {
+        const res = await auth_fetch("/api/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: text, chat_id: chatId }),
+          signal: controller.signal,
         });
         if (!res.ok) {
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
           wrap.classList.add("error");
           bubble.textContent = data.error || `请求失败（HTTP ${res.status}）`;
         } else if (res.body) {
@@ -838,11 +874,20 @@
               break;
             }
           }
+          if (!streamClosedCleanly && !streamCtx.replyText) {
+            wrap.classList.add("error");
+            bubble.textContent = "连接已提前中断，未收到完整回复。";
+          }
         }
       } catch (err) {
-        wrap.classList.add("error");
-        bubble.textContent = `网络异常：${err}`;
+        if (err && err.name === "AbortError") {
+          if (!streamCtx.replyText) bubble.textContent = "已切换会话，本轮输出已取消。";
+        } else {
+          wrap.classList.add("error");
+          bubble.textContent = `网络异常：${err}`;
+        }
       } finally {
+        if (activeAbortController === controller) activeAbortController = null;
         busy = false;
         sendBtn.disabled = false;
         inputEl.focus();
@@ -867,8 +912,12 @@
       modalBody.textContent = "加载中…";
       modal.classList.add("open");
       try {
-        const res = await fetch("/api/models");
-        const data = await res.json();
+        const res = await auth_fetch("/api/models");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          modalBody.textContent = data.error || `读取模型预设失败（HTTP ${res.status}）`;
+          return;
+        }
         const presets = data.presets || [];
         const optionsHtml = presets
           .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}（默认：${escapeHtml(p.default_model)}）</option>`)
@@ -891,7 +940,7 @@
               API Key（粘贴即可）
               <input id="apiKeyInput" type="password" autocomplete="off" placeholder="例如 sk-..." />
             </label>
-            <details>
+            <details id="advancedOptions">
               <summary style="cursor:pointer;color:var(--muted);font-size:12px;">高级选项（一般不用填）</summary>
               <div style="display:flex;flex-direction:column;gap:10px;margin-top:10px;">
                 <label>
@@ -912,10 +961,13 @@
         const presetSel = document.getElementById("presetSelect");
         const apiKeyRow = document.getElementById("apiKeyRow");
         const baseUrlRow = document.getElementById("baseUrlRow");
+        const advancedOptions = document.getElementById("advancedOptions");
         const syncVisibility = () => {
           const picked = presets.find((p) => p.id === presetSel.value);
           apiKeyRow.style.display = picked && !picked.needs_key ? "none" : "flex";
-          baseUrlRow.style.display = presetSel.value === "custom" ? "flex" : "none";
+          const isCustom = presetSel.value === "custom";
+          baseUrlRow.style.display = isCustom ? "flex" : "none";
+          if (isCustom) advancedOptions.open = true;
         };
         presetSel.addEventListener("change", syncVisibility);
         syncVisibility();
@@ -926,7 +978,7 @@
           msgEl.className = "setup-msg";
           msgEl.textContent = "正在生成配置并切换…";
           try {
-            const resp = await fetch("/api/models/setup", {
+            const resp = await auth_fetch("/api/models/setup", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -936,7 +988,7 @@
                 base_url: document.getElementById("baseUrlInput").value.trim(),
               }),
             });
-            const out = await resp.json();
+            const out = await resp.json().catch(() => ({}));
             if (!resp.ok) {
               msgEl.className = "setup-msg err";
               msgEl.textContent = out.error || "保存失败";
@@ -961,9 +1013,13 @@
       modalBody.textContent = "加载中…";
       modal.classList.add("open");
       try {
-        const [memRes, stRes] = await Promise.all([fetch("/api/memory"), fetch("/api/status")]);
-        const mem = await memRes.json();
-        const st = await stRes.json();
+        const [memRes, stRes] = await Promise.all([auth_fetch("/api/memory"), auth_fetch("/api/status")]);
+        const mem = await memRes.json().catch(() => ({}));
+        const st = await stRes.json().catch(() => ({}));
+        if (!memRes.ok || !stRes.ok) {
+          modalBody.textContent = mem.error || st.error || `读取失败（HTTP ${memRes.ok ? stRes.status : memRes.status}）`;
+          return;
+        }
         modalBody.textContent =
           `${mem.overview}\n\n【已启用工具 (${(st.tools || []).length})】\n${(st.tools || []).join(", ")}\n\n` +
           `【后台沉淀状态】\n${JSON.stringify(st.consolidation || {}, null, 2)}`;
@@ -973,17 +1029,31 @@
     });
 
     document.getElementById("btnRefresh").addEventListener("click", async () => {
-      await fetch("/api/refresh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId }),
-      });
-      appendMessage("assistant", "已刷新当前会话的系统提示词缓存，下一轮将加载最新规则与 MEMORY.md 索引。");
+      try {
+        const res = await auth_fetch("/api/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          appendMessage("assistant", data.error || `刷新失败（HTTP ${res.status}）`);
+          return;
+        }
+        appendMessage("assistant", "已刷新当前会话的系统提示词缓存，下一轮将加载最新规则与 MEMORY.md 索引。");
+      } catch (err) {
+        appendMessage("assistant", `刷新请求异常：${err}`);
+      }
     });
 
     document.getElementById("btnNewSession").addEventListener("click", () => {
+      if (activeAbortController) {
+        activeAbortController.abort();
+        activeAbortController = null;
+      }
       const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, "");
-      chatId = `web-${stamp}`;
+      const rand = Math.random().toString(36).slice(2, 6);
+      chatId = `web-${stamp}-${rand}`;
       localStorage.setItem("my_helper_chat_id", chatId);
       refreshStatus();
       loadHistory();

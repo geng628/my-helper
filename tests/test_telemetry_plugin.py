@@ -308,6 +308,57 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
     snap = obs.snapshot()
     total_turns = threads_n * turns_per_thread
     assert snap["cursor"] == total_turns
+
+    # 验证异常中止回合触发 turn_aborted 后清理 _in_flight，不污染下一轮指标也不计入后台沉淀统计
+    abort_obs = TelemetryObserver(TelemetryConfig(max_sessions=8))
+    abort_obs.on_event(
+        "s-err",
+        StreamDone(
+            message={"role": "assistant", "content": ""},
+            usage=TokenUsage(prompt_tokens=999, cached_tokens=0, completion_tokens=50),
+            ttft_ms=500.0,
+            latency_ms=1800.0,
+        ),
+    )
+    abort_obs.on_event(
+        "s-err",
+        ToolStep(tool="fetch_webpage", arguments="{}", observation="err", call_id="c1", duration_ms=400.0),
+    )
+    abort_obs.on_event("s-err", TaskEvent(kind="turn_aborted", duration_ms=0.0, error="turn_interrupted"))
+    abort_obs.on_event(
+        "s-err",
+        StreamDone(
+            message={"role": "assistant", "content": "ok"},
+            usage=TokenUsage(prompt_tokens=20, cached_tokens=5, completion_tokens=3),
+            ttft_ms=12.0,
+            latency_ms=30.0,
+        ),
+    )
+    abort_obs.on_event("s-err", TurnEnd(reply="ok", total_ms=35.0))
+    clean_snap = abort_obs.snapshot(session_key="s-err")
+    assert clean_snap["last_turn"]["prompt_tokens"] == 20
+    assert clean_snap["last_turn"]["llm_calls"] == 1
+    assert clean_snap["last_turn"]["tool_calls"] == 0
+    assert clean_snap["last_turn"]["ttft_ms"] == 12.0
+    assert clean_snap["background"]["runs"] == 0
+
+    # 验证进入 iter_react 前（如读取系统提示词阶段）抛异常时，原异常正常透出绝不被 UnboundLocalError 掩盖
+    import tempfile
+    from pathlib import Path
+    import pytest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_app = AssistantApp(data_root=Path(tmpdir) / "d", llm=ScriptedStreamLLM(lambda _m, _t: {"role": "assistant", "content": "x"}))
+        try:
+            # 模拟系统提示词构造前阶段抛异常
+            def _boom_prompt(_chat_id: str, _reg: object) -> str:
+                raise RuntimeError("boom prompt stage")
+
+            err_app.get_session_system_prompt = _boom_prompt  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="boom prompt stage"):
+                err_app.chat("触发前置异常", chat_id="s-early")
+        finally:
+            err_app.close()
     assert snap["task_cursor"] == total_turns
     assert snap["totals"]["turns"] == total_turns
     assert snap["totals"]["prompt_tokens"] == total_turns * 10

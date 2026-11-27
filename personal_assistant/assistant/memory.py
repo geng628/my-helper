@@ -208,8 +208,23 @@ class MemoryStore:
     def read_topic_snapshots(self, max_total_chars: int = 6000) -> str:
         return _read_topic_snapshots(self.memory_dir, max_total_chars=max_total_chars)
 
-    # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段及越界软链接
+    # 判断指定路径（及其软链接自身与目标）是否命中受保护 Inode 集合
+    @staticmethod
+    def _hits_protected(path: Path, protected: set[tuple[int, int]], *, resolved: Path | None = None) -> bool:
+        if not protected:
+            return False
+        for candidate, stat_fn in ((path, os.lstat), (resolved or path, os.stat)):
+            try:
+                st = stat_fn(candidate)
+                if (st.st_dev, st.st_ino) in protected:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    # 过滤目录遍历结果：跳过非文件、隐藏目录、敏感路径段、受保护 Inode 硬链接及越界软链接
     def _safe_files(self, target: Path, iterator: Iterable[Path]) -> list[Path]:
+        protected = self.policy.protected_inodes(self.data_root)
         files: list[Path] = []
         for item in sorted(iterator):
             if not item.is_file():
@@ -219,6 +234,8 @@ class MemoryStore:
             except OSError:
                 continue
             if not resolved.is_relative_to(target):
+                continue
+            if self._hits_protected(item, protected, resolved=resolved):
                 continue
             parts = resolved.relative_to(target).parts
             if not any(self._is_ignored_part(p) for p in parts):
@@ -255,6 +272,7 @@ class MemoryStore:
             raise ValueError(f"目录不存在：{root}")
         archive_resolved, memory_resolved = self.archive_dir.resolve(), self.memory_dir.resolve()
         searching_archive = target.is_relative_to(archive_resolved)
+        protected = self.policy.protected_inodes(self.data_root)
 
         files: list[tuple[Path, str, bool]] = []
         stack: list[Path] = [target]
@@ -284,17 +302,22 @@ class MemoryStore:
 
                 if not searching_archive and resolved.is_relative_to(archive_resolved):
                     continue
+                try:
+                    st = resolved.stat() if is_link else entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if protected and (
+                    (st.st_dev, st.st_ino) in protected
+                    or (is_link and self._hits_protected(entry_path, protected, resolved=resolved))
+                ):
+                    continue
                 if resolved.is_dir():
                     if not is_link:
                         stack.append(resolved)
                     continue
                 if resolved.suffix.lower() not in {".md", ".txt"}:
                     continue
-                try:
-                    st = resolved.stat() if is_link else entry.stat(follow_symlinks=False)
-                    if st.st_size > MAX_SEARCH_FILE_BYTES:
-                        continue
-                except OSError:
+                if st.st_size > MAX_SEARCH_FILE_BYTES:
                     continue
                 is_memory = not searching_archive and resolved.is_relative_to(memory_resolved)
                 files.append((resolved, self.display_path(resolved), is_memory))

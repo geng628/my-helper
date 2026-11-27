@@ -303,9 +303,6 @@ class FTS5Retriever:
             scored: list[tuple[float, str, int, str]] = []
             for path, line_no, section, bm25_score, p_tok, s_tok, b_tok, c_tok in rows:
                 bm25_val = max(0.0, float(bm25_score))
-                # SQLite FTS5 在极小语料（<10 行）下 ln((N-n+0.5)/(n+0.5)) 可能为 0，仅在语料达规模后启用 BM25 下限
-                if total_chunks >= 10 and bm25_val < self.config.min_bm25_score:
-                    continue
                 core_terms = set(f"{p_tok} {s_tok} {b_tok}".split())
                 all_terms = core_terms | set(c_tok.split())
                 matched_all = query_set & all_terms
@@ -315,13 +312,18 @@ class FTS5Retriever:
                 if len(matched_all) < min_matched:
                     continue
                 coverage = len(matched_all) / len(query_set)
+                # 语料达规模后启用 BM25 下限，但在高频聚焦主题文档（IDF 钳位到 ~1e-6）下对 >=0.6 高覆盖查询放行
+                high_coverage = coverage >= 0.6
+                if total_chunks >= 10 and bm25_val < self.config.min_bm25_score and not high_coverage:
+                    continue
                 # 长查询上若同时命中 >=3 个词且 BM25 显著高（>=10），即使中文 bigram 分母偏大也应放行
                 high_conf_bm25 = len(matched_all) >= 3 and bm25_val >= 10.0
                 if coverage < self.config.min_term_coverage and not high_conf_bm25:
                     continue
                 body_terms = set(b_tok.split())
                 body_ratio = len(query_set & body_terms) / len(query_set)
-                base_score = bm25_val if bm25_val > 0.0 else 0.1
+                # 对 IDF 钳位导致的极小正 bm25 值（~1e-6）同步托底，防止 round 后坍缩成 0.0 丢失排序
+                base_score = max(bm25_val, self.config.min_bm25_score, 0.1)
                 final_score = round(base_score * (1.0 + 0.6 * coverage + 0.4 * body_ratio), 4)
                 scored.append((final_score, str(path), int(line_no), str(section)))
 

@@ -913,3 +913,60 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     reply = client.respond([{"role": "user", "content": "retry"}])
     assert reply["content"] == "recovered"
     assert sleeps == [3.5, 10.0]
+
+    # 6. 验证 HTTPError 底层流确定性关闭，且 stream_options 报错含 "usage tokens" 仍能触发 400 自动降级
+    closed_flags: list[bool] = []
+
+    # 追踪 close() 调用次数的假响应流
+    class _TrackedBytesIO(io.BytesIO):
+        # 记录关闭状态
+        def close(self) -> None:
+            closed_flags.append(True)
+            super().close()
+
+    tracked_err = HTTPError(
+        "https://api.example.com/v1/chat/completions",
+        400,
+        "Bad Request",
+        {},
+        _TrackedBytesIO(b'{"error":"stream_options.include_usage is not supported for usage tokens"}'),
+    )
+    _, diag = llm_mod._format_http_error(tracked_err)
+    assert closed_flags == [True]
+    assert llm_mod._is_stream_options_incompat(diag) is True
+    assert llm_mod._is_stream_options_incompat("maximum context length exceeded (too many tokens)") is False
+
+    # 7. 验证 cli.main(["chat"]) 退出时必调用 app.close()，且 run_repl 遇运行时异常友好提示不崩退
+    from personal_assistant.assistant import cli as cli_mod
+
+    closed_cli: list[bool] = []
+    printed_cli: list[str] = []
+
+    # 模拟聊天报错并记录 close() 调用的假应用
+    class _FailingReplApp:
+        # 返回模拟工具注册表
+        @property
+        def tools(self):
+            # 最小工具名容器
+            class _Names:
+                names = ["read_markdown"]
+
+            return _Names()
+
+        llm = object()
+
+        # 模拟网络请求失败
+        def chat(self, text: str, *, chat_id: str = "cli", on_event=None):
+            raise RuntimeError("network timeout simulated")
+
+        # 记录资源释放
+        def close(self) -> None:
+            closed_cli.append(True)
+
+    inputs = iter(["你好", "exit"])
+    monkeypatch.setattr(cli_mod, "build_app", lambda **kw: _FailingReplApp())
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed_cli.append(" ".join(str(x) for x in a)))
+    cli_mod.main(["chat"])
+    assert closed_cli == [True]
+    assert any("本轮请求出错" in line for line in printed_cli)

@@ -12,7 +12,7 @@ from contextlib import closing, contextmanager
 from datetime import date
 from pathlib import Path
 
-from personal_assistant.agent.plugins import ObserverProtocol, RuntimeEvent
+from personal_assistant.agent.plugins import ObserverProtocol, RuntimeEvent, TaskEvent
 from personal_assistant.agent.react import (
     AgentEvent,
     ToolStart,
@@ -463,21 +463,22 @@ class AssistantApp:
     ) -> dict[str, object]:
         if self.config_path is None:
             raise ValueError("当前实例未加载 config/tools.json，无法写入模型配置。")
-        models_cfg = self.tools_config.save_model_setup(
-            self.config_path.parent,
-            preset=preset,
-            api_key=api_key,
-            model=model,
-            base_url=base_url,
-            name=name,
-            temperature=temperature,
-        )
-        self.reload_llm(
-            model_name=models_cfg.default,
-            consolidator_model="",
-            models_cfg=models_cfg,
-        )
-        return models_cfg.redacted_dict()
+        with self._llm_lock:
+            models_cfg = self.tools_config.save_model_setup(
+                self.config_path.parent,
+                preset=preset,
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                name=name,
+                temperature=temperature,
+            )
+            self.reload_llm(
+                model_name=models_cfg.default,
+                consolidator_model="",
+                models_cfg=models_cfg,
+            )
+            return models_cfg.redacted_dict()
 
     # 等待所有在途后台沉淀任务完成（供退出收尾或测试调用）
     def wait_for_consolidation(self, timeout: float = 15.0) -> None:
@@ -656,6 +657,7 @@ class AssistantApp:
             fact_used = False
 
             turn_persisted = False
+            turn_ended = False
             try:
                 registry = self._tool_registry
                 turn_ctx: dict[str, object] = {
@@ -727,6 +729,7 @@ class AssistantApp:
                         traces.append(step_dict)
                         yield {"type": "tool_step", **step_dict}
                     elif isinstance(event, TurnEnd):
+                        turn_ended = True
                         reply = event.reply
 
                 user_msg_id, assistant_msg_id = self.state.append_turn(chat_id, clean_text, reply)
@@ -734,6 +737,11 @@ class AssistantApp:
                 if fact_used:
                     self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
             finally:
+                if not turn_ended:
+                    self._emit_event(
+                        chat_id,
+                        TaskEvent(kind="turn_aborted", duration_ms=0.0, error="turn_interrupted"),
+                    )
                 if not turn_persisted and fact_used:
                     self.memory.finalize_turn_fact(turn_tag, message_id=None)
 
