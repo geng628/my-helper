@@ -211,7 +211,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - `StateStore` 基于 SQLite WAL 与 `RLock` 管理 `messages` 与 `session_compactions`：
      - `append_turn(chat_id, user_content, assistant_content)` 在同一事务中成对写入问答消息；
      - `get_context_snapshot(chat_id)` 在同一把锁内原子返回二元组 `(compaction, active_messages)`，消除前情摘要与活跃历史错配导致的消息漏读或重复注入（快照上界由独立的 `max_message_id()` 获取），同时被 `scripts/web_chat.py` 的 `/api/history` 复用。
-4. **外层回合预算、多协议装配、自适应滑窗与后台沉淀韧性（`app.py`、`commands.py`、`consolidator.py`）**：
+4. **外层回合预算、多协议装配、粘性按块裁剪与后台沉淀韧性（`app.py`、`commands.py`、`consolidator.py`）**：
    - `ToolsConfig.build_provider_registry()` 合并 `default_registry().copy()` 与 `plugin_manager.providers` 形成应用级隔离翻译器通讯录，`build_llm()` / `build_consolidator_llm()` 经 `from_model_profile(..., registry=registry)` 构造 `ModelInvoker`；
    - `_GuardedTurnLLM`（实现 `ModelInvoker`）在 `AssistantApp._run_stream_turn` 外层实施五项安全预算：单轮最大步数 `max_turn_steps=24`、累计 Token 上限 `max_turn_tokens=250_000`、单调墙钟上限 `max_turn_seconds=180.0`、完全相同工具与归一化 JSON 参数连续重复上限 `max_repeated_tool_calls=3`，以及 `StreamDone.reason == "length"` 且含工具调用时的截断熔断收束；遇 `StreamError` 立即上抛，并在 `finally` 广播 `TaskEvent(kind="turn_aborted")` 清理在途遥测与回滚未提交 `turn_tag` 暂存事实；
    - 动静分离、空闲 TTL 与粘性按块历史裁剪（`prompts.py` + `app.py`）：日期通过 `format_user_envelope()` 随每条用户消息定格（库内存干净原话，回放按 `created_at` 逐字节还原），前情摘要迁至 `messages` 头部，热聊期（默认 5 分钟 `prompt_cache_ttl_seconds=300`）死锁 `system_prompt` 并在空闲超时后免费刷新；`_select_chunked_history` 按会话粘性 `floor_id` 在 `60` 条 / `24,000` 字符上限内保持队头稳定，超限时整块切至目标水位对齐 `user` 边界；轮内 `_TurnContextProjector` 接入 `convert_to_llm`，低水位（`<= 48,000` 字符）零改动，超水位折叠前半批大 `ToolResultMessage`（保留 `read_markdown` 回读指针与原始 `TurnEnd.messages`）并锁定边界；

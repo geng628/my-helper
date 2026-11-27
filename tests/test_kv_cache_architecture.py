@@ -395,3 +395,187 @@ def test_sticky_high_water_turn_projector_folds_nondestructively_and_recovers_ap
         assert "B" * 2000 in raw_trs[1].content
     finally:
         app.close()
+
+
+# 回归测试 7（Reviewer Blocker 1）：超长不可折叠用户输入 + 连续等长工具输出不触发每步抖动，且超长 read_markdown 行绝不反向放大输出
+def test_turn_projector_hysteresis_no_thrashing_and_never_expands() -> None:
+    from personal_assistant.assistant.app import _TurnContextProjector
+
+    projector = _TurnContextProjector(trigger_chars=5000, keep_tail_messages=4, min_result_chars=800)
+    # 1. 含超长单行 read_markdown(...) 代码文本的工具结果：绝不能因拼接指针而比原文更长
+    long_code_line = 'call_info = read_markdown(path="huge.md") # ' + ("z" * 900)
+    short_tr = ToolResultMessage("c0", "read_file", long_code_line)
+    folded_short = projector._fold_tool_result(short_tr)
+    assert len(folded_short.content) < len(short_tr.content)
+    assert "z" * 400 not in folded_short.content
+
+    # 2. 用户直接贴入 10000 字符大文本（远超 trigger_chars=5000）+ 6 步连续等长工具输出：
+    #    得益于动态滞回水位，绝不能在每一步都抖动折叠（6 步中仅折叠 <= 2 次，其余步骤保持前缀稳定）
+    msgs: list[UserMessage | AssistantMessage | ToolResultMessage] = [UserMessage("U" * 10_000)]
+    prev_projected: Context | None = None
+    breaks = 0
+    for step in range(1, 7):
+        msgs.append(AssistantMessage(blocks=(ToolCall(f"t{step}", "dump", f'{{"s":{step}}}'),)))
+        msgs.append(ToolResultMessage(f"t{step}", "dump", f"S{step}:" + ("X" * 1800)))
+        projected = projector(Context(system_prompt="sys", messages=tuple(msgs)))
+        if prev_projected is not None:
+            if projected.messages[: len(prev_projected.messages)] != prev_projected.messages:
+                breaks += 1
+        prev_projected = projected
+    assert breaks <= 2
+
+    # 3. 仅有短工具输出（不可折叠）时，即使总长超过 trigger_chars 也绝不空推 _folded_until
+    short_proj = _TurnContextProjector(trigger_chars=500, keep_tail_messages=2, min_result_chars=800)
+    short_ctx = Context(
+        system_prompt="sys",
+        messages=(
+            UserMessage("P" * 2000),
+            AssistantMessage(blocks=(ToolCall("s1", "ping", "{}"),)),
+            ToolResultMessage("s1", "ping", "ok"),
+            AssistantMessage(blocks=(ToolCall("s2", "ping", "{}"),)),
+            ToolResultMessage("s2", "ping", "ok"),
+        ),
+    )
+    assert short_proj(short_ctx) is short_ctx
+    assert short_proj._folded_until == 0
+
+
+# 回归测试 8（Reviewer Blocker 2 + Nits）：跨午夜并发归档不丢清理、ttl=0 实时刷新、空保存沉淀保住 system_prompt 且仅清 floor
+def test_concurrent_midnight_archive_ttl_zero_and_empty_consolidation_callback(tmp_path: Path) -> None:
+    import json
+
+    fake_now = [500.0]
+    current_day = date(2026, 11, 26)
+    llm = _OptionsRecordingLLM(
+        [
+            AssistantMessage.from_text("r1", stop_reason="stop"),
+            AssistantMessage.from_text("r2", stop_reason="stop"),
+            AssistantMessage.from_text("r3", stop_reason="stop"),
+        ]
+    )
+    app = AssistantApp(
+        data_root=tmp_path / "race_data",
+        llm=llm,
+        today_fn=lambda: current_day,
+        clock=lambda: fake_now[0],
+        auto_consolidate=False,
+    )
+    try:
+        app.memory.apply_memory_operations(
+            "schedule",
+            "临时日程",
+            "短期安排",
+            [{"op": "add", "text": "2026-11-26 技术评审", "until": "2026-11-26"}],
+            today=current_day,
+        )
+        app.chat("第一天", chat_id="c1")
+        assert "c1" in app._session_prompts
+
+        # 模拟并发竞态：另一线程先将 _last_archive_day 推进到 2026-11-27，随后真正归档的线程仍必须清空 _session_prompts
+        current_day = date(2026, 11, 27)
+        orig_archive = app.memory.archive_expired_memories
+
+        # 在归档完成但进入 _prompt_lock 前模拟另一线程抢先写好 _last_archive_day
+        def raced_archive(today: date | None = None) -> dict[str, int]:
+            res = orig_archive(today=today)
+            app._last_archive_day = "2026-11-27"
+            return res
+
+        app.memory.archive_expired_memories = raced_archive  # type: ignore[method-assign]
+        app._maybe_archive_expired(today=current_day)
+        assert app._session_prompts == {}
+    finally:
+        app.close()
+
+    # prompt_cache_ttl_seconds=0.0 时每轮都实时刷新最新 MEMORY.md
+    app_ttl0 = AssistantApp(
+        data_root=tmp_path / "ttl0_data",
+        llm=_OptionsRecordingLLM(
+            [
+                AssistantMessage.from_text("a1", stop_reason="stop"),
+                AssistantMessage.from_text("a2", stop_reason="stop"),
+            ]
+        ),
+        prompt_cache_ttl_seconds=0.0,
+        auto_consolidate=False,
+    )
+    try:
+        app_ttl0.chat("首问", chat_id="t0")
+        app_ttl0.memory.remember_user_statement("立刻可见的事实", message_id=1)
+        p_next = app_ttl0.get_session_system_prompt("t0", app_ttl0.tools)
+        assert "data/memory/facts.md" in p_next
+    finally:
+        app_ttl0.close()
+
+    # 后台沉淀未修改任何记忆文件（saved_files=()）时：保留热 system_prompt，同时清空历史切块 floor_id
+    cons_llm = _OptionsRecordingLLM(
+        [AssistantMessage.from_text(json.dumps({"session_summary": "仅更新摘要", "memories": []}), stop_reason="stop")]
+    )
+    chat_llm = _OptionsRecordingLLM([AssistantMessage.from_text(f"ok-{i}", stop_reason="stop") for i in range(4)])
+    app_cons = AssistantApp(
+        data_root=tmp_path / "cons_preserve_data",
+        llm=chat_llm,
+        consolidator_llm=cons_llm,
+        consolidation_policy=ConsolidationPolicy(max_active_messages=4, keep_recent_messages=2, min_batch_messages=2),
+        auto_consolidate=True,
+    )
+    try:
+        app_cons.chat("第1句", chat_id="keep-sys")
+        app_cons._history_trim_floors["keep-sys"] = 99
+        frozen_before = app_cons._session_prompts["keep-sys"][0]
+        app_cons.chat("第2句", chat_id="keep-sys")
+        app_cons.wait_for_consolidation(timeout=5.0)
+        assert app_cons._session_prompts["keep-sys"][0] == frozen_before
+        assert "keep-sys" not in app_cons._history_trim_floors
+    finally:
+        app_cons.close()
+
+
+# 回归测试 9（Reviewer CacheMonitor Nits）：有界/无界一致、system 增删/列表缩短定位、空白 session_id 回退与字典隔离
+def test_cache_monitor_edge_cases_bounded_parity_and_isolation() -> None:
+    from personal_assistant.ai.cache import _context_segments, _join_segments, _locate_prefix_break
+
+    bounded = CacheMonitor(max_records=3, max_sessions=2)
+    unbounded = CacheMonitor(max_records=50, max_sessions=50)
+    tools = (ToolSchema(name="t", description="d", parameters={}),)
+
+    ctxs = [
+        ("s1", Context(system_prompt="", messages=(UserMessage("a"),), tools=tools)),
+        ("s1", Context(system_prompt="sys-added", messages=(UserMessage("a"),), tools=tools)),
+        ("s1", Context(system_prompt="sys-added", messages=(UserMessage("a"), AssistantMessage.from_text("b")), tools=tools)),
+        ("s1", Context(system_prompt="sys-added", messages=(UserMessage("a"),), tools=tools)),
+        ("s1", Context(system_prompt="", messages=(UserMessage("a"),), tools=tools)),
+    ]
+    breaks_seen: list[str | None] = []
+    for sk, ctx in ctxs:
+        segs = _context_segments(ctx)
+        ser = _join_segments(segs)
+        comp = context_composition(ctx)
+        r_b = bounded.record(sk, ser, TokenUsage(100, 50, 10), segments=segs, composition=comp)
+        unbounded.record(sk, ser, TokenUsage(100, 50, 10), segments=segs, composition=comp)
+        breaks_seen.append(r_b.break_section)
+
+    assert breaks_seen == ["cold_start", "system", "append", "message[1]:assistant", "system"]
+    assert bounded.summary() == unbounded.summary()
+
+    # 外部修改 record.composition 不应污染 monitor 内部 _last_composition
+    last_rec = bounded.records[-1]
+    assert last_rec.composition is not None
+    last_rec.composition["user"] = 999999
+    global_comp = bounded.summary()["last_composition"]
+    assert isinstance(global_comp, dict) and global_comp["user"] != 999999
+
+    # 空串 record 不应将空串写入 _last_serialized 污染后续冷启动判定
+    empty_mon = CacheMonitor()
+    empty_mon.record("e1", "")
+    rec_real = empty_mon.record("e1", "tools\nsys\n")
+    assert rec_real.break_section == "cold_start"
+
+    # TrackingModelClient 对纯空白 session_id 回退至默认 session_key，保留带空格 chat_id 不错配
+    llm = _OptionsRecordingLLM([AssistantMessage.from_text("ok"), AssistantMessage.from_text("ok2")])
+    mon = CacheMonitor()
+    tracked = mon.wrap(llm, session_key="  spaced-id  ")
+    tracked.complete(ctxs[0][1], options=StreamOptions(session_id="   "))
+    tracked.complete(ctxs[0][1], options=StreamOptions(session_id="  spaced-id  "))
+    assert mon.summary(session_key="  spaced-id  ")["llm_calls"] == 2
+    assert _locate_prefix_break(None, _context_segments(ctxs[0][1])) == "cold_start"

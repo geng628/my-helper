@@ -345,13 +345,15 @@ def _execute_steps(
 
         if action == "seed_history":
             seeded = 0
+            seed_day = step_day or clock_day[0]
+            seed_created_at = f"{seed_day.isoformat()}T12:00:00+08:00" if seed_day is not None else None
             for msg in raw_step.get("messages") or []:
                 if not isinstance(msg, dict):
                     continue
                 role = str(msg.get("role") or "").strip().lower()
                 content = str(msg.get("content") or "").strip()
                 if role in {"user", "assistant"} and content:
-                    app.state.append_message(chat_id, role, content)
+                    app.state.append_message(chat_id, role, content, created_at=seed_created_at)
                     seeded += 1
             step_logs.append(
                 {

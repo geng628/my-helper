@@ -238,7 +238,7 @@
   - **Layer 3（[../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py)、[../personal_assistant/assistant/db.py](../personal_assistant/assistant/db.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)）**：日期下沉至 `format_user_envelope()`（`StateStore.append_turn` 支持统一 `created_at`，回放逐字节还原且库内存干净原话）；前情摘要迁至 `messages` 头部；`get_session_system_prompt()` 升级为 5 分钟空闲 TTL（热聊死锁，跨天无实际过期归档不击穿，空闲超时免费刷新）；新增粘性按块裁剪 `_select_chunked_history()` 与轮内高水位非破坏性投影器 `_TurnContextProjector`（接入 `convert_to_llm`）；
   - **测试与文档**：新增 [../tests/test_kv_cache_architecture.py](../tests/test_kv_cache_architecture.py) 覆盖全部 6 项验收标准，并同步更新 `README.md`、`docs/mvp-design.md`、`AGENTS.md` 与相关旧测试断言。
 - **验证与同口径对比（`eadc201` → 本次提交）**：
-  - 单元测试：`209 passed → 215 passed`（含 6 项全链路 KV Cache 架构测试与三层依赖守卫全绿）；
+  - 单元测试：`209 passed → 218 passed`（含 9 项全链路 KV Cache 架构与边界回归测试及三层依赖守卫全绿）；
   - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测口径：本次涉及 `format_system_prompt` 日期下沉与摘要位置调整，离线确定性单测与 40 题 FTS5 门禁全部通过；表四 `1b421d2` 实模基线保持历史记录不篡改，后续可按需补跑新版实模对照。
 - **已知边界与下一步**：紧接着推进 PR 2——在 `tools.py` 与 `react.py` 实现「并行只读工具 + 写工具串行路障 + 按模型原序提交」（借鉴 Akashic ADR `0079`）。

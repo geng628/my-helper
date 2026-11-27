@@ -849,7 +849,7 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
     import threading
     from datetime import date
 
-    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded, _select_adaptive_history
+    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded, _select_chunked_history
     from personal_assistant.assistant.consolidator import ConsolidationPolicy
     from tests.test_streaming import ScriptedStreamLLM
 
@@ -881,7 +881,7 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
         for i in range(15):
             long_active.append({"id": i * 2 + 1, "role": "user", "content": f"U{i}:" + ("x" * 900)})
             long_active.append({"id": i * 2 + 2, "role": "assistant", "content": f"A{i}:" + ("y" * 900)})
-        sliced = _select_adaptive_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
+        sliced, _ = _select_chunked_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
         assert sliced[0]["role"] == "user"
         assert len(sliced) % 2 == 0
     finally:
@@ -1186,14 +1186,16 @@ class ProbeLifecyclePlugin(Plugin):
         assert res_map["chat-B"]["cache"]["prompt_tokens"] == 999  # type: ignore[index]
         assert hasattr(app_conc, "_llm_lock")
 
-        # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及自适应滑窗有界上限（60 条 / 24000 字符）
-        big_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
-        capped = _select_adaptive_history(big_active)
-        assert len(capped) == 24  # 24 * 1000 == 24000 字符上限
+        # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及粘性按块裁剪上限（60 条 / 24000 字符）
+        big_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
+        capped, big_floor = _select_chunked_history(big_active)
+        assert len(capped) == 12 and capped[0]["role"] == "user" and big_floor == 58
 
-        short_active = [{"role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
-        capped_count = _select_adaptive_history(short_active)
-        assert len(capped_count) == 60
+        short_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
+        within_cap, zero_floor = _select_chunked_history(short_active[:60])
+        assert len(within_cap) == 60 and zero_floor == 0
+        capped_count, count_floor = _select_chunked_history(short_active)
+        assert len(capped_count) == 20 and capped_count[0]["role"] == "user" and count_floor == 50
 
         stream_guard_llm = ScriptedStreamLLM(
             [

@@ -107,12 +107,8 @@ def serialize_context(context: Context) -> str:
     return _join_segments(_context_segments(context))
 
 
-# 统计中立 Context 各逻辑段（tools / system / user / assistant / tool_results）的字符构成
-def context_composition(context: Context) -> dict[str, int]:
-    tools_chars = 0
-    if context.tools:
-        segments = _context_segments(Context(tools=context.tools))
-        tools_chars = len(segments[0][1])
+# 基于已计算的 tools 规范行长度统计 Context 各逻辑段字符构成，避免重复序列化工具定义
+def _composition_from_segments(context: Context, tools_line_len: int) -> dict[str, int]:
     user_chars = 0
     assistant_chars = 0
     tool_result_chars = 0
@@ -130,12 +126,18 @@ def context_composition(context: Context) -> dict[str, int]:
                 elif isinstance(block, ToolCall):
                     assistant_chars += len(block.name) + len(block.arguments)
     return {
-        "tools": tools_chars,
+        "tools": tools_line_len if context.tools else 0,
         "system": len(context.system_prompt),
         "user": user_chars,
         "assistant": assistant_chars,
         "tool_results": tool_result_chars,
     }
+
+
+# 统计中立 Context 各逻辑段（tools / system / user / assistant / tool_results）的字符构成
+def context_composition(context: Context) -> dict[str, int]:
+    tools_chars = len(_context_segments(Context(tools=context.tools))[0][1]) if context.tools else 0
+    return _composition_from_segments(context, tools_chars)
 
 
 # 对比相邻两次调用的规范段序列，精准定位首次前缀失配来源（cold_start / append / tools / system / message[i]:role）
@@ -326,15 +328,16 @@ class CacheMonitor:
                 else:
                     break_section = "append" if serialized.startswith(prev) else "prefix"
 
-            if len(self._last_serialized) >= self.max_sessions:
-                evicted = next(iter(self._last_serialized))
-                self._last_serialized.pop(evicted, None)
-                self._last_segments.pop(evicted, None)
-            self._last_serialized[session_key] = serialized
-            if segments is not None:
-                self._last_segments[session_key] = segments
+            if total > 0:
+                if len(self._last_serialized) >= self.max_sessions:
+                    evicted = next(iter(self._last_serialized))
+                    self._last_serialized.pop(evicted, None)
+                    self._last_segments.pop(evicted, None)
+                self._last_serialized[session_key] = serialized
+                if segments is not None:
+                    self._last_segments[session_key] = segments
 
-            comp_copy = dict(composition) if composition is not None else None
+            record_comp = dict(composition) if composition is not None else None
             entry = CallCacheRecord(
                 session_key=session_key,
                 prefix_chars=prefix_len,
@@ -342,7 +345,7 @@ class CacheMonitor:
                 prefix_reuse_rate=reuse_rate,
                 usage=usage,
                 break_section=break_section,
-                composition=comp_copy,
+                composition=record_comp,
             )
             self._records.append(entry)
             self._total_recorded += 1
@@ -356,7 +359,7 @@ class CacheMonitor:
             if _is_prefix_break(break_section):
                 self._total_prefix_breaks += 1
             self._last_break_section = break_section
-            self._last_composition = comp_copy
+            self._last_composition = dict(composition) if composition is not None else None
             return entry
 
     # 汇总从非负游标 since 位置起的调用统计（支持按 session_key 切片隔离；since=0 且未指定会话时走 O(1) 全局累计）
@@ -420,10 +423,10 @@ class TrackingModelClient:
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
-    # 优先使用 StreamOptions.session_id 路由缓存统计会话，缺省回退至默认 session_key
+    # 优先使用非空白 StreamOptions.session_id 路由缓存统计会话（保留原始字符避免与外层 chat_id 键错配），缺省回退默认 session_key
     def _resolve_session_key(self, options: StreamOptions | None) -> str:
         if options is not None and options.session_id and options.session_id.strip():
-            return options.session_id.strip()
+            return options.session_id
         return self.session_key
 
     # 流式转发中立上下文给底层模型，并在 StreamDone 时单次记录本地前缀复用率、失配归因与服务端 usage
@@ -434,7 +437,7 @@ class TrackingModelClient:
     ) -> Iterator[AssistantMessageEvent]:
         segments = _context_segments(context)
         serialized = _join_segments(segments)
-        composition = context_composition(context)
+        composition = _composition_from_segments(context, len(segments[0][1]))
         effective_session = self._resolve_session_key(options)
         self.last_usage = None
         raw_iter = self.inner.stream(context, options)
@@ -474,7 +477,7 @@ class TrackingModelClient:
     ) -> AssistantMessage:
         segments = _context_segments(context)
         serialized = _join_segments(segments)
-        composition = context_composition(context)
+        composition = _composition_from_segments(context, len(segments[0][1]))
         effective_session = self._resolve_session_key(options)
         self.last_usage = None
         reply = self.inner.complete(context, options)

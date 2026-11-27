@@ -104,28 +104,11 @@ def _canonical_tool_args(raw_arguments: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-# 当未压缩活跃消息超出常规滑窗上限时，在字符与条数总预算内自适应保留更早消息，防止沉淀滞后静默丢上下文
-def _select_adaptive_history(
-    active_all: list[dict[str, object]],
-    *,
-    base_messages: int = MAX_HISTORY_MESSAGES,
-    max_messages: int = MAX_ADAPTIVE_HISTORY_MESSAGES,
-    max_chars: int = MAX_ADAPTIVE_HISTORY_CHARS,
-) -> list[dict[str, object]]:
-    if len(active_all) <= base_messages:
-        return active_all
-    selected_rev: list[dict[str, object]] = []
-    used_chars = 0
-    for idx, msg in enumerate(reversed(active_all)):
-        item_len = min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS)
-        if idx >= base_messages and (len(selected_rev) >= max_messages or used_chars + item_len > max_chars):
-            break
-        selected_rev.append(msg)
-        used_chars += item_len
-    while len(selected_rev) > 1 and selected_rev[-1].get("role") == "assistant":
-        selected_rev.pop()
-    selected_rev.reverse()
-    return selected_rev
+# 判断消息字典的 id 字段是否为有效整数（排除布尔值）
+def _valid_msg_id(raw_id: object) -> int | None:
+    if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+        return raw_id
+    return None
 
 
 # 粘性边界按块裁剪活跃历史：未超上限保持队头纹丝不动，仅在超限时整块切至目标水位并推进 floor_id 以守护 KV Cache
@@ -141,7 +124,7 @@ def _select_chunked_history(
         eligible = [
             msg
             for msg in active_all
-            if not isinstance(msg.get("id"), int) or int(msg["id"]) > floor_id
+            if (mid := _valid_msg_id(msg.get("id"))) is None or mid > floor_id
         ]
     else:
         eligible = list(active_all)
@@ -158,12 +141,7 @@ def _select_chunked_history(
     used_chars = 0
     for msg in reversed(eligible):
         item_len = min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS)
-        if selected_rev and (
-            len(selected_rev) >= target_msgs
-            or used_chars + item_len > target_chars
-            or len(selected_rev) >= max_messages
-            or used_chars + item_len > max_chars
-        ):
+        if selected_rev and (len(selected_rev) >= target_msgs or used_chars + item_len > target_chars):
             break
         selected_rev.append(msg)
         used_chars += item_len
@@ -172,13 +150,17 @@ def _select_chunked_history(
     selected_rev.reverse()
 
     new_floor = floor_id
-    if selected_rev and isinstance(selected_rev[0].get("id"), int):
-        new_floor = max(floor_id, int(selected_rev[0]["id"]) - 1)
+    if selected_rev:
+        first_id = _valid_msg_id(selected_rev[0].get("id"))
+        if first_id is not None:
+            new_floor = max(floor_id, first_id - 1)
     return selected_rev, new_floor
 
 
-# 从 SQLite 消息的 created_at 字段解析北京时间自然日（兼容 UTC / 带时区 ISO 与纯日期字符串）
+# 从 SQLite 消息的 created_at 字段解析北京时间自然日（兼容带时区 datetime / ISO 与纯日期字符串）
 def _message_shanghai_date(raw_created_at: object) -> date | None:
+    if isinstance(raw_created_at, datetime):
+        return raw_created_at.astimezone(SHANGHAI_TZ).date() if raw_created_at.tzinfo is not None else raw_created_at.date()
     if isinstance(raw_created_at, str):
         text = raw_created_at.strip()
         if not text:
@@ -208,9 +190,9 @@ def _message_char_len(msg: Message) -> int:
     return total
 
 
-# 轮内粘性高水位非破坏性上下文投影器（接入 react.iter_react 的 convert_to_llm 钩子）：低水位零改动吃满缓存，超水位锁定折叠边界
+# 轮内粘性高水位非破坏性上下文投影器（接入 react.iter_react 的 convert_to_llm 钩子）：带动态滞回水位防抖，绝不放大原输出
 class _TurnContextProjector:
-    # 初始化触发高水位字符阈值、尾部原文保护条数与单条大输出折叠阈值
+    # 初始化触发高水位字符阈值、动态下次触发水位、尾部原文保护条数与单条大输出折叠阈值
     def __init__(
         self,
         *,
@@ -220,19 +202,22 @@ class _TurnContextProjector:
         preview_chars: int = DEFAULT_FOLD_PREVIEW_CHARS,
     ) -> None:
         self._trigger_chars = trigger_chars
+        self._next_trigger_chars = trigger_chars
         self._keep_tail_messages = keep_tail_messages
         self._min_result_chars = min_result_chars
         self._preview_chars = preview_chars
         self._folded_until = 0
 
-    # 将单条超长 ToolResultMessage 确定性地投影为紧凑卡片（优先保留 TOAST 落盘的 read_markdown 回读指针）
+    # 将单条超长 ToolResultMessage 确定性地投影为紧凑卡片（仅提取有界 TOAST 回读指针，并严格保证折叠后更短）
     def _fold_tool_result(self, msg: ToolResultMessage) -> ToolResultMessage:
         if len(msg.content) <= self._min_result_chars:
             return msg
         pointer_line = ""
         for line in msg.content.splitlines():
-            if "read_markdown(" in line:
-                pointer_line = line.strip()
+            if 'read_markdown(path="' in line:
+                candidate = line.strip()
+                if len(candidate) <= 320:
+                    pointer_line = candidate
                 break
         preview = " ".join(msg.content[: self._preview_chars].split())
         parts = [f"[已折叠工具输出：{msg.tool_name}，原长 {len(msg.content)} 字符，原文完整保留]"]
@@ -240,14 +225,17 @@ class _TurnContextProjector:
             parts.append(f"{preview}…")
         if pointer_line:
             parts.append(pointer_line)
+        folded_content = "\n".join(parts)
+        if len(folded_content) >= len(msg.content):
+            return msg
         return ToolResultMessage(
             tool_call_id=msg.tool_call_id,
             tool_name=msg.tool_name,
-            content="\n".join(parts),
+            content=folded_content,
             is_error=msg.is_error,
         )
 
-    # 按粘性边界投影当前轮 Context：不修改原始 history，低水位零改写，超水位折叠前半批大输出后锁定下标
+    # 按粘性边界与动态滞回水位投影当前轮 Context：不改写原始 history，无实际折叠不推边界，折叠后抬高下次触发水位防每步抖动
     def __call__(self, context: Context) -> Context:
         msgs = list(context.messages)
         mutated = False
@@ -261,9 +249,10 @@ class _TurnContextProjector:
                     mutated = True
 
         total_chars = sum(_message_char_len(m) for m in msgs)
-        if total_chars > self._trigger_chars:
+        if total_chars > self._next_trigger_chars:
             cutoff = max(0, len(msgs) - self._keep_tail_messages)
             if cutoff > self._folded_until:
+                newly_folded = False
                 for idx in range(self._folded_until, cutoff):
                     item = msgs[idx]
                     if isinstance(item, ToolResultMessage):
@@ -271,7 +260,12 @@ class _TurnContextProjector:
                         if folded is not item:
                             msgs[idx] = folded
                             mutated = True
-                self._folded_until = cutoff
+                            newly_folded = True
+                if newly_folded:
+                    self._folded_until = cutoff
+                    post_fold_chars = sum(_message_char_len(m) for m in msgs)
+                    hysteresis = max(1, self._trigger_chars // 2)
+                    self._next_trigger_chars = max(self._trigger_chars, post_fold_chars + hysteresis)
 
         if not mutated:
             return context
@@ -779,14 +773,19 @@ class AssistantApp:
         with self._prompt_lock:
             self._history_trim_floors.pop(chat_id, None)
 
-    # 按会话粘性边界裁剪活跃历史并更新有界 LRU 游标表
+    # 按会话粘性边界裁剪活跃历史并按真 LRU 刷新命中会话热度（防止热会话在上限淘汰时被提前逐出）
     def _select_session_history(
         self,
         chat_id: str,
         active_all: list[dict[str, object]],
     ) -> list[dict[str, object]]:
         with self._prompt_lock:
-            floor_id = self._history_trim_floors.get(chat_id, 0)
+            existing = self._history_trim_floors.pop(chat_id, None)
+            if existing is not None:
+                self._history_trim_floors[chat_id] = existing
+                floor_id = existing
+            else:
+                floor_id = 0
         selected, new_floor = _select_chunked_history(active_all, floor_id=floor_id)
         if new_floor != floor_id:
             with self._prompt_lock:
@@ -877,10 +876,10 @@ class AssistantApp:
                 return
         archived = self.memory.archive_expired_memories(today=ref_day)
         with self._prompt_lock:
+            if archived:
+                self._session_prompts.clear()
             if self._last_archive_day != today_str:
                 self._last_archive_day = today_str
-                if archived:
-                    self._session_prompts.clear()
 
     # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
     def stream_chat(
