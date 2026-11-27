@@ -133,7 +133,7 @@ class _ToolCallAcc:
     args: list[str] = field(default_factory=list)
 
 
-# OpenAI Chat Completions 翻译器：提供清晰子类扩展点供外部插件（如 reasoning_provider）复用
+# OpenAI Chat Completions 翻译器：提供清晰子类扩展点供内建推理方言（openai_reasoning）与外部插件复用
 @dataclass
 class OpenAICompletionsProvider:
     api: str = "openai-completions"

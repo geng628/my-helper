@@ -1,4 +1,4 @@
-"""Slot-4 推理模型翻译器插件（plugins/reasoning_provider.py）单元测试与多轮 ReAct 集成测试。"""
+"""内建推理模型协议翻译器（personal_assistant/ai/providers/openai_reasoning.py）单元测试与多轮 ReAct 集成测试。"""
 from __future__ import annotations
 
 import io
@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from personal_assistant.agent import PluginManager, ToolStart, ToolStep, TurnEnd
+from personal_assistant.agent import ToolStart, ToolStep, TurnEnd
 from personal_assistant.ai import (
     ApiProvider,
     ApiProviderRegistry,
@@ -18,6 +18,7 @@ from personal_assistant.ai import (
     ModelClient,
     ModelInvoker,
     ModelProfile,
+    OpenAIReasoningProvider,
     StreamDone,
     StreamError,
     StreamStart,
@@ -33,25 +34,45 @@ from personal_assistant.ai import (
     ToolCall,
     ToolResultMessage,
     UserMessage,
+    available_api_providers,
+    default_registry,
     from_model_profile,
 )
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
 
+API_NAME = "openai-reasoning"
 
-# 测试 Slot-4 插件自动发现、ApiProvider 注册与 models_dsl 一键切换 DeepSeek Reasoner（零环境变量）
-def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
+
+# 测试 openai-reasoning 内建自动注册（无需加载 plugins/）与 models_dsl 一键切换 DeepSeek Reasoner（零环境变量）
+def test_builtin_openai_reasoning_provider_registers_and_builds_llm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API", raising=False)
 
-    manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
-    assert "openai-reasoning" in manager.providers
-    assert isinstance(manager.providers["openai-reasoning"], ApiProvider)
+    # 1. 不加载 plugins/ 目录时，Layer 1 默认注册表直接开箱支持 openai-reasoning
+    assert API_NAME in available_api_providers()
+    builtin_provider = default_registry().resolve(API_NAME)
+    assert isinstance(builtin_provider, ApiProvider)
+    assert isinstance(builtin_provider, OpenAIReasoningProvider)
+    assert not (REPO_ROOT / "plugins" / "reasoning_provider.py").exists()
 
+    direct_llm = from_model_profile(
+        ModelProfile(
+            name="r1",
+            api=API_NAME,
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+            api_key="sk-r1-standalone",
+        )
+    )
+    assert isinstance(direct_llm, ModelClient)
+    assert direct_llm.api == API_NAME
+
+    # 2. 经 ToolsConfig + build_app 一键切换 DeepSeek Reasoner 预设
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "tools.json").write_text(
@@ -67,7 +88,7 @@ def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
     )
 
     tcfg = ToolsConfig.load(cfg_dir / "tools.json", project_root=REPO_ROOT)
-    assert "openai-reasoning" in tcfg.plugin_manager.providers
+    assert API_NAME in tcfg.build_provider_registry().available()
     assert any(p["id"] == "deepseek-reasoner" for p in tcfg.model_presets())
 
     app = build_app(data_root=tmp_path / "data", config_root=cfg_dir, project_root=REPO_ROOT)
@@ -78,7 +99,7 @@ def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
         assert app.status()["llm_configured"] is True
         assert isinstance(app.llm, ModelInvoker)
         assert isinstance(app.llm, ModelClient)
-        assert app.llm.api == "openai-reasoning"
+        assert app.llm.api == API_NAME
         assert app.llm.model == "deepseek-reasoner"
     finally:
         app.close()
@@ -86,7 +107,6 @@ def test_reasoning_provider_plugin_registers_slot4_and_builds_llm(
 
 # 测试 OpenAIReasoningProvider 的请求报文规则（禁发 temperature、跨轮剥离/轮内透传 reasoning_content）与 12 事件流解析
 def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
-    from plugins.reasoning_provider import API_NAME, OpenAIReasoningProvider
 
     captured_requests: list[dict[str, object]] = []
     stream_attempts = 0
@@ -192,8 +212,6 @@ def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
 
 # 测试 AssistantApp 双轮端到端推理 + 工具调用：轮内透传 reasoning_content、跨轮剥离、观测指标与历史干净持久化
 def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path) -> None:
-    from plugins.reasoning_provider import API_NAME, OpenAIReasoningProvider
-
     wire_history: list[list[dict[str, object]]] = []
     turn_streams = [
         # Turn 1 Step 1：思考后发起 get_current_time 工具调用
@@ -280,10 +298,8 @@ def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path
         app.close()
 
 
-# 测试推理插件边界条件：空白归一化、无思考工具调用轮内补 reasoning_content=""、分片 tool_calls 与流中错误收敛为 StreamError
+# 测试推理翻译器边界条件：空白归一化、无思考工具调用轮内补 reasoning_content=""、分片 tool_calls 与流中错误收敛为 StreamError
 def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
-    from plugins.reasoning_provider import API_NAME, OpenAIReasoningProvider
-
     # 1. ModelProfile.from_dict + from_model_profile 归一化字段后直通 ModelClient + ApiProviderRegistry
     profile = ModelProfile.from_dict(
         "r1",

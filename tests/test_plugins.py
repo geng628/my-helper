@@ -238,37 +238,35 @@ class MathPlugin(Plugin):
     assert run_react(ScriptedLLM(responses), ctx, registry) == "6 乘以 7 等于 42。"
 
 
-# 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽（Slot 4 直用 Layer 1 ApiProvider）
-def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
+# 测试外层统一主板基类 Plugin(ABC)（4 个仓库内建插件 + Slot 4 外部协议插件）与内层全部 5 个子协议插槽
+def test_plugin_motherboard_abc_and_all_five_inner_protocols(tmp_path: Path) -> None:
     from personal_assistant.agent.plugins import (
         ObserverProtocol,
         RetrieverProtocol,
     )
     from personal_assistant.agent.tools import Tool
+    from personal_assistant.ai import OpenAIReasoningProvider
     from personal_assistant.assistant.common import REPO_ROOT
     from plugins.models_dsl import ModelsDSLCompiler
-    from plugins.reasoning_provider import OpenAIReasoningProvider
 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
     assert not hasattr(manager, "modules")
     assert not hasattr(manager, "default_tools")
 
-    # 1. 外层：主板加载 5 个同级 Plugin(ABC) 实例（tools 文件夹插件 + 4 个单文件插件）
-    assert len(manager.plugins) == 5
+    # 1. 外层：主板加载仓库 plugins/ 下的 4 个同级 Plugin(ABC) 实例（tools 文件夹插件 + 3 个单文件插件）
+    assert len(manager.plugins) == 4
     assert all(isinstance(p, Plugin) for p in manager.plugins)
     plugin_ids = {p.plugin_id for p in manager.plugins}
     assert plugin_ids == {
         "tools",
         "fts5_bm25",
         "models_dsl",
-        "openai-reasoning",
         "telemetry",
     }
     assert {type(p).__name__ for p in manager.plugins} == {
         "ToolsPlugin",
         "FTS5RetrieverPlugin",
         "ModelsDSLPlugin",
-        "ReasoningProviderPlugin",
         "TelemetryPlugin",
     }
     assert all(p.context.project_root == REPO_ROOT for p in manager.plugins)
@@ -293,28 +291,52 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
-    # 5. 内层子协议 4：Layer 1 ApiProvider 统一宪法（不再重复定义 LLMProviderProtocol）
+    # 5. 内层子协议 4：Layer 1 ApiProvider 统一宪法（内建 OpenAIReasoningProvider + 外部 Slot 4 插件扩展）
     reasoning_provider = OpenAIReasoningProvider()
     assert isinstance(reasoning_provider, ApiProvider)
     assert reasoning_provider.api == "openai-reasoning"
     assert not callable(reasoning_provider)
-    assert "openai-reasoning" in manager.providers
-    assert isinstance(manager.providers["openai-reasoning"], ApiProvider)
+
+    slot4_plugin = tmp_path / "custom_slot4_provider.py"
+    slot4_plugin.write_text(
+        (
+            "from dataclasses import dataclass\n"
+            "from personal_assistant.agent.plugins import Plugin\n"
+            "from personal_assistant.ai import OpenAICompletionsProvider\n"
+            "\n"
+            "# 自定义 Slot 4 协议翻译器\n"
+            "@dataclass\n"
+            "class CustomSlot4Provider(OpenAICompletionsProvider):\n"
+            "    api: str = 'custom-slot4-demo'\n"
+            "\n"
+            "# 外部 Slot 4 协议插件\n"
+            "class CustomSlot4Plugin(Plugin):\n"
+            "    plugin_id = 'custom-slot4-demo'\n"
+            "\n"
+            "    # 注册外部私有协议翻译器\n"
+            "    def initialize(self) -> None:\n"
+            "        self.context.register_provider(CustomSlot4Provider())\n"
+        ),
+        encoding="utf-8",
+    )
+    ext_manager = PluginManager.from_entries(["custom_slot4_provider.py"], tmp_path)
+    assert "custom-slot4-demo" in ext_manager.providers
+    assert isinstance(ext_manager.providers["custom-slot4-demo"], ApiProvider)
 
     reg = ApiProviderRegistry()
-    reg.register(manager.providers["openai-reasoning"])
-    reasoning_client = from_model_profile(
+    reg.register(ext_manager.providers["custom-slot4-demo"])
+    ext_client = from_model_profile(
         ModelProfile(
-            name="r1",
-            api="openai-reasoning",
-            base_url="https://api.deepseek.com/v1",
-            model="deepseek-reasoner",
+            name="custom",
+            api="custom-slot4-demo",
+            base_url="https://api.example.com/v1",
+            model="demo-model",
             api_key="sk-slot4-test",
         ),
         registry=reg,
     )
-    assert isinstance(reasoning_client, ModelClient)
-    assert reasoning_client.api == "openai-reasoning"
+    assert isinstance(ext_client, ModelClient)
+    assert ext_client.api == "custom-slot4-demo"
 
     # 6. 内层子协议 5：ObserverProtocol（AssistantApp 只认 on_event / snapshot）
     obs = manager.observers["telemetry"]({})
@@ -322,6 +344,7 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     assert obs.name == "telemetry"
 
     # 7. 统一生命周期清理钩子可正常调用
+    ext_manager.terminate_all()
     manager.terminate_all()
 
 

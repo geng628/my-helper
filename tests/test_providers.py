@@ -24,6 +24,7 @@ from personal_assistant.ai import (
     ModelProfile,
     NoopModelClient,
     OpenAICompletionsProvider,
+    OpenAIReasoningProvider,
     StreamDone,
     StreamError,
     StreamOptions,
@@ -58,8 +59,6 @@ from personal_assistant.assistant.app import build_app
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.common import REPO_ROOT
 from personal_assistant.assistant.memory import MemoryStore
-from plugins.reasoning_provider import API_NAME as REASONING_API_NAME
-from plugins.reasoning_provider import OpenAIReasoningProvider
 from plugins.telemetry import TelemetryObserver
 
 
@@ -127,12 +126,13 @@ def test_protocol_clamp_thinking_and_model_profile_validation() -> None:
     assert redacted["cache_retention"] == "long"
 
 
-# 测试全局默认注册表三大内建翻译器、同步抛 LLMNotConfigured、stream_simple 合并与 complete() 语义
+# 测试全局默认注册表四大内建翻译器、同步抛 LLMNotConfigured、stream_simple 合并与 complete() 语义
 def test_registry_builtin_providers_sync_auth_and_stream_simple() -> None:
     assert set(available_api_providers()) >= {
         "anthropic-messages",
         "google-generative-ai",
         "openai-completions",
+        "openai-reasoning",
     }
 
     # 缺密钥时 stream() 必须同步抛出 LLMNotConfigured（不等消费迭代器）
@@ -959,7 +959,7 @@ def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> 
         ),
         "reasoner": ModelProfile(
             name="r1",
-            api=REASONING_API_NAME,
+            api="openai-reasoning",
             base_url="https://api.deepseek.com/v1",
             model="deepseek-reasoner",
             api_key="sk-r1-swap",

@@ -9,7 +9,7 @@
 1. **零第三方运行依赖**：
    - 生产代码仅使用 Python 3.12+ 标准库（`urllib`、`http.client`、`sqlite3`、`threading`、`http.server`、`shlex`、`ipaddress`、`unicodedata` 等）；`pytest` 仅作为开发测试依赖。
 2. **三层单向依赖漏斗（`ai ← agent ← assistant`）与 Layer 1 三层解耦**：
-   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`anthropic_messages`/`google_genai` 三大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）；
+   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`openai_reasoning`/`anthropic_messages`/`google_genai` 四大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）；
    - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`）；包含中立 `Context` 驱动的通用 ReAct 循环、纯值对象工具递进扩展（`ToolSchema → Tool` + `bind_tool_context`）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 宪法）；
    - `personal_assistant/assistant/`（Layer 3）：个人与学习助手业务编排（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 会话存储、外层回合预算、后台压缩与 CLI/Web 接入）；
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级，产品包绝不反向导入 `evals/`，由 [../tests/test_architecture.py](../tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言扫描、子进程 `sys.modules` 断层隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 硬守卫强制保障。
@@ -52,7 +52,7 @@ flowchart TD
     subgraph L1["Layer 1: Pi ch04 三层模型调用翻译架构与缓存观测 (personal_assistant/ai/)"]
         Facade["第一层·统一前台与通讯录 stream/stream_simple/complete & ApiProviderRegistry (ai/registry.py)"]
         Proto["第二层·中立事件协议 Context/Message/12 事件/ApiProvider/ModelInvoker (ai/protocol.py)"]
-        Providers["第三层·原生翻译器 http + openai_completions / anthropic_messages / google_genai (ai/providers/)"]
+        Providers["第三层·原生翻译器 http + openai_completions / openai_reasoning / anthropic_messages / google_genai (ai/providers/)"]
         Cache["中立 Context 有界缓存观测 CacheMonitor / TrackingModelClient (ai/cache.py)"]
         Facade --> Proto
         Providers --> Proto
@@ -63,7 +63,7 @@ flowchart TD
         PTools["Slot 1 工具插槽: ToolsPlugin (plugins/tools/*.py)"]
         PRet["Slot 2 检索插槽: FTS5RetrieverPlugin (plugins/fts5_retriever.py)"]
         PDSL["Slot 3 编译插槽: ModelsDSLPlugin (plugins/models_dsl.py)"]
-        PR1["Slot 4 翻译器插槽: ReasoningProviderPlugin (ApiProvider: openai-reasoning)"]
+        PR1["Slot 4 翻译器插槽: 外部/私有协议 Plugin (ApiProvider)"]
         PObs["Slot 5 观测插槽: TelemetryPlugin (plugins/telemetry.py)"]
     end
 
@@ -101,19 +101,19 @@ my_helper_v2/
 │   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
 │   ├── fts5_retriever.py              # SQLite FTS5 + BM25 双语检索插件（RetrieverProtocol）
 │   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/reasoning/cache_retention）
-│   ├── reasoning_provider.py          # 推理模型协议翻译器插件（ApiProvider：openai-reasoning）
 │   └── telemetry.py                   # 有界 MRU 会话耗时拆解与后台任务观测插件（ObserverProtocol）
 ├── personal_assistant/                # 纯净三层产品包（绝不反向依赖 evals/）
 │   ├── __init__.py
 │   ├── __main__.py
 │   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测）：
-│   │   ├── __init__.py                #   统一导出并在导入期注册三大内建原生翻译器
+│   │   ├── __init__.py                #   统一导出并在导入期注册四大内建原生翻译器
 │   │   ├── protocol.py                #   第二层·零内部依赖事件与契约协议层
 │   │   ├── registry.py                #   第一层·统一前台入口、ApiProviderRegistry 与 ModelClient
 │   │   ├── providers/                 #   第三层·原生协议翻译器子包：
 │   │   │   ├── __init__.py            #     register_builtin_providers 汇总导出
 │   │   │   ├── http.py                #     共享标准库重试/429 Retry-After/脱敏/通用 SSE 底座
-│   │   │   ├── openai_completions.py  #     api="openai-completions" 翻译器
+│   │   │   ├── openai_completions.py  #     api="openai-completions" 翻译器（OpenAI/DeepSeek Chat 等）
+│   │   │   ├── openai_reasoning.py    #     api="openai-reasoning" 翻译器（DeepSeek Reasoner/R1 等）
 │   │   │   ├── anthropic_messages.py  #     api="anthropic-messages" 原生翻译器
 │   │   │   └── google_genai.py        #     api="google-generative-ai" 原生翻译器
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
@@ -172,10 +172,11 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - 轻量句柄与直通工厂：`ModelClient`（持有 `ModelProfile` 与可选局部 `registry`，线程局部记录 `last_usage`，多线程共享零串台）、`NoopModelClient`、`from_model_profile(profile, registry=...)` 与 `from_env(env, registry=...)`（复用 `ModelProfile.from_dict` 单点校验，支持 `LLM_API`/`LLM_MAX_TOKENS`/`LLM_REASONING`/`LLM_CACHE_RETENTION`）。
 3. **第三层·原生协议翻译器与共享传输底座（[../personal_assistant/ai/providers/](../personal_assistant/ai/providers/)）**：
    - **共享传输底座（`providers/http.py`，零内部依赖）**：标准库 `urllib` 的 `_post_with_retry` 对瞬时网络/TLS 异常及 HTTP `429`（支持合法 `Retry-After` 夹紧 `[0.1, 10.0]` 秒）/`5xx` 执行最多 2 次退避重试；`format_http_error` 与 `redact_error_tokens` 读取最多 1024 字节上游错误体、确定性关流并全量脱敏 `Bearer` / `sk-` / `x-api-key` / `x-goog-api-key` / `AIza*` / `?key=`；通用 `iter_sse_events` 同时兼容标准空行分隔、多行 `data:` 拼接、紧凑无空行流与提前中断关流。
-   - **`OpenAICompletionsProvider`（`providers/openai_completions.py`，`api="openai-completions"`）**：双向翻译中立 `Context` 与 `/chat/completions`（含 `reasoning_effort` 夹紧、`stream_options.include_usage` 400 自动降级与标准 `index` 工具分片归槽），并提供 `_thinking_delta_fields`、`_serialize_assistant_message`、`_extra_payload` 三个受保护扩展点供外围插件复用。
+   - **`OpenAICompletionsProvider`（`providers/openai_completions.py`，`api="openai-completions"`）**：双向翻译中立 `Context` 与 `/chat/completions`（覆盖 OpenAI / DeepSeek Chat / 通义千问 / Kimi / GLM / Ollama，兼容 `prompt_cache_hit_tokens`、`reasoning_effort` 夹紧、`stream_options.include_usage` 400 自动降级与标准 `index` 工具分片归槽），并提供 `_thinking_delta_fields`、`_serialize_assistant_message`、`_extra_payload` 三个受保护扩展点供推理方言与外部插件复用。
+   - **`OpenAIReasoningProvider`（`providers/openai_reasoning.py`，`api="openai-reasoning"`）**：继承 `OpenAICompletionsProvider` 适配 DeepSeek Reasoner / R1 等推理方言，将流式 `delta.reasoning_content` 实时翻译为 `ThinkingStart`/`ThinkingDelta`/`ThinkingEnd` 与 `ThinkingBlock`，轮内续传当前思维链（含工具调用无思考时补空串）、跨轮剥离旧思维链并省略 `temperature`/`reasoning_effort`。
    - **`AnthropicMessagesProvider`（`providers/anthropic_messages.py`，`api="anthropic-messages"`）**：原生对接 `/v1/messages` SSE（`message_start` / `content_block_*` / `message_delta` / `message_stop`），按 `CacheRetention` 在 `system`、末尾工具与末尾 `user`/`tool_result` 打 Prompt Caching 断点，支持 Extended Thinking 预算与 `signature` 保留（跨协议无签名 `ThinkingBlock` 自动跳过且绝不发空文本块），并在 `message_delta.usage` 含 `null` 时保留 `message_start` 的输入与缓存计数。
    - **`GoogleGenAIProvider`（`providers/google_genai.py`，`api="google-generative-ai"`）**：原生对接 `:streamGenerateContent?alt=sse`（支持 `/v1beta`/`/v1`/`/v1alpha` 与 `models/` 归一化、`x-goog-api-key` 鉴权头），双向翻译 `systemInstruction`、`contents`（`role="model"` + `parts` + `functionCall` + `functionResponse`）、`functionDeclarations`（零参数工具省略空 `OBJECT.properties` 防 HTTP 400）与 `thinkingConfig`（`includeThoughts` + `thinkingBudget`）。
-   - **单点扩展机制**：`personal_assistant/ai/__init__.py` 导入时自动调用 `register_builtin_providers(default_registry())` 注册上述三大原生翻译器；新增任意协议（如 Slot 4 插件 [../plugins/reasoning_provider.py](../plugins/reasoning_provider.py) 的 `OpenAIReasoningProvider`，或全新第 5 套私有协议）只需实现 `ApiProvider.stream()` 并注册到 `ApiProviderRegistry` / `PluginContext.register_provider()`，再在 `models.dsl` 中配置 `api` 字段即可全链路生效。
+   - **单点扩展机制**：`personal_assistant/ai/__init__.py` 导入时自动调用 `register_builtin_providers(default_registry())` 注册上述四大原生翻译器（即使不加载 `plugins/`，Layer 1 也可开箱驱动 OpenAI / DeepSeek Chat / DeepSeek Reasoner / Anthropic / Gemini）；新增任意第 5 套私有或第三方协议只需实现 `ApiProvider.stream()` 并注册到 `ApiProviderRegistry` / Slot 4 `PluginContext.register_provider()`，再在 `models.dsl` 中配置 `api` 字段即可全链路生效。
 4. **有界 KV 缓存观测（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)）**：
    - `serialize_context(context)` 将厂商中立的 `Context` 序列化为逐行稳定规范文本；`CacheMonitor(max_records=2000, max_sessions=256)` 维护线程安全的有界滑动窗口、MRU 会话前缀表、单调游标 `snapshot_index()` 与 $O(1)$ 全局累计账本；`TrackingModelClient`（实现 `ModelInvoker`）在 `StreamDone` 时记录本地前缀复用率与服务端 `TokenUsage`，遇 `StreamError` 不污染统计，且在同一会话内跨厂商热切换时前缀统计保持连续准确。
 
@@ -259,7 +260,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
    - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `209 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 零内部依赖）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
-   - `tests/test_providers.py` 覆盖协议契约、三大原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
+   - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：
    - `evals/cli.py` 单次加载 `ToolsConfig` 并向下透传（支持 `--consolidator-model` 指定独立沉淀模型及 `--fail-under <0~1>` CI 门禁；GitHub Actions 对离线检索启用 `--fail-under 0.90` 与 `timeout-minutes: 10`）；
    - `evals/agent_eval.py` 与 `evals/memory_eval.py` 统一基于 `AssistantApp(..., auto_consolidate=False, ...)` 执行逐题隔离沙箱评测：`agent_eval.py` 正确透传每题逻辑日期 `case["today"]` 并走齐回合预算、记忆注入与安全护栏；`memory_eval.py` 统一仅保留 `shared_setup` 场景格式、经 `app.consolidator` 使双模型沉淀真实生效，对单场景异常做故障隔离（记为单题 `passed=False` 而不中断整批长跑），对纯 ASCII 词/数字关键字统一按同类字符边界匹配（移除旧长度魔法阈值，避免 `"Go"` 误中 `"Google"` 或 `"10"` 误中 `"100"`；含中文或标点时执行规范子串匹配），并使用不含任何公开测试集人物或事件名的中立评分提示词（`JUDGE_PROMPT_VERSION = "v2-neutral"`），在报告 JSON 中记录 `prompt_sha256`、Judge 模型名与 `self_judged` 布尔标记。
