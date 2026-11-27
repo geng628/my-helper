@@ -200,7 +200,7 @@ def save_study_card(topic: str, concept: str, summary: str, grade: str, *, data_
 
 
 # 插件工具：查询学习卡片与间隔复习队列（due / all / 指定专题）
-@tool(description="查询 data/workspace/study/ 中的学习卡片与间隔复习队列（传 'due' 查看今日及逾期需复习卡片，传 'all' 查看全局学习概览与统计，或传具体专题名筛选该专题卡片），用于主动出题考评与查漏补缺。", parameters={"scope": "查询范围：'due'（今日及逾期需复习）、'all'（全部概览）或具体专题名称"}, risk="read")
+@tool(description="查询 data/workspace/study/ 中的学习卡片与间隔复习队列（传 'due' 查看今日及逾期需复习卡片，传 'all' 查看全局学习概览与统计，或传具体专题名筛选该专题卡片），用于主动出题考评与查漏补缺。", parameters={"scope": "查询范围：'due'（今日及逾期需复习）、'all'（全部概览）或具体专题名称"}, risk="read", parallel=True)
 def list_due_reviews(scope: str, *, data_root: Path | None = None, today: date | str | None = None) -> str:
     if not isinstance(scope, str) or "\x00" in scope or not (raw_scope := scope.strip()):
         raise ValueError("查询范围 scope 必须是非空字符串。")

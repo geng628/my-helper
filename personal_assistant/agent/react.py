@@ -1,9 +1,11 @@
-"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：面向中立 Context 与 12 种统一事件驱动，零厂商方言。"""
+"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：中立 Context 驱动、只读工具分批并发与写路障原序提交。"""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
+from types import MappingProxyType
 
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.protocol import (
@@ -15,10 +17,12 @@ from personal_assistant.ai.protocol import (
     StreamDone,
     StreamError,
     StreamOptions,
+    ToolCall,
     ToolResultMessage,
 )
 
 ContextTransformer = Callable[[Context], Context]
+DEFAULT_MAX_PARALLEL_TOOLS = 4
 
 
 # 单步工具开始执行事件：在工具运行前向外部观察者与界面通知工具名、参数与调用标识
@@ -50,6 +54,67 @@ class TurnEnd:
 AgentEvent = AssistantMessageEvent | ToolStart | ToolStep | TurnEnd
 
 
+# 校验单批最大并发工具数为正整数（拒绝布尔值与非正整数）
+def _validate_max_parallel_tools(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("max_parallel_tools 必须是正整数。")
+    return value
+
+
+# 将同轮工具调用按并发安全性切分为有序批次：连续 parallel=True 合并为并发批，其余作为单条串行路障
+def _split_tool_batches(
+    tool_calls: tuple[ToolCall, ...],
+    tools: ToolRegistry,
+) -> list[tuple[bool, tuple[ToolCall, ...]]]:
+    is_parallel_fn = getattr(tools, "is_parallel", None)
+    batches: list[tuple[bool, tuple[ToolCall, ...]]] = []
+    parallel_buf: list[ToolCall] = []
+    for call in tool_calls:
+        if callable(is_parallel_fn) and bool(is_parallel_fn(call.name)):
+            parallel_buf.append(call)
+        else:
+            if parallel_buf:
+                batches.append((True, tuple(parallel_buf)))
+                parallel_buf.clear()
+            batches.append((False, (call,)))
+    if parallel_buf:
+        batches.append((True, tuple(parallel_buf)))
+    return batches
+
+
+# 执行单条工具调用并测量其独立执行耗时（毫秒）
+def _execute_single_tool(
+    tools: ToolRegistry,
+    call: ToolCall,
+    context: Mapping[str, object] | None,
+) -> tuple[str, float]:
+    t_tool = perf_counter()
+    observation = tools.execute(call.name, call.arguments, context=context)
+    duration_ms = round((perf_counter() - t_tool) * 1000, 3)
+    return observation, duration_ms
+
+
+# 执行单个工具批次：单条/串行/上限为 1 时主线程内联执行，多条并发批经有界线程池执行并按发射原序返回结果
+def _execute_tool_batch(
+    tools: ToolRegistry,
+    batch: tuple[ToolCall, ...],
+    *,
+    is_parallel: bool,
+    tool_context: Mapping[str, object] | None,
+    max_parallel_tools: int,
+) -> list[tuple[str, float]]:
+    if not is_parallel or len(batch) <= 1 or max_parallel_tools <= 1:
+        return [_execute_single_tool(tools, call, tool_context) for call in batch]
+    # 并发工作线程仅接收只读快照，隔离主线程可变上下文防止竞态与误改写
+    readonly_ctx: Mapping[str, object] | None = (
+        MappingProxyType(dict(tool_context)) if tool_context is not None else None
+    )
+    workers = min(len(batch), max_parallel_tools)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_execute_single_tool, tools, call, readonly_ctx) for call in batch]
+        return [fut.result() for fut in futures]
+
+
 # 透传单轮模型流式事件，确定性关闭底层流并返回 (StreamDone, StreamError) 终止态
 def _stream_llm_round(
     llm: ModelInvoker,
@@ -75,15 +140,16 @@ def _stream_llm_round(
     return done, err
 
 
-# 执行流式通用 ReAct 主循环：纯中立 Context 驱动，透传可选 StreamOptions，遇 StreamError 退出、非 toolUse 自然收尾
-def iter_react(
+# 内部流式 ReAct 循环生成器：在完成入参校验后执行多轮 Reason -> Act & Observe，并发批按原序提交结果
+def _iter_react_loop(
     llm: ModelInvoker,
     context: Context,
     tools: ToolRegistry,
     *,
-    convert_to_llm: ContextTransformer | None = None,
-    tool_context: Mapping[str, object] | None = None,
-    options: StreamOptions | None = None,
+    convert_to_llm: ContextTransformer | None,
+    tool_context: Mapping[str, object] | None,
+    options: StreamOptions | None,
+    max_parallel_tools: int,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
     history: list[Message] = list(context.messages)
@@ -121,31 +187,60 @@ def iter_react(
             )
             return
 
-        # 2. Act & Observe：先发出 ToolStart，再执行强类型 ToolCall 并产出 ToolStep，结果写回中立轨迹
+        # 2. Act & Observe：按只读并发批与写路障分批执行，主线程按原序发出 ToolStart -> 批量执行 -> 按原序提交 ToolStep 与轨迹
         history.append(assistant_msg)
-        for call in tool_calls:
-            yield ToolStart(tool=call.name, arguments=call.arguments, call_id=call.id)
-            t_tool = perf_counter()
-            observation = tools.execute(call.name, call.arguments, context=tool_context)
-            duration_ms = round((perf_counter() - t_tool) * 1000, 3)
-            yield ToolStep(
-                tool=call.name,
-                arguments=call.arguments,
-                observation=observation,
-                duration_ms=duration_ms,
-                call_id=call.id,
+        for is_parallel, batch in _split_tool_batches(tool_calls, tools):
+            for call in batch:
+                yield ToolStart(tool=call.name, arguments=call.arguments, call_id=call.id)
+            results = _execute_tool_batch(
+                tools,
+                batch,
+                is_parallel=is_parallel,
+                tool_context=tool_context,
+                max_parallel_tools=max_parallel_tools,
             )
-            history.append(
-                ToolResultMessage(
-                    tool_call_id=call.id,
-                    tool_name=call.name,
-                    content=observation,
-                    is_error=observation.startswith("错误："),
+            for call, (observation, duration_ms) in zip(batch, results, strict=True):
+                yield ToolStep(
+                    tool=call.name,
+                    arguments=call.arguments,
+                    observation=observation,
+                    duration_ms=duration_ms,
+                    call_id=call.id,
                 )
-            )
+                history.append(
+                    ToolResultMessage(
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        content=observation,
+                        is_error=observation.startswith("错误："),
+                    )
+                )
 
 
-# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent、上下文转换与 StreamOptions；遇 StreamError 抛 RuntimeError，正常返回最终回答
+# 执行流式通用 ReAct 主循环：入参即时校验，纯中立 Context 驱动，支持并发只读批与写路障原序提交
+def iter_react(
+    llm: ModelInvoker,
+    context: Context,
+    tools: ToolRegistry,
+    *,
+    convert_to_llm: ContextTransformer | None = None,
+    tool_context: Mapping[str, object] | None = None,
+    options: StreamOptions | None = None,
+    max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
+) -> Iterator[AgentEvent]:
+    parallel_limit = _validate_max_parallel_tools(max_parallel_tools)
+    return _iter_react_loop(
+        llm,
+        context,
+        tools,
+        convert_to_llm=convert_to_llm,
+        tool_context=tool_context,
+        options=options,
+        max_parallel_tools=parallel_limit,
+    )
+
+
+# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent、上下文转换、StreamOptions 与并发上限；遇 StreamError 抛 RuntimeError
 def run_react(
     llm: ModelInvoker,
     context: Context,
@@ -155,6 +250,7 @@ def run_react(
     convert_to_llm: ContextTransformer | None = None,
     tool_context: Mapping[str, object] | None = None,
     options: StreamOptions | None = None,
+    max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
 ) -> str:
     reply = ""
     event_iter = iter_react(
@@ -164,6 +260,7 @@ def run_react(
         convert_to_llm=convert_to_llm,
         tool_context=tool_context,
         options=options,
+        max_parallel_tools=max_parallel_tools,
     )
     try:
         for event in event_iter:

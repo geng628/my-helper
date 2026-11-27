@@ -10,6 +10,7 @@ from personal_assistant.agent.tools import tool
 # 插件工具：返回当前北京时间字符串（若宿主注入逻辑日期 today 则对齐该日期并保留当前时分秒）
 @tool(
     description="获取当前北京时间（YYYY-MM-DD HH:MM:SS）。",
+    parallel=True,
 )
 def get_current_time(*, today: date | str | None = None) -> str:
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -31,6 +32,7 @@ def get_current_time(*, today: date | str | None = None) -> str:
 @tool(
     description="计算两个整数之和。",
     parameters={"a": "第一个整数", "b": "第二个整数"},
+    parallel=True,
 )
 def add_numbers(a: str, b: str) -> str:
     return str(int(a) + int(b))

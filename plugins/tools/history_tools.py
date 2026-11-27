@@ -456,6 +456,7 @@ def execute_search_chat_history(
     ),
     parameters={"query": "搜索关键词（请使用原对话语言的核心词，如英文对话用英文词、中文对话用中文词）"},
     risk="read",
+    parallel=True,
 )
 def search_chat_history(
     query: str,

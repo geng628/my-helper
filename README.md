@@ -17,8 +17,8 @@
    - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 协议）。
    - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入），全程面向中立 `Context` / `Message` / `ModelInvoker` 编排。
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言符号扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
-2. **极简单层 ReAct 内核 + 外层安全预算**：
-   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为极简单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `done.reason != "toolUse" or not assistant_msg.tool_calls` 作为自然终止信号，遇 `StreamError` 透传退出（`run_react()` 转抛 `RuntimeError`），并支持单步 `convert_to_llm: ContextTransformer` 非破坏性上下文投影、执行期 `tool_context` 注入与 `StreamOptions` 全链路透传。
+2. **极简单层 ReAct 内核 + 并行只读工具 + 外层安全预算**：
+   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为极简单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `done.reason != "toolUse" or not assistant_msg.tool_calls` 作为自然终止信号，遇 `StreamError` 透传退出（`run_react()` 转抛 `RuntimeError`），并支持单步 `convert_to_llm: ContextTransformer` 非破坏性上下文投影、执行期 `tool_context` 注入、`StreamOptions` 全链路透传，以及基于 `ToolMetadata.parallel`（默认 `False` 安全串行）的**同轮只读工具分批并发 + 写/执行工具串行路障 + 按模型发射原序提交**（默认上限 `max_parallel_tools=4`，守护 KV Cache 前缀确定性）。
    - 防死循环与成本控制由 Layer 3 `AssistantApp` 的 `_GuardedTurnLLM`（实现 `ModelInvoker`）在外层实施（默认单轮上限 `24` 步、`250,000` Token、`180s` 墙钟、连续 `3` 次等价工具调用熔断及 `StreamDone.reason == "length"` 截断工具调用熔断），兼顾内核简洁性与运行期有界性。
 3. **学习助手叠加能力（零微内核侵入）**：
    - **流式推导视图与跨协议热切换**：通过 12 种规范流事件（含 `ThinkingDelta`、`TextDelta`）与 `ToolStart` 事件，在 CLI 与本地网页端实时展示可折叠的推理过程与慢工具执行状态；同一条中立对话轨迹支持跨 `anthropic-messages` / `openai-completions` / `google-generative-ai` / `openai-reasoning` 无缝热切换，落库历史始终仅含纯净问答正文。
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（219 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（224 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）

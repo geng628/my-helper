@@ -65,13 +65,16 @@ class MemoryToolsetProvider(ToolsetProvider):
             path = memory.save_rule(statement, source="agent")
             return f"已保存行为规则：data/memory/rules/{path.name}"
 
-        specs: list[tuple[str, str, dict[str, str], Callable[..., str], str, dict[str, tuple[str, ...]] | None]] = [
+        specs: list[
+            tuple[str, str, dict[str, str], Callable[..., str], str, bool, dict[str, tuple[str, ...]] | None]
+        ] = [
             (
                 "list_files",
                 "在允许读取的目录内按 glob 列出文件路径，先看结构再决定读哪篇。",
                 {"root": "目录起点，如 data/memory、data/memory/archive、data/workspace、docs", "pattern": "glob 模式，如 *.md"},
                 memory.list_files,
                 "read",
+                True,
                 None,
             ),
             (
@@ -80,6 +83,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {"query": "搜索关键词", "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs"},
                 search_markdown,
                 "read",
+                True,
                 None,
             ),
             (
@@ -88,6 +92,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {"path": "相对路径，如 data/memory/MEMORY.md 或 data/workspace/note.md", "start_line": "起始行号（从1开始，默认 1）", "end_line": "结束行号（默认 120）"},
                 read_markdown,
                 "read",
+                True,
                 None,
             ),
             (
@@ -96,6 +101,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {"path": "data/workspace 内的相对路径", "content": "UTF-8 完整文件内容", "mode": "create 或 overwrite"},
                 write_file,
                 "write",
+                False,
                 {"mode": ("create", "overwrite")},
             ),
             (
@@ -104,6 +110,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {},
                 remember_fact,
                 "write",
+                False,
                 None,
             ),
             (
@@ -112,6 +119,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {"statement": "规则内容"},
                 save_rule,
                 "write",
+                False,
                 None,
             ),
         ]
@@ -123,6 +131,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 parameters=params,
                 param_enums=enums,
                 risk=risk,
+                parallel=parallel,
             )
-            for name, desc, params, fn, risk, enums in specs
+            for name, desc, params, fn, risk, parallel, enums in specs
         ]

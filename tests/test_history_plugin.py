@@ -93,7 +93,7 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
         tool_context={"history_db_path": db_path},
     )
     assert "search_chat_history" in registry.names
-    assert registry.metadata("search_chat_history") == ToolMetadata(risk="read", always_on=False)
+    assert registry.metadata("search_chat_history") == ToolMetadata(risk="read", always_on=False, parallel=True)
     tool_obj = next(t for t in registry if t.name == "search_chat_history")
     assert set(tool_obj.parameters) == {"query"}
     assert "原对话语言" in tool_obj.parameters["query"]
