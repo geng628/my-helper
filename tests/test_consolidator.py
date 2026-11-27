@@ -281,6 +281,8 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
             for m in turn4_ctx.messages
         ]
         assert len(contents) == 3
+        assert "<system-reminder>" in contents[0]
+        assert "</system-reminder>" in contents[0]
         assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in contents[0]
         assert "第3轮：继续推进" in contents[0]
         assert contents[1] == "答3"

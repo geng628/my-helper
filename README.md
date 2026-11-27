@@ -39,9 +39,9 @@
 - `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 
 ### 2. 全链路 KV Cache 友好的 Markdown 记忆、按块裁剪与非破坏性投影
-- **动静分离与空闲 TTL 刷新**：`system_prompt` 仅包含静态指令、白名单工具、规则摘要与 `MEMORY.md` 索引（前 100 行 / 4000 字符），不含逐日日期与滚动前情摘要；当前逻辑日期通过 `format_user_envelope()` 下沉至每条用户消息头（库内仍存干净原话，回放按 `created_at` 逐字节还原），前情摘要置于 `messages` 头部。热聊期内（默认 5 分钟 `prompt_cache_ttl_seconds=300`）死锁 `system` 前缀，跨自然日若无过期记忆归档亦零击穿缓存，空闲超时后零代价刷新最新索引。
+- **动静分离与空闲 TTL 刷新**：由独立上下文装配引擎 [personal_assistant/assistant/context.py](personal_assistant/assistant/context.py)（`ContextAssembler`）统一收口：`system_prompt` 仅包含静态指令、白名单工具、规则摘要与 `MEMORY.md` 索引（前 100 行 / 4000 字符），不含逐日日期与滚动前情摘要；当前逻辑日期通过 `format_user_envelope()` 下沉至每条用户消息头（库内仍存干净原话，回放按 `created_at` 逐字节还原），前情摘要经 `format_compaction_summary()` 包裹 `<system-reminder>` 信源隔离围栏后置于 `messages` 头部。热聊期内（默认 5 分钟 `prompt_cache_ttl_seconds=300`）死锁 `system` 前缀，跨自然日若无过期记忆归档亦零击穿缓存，空闲超时后零代价刷新最新索引。
 - **记忆生命周期与轮内暂存**：`remember_fact` 轮内先写入 `(turn#<tag>)` 暂存行，回合成功落库后升级为 `(msg#<id>)`，流中断或 `StreamError` 时自动回滚；后台沉淀支持 `add` / `merge` / `replace` / `remove`，被替换或删除的旧事实软退休至 `data/memory/archive/YYYY-MM.md`（热检索默认隔离归档目录）。
-- **成对原子落库、粘性按块裁剪与轮内高水位投影**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；超限时通过 `_select_chunked_history()` 按会话粘性 `floor_id` 整块切至目标水位（避免逐条滑窗每轮击穿历史缓存）；单轮长工具链经 `_TurnContextProjector` 接入 `convert_to_llm`，低水位（`<= 48,000` 字符）零改写吃满轮内缓存，超水位一次性折叠前半批大 `ToolResultMessage`（保留 `read_markdown` 回读指针与完整 `TurnEnd.messages` 原文）并锁定折叠下标使后续步骤恢复纯追加。
+- **成对原子落库、粘性按块裁剪与轮内高水位投影**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；超限时通过 `select_chunked_history()` 按会话粘性 `floor_id` 整块切至目标水位（避免逐条滑窗每轮击穿历史缓存）；单轮长工具链经 `TurnContextProjector` 接入 `convert_to_llm`，低水位（`<= 48,000` 字符）零改写吃满轮内缓存，超水位一次性折叠前半批大 `ToolResultMessage`（保留 `read_markdown` 回读指针与完整 `TurnEnd.messages` 原文）并按滞回水位锁定折叠下标使后续步骤恢复纯追加。
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（209 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（219 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -193,7 +193,7 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
+│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本

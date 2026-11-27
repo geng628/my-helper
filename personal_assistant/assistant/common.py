@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import tempfile
@@ -52,6 +53,13 @@ def require_positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} 必须是正整数。")
     return value
+
+
+# 严格校验参数为非负有限浮点数（>= 0 且拒绝布尔值、NaN 与 Inf）
+def require_non_negative_float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} 必须是非负有限数字。")
+    return float(value)
 
 
 # 通过同目录 .tmp- 临时文件与 os.replace 原子落盘 UTF-8 文本（可选在写内容前通过 fchmod 设置权限如 0o600）

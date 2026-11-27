@@ -330,12 +330,14 @@ def test_stream_failure_and_close_rollback_prevent_consecutive_user_messages(tmp
         app.close()
 
     # 第二道防线：即使 SQLite 中已存在历史遗留的连续孤儿 user 消息，拼装上下文也绝不发连续两条 UserMessage
+    from personal_assistant.assistant.context import build_history_messages
+
     dirty_llm = StrictAlternatingLLM([AssistantMessage.from_text("已合并历史孤儿并正常答复", stop_reason="stop")])
     dirty_app = AssistantApp(data_root=tmp_path / "dirty_data", llm=dirty_llm)
     try:
         dirty_app.state.append_message("s-dirty", "user", "遗留孤儿1")
         dirty_app.state.append_message("s-dirty", "user", "遗留孤儿2")
-        merged_hist = AssistantApp._build_history_messages(
+        merged_hist = build_history_messages(
             dirty_app.state.active_messages("s-dirty")
         )
         assert len(merged_hist) == 1
@@ -362,8 +364,9 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
     import time
 
     import personal_assistant.assistant.app as app_mod
+    import personal_assistant.assistant.context as context_mod
 
-    monkeypatch.setattr(app_mod, "MAX_SESSION_PROMPTS", 4)
+    monkeypatch.setattr(context_mod, "MAX_SESSION_PROMPTS", 4)
     monkeypatch.setattr(app_mod, "MAX_SESSION_LOCKS", 4)
 
     lock = threading.Lock()
@@ -449,10 +452,10 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
         assert stored[1]["content"] == f"reply:{stored[0]['content']}"
         assert stored[3]["content"] == f"reply:{stored[2]['content']}"
 
-        # 验证跨多个不同 chat_id 后，_session_prompts 与 _chat_locks 均保持在上限以内
+        # 验证跨多个不同 chat_id 后，ContextAssembler._session_prompts 与 _chat_locks 均保持在上限以内
         for i in range(10):
             app.chat(f"ping-{i}", chat_id=f"bounded-{i}")
-        assert len(app._session_prompts) <= 4
+        assert len(app.context_assembler._session_prompts) <= 4
         assert len(app._chat_locks) <= 4
     finally:
         release_same.set()
@@ -849,8 +852,9 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
     import threading
     from datetime import date
 
-    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded, _select_chunked_history
+    from personal_assistant.assistant.app import AssistantApp, TurnBudgetExceeded
     from personal_assistant.assistant.consolidator import ConsolidationPolicy
+    from personal_assistant.assistant.context import select_chunked_history
     from tests.test_streaming import ScriptedStreamLLM
 
     assert issubclass(TurnBudgetExceeded, RuntimeError)
@@ -881,7 +885,7 @@ def test_assistant_app_budget_guardrails_adaptive_window_untrusted_and_lifecycle
         for i in range(15):
             long_active.append({"id": i * 2 + 1, "role": "user", "content": f"U{i}:" + ("x" * 900)})
             long_active.append({"id": i * 2 + 2, "role": "assistant", "content": f"A{i}:" + ("y" * 900)})
-        sliced, _ = _select_chunked_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
+        sliced, _ = select_chunked_history(long_active, base_messages=20, max_messages=60, max_chars=19500)
         assert sliced[0]["role"] == "user"
         assert len(sliced) % 2 == 0
     finally:
@@ -1188,13 +1192,13 @@ class ProbeLifecyclePlugin(Plugin):
 
         # 5. 验证 stream_chat 熔断时实时吐出 text_delta 并附带 budget_exceeded，以及粘性按块裁剪上限（60 条 / 24000 字符）
         big_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "x" * 1000} for i in range(70)]
-        capped, big_floor = _select_chunked_history(big_active)
+        capped, big_floor = select_chunked_history(big_active)
         assert len(capped) == 12 and capped[0]["role"] == "user" and big_floor == 58
 
         short_active = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": "hi"} for i in range(70)]
-        within_cap, zero_floor = _select_chunked_history(short_active[:60])
+        within_cap, zero_floor = select_chunked_history(short_active[:60])
         assert len(within_cap) == 60 and zero_floor == 0
-        capped_count, count_floor = _select_chunked_history(short_active)
+        capped_count, count_floor = select_chunked_history(short_active)
         assert len(capped_count) == 20 and capped_count[0]["role"] == "user" and count_floor == 50
 
         stream_guard_llm = ScriptedStreamLLM(

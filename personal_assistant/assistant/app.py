@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import closing, contextmanager
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 from personal_assistant.agent.plugins import ObserverProtocol, RuntimeEvent, TaskEvent
@@ -27,7 +26,6 @@ from personal_assistant.ai import (
     CacheMonitor,
     Context,
     LLMNotConfigured,
-    Message,
     ModelInvoker,
     ModelsConfig,
     NoopModelClient,
@@ -35,23 +33,17 @@ from personal_assistant.ai import (
     StreamError,
     StreamOptions,
     StreamStart,
-    TextBlock,
     TextDelta,
     TextEnd,
     TextStart,
-    ThinkingBlock,
     ThinkingDelta,
     TokenUsage,
-    ToolCall,
-    ToolResultMessage,
-    UserMessage,
 )
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import (
-    SHANGHAI_TZ,
     now_shanghai,
-    parse_iso_date,
+    require_non_negative_float,
     require_positive_int,
     today_shanghai,
 )
@@ -60,22 +52,16 @@ from personal_assistant.assistant.consolidator import (
     ConsolidationPolicy,
     MemoryConsolidator,
 )
+from personal_assistant.assistant.context import (
+    DEFAULT_FOLD_TRIGGER_CHARS,
+    DEFAULT_PROMPT_CACHE_TTL_SECONDS,
+    ContextAssembler,
+)
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.files_policy import FilesPolicy
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.assistant.prompts import format_system_prompt, format_user_envelope
 
-MAX_HISTORY_MESSAGES = 20
-MAX_ADAPTIVE_HISTORY_MESSAGES = 60
-MAX_ADAPTIVE_HISTORY_CHARS = 24_000
-MAX_HISTORY_ITEM_CHARS = 2000
-MAX_SESSION_PROMPTS = 256
 MAX_SESSION_LOCKS = 256
-DEFAULT_PROMPT_CACHE_TTL_SECONDS = 300.0
-DEFAULT_FOLD_TRIGGER_CHARS = 48_000
-DEFAULT_FOLD_KEEP_TAIL_MESSAGES = 4
-DEFAULT_FOLD_MIN_RESULT_CHARS = 800
-DEFAULT_FOLD_PREVIEW_CHARS = 240
 
 
 # 单轮推理或工具调用超出运行期安全预算时构造的结构化异常
@@ -87,13 +73,6 @@ class TurnBudgetExceeded(RuntimeError):
         super().__init__(reason)
 
 
-# 校验运行期浮点秒数预算配置为非负有限数（严格拒绝布尔值、NaN 与 Inf）
-def _validate_non_negative_float(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} 必须是非负有限数字。")
-    return float(value)
-
-
 # 将工具调用原始 JSON 参数规范化为紧凑有序串，便于检测等价参数的死循环重复调用
 def _canonical_tool_args(raw_arguments: str) -> str:
     text = (raw_arguments or "{}").strip() or "{}"
@@ -102,178 +81,6 @@ def _canonical_tool_args(raw_arguments: str) -> str:
     except (json.JSONDecodeError, TypeError):
         return " ".join(text.split())
     return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-# 判断消息字典的 id 字段是否为有效整数（排除布尔值）
-def _valid_msg_id(raw_id: object) -> int | None:
-    if isinstance(raw_id, int) and not isinstance(raw_id, bool):
-        return raw_id
-    return None
-
-
-# 粘性边界按块裁剪活跃历史：未超上限保持队头纹丝不动，仅在超限时整块切至目标水位并推进 floor_id 以守护 KV Cache
-def _select_chunked_history(
-    active_all: list[dict[str, object]],
-    *,
-    floor_id: int = 0,
-    base_messages: int = MAX_HISTORY_MESSAGES,
-    max_messages: int = MAX_ADAPTIVE_HISTORY_MESSAGES,
-    max_chars: int = MAX_ADAPTIVE_HISTORY_CHARS,
-) -> tuple[list[dict[str, object]], int]:
-    if floor_id > 0:
-        eligible = [
-            msg
-            for msg in active_all
-            if (mid := _valid_msg_id(msg.get("id"))) is None or mid > floor_id
-        ]
-    else:
-        eligible = list(active_all)
-
-    total_chars = sum(min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS) for msg in eligible)
-    if len(eligible) <= max_messages and total_chars <= max_chars:
-        while len(eligible) > 1 and eligible[0].get("role") == "assistant":
-            eligible.pop(0)
-        return eligible, floor_id
-
-    target_msgs = min(max(2, base_messages), max_messages)
-    target_chars = min(max_chars, max(MAX_HISTORY_ITEM_CHARS * 2, max_chars // 2))
-    selected_rev: list[dict[str, object]] = []
-    used_chars = 0
-    for msg in reversed(eligible):
-        item_len = min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS)
-        if selected_rev and (len(selected_rev) >= target_msgs or used_chars + item_len > target_chars):
-            break
-        selected_rev.append(msg)
-        used_chars += item_len
-    while len(selected_rev) > 1 and selected_rev[-1].get("role") == "assistant":
-        selected_rev.pop()
-    selected_rev.reverse()
-
-    new_floor = floor_id
-    if selected_rev:
-        first_id = _valid_msg_id(selected_rev[0].get("id"))
-        if first_id is not None:
-            new_floor = max(floor_id, first_id - 1)
-    return selected_rev, new_floor
-
-
-# 从 SQLite 消息的 created_at 字段解析北京时间自然日（兼容带时区 datetime / ISO 与纯日期字符串）
-def _message_shanghai_date(raw_created_at: object) -> date | None:
-    if isinstance(raw_created_at, datetime):
-        return raw_created_at.astimezone(SHANGHAI_TZ).date() if raw_created_at.tzinfo is not None else raw_created_at.date()
-    if isinstance(raw_created_at, str):
-        text = raw_created_at.strip()
-        if not text:
-            return None
-        try:
-            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            return dt.astimezone(SHANGHAI_TZ).date() if dt.tzinfo is not None else dt.date()
-        except ValueError:
-            return parse_iso_date(text)
-    return parse_iso_date(raw_created_at)
-
-
-# 计算单条中立消息的大致字符长度，供轮内高水位投影阈值判断
-def _message_char_len(msg: Message) -> int:
-    if isinstance(msg, UserMessage):
-        return len(msg.content)
-    if isinstance(msg, ToolResultMessage):
-        return len(msg.content)
-    total = 0
-    for block in msg.blocks:
-        if isinstance(block, TextBlock):
-            total += len(block.text)
-        elif isinstance(block, ThinkingBlock):
-            total += len(block.text) + len(block.signature)
-        elif isinstance(block, ToolCall):
-            total += len(block.name) + len(block.arguments)
-    return total
-
-
-# 轮内粘性高水位非破坏性上下文投影器（接入 react.iter_react 的 convert_to_llm 钩子）：带动态滞回水位防抖，绝不放大原输出
-class _TurnContextProjector:
-    # 初始化触发高水位字符阈值、动态下次触发水位、尾部原文保护条数与单条大输出折叠阈值
-    def __init__(
-        self,
-        *,
-        trigger_chars: int = DEFAULT_FOLD_TRIGGER_CHARS,
-        keep_tail_messages: int = DEFAULT_FOLD_KEEP_TAIL_MESSAGES,
-        min_result_chars: int = DEFAULT_FOLD_MIN_RESULT_CHARS,
-        preview_chars: int = DEFAULT_FOLD_PREVIEW_CHARS,
-    ) -> None:
-        self._trigger_chars = trigger_chars
-        self._next_trigger_chars = trigger_chars
-        self._keep_tail_messages = keep_tail_messages
-        self._min_result_chars = min_result_chars
-        self._preview_chars = preview_chars
-        self._folded_until = 0
-
-    # 将单条超长 ToolResultMessage 确定性地投影为紧凑卡片（仅提取有界 TOAST 回读指针，并严格保证折叠后更短）
-    def _fold_tool_result(self, msg: ToolResultMessage) -> ToolResultMessage:
-        if len(msg.content) <= self._min_result_chars:
-            return msg
-        pointer_line = ""
-        for line in msg.content.splitlines():
-            if 'read_markdown(path="' in line:
-                candidate = line.strip()
-                if len(candidate) <= 320:
-                    pointer_line = candidate
-                break
-        preview = " ".join(msg.content[: self._preview_chars].split())
-        parts = [f"[已折叠工具输出：{msg.tool_name}，原长 {len(msg.content)} 字符，原文完整保留]"]
-        if preview:
-            parts.append(f"{preview}…")
-        if pointer_line:
-            parts.append(pointer_line)
-        folded_content = "\n".join(parts)
-        if len(folded_content) >= len(msg.content):
-            return msg
-        return ToolResultMessage(
-            tool_call_id=msg.tool_call_id,
-            tool_name=msg.tool_name,
-            content=folded_content,
-            is_error=msg.is_error,
-        )
-
-    # 按粘性边界与动态滞回水位投影当前轮 Context：不改写原始 history，无实际折叠不推边界，折叠后抬高下次触发水位防每步抖动
-    def __call__(self, context: Context) -> Context:
-        msgs = list(context.messages)
-        mutated = False
-        locked = min(self._folded_until, len(msgs))
-        for idx in range(locked):
-            item = msgs[idx]
-            if isinstance(item, ToolResultMessage):
-                folded = self._fold_tool_result(item)
-                if folded is not item:
-                    msgs[idx] = folded
-                    mutated = True
-
-        total_chars = sum(_message_char_len(m) for m in msgs)
-        if total_chars > self._next_trigger_chars:
-            cutoff = max(0, len(msgs) - self._keep_tail_messages)
-            if cutoff > self._folded_until:
-                newly_folded = False
-                for idx in range(self._folded_until, cutoff):
-                    item = msgs[idx]
-                    if isinstance(item, ToolResultMessage):
-                        folded = self._fold_tool_result(item)
-                        if folded is not item:
-                            msgs[idx] = folded
-                            mutated = True
-                            newly_folded = True
-                if newly_folded:
-                    self._folded_until = cutoff
-                    post_fold_chars = sum(_message_char_len(m) for m in msgs)
-                    hysteresis = max(1, self._trigger_chars // 2)
-                    self._next_trigger_chars = max(self._trigger_chars, post_fold_chars + hysteresis)
-
-        if not mutated:
-            return context
-        return Context(
-            system_prompt=context.system_prompt,
-            messages=tuple(msgs),
-            tools=context.tools,
-        )
 
 
 # 外层回合预算护栏包装器（实现 ModelInvoker）：在零改动 Layer 2 微内核的前提下执行步数/Token/墙钟/重复/截断熔断
@@ -433,39 +240,6 @@ class _GuardedTurnLLM:
         raise RuntimeError("模型流式响应异常终止，未收到 StreamDone 事件。")
 
 
-# 向中立消息列表追加对话消息，遇到连续同角色纯文本消息时安全合并以防严格交替协议报错
-def _append_alternating_message(
-    messages: list[Message],
-    message: Message,
-) -> None:
-    if not messages:
-        messages.append(message)
-        return
-    prev = messages[-1]
-    if isinstance(prev, UserMessage) and isinstance(message, UserMessage):
-        merged = (
-            f"{prev.content}\n\n{message.content}"
-            if (prev.content and message.content)
-            else (prev.content or message.content)
-        )
-        messages[-1] = UserMessage(content=merged)
-        return
-    if (
-        isinstance(prev, AssistantMessage)
-        and isinstance(message, AssistantMessage)
-        and not prev.tool_calls
-        and not message.tool_calls
-        and not prev.thinking
-        and not message.thinking
-    ):
-        prev_text = prev.text
-        curr_text = message.text
-        merged = f"{prev_text}\n\n{curr_text}" if (prev_text and curr_text) else (prev_text or curr_text)
-        messages[-1] = AssistantMessage.from_text(merged)
-        return
-    messages.append(message)
-
-
 # 统一编排层：供终端 CLI 与本地 HTTP 接口共同调用
 class AssistantApp:
     # 装配数据目录、工具白名单配置、Markdown 记忆库、SQLite 历史、大模型与后台沉淀器
@@ -496,11 +270,11 @@ class AssistantApp:
     ) -> None:
         self.max_turn_steps = require_positive_int(max_turn_steps, "max_turn_steps")
         self.max_turn_tokens = require_positive_int(max_turn_tokens, "max_turn_tokens")
-        self.max_turn_seconds = _validate_non_negative_float(max_turn_seconds, "max_turn_seconds")
+        self.max_turn_seconds = require_non_negative_float(max_turn_seconds, "max_turn_seconds")
         self.max_repeated_tool_calls = require_positive_int(
             max_repeated_tool_calls, "max_repeated_tool_calls"
         )
-        self.prompt_cache_ttl_seconds = _validate_non_negative_float(
+        self.prompt_cache_ttl_seconds = require_non_negative_float(
             prompt_cache_ttl_seconds, "prompt_cache_ttl_seconds"
         )
         self.max_turn_context_chars = require_positive_int(
@@ -559,10 +333,12 @@ class AssistantApp:
             else self.tools_config.build_llm(cfg_dir, model_name=model_name, models_cfg=models_cfg)
         )
         self._llm_lock = threading.RLock()
-        self._prompt_lock = threading.Lock()
-        self._session_prompts: dict[str, tuple[str, float]] = {}
-        self._history_trim_floors: dict[str, int] = {}
-        self._last_archive_day = ""
+        self.context_assembler = ContextAssembler(
+            self.memory,
+            prompt_cache_ttl_seconds=self.prompt_cache_ttl_seconds,
+            max_turn_context_chars=self.max_turn_context_chars,
+            clock=self._clock,
+        )
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: dict[str, tuple[threading.Lock, int]] = {}
         self.cache_monitor = CacheMonitor()
@@ -736,64 +512,17 @@ class AssistantApp:
     def tools(self) -> ToolRegistry:
         return self._tool_registry
 
-    # 拼装纯静态/低频系统提示词（不含逐日日期与动态摘要），最大化前缀 KV Cache 复用
+    # 拼装纯静态/低频系统提示词（委托 ContextAssembler，不含逐日日期与动态摘要）
     def build_system_prompt(self, registry: ToolRegistry) -> str:
-        return format_system_prompt(self.memory, tool_names=registry.names)
+        return self.context_assembler.build_system_prompt(registry)
 
-    # 获取指定会话冻结的系统提示词：热聊期（空闲 < TTL）死锁复用，空闲超时后零代价刷新最新记忆索引
+    # 获取指定会话冻结的系统提示词（委托 ContextAssembler 执行空闲 TTL 冻结与 LRU 管理）
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
-        now = self._clock()
-        with self._prompt_lock:
-            cached = self._session_prompts.pop(chat_id, None)
-            if (
-                cached is not None
-                and self.prompt_cache_ttl_seconds > 0
-                and (now - cached[1]) < self.prompt_cache_ttl_seconds
-            ):
-                prompt = cached[0]
-            else:
-                prompt = self.build_system_prompt(registry)
-            if len(self._session_prompts) >= MAX_SESSION_PROMPTS:
-                self._session_prompts.pop(next(iter(self._session_prompts)))
-            self._session_prompts[chat_id] = (prompt, now)
-            return prompt
+        return self.context_assembler.get_session_system_prompt(chat_id, registry)
 
-    # 主动重置指定会话（或全部会话）冻结的系统提示词与历史切块边界，用于沉淀改写索引或手动刷新
+    # 主动重置指定会话（或全部会话）冻结的系统提示词与历史切块边界
     def reset_session_prompt(self, chat_id: str | None = None) -> None:
-        with self._prompt_lock:
-            if chat_id is None:
-                self._session_prompts.clear()
-                self._history_trim_floors.clear()
-            else:
-                self._session_prompts.pop(chat_id, None)
-                self._history_trim_floors.pop(chat_id, None)
-
-    # 仅重置指定会话的历史切块游标（例如后台沉淀推进了压缩边界但未改写 MEMORY.md 时保留热 system_prompt）
-    def _clear_history_trim_floor(self, chat_id: str) -> None:
-        with self._prompt_lock:
-            self._history_trim_floors.pop(chat_id, None)
-
-    # 按会话粘性边界裁剪活跃历史并按真 LRU 刷新命中会话热度（防止热会话在上限淘汰时被提前逐出）
-    def _select_session_history(
-        self,
-        chat_id: str,
-        active_all: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
-        with self._prompt_lock:
-            existing = self._history_trim_floors.pop(chat_id, None)
-            if existing is not None:
-                self._history_trim_floors[chat_id] = existing
-                floor_id = existing
-            else:
-                floor_id = 0
-        selected, new_floor = _select_chunked_history(active_all, floor_id=floor_id)
-        if new_floor != floor_id:
-            with self._prompt_lock:
-                self._history_trim_floors.pop(chat_id, None)
-                if len(self._history_trim_floors) >= MAX_SESSION_PROMPTS:
-                    self._history_trim_floors.pop(next(iter(self._history_trim_floors)))
-                self._history_trim_floors[chat_id] = new_floor
-        return selected
+        self.context_assembler.reset_session(chat_id)
 
     # 为指定 chat_id 获取有界会话级互斥锁，确保同会话并发请求严格串行并在空闲或中断时安全清理引用计数
     @contextmanager
@@ -822,64 +551,6 @@ class AssistantApp:
                         self._chat_locks.pop(chat_id, None)
                     else:
                         self._chat_locks[chat_id] = (lock, new_refs)
-
-    # 将持久化历史转换为中立追加式消息列表：按记录日期还原用户信封并合并异常连续同角色，保持前缀字节级稳定
-    @staticmethod
-    def _build_history_messages(history: list[dict[str, object]]) -> list[Message]:
-        result: list[Message] = []
-        for msg in history:
-            role = str(msg.get("role") or "")
-            if role not in {"user", "assistant"}:
-                continue
-            content = str(msg.get("content") or "")
-            if len(content) > MAX_HISTORY_ITEM_CHARS:
-                content = content[:MAX_HISTORY_ITEM_CHARS] + "…"
-            if role == "user":
-                msg_day = _message_shanghai_date(msg.get("created_at"))
-                rendered = format_user_envelope(content, today=msg_day) if msg_day is not None else content
-                item: Message = UserMessage(content=rendered)
-            else:
-                item = AssistantMessage.from_text(content)
-            _append_alternating_message(result, item)
-        return result
-
-    # 组装中立 Context：纯净静态 system_prompt + 位于 messages 头部的前情摘要 + 稳定历史 + 带日期信封的当前提问
-    def _assemble_context(
-        self,
-        system_prompt: str,
-        summary_text: str,
-        history: list[dict[str, object]],
-        clean_text: str,
-        registry: ToolRegistry,
-        *,
-        today: date | None = None,
-    ) -> Context:
-        messages: list[Message] = []
-        if summary_text:
-            messages.append(UserMessage(content=f"【本会话已压缩前情摘要】\n{summary_text}"))
-        for msg in self._build_history_messages(history):
-            _append_alternating_message(messages, msg)
-        envelope = format_user_envelope(clean_text, today=today or self._today())
-        _append_alternating_message(messages, UserMessage(content=envelope))
-        return Context(
-            system_prompt=system_prompt,
-            messages=tuple(messages),
-            tools=registry.schemas(),
-        )
-
-    # 每个自然日首次对话时执行过期归档；仅在实际归档改动了记忆文件时才刷新会话提示词，无过期时零击穿缓存
-    def _maybe_archive_expired(self, *, today: date | None = None) -> None:
-        ref_day = today or self._today()
-        today_str = ref_day.isoformat()
-        with self._prompt_lock:
-            if self._last_archive_day == today_str:
-                return
-        archived = self.memory.archive_expired_memories(today=ref_day)
-        with self._prompt_lock:
-            if archived:
-                self._session_prompts.clear()
-            if self._last_archive_day != today_str:
-                self._last_archive_day = today_str
 
     # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
     def stream_chat(
@@ -914,9 +585,9 @@ class AssistantApp:
     ) -> Generator[dict[str, object], None, None]:
         with self._chat_turn_lock(chat_id):
             turn_day, turn_created_at = self._turn_clock_stamp()
-            self._maybe_archive_expired(today=turn_day)
+            self.context_assembler.maybe_archive_expired(turn_day)
             compaction, active_all = self.state.get_context_snapshot(chat_id)
-            history = self._select_session_history(chat_id, active_all)
+            history = self.context_assembler.select_history(chat_id, active_all)
             before_msg_id = self.state.max_message_id() + 1
             turn_tag = uuid.uuid4().hex[:12]
             fact_used = False
@@ -935,12 +606,12 @@ class AssistantApp:
                 }
                 system_prompt = self.get_session_system_prompt(chat_id, registry)
                 summary_text = str(compaction.get("summary") or "").strip()
-                context = self._assemble_context(
-                    system_prompt,
-                    summary_text,
-                    history,
-                    clean_text,
-                    registry,
+                context = self.context_assembler.assemble(
+                    system_prompt=system_prompt,
+                    summary_text=summary_text,
+                    history=history,
+                    user_text=clean_text,
+                    registry=registry,
                     today=turn_day,
                 )
 
@@ -959,7 +630,7 @@ class AssistantApp:
                     max_repeated_tool_calls=self.max_repeated_tool_calls,
                     clock=self._clock,
                 )
-                projector = _TurnContextProjector(trigger_chars=self.max_turn_context_chars)
+                projector = self.context_assembler.create_turn_projector()
                 with closing(
                     iter_react(
                         guarded_llm,
@@ -1033,7 +704,7 @@ class AssistantApp:
                     on_complete=lambda res: (
                         self.reset_session_prompt(res.chat_id)
                         if res.saved_files
-                        else self._clear_history_trim_floor(res.chat_id)
+                        else self.context_assembler.clear_history_floor(res.chat_id)
                     ),
                 )
                 if self.auto_consolidate
