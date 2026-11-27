@@ -37,7 +37,7 @@ flowchart TD
 
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
         App --> Ctx["上下文与 KV Cache 装配引擎 ContextAssembler (assistant/context.py)"]
-        Ctx --> Prompts["提示词模板与 <system-reminder> 隔离 (assistant/prompts.py)"]
+        Ctx --> Prompts["提示词模板与 system-reminder 信源隔离 (assistant/prompts.py)"]
         Ctx --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
         App --> Mem
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]

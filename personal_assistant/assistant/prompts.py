@@ -12,8 +12,8 @@ if TYPE_CHECKING:
     from personal_assistant.assistant.memory import MemoryStore
 
 _REMINDER_TAG_RE = re.compile(
-    r"(?i)[<\uff1c]\s*([/\uff0f]*)\s*system[-\u2010-\u2015\u2212\uff0d]reminder\b"
-    r"(?:((?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:\"[^\"<\uff1c]*\"|'[^'<\uff1c]*'|[^\s<>\uff1c\uff1e\"']+))?)*\s*[/\uff0f]*\s*)[>\uff1e]|([/\uff0f]*)[>\uff1e]?)"
+    r"(?i)[<\uff1c]([\s/\uff0f]*)system[-\u2010-\u2015\u2212\uff0d]reminder\b"
+    r"(?:((?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:\"[^\"<\uff1c]*\"|'[^'<\uff1c]*'|[^\s<>\uff1c\uff1e\"']+))?)*[\s/\uff0f]*)[>\uff1e]|([/\uff0f]*)[>\uff1e]?)"
 )
 
 SYSTEM_PROMPT = (
@@ -54,7 +54,7 @@ def _sanitize_reminder_body(text: str) -> str:
 
     # 将单个匹配到的 <system-reminder...> 或未闭合标签统一改写为方括号惰性文本
     def _replace(match: re.Match[str]) -> str:
-        slashes = match.group(1).replace("\uff0f", "/")
+        slashes = "".join("/" for ch in match.group(1) if ch in "/\uff0f")
         attrs = match.group(2) if match.group(2) is not None else (match.group(3) or "")
         attrs = attrs.replace("\uff0f", "/")
         return f"[{slashes}system-reminder{attrs}]"
