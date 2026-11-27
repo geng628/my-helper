@@ -4,17 +4,18 @@
 
 ## 核心红线
 
-1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`sqlite3`、`urllib`、`threading`、`http.server` 等）；`pytest` 仅作为开发测试依赖。
-2. **插件优先与三层漏斗架构**：
-   - 严格守住三层单向依赖：`personal_assistant/` 仅保留纯净三层产品代码——`ai`（纯 LLM 协议，零向上依赖） ← `agent`（通用 ReAct 与插件发现，只依赖 `ai`） ← `assistant`（个人助手业务）；顶层评测包 `evals/` 与 `tests/`、`plugins/` 平级（`personal_assistant/` 绝不反向依赖 `evals/`，且 `evals/` 绝不反向依赖 `assistant/cli.py`），每次改动必须通过 `tests/test_architecture.py` 架构守卫测试。
-   - 新增工具优先写入 [plugins/tools/](plugins/tools/) 下的 `@tool` 模块并由 [plugins/tools/plugin.py](plugins/tools/plugin.py)（`ToolsPlugin`）统一接入 `Tool` 协议；新增检索引擎、配置编译器或模型底座驱动则实现为继承外层统一主板基类 `Plugin(ABC)` 的独立插件 `plugins/*.py`，分别接入 `RetrieverProtocol`、`ConfigCompilerProtocol` 或 `LLMProviderProtocol`；非必要不动核心 `personal_assistant/agent/react.py`。
+1. **零第三方运行依赖**：生产代码仅使用 Python 3.12+ 标准库（`sqlite3`、`urllib`、`http.client`、`threading`、`http.server` 等）；`pytest` 仅作为开发测试依赖。
+2. **插件优先、三层漏斗与 Pi ch04 三层翻译架构**：
+   - 严格守住三层单向依赖：`personal_assistant/` 仅保留纯净三层产品代码——`ai`（Layer 1：零向上依赖，内部遵循 Pi ch04 三层解耦：`protocol.py` 中立 12 事件协议 ← `registry.py` 统一前台 `stream`/`stream_simple`/`complete` 与 `ApiProviderRegistry` ← `providers/` 原生翻译器，加 `cache.py` 中立缓存观测） ← `agent`（Layer 2：通用 ReAct 循环、纯值对象 `Tool(ToolSchema)` 与零业务字段插件主板，只依赖 `ai`） ← `assistant`（Layer 3：个人助手业务）；顶层评测包 `evals/` 与 `tests/`、`plugins/` 平级（`personal_assistant/` 绝不反向依赖 `evals/`，且 `evals/` 绝不反向依赖 `assistant/cli.py`）。
+   - Layer 2（`agent/`）与 Layer 3（`assistant/`）**严禁重新引入 OpenAI 方言渗透**（禁止 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls` 或裸厂商 wire 字典）；统一消费中立 `Context` / `Message` / `ToolSchema` / `ModelInvoker`。每次改动必须通过 [tests/test_architecture.py](tests/test_architecture.py) 架构守卫（三层漏斗、`ai/` 内部三层解耦、零 OpenAI 方言符号、零业务字面量与四棵受管目录树 `0` 处 `# type: ignore`）。
+   - 新增工具优先写入 [plugins/tools/](plugins/tools/) 下的 `@tool` 模块并由 [plugins/tools/plugin.py](plugins/tools/plugin.py)（`ToolsPlugin`）统一接入 `Tool` 协议；新增检索引擎、配置编译器、模型协议翻译器或运行观测器则实现为继承外层统一主板基类 `Plugin(ABC)` 的独立插件 `plugins/*.py`，分别接入 `RetrieverProtocol`、`ConfigCompilerProtocol`、`ApiProvider`（Slot 4，按 `models.dsl` 的 `api` 字段单点扩展新厂商，无需改动核心代码）或 `ObserverProtocol`；非必要不动核心 [personal_assistant/agent/react.py](personal_assistant/agent/react.py)。
 3. **安全与隐私边界**：
-   - 保持 `write_root = data/workspace`、只读 Shell 白名单、防 SSRF 校验；**禁止**开放让 LLM 无人工审批直接写入 `plugins/` 或 `personal_assistant/`。
+   - 保持 `write_root = data/workspace`、APFS Unicode/Inode 文件隔离、只读 Shell 白名单（含 `find` 原语白名单与 `git` 逐子命令只读白名单）、DNS Pinning 防 SSRF 与同轮联网锁死 `save_rule`；**禁止**开放让 LLM 无人工审批直接写入 `plugins/` 或 `personal_assistant/`。
    - 严禁提交 `.env`、`data/`、`evals/public/`；不得修改父目录中的旧版仓库。
    - 不引入 Telegram、旧版知识库或手动 `/compact`、`/yes` 队列。
 4. **编码与测试规范**：
    - 严格遵循 **TDD（Red → Green → Refactor）**：先写失败单元测试并运行 `uv run pytest` 确认红灯，再写最小实现跑绿灯。
-   - 所有 Python 文件的每个 `class` 和 `def` 上方写一句简洁中文 `#` 注释。
+   - 所有 Python 文件（含 `tests/`）的每个 `class`、`def` 和 `async def`（含嵌套类/函数）上方写一句含中文字符的简洁 `#` 注释；`personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树保持 `0` 处 `# type: ignore`。
    - 保持改动小步、清晰并及时 Git 提交（SSH 推送：`GIT_SSH_COMMAND="ssh -o BatchMode=yes" git push`）。
 
 ## 评测与诚实汇报纪律
