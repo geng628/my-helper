@@ -459,6 +459,26 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
                 self.send_response(404, "Not Found")
                 self.end_headers()
                 return
+            if self.path == "/empty-close":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                return
+            if self.path == "/slow-close":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for _ in range(10):
+                    try:
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                    time.sleep(0.08)
+                return
             body = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -621,6 +641,27 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
                 resolve_dns=make_resolver("93.184.216.34"),
             )
         assert http_exc.value.code == 404
+
+        # Connection: close 空响应体不抛 Bad file descriptor；慢速滴水响应须在剩余截止时间内严格超时
+        _, _, empty_raw = wt._default_http_get(
+            f"http://origin.example:{srv.server_port}/empty-close",
+            {},
+            3.0,
+            4096,
+            resolve_dns=make_resolver("93.184.216.34"),
+        )
+        assert empty_raw == b""
+
+        t_slow = time.monotonic()
+        with pytest.raises(TimeoutError):
+            wt._default_http_get(
+                f"http://origin.example:{srv.server_port}/slow-close",
+                {},
+                0.25,
+                4096,
+                resolve_dns=make_resolver("93.184.216.34"),
+            )
+        assert time.monotonic() - t_slow < 0.45
     finally:
         srv.shutdown()
         srv.server_close()

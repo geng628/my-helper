@@ -637,6 +637,12 @@ def test_files_policy_unicode_casefold_symlink_and_inode_protection(tmp_path: Pa
     search_ws = memory.search_markdown("secret", root="data/workspace")
     assert search_ws.startswith("未在") and "hardlink.txt" not in search_ws
 
+    # FTS5Retriever 经 iter_searchable_files 同样严格阻断硬链接文件检索
+    from plugins.fts5_retriever import FTS5Retriever
+
+    fts_memory = MemoryStore(data_root, policy=policy, retriever=FTS5Retriever())
+    assert fts_memory.search_hits("secret", root="data/workspace") == []
+
 
 # 测试 save_rule 防间接提示词注入（untrusted_tool_seen 阻断、正常放行）与 prompts.py 非指令数据围栏声明
 def test_save_rule_indirect_injection_guard_and_prompt_fence(tmp_path: Path) -> None:

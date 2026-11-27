@@ -166,7 +166,7 @@ def _parse_single_command(command: str) -> list[str]:
     if not tokens:
         raise ValueError("command 不能为空。")
     for tok in tokens:
-        if tok in SHELL_OPERATORS:
+        if tok in SHELL_OPERATORS and not (tokens[0] == "find" and tok in {"(", ")"}):
             raise ValueError(f"不支持壳操作符「{tok}」（管道/拼接/重定向）；请拆分为单条命令调用。")
     return tokens
 
@@ -480,11 +480,13 @@ def _parse_search_args(exe: str, args: list[str], policy: ShellPolicy) -> tuple[
 def _validate_find_args(args: list[str], policy: ShellPolicy, *, protected_ctx: ProtectedCtx) -> None:
     idx = 0
     seen_expr = False
+    seen_dd = False
     while idx < len(args):
         tok = args[idx]
         if tok == "--":
-            if seen_expr:
-                raise ValueError("find 不支持在表达式中再次使用 --。")
+            if seen_expr or seen_dd:
+                raise ValueError("find 不支持重复或在表达式中使用 --。")
+            seen_dd = True
             idx += 1
             continue
         if tok in FIND_BOOL_PRIMARIES:
@@ -530,7 +532,11 @@ def _validate_generic_args(exe: str, args: list[str], policy: ShellPolicy) -> No
             after_dd = True
         elif not after_dd and arg.startswith("-") and arg != "-":
             if exe == "ls":
-                if arg in LS_FORBIDDEN_LONG or (not arg.startswith("--") and any(ch in "LH" for ch in arg[1:])):
+                if (
+                    arg in LS_FORBIDDEN_LONG
+                    or arg.startswith("--dereference")
+                    or (not arg.startswith("--") and any(ch in "LH" for ch in arg[1:]))
+                ):
                     raise ValueError(f"ls 禁止跟随符号链接选项：{arg}")
             if exe == "wc":
                 if arg.startswith("--"):

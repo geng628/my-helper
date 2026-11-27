@@ -657,6 +657,7 @@ class AssistantApp:
             fact_used = False
 
             turn_persisted = False
+            turn_ended = False
             try:
                 registry = self._tool_registry
                 turn_ctx: dict[str, object] = {
@@ -688,7 +689,6 @@ class AssistantApp:
                     max_repeated_tool_calls=self.max_repeated_tool_calls,
                     clock=self._clock,
                 )
-                turn_ended = False
                 for event in iter_react(
                     guarded_llm,
                     messages,

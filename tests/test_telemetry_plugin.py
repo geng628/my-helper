@@ -341,6 +341,24 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
     assert clean_snap["last_turn"]["tool_calls"] == 0
     assert clean_snap["last_turn"]["ttft_ms"] == 12.0
     assert clean_snap["background"]["runs"] == 0
+
+    # 验证进入 iter_react 前（如读取系统提示词阶段）抛异常时，原异常正常透出绝不被 UnboundLocalError 掩盖
+    import tempfile
+    from pathlib import Path
+    import pytest
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        err_app = AssistantApp(data_root=Path(tmpdir) / "d", llm=ScriptedStreamLLM(lambda _m, _t: {"role": "assistant", "content": "x"}))
+        try:
+            # 模拟系统提示词构造前阶段抛异常
+            def _boom_prompt(_chat_id: str, _reg: object) -> str:
+                raise RuntimeError("boom prompt stage")
+
+            err_app.get_session_system_prompt = _boom_prompt  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="boom prompt stage"):
+                err_app.chat("触发前置异常", chat_id="s-early")
+        finally:
+            err_app.close()
     assert snap["task_cursor"] == total_turns
     assert snap["totals"]["turns"] == total_turns
     assert snap["totals"]["prompt_tokens"] == total_turns * 10

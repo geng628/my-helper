@@ -786,6 +786,9 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
         bad_out = execute_safe_command(bad_cmd, bypass_policy)
         assert bad_out.startswith("错误："), f"应拦截但放行：{bad_cmd!r} -> {bad_out!r}"
     assert "退出码：0" in execute_safe_command("find -- . -maxdepth 1 -name '*.md'", bypass_policy)
+    assert "退出码：0" in execute_safe_command(r"find . -maxdepth 1 \( -name '*.md' -o -name '*.txt' \)", bypass_policy)
+    assert execute_safe_command("find -- -P -- .", bypass_policy).startswith("错误：")
+    assert execute_safe_command("ls --dereference-command-line-s .", bypass_policy).startswith("错误：")
     assert "退出码：0" in execute_safe_command("wc -l README.md", bypass_policy)
     rg_argv = shell_mod._augment_safe_argv(["rg", "hello", "."], bypass_policy)
     assert any(tok.startswith("--iglob=!") for tok in rg_argv)

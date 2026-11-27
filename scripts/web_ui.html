@@ -751,13 +751,18 @@
       let token = sessionStorage.getItem("my_helper_web_token") || "";
       let res = await fetch(url, buildInit(token));
       if (res.status === 401) {
-        const entered = window.prompt("服务端已启用访问口令，请输入 Bearer Token：");
-        if (entered && entered.trim()) {
-          token = entered.trim();
-          sessionStorage.setItem("my_helper_web_token", token);
-          res = await fetch(url, buildInit(token));
-          if (res.status === 401) {
-            sessionStorage.removeItem("my_helper_web_token");
+        const latest = sessionStorage.getItem("my_helper_web_token") || "";
+        if (latest && latest !== token) {
+          res = await fetch(url, buildInit(latest));
+        } else {
+          const entered = window.prompt("服务端已启用访问口令，请输入 Bearer Token：");
+          if (entered && entered.trim()) {
+            token = entered.trim();
+            sessionStorage.setItem("my_helper_web_token", token);
+            res = await fetch(url, buildInit(token));
+            if (res.status === 401) {
+              sessionStorage.removeItem("my_helper_web_token");
+            }
           }
         }
       }

@@ -227,13 +227,15 @@ def _ascii_hostname(host: str) -> str:
     return host if host.isascii() else host.encode("idna").decode("ascii")
 
 
-# 按剩余总截止时间刷新底层套接字超时，防止慢速滴水响应拖延超过上限
+# 按剩余总截止时间刷新底层套接字超时，防止慢速滴水响应拖延超过上限（已关闭套接字安全跳过）
 def _refresh_socket_timeout(sock: Any, deadline: float, message: str) -> None:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(message)
     if sock is not None and hasattr(sock, "settimeout"):
-        sock.settimeout(remaining)
+        fileno = getattr(sock, "fileno", None)
+        if not callable(fileno) or fileno() != -1:
+            sock.settimeout(remaining)
 
 
 # 在总截止时间与最大字节数约束内分块读取响应体，并在每次阻塞读前刷新套接字剩余超时
@@ -308,11 +310,12 @@ def _default_http_get(
 
         target_path = _encode_request_target(parts.path, parts.query)
         conn = _connect_pinned(scheme, host, port, pinned_ip, step_timeout, ssl_context=ssl_context)
+        raw_sock = conn.sock
         resp: http.client.HTTPResponse | None = None
         try:
-            _refresh_socket_timeout(conn.sock, deadline, "网页请求超过总时长限制。")
+            _refresh_socket_timeout(raw_sock, deadline, "网页请求超过总时长限制。")
             conn.request("GET", target_path, headers=req_headers)
-            _refresh_socket_timeout(conn.sock, deadline, "网页请求超过总时长限制。")
+            _refresh_socket_timeout(raw_sock, deadline, "网页请求超过总时长限制。")
             resp = conn.getresponse()
             if resp.status in REDIRECT_STATUSES:
                 loc = (resp.getheader("Location") or "").strip()
@@ -327,7 +330,7 @@ def _default_http_get(
             return (
                 clean_url,
                 resp.getheader("Content-Type") or "text/plain",
-                _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock),
+                _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock or raw_sock),
             )
         finally:
             if resp is not None:
@@ -365,20 +368,21 @@ def _default_http_post_json(
     parts = urlsplit(clean_url)
     target_path = _encode_request_target(parts.path, parts.query)
     conn = _connect_pinned(parts.scheme.lower(), host, port, pinned_ip, max(0.001, deadline - time.monotonic()))
+    raw_sock = conn.sock
     resp: http.client.HTTPResponse | None = None
     try:
-        _refresh_socket_timeout(conn.sock, deadline, "搜索请求超过总时长限制。")
+        _refresh_socket_timeout(raw_sock, deadline, "搜索请求超过总时长限制。")
         conn.request(
             "POST",
             target_path,
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"User-Agent": DEFAULT_USER_AGENT, "Content-Type": "application/json", **headers},
         )
-        _refresh_socket_timeout(conn.sock, deadline, "搜索请求超过总时长限制。")
+        _refresh_socket_timeout(raw_sock, deadline, "搜索请求超过总时长限制。")
         resp = conn.getresponse()
         if resp.status >= 400:
             raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
-        raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock)
+        raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock or raw_sock)
     finally:
         if resp is not None:
             resp.close()
