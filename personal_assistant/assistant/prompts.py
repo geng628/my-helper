@@ -1,4 +1,4 @@
-"""Layer 3 个人助手业务系统提示词定义与组装（从通用 ReAct 引擎中剥离）。"""
+"""Layer 3 个人助手业务系统提示词定义、动静分离组装与每轮用户日期信封。"""
 from __future__ import annotations
 
 from datetime import date
@@ -19,12 +19,11 @@ SYSTEM_PROMPT = (
 )
 
 
-# 组装个人助手系统提示词：静态指令与规则在前、目录索引与日期在后，最大化服务端 KV Cache 命中率
+# 组装纯静态/低频系统提示词（指令、白名单工具、规则与记忆索引），不含逐日变化日期以守护跨天 KV Cache
 def format_system_prompt(
     memory: "MemoryStore",
     *,
     tool_names: list[str] | None = None,
-    today: date | None = None,
 ) -> str:
     parts = [SYSTEM_PROMPT]
     if tool_names is not None:
@@ -39,6 +38,10 @@ def format_system_prompt(
     index = memory.read_memory_index()
     if index:
         parts.append(f"【记忆索引 (data/memory/MEMORY.md)】\n{index}")
-    ref_day = today or today_shanghai()
-    parts.append(f"今天是 {format_date_with_weekday(ref_day)}。")
     return "\n\n".join(parts)
+
+
+# 为单条用户消息包裹逻辑日期信封（动态日期随消息定格，跨自然日不击穿前缀缓存）
+def format_user_envelope(text: str, *, today: date | None = None) -> str:
+    ref_day = today or today_shanghai()
+    return f"[当前日期：{format_date_with_weekday(ref_day)}]\n{text}"

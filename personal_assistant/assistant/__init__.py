@@ -25,6 +25,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     "is_line_expired": ("personal_assistant.assistant.memory_lifecycle", "is_line_expired"),
     "SYSTEM_PROMPT": ("personal_assistant.assistant.prompts", "SYSTEM_PROMPT"),
     "format_system_prompt": ("personal_assistant.assistant.prompts", "format_system_prompt"),
+    "format_user_envelope": ("personal_assistant.assistant.prompts", "format_user_envelope"),
     "tokenize_text": ("personal_assistant.assistant.text_search", "tokenize_text"),
 }
 

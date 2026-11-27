@@ -81,23 +81,35 @@ class StateStore:
         assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
-    # 追加一条对话消息（user 或 assistant），返回自增消息编号
-    def append_message(self, chat_id: str, role: str, content: str) -> int:
-        created_at = datetime.now(UTC).isoformat()
+    # 追加一条对话消息（user 或 assistant），可选指定逻辑时间戳 created_at，返回自增消息编号
+    def append_message(
+        self,
+        chat_id: str,
+        role: str,
+        content: str,
+        *,
+        created_at: str | None = None,
+    ) -> int:
+        stamp = created_at or datetime.now(UTC).isoformat()
         with self._lock:
-            msg_id = self._insert_message(chat_id, role, content, created_at)
+            msg_id = self._insert_message(chat_id, role, content, stamp)
             self.conn.commit()
             return msg_id
 
-    # 在同一事务内原子成对写入本轮 user 与 assistant 消息，返回 (user_msg_id, assistant_msg_id)
+    # 在同一事务内原子成对写入本轮 user 与 assistant 消息，可选传入本轮逻辑时间戳，返回 (user_msg_id, assistant_msg_id)
     def append_turn(
-        self, chat_id: str, user_content: str, assistant_content: str
+        self,
+        chat_id: str,
+        user_content: str,
+        assistant_content: str,
+        *,
+        created_at: str | None = None,
     ) -> tuple[int, int]:
-        created_at = datetime.now(UTC).isoformat()
+        stamp = created_at or datetime.now(UTC).isoformat()
         with self._lock:
             try:
-                user_id = self._insert_message(chat_id, "user", user_content, created_at)
-                assistant_id = self._insert_message(chat_id, "assistant", assistant_content, created_at)
+                user_id = self._insert_message(chat_id, "user", user_content, stamp)
+                assistant_id = self._insert_message(chat_id, "assistant", assistant_content, stamp)
                 self.conn.commit()
             except BaseException:
                 self.conn.rollback()

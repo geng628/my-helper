@@ -154,15 +154,17 @@ def test_assistant_app_kv_cache_prefix_and_memory_index(tmp_path: Path) -> None:
         turn2 = app.chat("我刚才说自己在做什么？", chat_id="cli-1")
         assert "my-helper" in str(turn2["reply"])
 
-        # 验证 KV Cache 友好性：第 2 轮 system 与第 1 轮字节级完全相同，历史按中立 User/Assistant 追加
+        # 验证 KV Cache 友好性：第 2 轮 system 与第 1 轮字节级完全相同，历史按中立 User/Assistant 追加且首条日期信封逐字节一致
         turn1_ctx = llm.requests[0]
         turn2_ctx = llm.requests[2]
         assert turn2_ctx.system_prompt == turn1_ctx.system_prompt
-        assert list(turn2_ctx.messages) == [
-            UserMessage("记住，我正在开发 my-helper 项目"),
-            AssistantMessage.from_text("已记下你的项目，并查看了当前时间。"),
-            UserMessage("我刚才说自己在做什么？"),
-        ]
+        assert len(turn2_ctx.messages) == 3
+        assert turn2_ctx.messages[0] == turn1_ctx.messages[0]
+        assert isinstance(turn2_ctx.messages[0], UserMessage)
+        assert turn2_ctx.messages[0].content.endswith("\n记住，我正在开发 my-helper 项目")
+        assert turn2_ctx.messages[1] == AssistantMessage.from_text("已记下你的项目，并查看了当前时间。")
+        assert isinstance(turn2_ctx.messages[2], UserMessage)
+        assert turn2_ctx.messages[2].content.endswith("\n我刚才说自己在做什么？")
 
         # 开启新会话（或 reset_session_prompt 后）：system 加载 MEMORY.md 目录索引，但不灌入具体事实正文
         app.chat("查一下我的项目备忘", chat_id="cli-2")
@@ -380,7 +382,7 @@ def test_per_chat_id_mutex_serialization_and_bounded_caches(
             nonlocal active_same, max_active_same
             last = context.messages[-1]
             assert isinstance(last, UserMessage)
-            content = last.content
+            content = last.content.splitlines()[-1]
             if content.startswith("same-"):
                 with lock:
                     active_same += 1
@@ -488,20 +490,23 @@ def test_cross_midnight_today_fn_refreshes_session_prompt_and_freezes_within_sam
 
         app.chat("今天有什么安排", chat_id="daily-1")
         prompt_day1_turn1 = llm.requests[0].system_prompt
-        assert "今天是 2026-11-26" in prompt_day1_turn1
+        assert "2026-11-26" not in prompt_day1_turn1
+        assert isinstance(llm.requests[0].messages[-1], UserMessage)
+        assert "2026-11-26（星期四，北京时间）" in llm.requests[0].messages[-1].content
 
-        # 同日内新增记忆索引文件后，同日次轮仍保持冻结不变（保护 KV Cache）
+        # 同日内新增记忆索引文件后，热聊期次轮仍保持冻结不变（保护 KV Cache）
         app.memory.remember_user_statement("同日内新增的一条事实", message_id=99)
         app.chat("同一天第二句", chat_id="daily-1")
         prompt_day1_turn2 = llm.requests[1].system_prompt
         assert prompt_day1_turn2 == prompt_day1_turn1
 
-        # 跨自然日切换到 2026-11-27：自动归档过期记忆并清空重建系统提示词
+        # 跨自然日切换到 2026-11-27：自动归档过期日程，因记忆文件发生变更而刷新系统提示词，新日期落在用户消息信封
         current_day = date(2026, 11, 27)
         app.chat("新的一天早上好", chat_id="daily-1")
         prompt_day2 = llm.requests[2].system_prompt
-        assert "今天是 2026-11-27" in prompt_day2
-        assert "今天是 2026-11-26" not in prompt_day2
+        assert "2026-11-27" not in prompt_day2
+        assert isinstance(llm.requests[2].messages[-1], UserMessage)
+        assert "2026-11-27（星期五，北京时间）" in llm.requests[2].messages[-1].content
         assert "data/memory/facts.md" in prompt_day2
         assert "晚上技术分享" not in (app.memory.memory_dir / "schedule.md").read_text(encoding="utf-8")
     finally:
@@ -1138,7 +1143,7 @@ class ProbeLifecyclePlugin(Plugin):
         def _reply_for(self, context: Context) -> AssistantMessage:
             last = context.messages[-1]
             assert isinstance(last, UserMessage)
-            q = last.content
+            q = last.content.splitlines()[-1]
             barrier.wait()
             tok = 111 if q == "问A" else 999
             usage = TokenUsage(prompt_tokens=tok, cached_tokens=0, completion_tokens=1)

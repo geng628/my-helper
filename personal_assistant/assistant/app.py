@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from personal_assistant.agent.plugins import ObserverProtocol, RuntimeEvent, TaskEvent
@@ -35,16 +35,26 @@ from personal_assistant.ai import (
     StreamError,
     StreamOptions,
     StreamStart,
+    TextBlock,
     TextDelta,
     TextEnd,
     TextStart,
+    ThinkingBlock,
     ThinkingDelta,
     TokenUsage,
+    ToolCall,
+    ToolResultMessage,
     UserMessage,
 )
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.assistant.common import require_positive_int, today_shanghai
+from personal_assistant.assistant.common import (
+    SHANGHAI_TZ,
+    now_shanghai,
+    parse_iso_date,
+    require_positive_int,
+    today_shanghai,
+)
 from personal_assistant.assistant.consolidator import (
     BackgroundConsolidator,
     ConsolidationPolicy,
@@ -53,7 +63,7 @@ from personal_assistant.assistant.consolidator import (
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.files_policy import FilesPolicy
 from personal_assistant.assistant.memory import MemoryStore
-from personal_assistant.assistant.prompts import format_system_prompt
+from personal_assistant.assistant.prompts import format_system_prompt, format_user_envelope
 
 MAX_HISTORY_MESSAGES = 20
 MAX_ADAPTIVE_HISTORY_MESSAGES = 60
@@ -61,6 +71,11 @@ MAX_ADAPTIVE_HISTORY_CHARS = 24_000
 MAX_HISTORY_ITEM_CHARS = 2000
 MAX_SESSION_PROMPTS = 256
 MAX_SESSION_LOCKS = 256
+DEFAULT_PROMPT_CACHE_TTL_SECONDS = 300.0
+DEFAULT_FOLD_TRIGGER_CHARS = 48_000
+DEFAULT_FOLD_KEEP_TAIL_MESSAGES = 4
+DEFAULT_FOLD_MIN_RESULT_CHARS = 800
+DEFAULT_FOLD_PREVIEW_CHARS = 240
 
 
 # 单轮推理或工具调用超出运行期安全预算时构造的结构化异常
@@ -111,6 +126,160 @@ def _select_adaptive_history(
         selected_rev.pop()
     selected_rev.reverse()
     return selected_rev
+
+
+# 粘性边界按块裁剪活跃历史：未超上限保持队头纹丝不动，仅在超限时整块切至目标水位并推进 floor_id 以守护 KV Cache
+def _select_chunked_history(
+    active_all: list[dict[str, object]],
+    *,
+    floor_id: int = 0,
+    base_messages: int = MAX_HISTORY_MESSAGES,
+    max_messages: int = MAX_ADAPTIVE_HISTORY_MESSAGES,
+    max_chars: int = MAX_ADAPTIVE_HISTORY_CHARS,
+) -> tuple[list[dict[str, object]], int]:
+    if floor_id > 0:
+        eligible = [
+            msg
+            for msg in active_all
+            if not isinstance(msg.get("id"), int) or int(msg["id"]) > floor_id
+        ]
+    else:
+        eligible = list(active_all)
+
+    total_chars = sum(min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS) for msg in eligible)
+    if len(eligible) <= max_messages and total_chars <= max_chars:
+        while len(eligible) > 1 and eligible[0].get("role") == "assistant":
+            eligible.pop(0)
+        return eligible, floor_id
+
+    target_msgs = min(max(2, base_messages), max_messages)
+    target_chars = min(max_chars, max(MAX_HISTORY_ITEM_CHARS * 2, max_chars // 2))
+    selected_rev: list[dict[str, object]] = []
+    used_chars = 0
+    for msg in reversed(eligible):
+        item_len = min(len(str(msg.get("content") or "")), MAX_HISTORY_ITEM_CHARS)
+        if selected_rev and (
+            len(selected_rev) >= target_msgs
+            or used_chars + item_len > target_chars
+            or len(selected_rev) >= max_messages
+            or used_chars + item_len > max_chars
+        ):
+            break
+        selected_rev.append(msg)
+        used_chars += item_len
+    while len(selected_rev) > 1 and selected_rev[-1].get("role") == "assistant":
+        selected_rev.pop()
+    selected_rev.reverse()
+
+    new_floor = floor_id
+    if selected_rev and isinstance(selected_rev[0].get("id"), int):
+        new_floor = max(floor_id, int(selected_rev[0]["id"]) - 1)
+    return selected_rev, new_floor
+
+
+# 从 SQLite 消息的 created_at 字段解析北京时间自然日（兼容 UTC / 带时区 ISO 与纯日期字符串）
+def _message_shanghai_date(raw_created_at: object) -> date | None:
+    if isinstance(raw_created_at, str):
+        text = raw_created_at.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt.astimezone(SHANGHAI_TZ).date() if dt.tzinfo is not None else dt.date()
+        except ValueError:
+            return parse_iso_date(text)
+    return parse_iso_date(raw_created_at)
+
+
+# 计算单条中立消息的大致字符长度，供轮内高水位投影阈值判断
+def _message_char_len(msg: Message) -> int:
+    if isinstance(msg, UserMessage):
+        return len(msg.content)
+    if isinstance(msg, ToolResultMessage):
+        return len(msg.content)
+    total = 0
+    for block in msg.blocks:
+        if isinstance(block, TextBlock):
+            total += len(block.text)
+        elif isinstance(block, ThinkingBlock):
+            total += len(block.text) + len(block.signature)
+        elif isinstance(block, ToolCall):
+            total += len(block.name) + len(block.arguments)
+    return total
+
+
+# 轮内粘性高水位非破坏性上下文投影器（接入 react.iter_react 的 convert_to_llm 钩子）：低水位零改动吃满缓存，超水位锁定折叠边界
+class _TurnContextProjector:
+    # 初始化触发高水位字符阈值、尾部原文保护条数与单条大输出折叠阈值
+    def __init__(
+        self,
+        *,
+        trigger_chars: int = DEFAULT_FOLD_TRIGGER_CHARS,
+        keep_tail_messages: int = DEFAULT_FOLD_KEEP_TAIL_MESSAGES,
+        min_result_chars: int = DEFAULT_FOLD_MIN_RESULT_CHARS,
+        preview_chars: int = DEFAULT_FOLD_PREVIEW_CHARS,
+    ) -> None:
+        self._trigger_chars = trigger_chars
+        self._keep_tail_messages = keep_tail_messages
+        self._min_result_chars = min_result_chars
+        self._preview_chars = preview_chars
+        self._folded_until = 0
+
+    # 将单条超长 ToolResultMessage 确定性地投影为紧凑卡片（优先保留 TOAST 落盘的 read_markdown 回读指针）
+    def _fold_tool_result(self, msg: ToolResultMessage) -> ToolResultMessage:
+        if len(msg.content) <= self._min_result_chars:
+            return msg
+        pointer_line = ""
+        for line in msg.content.splitlines():
+            if "read_markdown(" in line:
+                pointer_line = line.strip()
+                break
+        preview = " ".join(msg.content[: self._preview_chars].split())
+        parts = [f"[已折叠工具输出：{msg.tool_name}，原长 {len(msg.content)} 字符，原文完整保留]"]
+        if preview:
+            parts.append(f"{preview}…")
+        if pointer_line:
+            parts.append(pointer_line)
+        return ToolResultMessage(
+            tool_call_id=msg.tool_call_id,
+            tool_name=msg.tool_name,
+            content="\n".join(parts),
+            is_error=msg.is_error,
+        )
+
+    # 按粘性边界投影当前轮 Context：不修改原始 history，低水位零改写，超水位折叠前半批大输出后锁定下标
+    def __call__(self, context: Context) -> Context:
+        msgs = list(context.messages)
+        mutated = False
+        locked = min(self._folded_until, len(msgs))
+        for idx in range(locked):
+            item = msgs[idx]
+            if isinstance(item, ToolResultMessage):
+                folded = self._fold_tool_result(item)
+                if folded is not item:
+                    msgs[idx] = folded
+                    mutated = True
+
+        total_chars = sum(_message_char_len(m) for m in msgs)
+        if total_chars > self._trigger_chars:
+            cutoff = max(0, len(msgs) - self._keep_tail_messages)
+            if cutoff > self._folded_until:
+                for idx in range(self._folded_until, cutoff):
+                    item = msgs[idx]
+                    if isinstance(item, ToolResultMessage):
+                        folded = self._fold_tool_result(item)
+                        if folded is not item:
+                            msgs[idx] = folded
+                            mutated = True
+                self._folded_until = cutoff
+
+        if not mutated:
+            return context
+        return Context(
+            system_prompt=context.system_prompt,
+            messages=tuple(msgs),
+            tools=context.tools,
+        )
 
 
 # 外层回合预算护栏包装器（实现 ModelInvoker）：在零改动 Layer 2 微内核的前提下执行步数/Token/墙钟/重复/截断熔断
@@ -327,6 +496,8 @@ class AssistantApp:
         max_turn_tokens: int = 250_000,
         max_turn_seconds: float = 180.0,
         max_repeated_tool_calls: int = 3,
+        prompt_cache_ttl_seconds: float = DEFAULT_PROMPT_CACHE_TTL_SECONDS,
+        max_turn_context_chars: int = DEFAULT_FOLD_TRIGGER_CHARS,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.max_turn_steps = require_positive_int(max_turn_steps, "max_turn_steps")
@@ -334,6 +505,12 @@ class AssistantApp:
         self.max_turn_seconds = _validate_non_negative_float(max_turn_seconds, "max_turn_seconds")
         self.max_repeated_tool_calls = require_positive_int(
             max_repeated_tool_calls, "max_repeated_tool_calls"
+        )
+        self.prompt_cache_ttl_seconds = _validate_non_negative_float(
+            prompt_cache_ttl_seconds, "prompt_cache_ttl_seconds"
+        )
+        self.max_turn_context_chars = require_positive_int(
+            max_turn_context_chars, "max_turn_context_chars"
         )
         self._clock: Callable[[], float] = clock or time.monotonic
         self.auto_consolidate = bool(auto_consolidate)
@@ -389,7 +566,8 @@ class AssistantApp:
         )
         self._llm_lock = threading.RLock()
         self._prompt_lock = threading.Lock()
-        self._session_prompts: dict[str, tuple[str, str]] = {}
+        self._session_prompts: dict[str, tuple[str, float]] = {}
+        self._history_trim_floors: dict[str, int] = {}
         self._last_archive_day = ""
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: dict[str, tuple[threading.Lock, int]] = {}
@@ -543,6 +721,14 @@ class AssistantApp:
             return self._today_fn()
         return today_shanghai()
 
+    # 单次采样本轮统一的逻辑自然日与持久化 ISO 时间戳，确保跨零点瞬间仍逐字节一致
+    def _turn_clock_stamp(self) -> tuple[date, str]:
+        if self._today_fn is not None:
+            day = self._today_fn()
+            return day, f"{day.isoformat()}T12:00:00+08:00"
+        now = now_shanghai()
+        return now.date(), now.isoformat()
+
     # 在应用启动时一次性构建受白名单管控的常驻工具注册表（跨轮复用，动态上下文走执行期 tool_context）
     def _build_base_registry(self) -> ToolRegistry:
         return self.tools_config.build_registry(
@@ -556,31 +742,59 @@ class AssistantApp:
     def tools(self) -> ToolRegistry:
         return self._tool_registry
 
-    # 拼装系统提示词：静态指令与规则在前、目录索引与日期在后，最大化前缀 KV Cache 复用
+    # 拼装纯静态/低频系统提示词（不含逐日日期与动态摘要），最大化前缀 KV Cache 复用
     def build_system_prompt(self, registry: ToolRegistry) -> str:
-        return format_system_prompt(self.memory, tool_names=registry.names, today=self._today())
+        return format_system_prompt(self.memory, tool_names=registry.names)
 
-    # 获取指定会话冻结的系统提示词：按自然日与会话键复用首次快照（有界 LRU），跨日自动失效重算
+    # 获取指定会话冻结的系统提示词：热聊期（空闲 < TTL）死锁复用，空闲超时后零代价刷新最新记忆索引
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
-        today_str = self._today().isoformat()
+        now = self._clock()
         with self._prompt_lock:
             cached = self._session_prompts.pop(chat_id, None)
-            if cached is not None and cached[0] == today_str:
-                prompt = cached[1]
+            if (
+                cached is not None
+                and self.prompt_cache_ttl_seconds > 0
+                and (now - cached[1]) < self.prompt_cache_ttl_seconds
+            ):
+                prompt = cached[0]
             else:
                 prompt = self.build_system_prompt(registry)
             if len(self._session_prompts) >= MAX_SESSION_PROMPTS:
                 self._session_prompts.pop(next(iter(self._session_prompts)))
-            self._session_prompts[chat_id] = (today_str, prompt)
+            self._session_prompts[chat_id] = (prompt, now)
             return prompt
 
-    # 主动重置指定会话（或全部会话）冻结的系统提示词，用于后台沉淀或手动改文件后刷新
+    # 主动重置指定会话（或全部会话）冻结的系统提示词与历史切块边界，用于沉淀改写索引或手动刷新
     def reset_session_prompt(self, chat_id: str | None = None) -> None:
         with self._prompt_lock:
             if chat_id is None:
                 self._session_prompts.clear()
+                self._history_trim_floors.clear()
             else:
                 self._session_prompts.pop(chat_id, None)
+                self._history_trim_floors.pop(chat_id, None)
+
+    # 仅重置指定会话的历史切块游标（例如后台沉淀推进了压缩边界但未改写 MEMORY.md 时保留热 system_prompt）
+    def _clear_history_trim_floor(self, chat_id: str) -> None:
+        with self._prompt_lock:
+            self._history_trim_floors.pop(chat_id, None)
+
+    # 按会话粘性边界裁剪活跃历史并更新有界 LRU 游标表
+    def _select_session_history(
+        self,
+        chat_id: str,
+        active_all: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        with self._prompt_lock:
+            floor_id = self._history_trim_floors.get(chat_id, 0)
+        selected, new_floor = _select_chunked_history(active_all, floor_id=floor_id)
+        if new_floor != floor_id:
+            with self._prompt_lock:
+                self._history_trim_floors.pop(chat_id, None)
+                if len(self._history_trim_floors) >= MAX_SESSION_PROMPTS:
+                    self._history_trim_floors.pop(next(iter(self._history_trim_floors)))
+                self._history_trim_floors[chat_id] = new_floor
+        return selected
 
     # 为指定 chat_id 获取有界会话级互斥锁，确保同会话并发请求严格串行并在空闲或中断时安全清理引用计数
     @contextmanager
@@ -610,7 +824,7 @@ class AssistantApp:
                     else:
                         self._chat_locks[chat_id] = (lock, new_refs)
 
-    # 将持久化历史转换为中立追加式消息列表，安全合并异常连续同角色消息，保持前缀字节级稳定以命中 KV Cache
+    # 将持久化历史转换为中立追加式消息列表：按记录日期还原用户信封并合并异常连续同角色，保持前缀字节级稳定
     @staticmethod
     def _build_history_messages(history: list[dict[str, object]]) -> list[Message]:
         result: list[Message] = []
@@ -621,15 +835,16 @@ class AssistantApp:
             content = str(msg.get("content") or "")
             if len(content) > MAX_HISTORY_ITEM_CHARS:
                 content = content[:MAX_HISTORY_ITEM_CHARS] + "…"
-            item: Message = (
-                UserMessage(content=content)
-                if role == "user"
-                else AssistantMessage.from_text(content)
-            )
+            if role == "user":
+                msg_day = _message_shanghai_date(msg.get("created_at"))
+                rendered = format_user_envelope(content, today=msg_day) if msg_day is not None else content
+                item: Message = UserMessage(content=rendered)
+            else:
+                item = AssistantMessage.from_text(content)
             _append_alternating_message(result, item)
         return result
 
-    # 组装中立 Context（稳定 system_prompt + 按需拼入前情摘要 + 严格交替历史与当前提问 + 中立工具签名）
+    # 组装中立 Context：纯净静态 system_prompt + 位于 messages 头部的前情摘要 + 稳定历史 + 带日期信封的当前提问
     def _assemble_context(
         self,
         system_prompt: str,
@@ -637,38 +852,35 @@ class AssistantApp:
         history: list[dict[str, object]],
         clean_text: str,
         registry: ToolRegistry,
+        *,
+        today: date | None = None,
     ) -> Context:
-        effective_system = (
-            f"{system_prompt}\n\n【本会话已压缩前情摘要】\n{summary_text}"
-            if summary_text
-            else system_prompt
-        )
-        messages: list[Message] = self._build_history_messages(history)
-        _append_alternating_message(messages, UserMessage(content=clean_text))
+        messages: list[Message] = []
+        if summary_text:
+            messages.append(UserMessage(content=f"【本会话已压缩前情摘要】\n{summary_text}"))
+        for msg in self._build_history_messages(history):
+            _append_alternating_message(messages, msg)
+        envelope = format_user_envelope(clean_text, today=today or self._today())
+        _append_alternating_message(messages, UserMessage(content=envelope))
         return Context(
-            system_prompt=effective_system,
+            system_prompt=system_prompt,
             messages=tuple(messages),
             tools=registry.schemas(),
         )
 
-    # 每个自然日首次对话时先执行过期归档，归档成功后再更新日期游标并清理过时会话冻结提示词
-    def _maybe_archive_expired(self) -> None:
-        today = self._today()
-        today_str = today.isoformat()
+    # 每个自然日首次对话时执行过期归档；仅在实际归档改动了记忆文件时才刷新会话提示词，无过期时零击穿缓存
+    def _maybe_archive_expired(self, *, today: date | None = None) -> None:
+        ref_day = today or self._today()
+        today_str = ref_day.isoformat()
         with self._prompt_lock:
             if self._last_archive_day == today_str:
                 return
-        self.memory.archive_expired_memories(today=today)
+        archived = self.memory.archive_expired_memories(today=ref_day)
         with self._prompt_lock:
             if self._last_archive_day != today_str:
                 self._last_archive_day = today_str
-                stale = [
-                    cid
-                    for cid, (day_key, _) in self._session_prompts.items()
-                    if day_key != today_str
-                ]
-                for cid in stale:
-                    self._session_prompts.pop(cid, None)
+                if archived:
+                    self._session_prompts.clear()
 
     # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
     def stream_chat(
@@ -702,9 +914,10 @@ class AssistantApp:
         on_event: Callable[[AgentEvent], None] | None,
     ) -> Generator[dict[str, object], None, None]:
         with self._chat_turn_lock(chat_id):
-            self._maybe_archive_expired()
+            turn_day, turn_created_at = self._turn_clock_stamp()
+            self._maybe_archive_expired(today=turn_day)
             compaction, active_all = self.state.get_context_snapshot(chat_id)
-            history = _select_adaptive_history(active_all)
+            history = self._select_session_history(chat_id, active_all)
             before_msg_id = self.state.max_message_id() + 1
             turn_tag = uuid.uuid4().hex[:12]
             fact_used = False
@@ -718,13 +931,18 @@ class AssistantApp:
                     "before_msg_id": before_msg_id,
                     "turn_tag": turn_tag,
                     "untrusted_tool_seen": False,
-                    "today": self._today(),
+                    "today": turn_day,
                     "history_db_path": self.state.db_path,
                 }
                 system_prompt = self.get_session_system_prompt(chat_id, registry)
                 summary_text = str(compaction.get("summary") or "").strip()
                 context = self._assemble_context(
-                    system_prompt, summary_text, history, clean_text, registry
+                    system_prompt,
+                    summary_text,
+                    history,
+                    clean_text,
+                    registry,
+                    today=turn_day,
                 )
 
                 traces: list[dict[str, object]] = []
@@ -742,13 +960,15 @@ class AssistantApp:
                     max_repeated_tool_calls=self.max_repeated_tool_calls,
                     clock=self._clock,
                 )
+                projector = _TurnContextProjector(trigger_chars=self.max_turn_context_chars)
                 with closing(
                     iter_react(
                         guarded_llm,
                         context,
                         registry,
-                        convert_to_llm=None,
+                        convert_to_llm=projector,
                         tool_context=turn_ctx,
+                        options=StreamOptions(session_id=chat_id),
                     )
                 ) as react_events:
                     for event in react_events:
@@ -790,7 +1010,12 @@ class AssistantApp:
                             turn_ended = True
                             reply = event.reply
 
-                user_msg_id, assistant_msg_id = self.state.append_turn(chat_id, clean_text, reply)
+                user_msg_id, assistant_msg_id = self.state.append_turn(
+                    chat_id,
+                    clean_text,
+                    reply,
+                    created_at=turn_created_at,
+                )
                 turn_persisted = True
                 if fact_used:
                     self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
@@ -806,7 +1031,11 @@ class AssistantApp:
             scheduled = (
                 self.background_consolidator.maybe_schedule(
                     chat_id,
-                    on_complete=lambda res: self.reset_session_prompt(res.chat_id),
+                    on_complete=lambda res: (
+                        self.reset_session_prompt(res.chat_id)
+                        if res.saved_files
+                        else self._clear_history_trim_floor(res.chat_id)
+                    ),
                 )
                 if self.auto_consolidate
                 else False

@@ -260,18 +260,19 @@ def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() 
         }
     ]
 
-    seen_ask_system_prompts: list[str] = []
+    seen_ask_user_envelopes: list[str] = []
 
-    # 拦截 ask 阶段的 system prompt 以验证 today 时钟确实生效
+    # 拦截 ask 阶段的用户消息日期信封以验证 today 时钟确实生效且 system_prompt 不含动态日期
     class ClockCapturingLLM(ScriptedMemoryEvalLLM):
-        # 记录带工具的前台调用 system prompt 并返回预设回复
+        # 记录带工具的前台调用用户消息信封并返回预设回复
         def complete(
             self,
             context: Context,
             options: StreamOptions | None = None,
         ) -> AssistantMessage:
-            if context.tools:
-                seen_ask_system_prompts.append(context.system_prompt)
+            if context.tools and context.messages and isinstance(context.messages[0], UserMessage):
+                assert "2023-06-01" not in context.system_prompt
+                seen_ask_user_envelopes.append(context.messages[0].content)
             return super().complete(context, options)
 
     agent_llm = ClockCapturingLLM(
@@ -330,8 +331,8 @@ def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() 
     assert report["summary"]["passed_scenarios"] == 1
     assert report["summary"]["by_category"]["knowledge-update"]["passed_scenarios"] == 1
     assert report["summary"]["by_category"]["knowledge-update"]["pass_rate"] == 1.0
-    # 确认 ask 阶段注入的是历史日期 2023-06-01
-    assert seen_ask_system_prompts and "2023-06-01" in seen_ask_system_prompts[0]
+    # 确认 ask 阶段通过用户日期信封注入历史日期 2023-06-01
+    assert seen_ask_user_envelopes and "2023-06-01" in seen_ask_user_envelopes[0]
     # 确认 Judge 的 LLM 调用没有污染 Agent 的 KV 缓存统计（agent 共 3 次调用）
     assert report["summary"]["cache"]["llm_calls"] == 3
     ask_step = report["scenarios"][0]["steps"][-1]

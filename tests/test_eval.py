@@ -21,6 +21,7 @@ from personal_assistant.ai import (
     TokenUsage,
     ToolCall,
     ToolResultMessage,
+    UserMessage,
     available_api_providers,
     register_api_provider,
 )
@@ -282,7 +283,8 @@ def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
         def _reply_for(self, context: Context) -> AssistantMessage:
             self._step += 1
             if self._step == 1:
-                seen_prompts.append(context.system_prompt)
+                last_msg = context.messages[-1]
+                seen_prompts.append(last_msg.content if isinstance(last_msg, UserMessage) else "")
                 return AssistantMessage(
                     blocks=(
                         ToolCall(

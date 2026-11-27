@@ -14,6 +14,7 @@ from personal_assistant.ai.protocol import (
     ModelInvoker,
     StreamDone,
     StreamError,
+    StreamOptions,
     ToolResultMessage,
 )
 
@@ -53,10 +54,11 @@ AgentEvent = AssistantMessageEvent | ToolStart | ToolStep | TurnEnd
 def _stream_llm_round(
     llm: ModelInvoker,
     context: Context,
+    options: StreamOptions | None = None,
 ) -> Generator[AgentEvent, None, tuple[StreamDone | None, StreamError | None]]:
     done: StreamDone | None = None
     err: StreamError | None = None
-    event_iter = llm.stream(context)
+    event_iter = llm.stream(context, options) if options is not None else llm.stream(context)
     try:
         for event in event_iter:
             yield event
@@ -73,7 +75,7 @@ def _stream_llm_round(
     return done, err
 
 
-# 执行流式通用 ReAct 主循环：纯中立 Context 驱动，遇 StreamError 透传后立即退出，遇非 toolUse 自然收尾
+# 执行流式通用 ReAct 主循环：纯中立 Context 驱动，透传可选 StreamOptions，遇 StreamError 退出、非 toolUse 自然收尾
 def iter_react(
     llm: ModelInvoker,
     context: Context,
@@ -81,6 +83,7 @@ def iter_react(
     *,
     convert_to_llm: ContextTransformer | None = None,
     tool_context: Mapping[str, object] | None = None,
+    options: StreamOptions | None = None,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
     history: list[Message] = list(context.messages)
@@ -94,7 +97,7 @@ def iter_react(
             tools=active_tools,
         )
         llm_ctx = convert_to_llm(round_ctx) if convert_to_llm is not None else round_ctx
-        done, err = yield from _stream_llm_round(llm, llm_ctx)
+        done, err = yield from _stream_llm_round(llm, llm_ctx, options)
         if err is not None:
             return
         if done is None:
@@ -142,7 +145,7 @@ def iter_react(
             )
 
 
-# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent 与上下文转换；遇 StreamError 抛 RuntimeError，正常返回最终回答
+# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent、上下文转换与 StreamOptions；遇 StreamError 抛 RuntimeError，正常返回最终回答
 def run_react(
     llm: ModelInvoker,
     context: Context,
@@ -151,6 +154,7 @@ def run_react(
     on_event: Callable[[AgentEvent], None] | None = None,
     convert_to_llm: ContextTransformer | None = None,
     tool_context: Mapping[str, object] | None = None,
+    options: StreamOptions | None = None,
 ) -> str:
     reply = ""
     event_iter = iter_react(
@@ -159,6 +163,7 @@ def run_react(
         tools,
         convert_to_llm=convert_to_llm,
         tool_context=tool_context,
+        options=options,
     )
     try:
         for event in event_iter:
