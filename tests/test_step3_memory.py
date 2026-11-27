@@ -10,24 +10,29 @@ import pytest
 
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.ai import LLMClient
+from personal_assistant.ai import AssistantMessage, Context, StreamDone, ToolCall, UserMessage
 from personal_assistant.assistant.files_policy import FilesPolicy
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.agent.react import run_react
 
 
-# 预录回复的假模型，用于确定性验证记忆工具与 ReAct 联动
-class ScriptedLLM(LLMClient):
+# 预录回复的假模型（实现 ModelInvoker），用于确定性验证记忆工具与 ReAct 联动
+class ScriptedLLM:
+    last_usage = None
+
     # 保存预设回复队列
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
 
-    # 按序弹出下一条预设回复
-    def respond(
-        self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+    # 流式产出下一条预设回复
+    def stream(self, context: Context, options=None):
+        del context, options
+        msg = self._responses.pop(0)
+        yield StreamDone(reason="toolUse" if msg.tool_calls else "stop", message=msg)
+
+    # 同步返回下一条预设回复
+    def complete(self, context: Context, options=None) -> AssistantMessage:
+        del context, options
         return self._responses.pop(0)
 
 
@@ -140,59 +145,42 @@ def test_memory_tools_and_react_integration(tmp_path: Path) -> None:
 
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "c1",
-                        "type": "function",
-                        "function": {
-                            "name": "search_markdown",
-                            "arguments": '{"query": "固定 argv shell=False", "root": "data/memory"}',
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "c2",
-                        "type": "function",
-                        "function": {
-                            "name": "read_markdown",
-                            "arguments": '{"path": "data/memory/guide.md", "start_line": "1", "end_line": "5"}',
-                        },
-                    },
-                    {
-                        "id": "c3",
-                        "type": "function",
-                        "function": {"name": "remember_fact", "arguments": "{}"},
-                    },
-                    {
-                        "id": "c4",
-                        "type": "function",
-                        "function": {"name": "save_rule", "arguments": '{"statement": "回答前先查证已有记录"}'},
-                    },
-                    {
-                        "id": "c5",
-                        "type": "function",
-                        "function": {
-                            "name": "write_file",
-                            "arguments": '{"path": "summary.md", "content": "命令必须设置 shell=False", "mode": "create"}',
-                        },
-                    },
-                ],
-            },
-            {"role": "assistant", "content": "规范要求外部命令使用固定 argv 并设置 shell=False；我也已记下你的偏好与规则并写入 summary.md。"},
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="c1",
+                        name="search_markdown",
+                        arguments='{"query": "固定 argv shell=False", "root": "data/memory"}',
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="c2",
+                        name="read_markdown",
+                        arguments='{"path": "data/memory/guide.md", "start_line": "1", "end_line": "5"}',
+                    ),
+                    ToolCall(id="c3", name="remember_fact", arguments="{}"),
+                    ToolCall(id="c4", name="save_rule", arguments='{"statement": "回答前先查证已有记录"}'),
+                    ToolCall(
+                        id="c5",
+                        name="write_file",
+                        arguments='{"path": "summary.md", "content": "命令必须设置 shell=False", "mode": "create"}',
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text(
+                "规范要求外部命令使用固定 argv 并设置 shell=False；我也已记下你的偏好与规则并写入 summary.md。",
+                stop_reason="stop",
+            ),
         ]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "外部命令执行有什么安全要求？"}]
     reply = run_react(
         llm,
-        messages,
+        Context(messages=(UserMessage("外部命令执行有什么安全要求？"),)),
         registry,
         tool_context={"user_text": "记住，回复优先给 Python 标准库示例", "turn_tag": "t99"},
     )

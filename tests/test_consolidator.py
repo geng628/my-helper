@@ -3,11 +3,25 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    StreamDone,
+    StreamOptions,
+    StreamStart,
+    TextDelta,
+    TextEnd,
+    TextStart,
+    TokenUsage,
+    UserMessage,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.common import format_date_with_weekday
 from personal_assistant.assistant.consolidator import (
@@ -18,13 +32,12 @@ from personal_assistant.assistant.consolidator import (
     _parse_json_object,
 )
 from personal_assistant.assistant.db import StateStore
-from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT, format_system_prompt
 
 
-# 可录制请求并按预设回复（支持门控同步）的假模型
-class ControlledLLM(LLMClient):
+# 可录制请求并按预设回复（支持门控同步）的假模型（实现 ModelInvoker）
+class ControlledLLM:
     # 保存预设文本列表、可选门控事件与请求历史
     def __init__(
         self,
@@ -36,20 +49,43 @@ class ControlledLLM(LLMClient):
         self._contents = list(contents)
         self._gate = gate
         self._started = started
-        self.requests: list[list[dict[str, object]]] = []
+        self.requests: list[Context] = []
+        self.last_usage: TokenUsage | None = None
 
     # 记录请求，在设置了门控事件时等待放行后再返回下一条回复
-    def respond(
+    def complete(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        self.requests.append([dict(m) for m in messages])
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del options
+        self.requests.append(
+            Context(
+                system_prompt=context.system_prompt,
+                messages=tuple(context.messages),
+                tools=tuple(context.tools),
+            )
+        )
         if self._started is not None:
             self._started.set()
         if self._gate is not None:
             self._gate.wait(timeout=5.0)
-        return {"role": "assistant", "content": self._contents.pop(0)}
+        return AssistantMessage.from_text(self._contents.pop(0), stop_reason="stop")
+
+    # 流式调用入口：基于 complete 产出标准流式事件
+    def stream(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        msg = self.complete(context, options)
+        text = msg.text
+        yield StreamStart(partial=AssistantMessage())
+        if text:
+            yield TextStart(content_index=0, partial=AssistantMessage())
+            yield TextDelta(content_index=0, text=text, partial=msg)
+            yield TextEnd(content_index=0, text=text, partial=msg)
+        yield StreamDone(reason="stop", message=msg, usage=self.last_usage)
 
 
 # 测试同步沉淀核心：达阈值提炼长期记忆写盘、去重、更新索引并原子缩减活跃上下文
@@ -228,17 +264,18 @@ def test_assistant_app_auto_background_consolidation_and_context_shrinking(tmp_p
         app.wait_for_consolidation(timeout=5.0)
 
         assert "data/memory/preferences.md" in app.memory.read_memory_index()
-        assert app.status()["consolidation"]["last_result"]["compacted_messages"] == 4
+        assert app.status()["consolidation"]["last_result"]["compacted_messages"] == 4  # type: ignore[index]
 
-        # 第 4 轮验证上下文已缩减：单条 system 更新了索引并拼入前情摘要 + 仅保留第3轮 2 条原话 + 本轮提问
+        # 第 4 轮验证上下文已缩减：system 更新了索引并拼入前情摘要 + 仅保留第3轮 2 条原话 + 本轮提问
         r4 = app.chat("第4轮：现在还记得吗？", chat_id="auto-1")
         assert r4["reply"] == "答4"
-        turn4_msgs = chat_llm.requests[3]
-        assert turn4_msgs[0]["role"] == "system"
-        assert "data/memory/preferences.md" in str(turn4_msgs[0]["content"])
-        assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in str(turn4_msgs[0]["content"])
-        # 仅保留最近 2 条（第3轮一问一答）+ 本轮提问，零伪造承接对，第1/2轮原话已缩减掉
-        contents = [str(m["content"]) for m in turn4_msgs[1:]]
+        turn4_ctx = chat_llm.requests[3]
+        assert "data/memory/preferences.md" in turn4_ctx.system_prompt
+        assert "【本会话已压缩前情摘要】\n用户偏好简洁中文回答，正在开发 my-helper 助手。" in turn4_ctx.system_prompt
+        contents = [
+            m.content if isinstance(m, UserMessage) else (m.text if isinstance(m, AssistantMessage) else m.content)
+            for m in turn4_ctx.messages
+        ]
         assert contents == ["第3轮：继续推进", "答3", "第4轮：现在还记得吗？"]
         # 原始 SQLite 历史仍然完整保留全部 8 条消息
         assert app.state.count_messages("auto-1") == 8
@@ -284,7 +321,9 @@ def test_weekday_injected_consistently_in_system_prompt_and_consolidator(tmp_pat
         policy = ConsolidationPolicy(max_active_messages=2, keep_recent_messages=0, min_batch_messages=2)
         runner = MemoryConsolidator(state, memory, llm, policy=policy)
         runner.consolidate_once("s-day", today=monday)
-        assert "【当前日期】2026-11-16（星期一，北京时间）" in str(llm.requests[0][1]["content"])
+        first_msg = llm.requests[0].messages[0]
+        assert isinstance(first_msg, UserMessage)
+        assert "【当前日期】2026-11-16（星期一，北京时间）" in first_msg.content
     finally:
         state.close()
 
@@ -531,7 +570,9 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
         )
         res_day = cons_day.consolidate_once("s-turn-protect")
         assert res_day is not None
-        prompt_sent = str(cons_llm.requests[0][1]["content"])
+        first_msg = cons_llm.requests[0].messages[0]
+        assert isinstance(first_msg, UserMessage)
+        prompt_sent = first_msg.content
         assert "【当前日期】2025-03-15" in prompt_sent
         assert "(turn#deadbeef1234)" not in prompt_sent
         assert "前台尚未落库的在途事实" not in prompt_sent
@@ -557,26 +598,47 @@ def test_consolidator_batch_cap_today_fn_turn_tag_protection_and_backoff(tmp_pat
             state.append_turn("s-other", f"ou-{i}", f"oa-{i}")
 
         now_ts = [1000.0]
+
         # 记录并响应不同会话请求的受控模型：s-backoff 前两次失败、第三次成功；s-other 立即成功
-        class BackoffProbeLLM(LLMClient):
+        class BackoffProbeLLM:
+            last_usage: TokenUsage | None = None
+
             # 初始化状态计数器
             def __init__(self) -> None:
                 self.calls: list[str] = []
 
             # 根据批次内容决定抛错或返回合法 JSON
-            def respond(
+            def complete(
                 self,
-                messages: list[dict[str, object]],
-                tools: list[dict[str, object]] | None = None,
-            ) -> dict[str, object]:
-                content = str(messages[1]["content"])
+                context: Context,
+                options: StreamOptions | None = None,
+            ) -> AssistantMessage:
+                del options
+                first = context.messages[0]
+                assert isinstance(first, UserMessage)
+                content = first.content
                 if "bu-" in content:
                     self.calls.append("s-backoff")
                     if self.calls.count("s-backoff") <= 2:
                         raise RuntimeError("transient llm error")
-                    return {"role": "assistant", "content": json.dumps({"session_summary": "backoff recovered", "memories": []})}
+                    return AssistantMessage.from_text(
+                        json.dumps({"session_summary": "backoff recovered", "memories": []}),
+                        stop_reason="stop",
+                    )
                 self.calls.append("s-other")
-                return {"role": "assistant", "content": json.dumps({"session_summary": "other ok", "memories": []})}
+                return AssistantMessage.from_text(
+                    json.dumps({"session_summary": "other ok", "memories": []}),
+                    stop_reason="stop",
+                )
+
+            # 流式接口委派 complete
+            def stream(
+                self,
+                context: Context,
+                options: StreamOptions | None = None,
+            ) -> Iterator[AssistantMessageEvent]:
+                msg = self.complete(context, options)
+                yield StreamDone(reason="stop", message=msg)
 
         probe_llm = BackoffProbeLLM()
         bg = BackgroundConsolidator(

@@ -16,8 +16,7 @@ from evals.common import (
     parse_optional_date,
     resolve_eval_tools_config,
 )
-from personal_assistant.ai.cache import CallCacheRecord, summarize_records
-from personal_assistant.ai.client import LLMClient
+from personal_assistant.ai import CallCacheRecord, ModelInvoker, summarize_records
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 
@@ -42,7 +41,7 @@ def _make_today_fn(ref_day: date) -> Callable[[], date]:
 
 # 批量运行端到端 Agent 评测（逐题复用 AssistantApp 沙箱、逻辑日期与安全护栏），保存工具调用轨迹与回答
 def evaluate_agent(
-    llm: LLMClient,
+    llm: ModelInvoker,
     data_dir: Path,
     cases: list[dict[str, object]],
     *,

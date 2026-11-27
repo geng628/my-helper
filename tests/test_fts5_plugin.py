@@ -10,7 +10,7 @@ import pytest
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 from evals import main as eval_main
-from personal_assistant.ai import NoopLLMClient
+from personal_assistant.ai import NoopModelClient
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.agent.plugins import PluginManager
 
@@ -187,7 +187,7 @@ def test_app_and_eval_cli_integrate_fts5_plugin(tmp_path: Path) -> None:
         data_root=tmp_path / "app_data",
         config_path=repo_root / "config" / "tools.json",
         project_root=repo_root,
-        llm=NoopLLMClient(),
+        llm=NoopModelClient(),
     )
     try:
         status = app.status()

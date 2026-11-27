@@ -22,12 +22,14 @@ from personal_assistant.agent.tools import (
     ToolsetProvider,
     build_tool,
 )
-from personal_assistant.ai.client import (
-    LLMClient,
+from personal_assistant.ai import (
+    ApiProviderRegistry,
+    ModelInvoker,
+    ModelsConfig,
+    default_registry,
     from_env,
     from_model_profile,
 )
-from personal_assistant.ai.types import ModelsConfig
 from personal_assistant.assistant.common import (
     REPO_ROOT,
     atomic_write_text,
@@ -467,7 +469,14 @@ class ToolsConfig:
                 return preset
         return None
 
-    # 基于预编译或即时读取的 ModelsConfig、内置预设或环境变量统一构造 LLMClient
+    # 合并内建翻译器注册表与当前插件主板注册的 Slot 4 翻译器，返回独立隔离副本
+    def build_provider_registry(self) -> ApiProviderRegistry:
+        registry = default_registry().copy()
+        for provider in self.plugin_manager.providers.values():
+            registry.register(provider)
+        return registry
+
+    # 基于预编译或即时读取的 ModelsConfig、内置预设或环境变量统一构造 ModelInvoker
     def build_llm(
         self,
         config_dir: Path | None = None,
@@ -475,10 +484,10 @@ class ToolsConfig:
         model_name: str | None = None,
         env: Mapping[str, str] | None = None,
         models_cfg: ModelsConfig | None = None,
-    ) -> LLMClient:
+    ) -> ModelInvoker:
         clean_name = (model_name or "").strip() or None
         source_env = os.environ if env is None else env
-        providers = self.plugin_manager.providers
+        registry = self.build_provider_registry()
         resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
         if resolved_cfg is not None:
             target = clean_name
@@ -490,14 +499,14 @@ class ToolsConfig:
             return from_model_profile(
                 resolved_cfg.get_profile(target),
                 env=source_env,
-                providers=providers,
+                registry=registry,
             )
         if clean_name is None:
-            return from_env(source_env, providers=providers)
+            return from_env(source_env, registry=registry)
         merged = dict(source_env)
         preset = self._match_preset(clean_name)
         if preset is not None:
-            merged["LLM_PROVIDER"] = str(preset.get("provider") or "openai_compatible")
+            merged["LLM_API"] = str(preset.get("api") or "openai-completions")
             merged["LLM_MODEL"] = str(preset.get("default_model") or clean_name)
             if not merged.get("LLM_BASE_URL", "").strip() and preset.get("base_url"):
                 merged["LLM_BASE_URL"] = str(preset["base_url"])
@@ -505,18 +514,18 @@ class ToolsConfig:
                 merged["LLM_API_KEY"] = str(preset.get("id") or "local")
         else:
             merged["LLM_MODEL"] = clean_name
-        return from_env(merged, providers=providers)
+        return from_env(merged, registry=registry)
 
     # 按「显式参数 > ModelsConfig.roles['consolidator'] > 纯环境变量 LLM_CONSOLIDATOR_MODEL > 复用 fallback_llm」构造后台沉淀模型
     def build_consolidator_llm(
         self,
         config_dir: Path | None = None,
         *,
-        fallback_llm: LLMClient,
+        fallback_llm: ModelInvoker,
         model_name: str | None = None,
         env: Mapping[str, str] | None = None,
         models_cfg: ModelsConfig | None = None,
-    ) -> LLMClient:
+    ) -> ModelInvoker:
         clean_name = (model_name or "").strip() or None
         source_env = os.environ if env is None else env
         resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
@@ -533,7 +542,7 @@ class ToolsConfig:
                 return from_model_profile(
                     resolved_cfg.get_profile(role_target),
                     env=source_env,
-                    providers=self.plugin_manager.providers,
+                    registry=self.build_provider_registry(),
                 )
             return fallback_llm
         env_val = str(source_env.get("LLM_CONSOLIDATOR_MODEL") or "").strip()

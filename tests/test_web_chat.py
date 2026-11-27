@@ -1,7 +1,7 @@
 """本地网页对话脚本（scripts/web_chat.py）单元测试（TDD）。"""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 import http.client
 import io
 import json
@@ -15,23 +15,48 @@ from urllib.request import Request, urlopen
 import pytest
 
 from personal_assistant.assistant.app import AssistantApp
-from personal_assistant.ai import LLMClient, TokenUsage
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelInvoker,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+)
 from scripts.web_chat import create_web_server
 
 
-# 用于网页接口集成测试的脚本化假模型
-class WebTestLLM(LLMClient):
+# 用于网页接口集成测试的脚本化假模型（实现 ModelInvoker）
+class WebTestLLM:
     # 保存预设回复队列并初始化 last_usage
-    def __init__(self, responses: list[tuple[dict[str, object], TokenUsage | None]]) -> None:
+    def __init__(self, responses: list[tuple[AssistantMessage, TokenUsage | None]]) -> None:
         self._responses = list(responses)
         self.last_usage: TokenUsage | None = None
 
-    # 弹出下一条预设回复并更新 last_usage
-    def respond(
+    # 流式弹出下一条预设回复并更新 last_usage
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del context, options
+        reply, usage = self._responses.pop(0)
+        self.last_usage = usage
+        if reply.text:
+            yield TextDelta(content_index=0, text=reply.text, partial=reply)
+        reason = "toolUse" if reply.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=reply, usage=usage)
+
+    # 同步弹出下一条预设回复并更新 last_usage
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del context, options
         reply, usage = self._responses.pop(0)
         self.last_usage = usage
         return reply
@@ -55,21 +80,14 @@ def test_web_chat_server_end_to_end(tmp_path: Path) -> None:
     llm = WebTestLLM(
         [
             (
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_time",
-                            "type": "function",
-                            "function": {"name": "get_current_time", "arguments": "{}"},
-                        }
-                    ],
-                },
+                AssistantMessage(
+                    blocks=(ToolCall(id="call_time", name="get_current_time", arguments="{}"),),
+                    stop_reason="toolUse",
+                ),
                 TokenUsage(prompt_tokens=1000, cached_tokens=0, completion_tokens=20),
             ),
             (
-                {"role": "assistant", "content": "已通过工具查到当前时间。"},
+                AssistantMessage.from_text("已通过工具查到当前时间。", stop_reason="stop"),
                 TokenUsage(prompt_tokens=1100, cached_tokens=896, completion_tokens=25),
             ),
         ]
@@ -469,7 +487,7 @@ def _start_security_test_server(
     tmp_path: Path,
     *,
     host: str = "127.0.0.1",
-    llm: LLMClient | None = None,
+    llm: ModelInvoker | None = None,
 ) -> tuple[AssistantApp, Path, object, threading.Thread, str]:
     repo_root = Path(__file__).resolve().parent.parent
     cfg_dir = tmp_path / "config"
@@ -503,7 +521,7 @@ def _start_security_test_server(
 def test_web_chat_rejects_non_json_content_type_with_415(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    llm = WebTestLLM([({"role": "assistant", "content": "不应触发"}, None)])
+    llm = WebTestLLM([(AssistantMessage.from_text("不应触发", stop_reason="stop"), None)])
     app, cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
     try:
         for ct in (
@@ -563,7 +581,7 @@ def test_web_chat_rejects_non_json_content_type_with_415(tmp_path: Path, monkeyp
 def test_web_chat_blocks_cross_origin_and_cross_site_requests(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    llm = WebTestLLM([({"role": "assistant", "content": "同源正常响应"}, None)])
+    llm = WebTestLLM([(AssistantMessage.from_text("同源正常响应", stop_reason="stop"), None)])
     app, cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
     port = server.server_port
     try:
@@ -697,7 +715,7 @@ def test_web_chat_blocks_cross_origin_and_cross_site_requests(tmp_path: Path, mo
 
 # 测试 Host 头校验（防 DNS Rebinding）：拦截伪造域名、错误端口与缺失 Host，放行合法回环 Host
 def test_web_chat_enforces_host_header_against_dns_rebinding(tmp_path: Path) -> None:
-    llm = WebTestLLM([({"role": "assistant", "content": "Host 合法"}, None)])
+    llm = WebTestLLM([(AssistantMessage.from_text("Host 合法", stop_reason="stop"), None)])
     app, _cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
     port = server.server_port
     try:
@@ -868,7 +886,7 @@ def test_web_chat_security_headers_sse_closing_non_loopback_warn_and_bearer_auth
     # 1. 验证安全响应头（HTML 与 JSON）与 WebChatHandler.timeout == 30
     llm = WebTestLLM(
         [
-            ({"role": "assistant", "content": "ok"}, None),
+            (AssistantMessage.from_text("ok", stop_reason="stop"), None),
         ]
     )
     app, _cfg_dir, server, thread, base_url = _start_security_test_server(tmp_path, llm=llm)
@@ -905,41 +923,48 @@ def test_web_chat_security_headers_sse_closing_non_loopback_warn_and_bearer_auth
     second_chunk_gate = threading.Event()
 
     # 控制流式吐帧节奏：首帧后调用 remember_fact 暂存并在第二帧前等待门栓，随后恢复正常对话
-    class SlowDisconnectLLM(LLMClient):
+    class SlowDisconnectLLM:
+        last_usage: TokenUsage | None = None
+
         # 初始化脚本步数
         def __init__(self) -> None:
             self._step = 0
 
         # 同步响应入口（用于断连恢复后的下一轮对话）
-        def respond(
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            return {"role": "assistant", "content": "恢复后正常"}
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del context, options
+            return AssistantMessage.from_text("恢复后正常", stop_reason="stop")
 
         # 流式响应：第 1 步调 remember_fact，第 2 步先吐 1 帧后卡住等待客户端断开
-        def stream(self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None = None):
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del context, options
             self._step += 1
             if self._step == 1:
-                msg = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{"id": "c_rem", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}],
-                }
-                yield StreamDone(message=msg)
+                msg = AssistantMessage(
+                    blocks=(ToolCall(id="c_rem", name="remember_fact", arguments="{}"),),
+                    stop_reason="toolUse",
+                )
+                yield StreamDone(reason="toolUse", message=msg)
                 return
             if self._step == 2:
-                yield TextDelta(text="第一段")
+                yield TextDelta(content_index=0, text="第一段")
                 first_chunk_sent.set()
                 second_chunk_gate.wait(timeout=3.0)
-                yield TextDelta(text="第二段")
+                yield TextDelta(content_index=0, text="第二段")
                 time.sleep(0.05)
-                yield TextDelta(text="第三段")
-                yield StreamDone(message={"role": "assistant", "content": "第一段第二段第三段"})
+                yield TextDelta(content_index=0, text="第三段")
+                yield StreamDone(reason="stop", message=AssistantMessage.from_text("第一段第二段第三段", stop_reason="stop"))
                 return
-            yield TextDelta(text="恢复后正常")
-            yield StreamDone(message={"role": "assistant", "content": "恢复后正常"})
+            yield TextDelta(content_index=0, text="恢复后正常")
+            yield StreamDone(reason="stop", message=AssistantMessage.from_text("恢复后正常", stop_reason="stop"))
 
     sse_app = AssistantApp(data_root=tmp_path / "sse_data", llm=SlowDisconnectLLM())
     sse_srv = create_web_server(sse_app, host="127.0.0.1", port=0)

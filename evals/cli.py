@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from personal_assistant.ai.client import LLMClient, from_env
+from personal_assistant.ai import ModelInvoker, from_env
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import load_dotenv
 from personal_assistant.assistant.memory import MemoryStore
@@ -55,7 +55,7 @@ def _build_eval_llm(
     loaded_cfg: ToolsConfig | None,
     tools_cfg_path: Path,
     model_name: str | None = None,
-) -> LLMClient:
+) -> ModelInvoker:
     clean_name = (model_name or "").strip() or None
     if loaded_cfg is not None:
         return loaded_cfg.build_llm(tools_cfg_path.parent, model_name=clean_name)
@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             llm = _build_eval_llm(loaded_cfg, tools_cfg_path, args.model)
             cons_name = (args.consolidator_model or "").strip() or None
             if loaded_cfg is not None:
-                consolidator_llm: LLMClient | None = loaded_cfg.build_consolidator_llm(
+                consolidator_llm: ModelInvoker | None = loaded_cfg.build_consolidator_llm(
                     tools_cfg_path.parent,
                     fallback_llm=llm,
                     model_name=cons_name,
@@ -170,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 consolidator_llm = None
             judge_name = (args.judge_model or "").strip() or None
             if args.no_judge:
-                judge: LLMClient | None = None
+                judge: ModelInvoker | None = None
             elif judge_name is not None:
                 judge = _build_eval_llm(loaded_cfg, tools_cfg_path, judge_name)
             else:

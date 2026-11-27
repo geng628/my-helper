@@ -14,8 +14,14 @@ from statistics import mean
 from time import perf_counter
 from typing import TypeVar, cast
 
-from personal_assistant.ai.cache import CallCacheRecord, summarize_records
-from personal_assistant.ai.client import LLMClient, NoopLLMClient
+from personal_assistant.ai import (
+    CallCacheRecord,
+    Context,
+    ModelInvoker,
+    NoopModelClient,
+    UserMessage,
+    summarize_records,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import today_shanghai
@@ -141,28 +147,27 @@ def _normalize_tokens(text: str) -> set[str]:
 
 # 使用独立 LLM-as-a-Judge（或离线词面兜底）评判开放式问答的事实正确性与拒答表现
 def judge_answer(
-    judge_llm: LLMClient | None,
+    judge_llm: ModelInvoker | None,
     question: str,
     expected_answer: str,
     reply: str,
     *,
     is_abstention: bool = False,
 ) -> dict[str, object]:
-    if judge_llm is not None and not isinstance(judge_llm, NoopLLMClient):
+    if judge_llm is not None and not isinstance(judge_llm, NoopModelClient):
         payload = (
             f"Question: {question}\n"
             f"Reference Answer: {expected_answer}\n"
             f"is_abstention: {str(is_abstention).lower()}\n"
             f"Assistant Reply: {reply}"
         )
-        msg = judge_llm.respond(
-            [
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": payload},
-            ],
-            tools=None,
+        msg = judge_llm.complete(
+            Context(
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                messages=(UserMessage(content=payload),),
+            )
         )
-        raw_content = str(msg.get("content") or "")
+        raw_content = msg.text
         try:
             parsed = _parse_json_object(raw_content)
             correct = bool(parsed.get("correct"))
@@ -218,7 +223,7 @@ def _check_ask_assertions(
     step: dict[str, object],
     result: dict[str, object],
     *,
-    judge_llm: LLMClient | None = None,
+    judge_llm: ModelInvoker | None = None,
 ) -> tuple[list[str], dict[str, object] | None]:
     reasons: list[str] = []
     reply = str(result.get("reply") or "")
@@ -323,7 +328,7 @@ def _execute_steps(
     clock_day: list[date | None],
     current_today: Callable[[], date],
     *,
-    judge_llm: LLMClient | None = None,
+    judge_llm: ModelInvoker | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     step_logs: list[dict[str, object]] = []
     reasons: list[str] = []
@@ -445,15 +450,15 @@ def _execute_steps(
 def _run_eval_session(
     *,
     data_root: Path,
-    llm: LLMClient,
-    consolidator_llm: LLMClient | None,
+    llm: ModelInvoker,
+    consolidator_llm: ModelInvoker | None,
     cfg_path: Path | None,
     project_root: Path,
     tools_config: ToolsConfig | None,
     spec: dict[str, object],
     steps: list[dict[str, object]],
     base_data_dir: Path | None = None,
-    judge_llm: LLMClient | None = None,
+    judge_llm: ModelInvoker | None = None,
 ) -> tuple[list[dict[str, object]], list[str], list[CallCacheRecord], dict[str, object], str | None]:
     policy = _build_policy(spec.get("policy"))
     clock_day: list[date | None] = [parse_optional_date(spec.get("today"))]
@@ -511,7 +516,7 @@ def _run_eval_session(
 
 # 为共享长记忆组执行一次前置历史注入与沉淀，产出可供多道 QA 并发拷贝复用的基准目录快照
 def _build_shared_setup(
-    llm: LLMClient,
+    llm: ModelInvoker,
     group_id: str,
     setup_spec: dict[str, object],
     base_data_dir: Path,
@@ -519,7 +524,7 @@ def _build_shared_setup(
     project_root: Path,
     *,
     tools_config: ToolsConfig | None = None,
-    consolidator_llm: LLMClient | None = None,
+    consolidator_llm: ModelInvoker | None = None,
 ) -> tuple[dict[str, object], list[CallCacheRecord]]:
     steps = list(setup_spec.get("steps") or [])
     t0 = perf_counter()
@@ -551,14 +556,14 @@ def _build_shared_setup(
 
 # 在完全隔离的临时目录中执行单个端到端记忆场景（支持从共享沉淀快照拷贝初始状态，并隔离单题运行时异常）
 def _run_single_scenario(
-    llm: LLMClient,
+    llm: ModelInvoker,
     scenario: dict[str, object],
     cfg_path: Path | None,
     project_root: Path,
     *,
     tools_config: ToolsConfig | None = None,
-    consolidator_llm: LLMClient | None = None,
-    judge_llm: LLMClient | None = None,
+    consolidator_llm: ModelInvoker | None = None,
+    judge_llm: ModelInvoker | None = None,
     base_data_dir: Path | None = None,
     steps_override: list[dict[str, object]] | None = None,
     setup_error: str | None = None,
@@ -675,13 +680,13 @@ def _run_ordered_jobs(
 
 # 批量运行端到端记忆与生命周期评测（默认 workers=1 串行；workers>1 使用线程池并发独立场景并按输入序汇总）
 def evaluate_memory(
-    llm: LLMClient,
+    llm: ModelInvoker,
     scenarios: list[dict[str, object]],
     *,
     config_path: Path | None = None,
     tools_config: ToolsConfig | None = None,
-    consolidator_llm: LLMClient | None = None,
-    judge_llm: LLMClient | None = None,
+    consolidator_llm: ModelInvoker | None = None,
+    judge_llm: ModelInvoker | None = None,
     git_commit: str | None = None,
     workers: int = 1,
     on_progress: ProgressCallback | None = None,
@@ -797,7 +802,7 @@ def evaluate_memory(
             loaded_cfg.plugin_manager.terminate_all()
 
     effective_judge = judge_llm
-    use_judge = effective_judge is not None and not isinstance(effective_judge, NoopLLMClient)
+    use_judge = effective_judge is not None and not isinstance(effective_judge, NoopModelClient)
     judge_meta: dict[str, object] = {
         "enabled": use_judge,
         "model": (

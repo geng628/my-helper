@@ -1,4 +1,4 @@
-"""pytest 全局测试夹具：隔离宿主机环境变量、仓库根目录 .env / models.dsl 与全局 Provider 注册表。"""
+"""pytest 全局测试夹具：隔离宿主机环境变量、仓库根目录 .env / models.dsl 与全局默认协议注册表。"""
 from __future__ import annotations
 
 import os
@@ -8,17 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from personal_assistant.ai import client as client_mod
+from personal_assistant.ai import default_registry
 from personal_assistant.assistant import commands as commands_mod
 from personal_assistant.assistant import common as common_mod
 
 _HOST_ENV_VARS = (
     "LLM_MODE",
+    "LLM_API",
     "LLM_API_KEY",
     "LLM_BASE_URL",
     "LLM_MODEL",
-    "LLM_PROVIDER",
     "LLM_TEMPERATURE",
+    "LLM_MAX_TOKENS",
+    "LLM_REASONING",
+    "LLM_CACHE_RETENTION",
     "LLM_CONSOLIDATOR_MODEL",
     "TAVILY_API_KEY",
     "BRAVE_API_KEY",
@@ -35,11 +38,11 @@ _REPO_DOTENV = (_REAL_REPO_ROOT / ".env").resolve()
 _REPO_CONFIG_DIR = (_REAL_REPO_ROOT / "config").resolve()
 
 
-# 统一在每个用例前后隔离宿主机环境变量、仓库根目录 .env / models.dsl 与全局 _PROVIDERS 注册表
+# 统一在每个用例前后隔离宿主机环境变量、仓库根目录 .env / models.dsl 与全局默认 ApiProviderRegistry
 @pytest.fixture(autouse=True)
 def isolate_host_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    orig_providers_dict = client_mod._PROVIDERS
-    saved_providers = dict(orig_providers_dict)
+    reg = default_registry()
+    saved_providers = reg.snapshot()
 
     for var in _HOST_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -85,5 +88,4 @@ def isolate_host_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     finally:
         for var in _HOST_ENV_VARS:
             os.environ.pop(var, None)
-        orig_providers_dict.clear()
-        orig_providers_dict.update(saved_providers)
+        reg.restore(saved_providers)

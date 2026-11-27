@@ -2,34 +2,63 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    UserMessage,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.consolidator import ConsolidationPolicy, MemoryConsolidator
 from personal_assistant.assistant.db import StateStore
-from personal_assistant.ai import LLMClient
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.assistant.memory_lifecycle import is_line_expired
 
 
-# 录制每次请求的预设回复模型，用于验证沉淀器传给模型的上下文内容
-class CapturingLLM(LLMClient):
+# 录制每次请求的预设回复模型，用于验证沉淀器传给模型的上下文内容（实现 ModelInvoker）
+class CapturingLLM:
     # 保存预设回复并初始化请求记录
     def __init__(self, contents: list[str]) -> None:
         self._contents = list(contents)
-        self.requests: list[list[dict[str, object]]] = []
+        self.requests: list[Context] = []
+        self.last_usage: TokenUsage | None = None
 
-    # 记录请求列表并弹出下一条预设回复
-    def respond(
+    # 记录请求 Context 并弹出下一条预设回复
+    def complete(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        self.requests.append([dict(m) for m in messages])
-        return {"role": "assistant", "content": self._contents.pop(0)}
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del options
+        self.requests.append(
+            Context(
+                system_prompt=context.system_prompt,
+                messages=tuple(context.messages),
+                tools=tuple(context.tools),
+            )
+        )
+        return AssistantMessage.from_text(self._contents.pop(0), stop_reason="stop")
+
+    # 流式入口委派 complete
+    def stream(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        msg = self.complete(context, options)
+        if msg.text:
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+        yield StreamDone(reason="stop", message=msg)
 
 
 # 测试写入期冲突消解：在极短文件上原地 replace、remove、跳过已过期新增以及拦截保留主题名
@@ -206,7 +235,9 @@ def test_consolidator_reads_existing_topics_resolves_conflicts_and_sets_expiry(t
         assert result is not None
 
         # 验证沉淀器确实把当前日期与已有 projects.md 正文喂给了模型，支持读旧改旧
-        prompt_user = str(llm.requests[0][1]["content"])
+        first_msg = llm.requests[0].messages[0]
+        assert isinstance(first_msg, UserMessage)
+        prompt_user = first_msg.content
         assert "2026-11-20" in prompt_user
         assert "极光后端端口定为 9091" in prompt_user
 

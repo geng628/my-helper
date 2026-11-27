@@ -21,16 +21,26 @@ from personal_assistant.agent.react import (
     iter_react,
 )
 from personal_assistant.agent.tools import ToolRegistry
-from personal_assistant.ai.cache import CacheMonitor
-from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient
-from personal_assistant.ai.types import (
-    LLMStreamEvent,
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    CacheMonitor,
+    Context,
+    LLMNotConfigured,
+    Message,
+    ModelInvoker,
     ModelsConfig,
+    NoopModelClient,
     StreamDone,
+    StreamError,
+    StreamOptions,
+    StreamStart,
     TextDelta,
+    TextEnd,
+    TextStart,
     ThinkingDelta,
     TokenUsage,
-    extract_tool_calls,
+    UserMessage,
 )
 from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
 from personal_assistant.assistant.commands import ToolsConfig
@@ -79,18 +89,6 @@ def _canonical_tool_args(raw_arguments: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-# 检查助手消息的 tool_calls 参数是否为非法/截断 JSON（用于 finish_reason == "length" 熔断判定）
-def _has_truncated_tool_call_json(message: Mapping[str, object]) -> bool:
-    for call in extract_tool_calls(message):
-        try:
-            parsed = json.loads(call.arguments or "{}")
-        except (json.JSONDecodeError, TypeError):
-            return True
-        if not isinstance(parsed, dict):
-            return True
-    return False
-
-
 # 当未压缩活跃消息超出常规滑窗上限时，在字符与条数总预算内自适应保留更早消息，防止沉淀滞后静默丢上下文
 def _select_adaptive_history(
     active_all: list[dict[str, object]],
@@ -115,12 +113,12 @@ def _select_adaptive_history(
     return selected_rev
 
 
-# 外层回合预算护栏包装器：在零改动 Layer 2 微内核的前提下执行步数、Token、墙钟与死循环熔断并优雅收束
-class _GuardedTurnLLM(LLMClient):
-    # 绑定底层 LLMClient、预算上限与单调时钟
+# 外层回合预算护栏包装器（实现 ModelInvoker）：在零改动 Layer 2 微内核的前提下执行步数/Token/墙钟/重复/截断熔断
+class _GuardedTurnLLM:
+    # 绑定底层 ModelInvoker、预算上限与单调时钟
     def __init__(
         self,
-        inner: LLMClient,
+        inner: ModelInvoker,
         *,
         max_steps: int,
         max_tokens: int,
@@ -152,7 +150,7 @@ class _GuardedTurnLLM(LLMClient):
             self.last_tool_sig = sig
             self.repeat_streak = 1
 
-    # 进入新一轮模型推理前核查四大预算护栏，命中任一阈值即返回 TurnBudgetExceeded
+    # 进入新一轮模型推理前核查预算护栏，命中任一阈值即返回 TurnBudgetExceeded
     def _check_budget(self) -> TurnBudgetExceeded | None:
         if self.steps >= self._max_steps:
             return TurnBudgetExceeded("max_steps", f"推理步数达到上限 {self._max_steps}")
@@ -170,18 +168,23 @@ class _GuardedTurnLLM(LLMClient):
             )
         return None
 
-    # 构造不带 tool_calls 的优雅降级收束消息，使 iter_react 自然退出并释放会话锁
+    # 构造不带工具调用的优雅降级收束 AssistantMessage，使 iter_react 自然退出并释放会话锁
     @staticmethod
-    def _fallback_message(breach: TurnBudgetExceeded) -> dict[str, object]:
-        return {
-            "role": "assistant",
-            "content": (
+    def _fallback_message(
+        breach: TurnBudgetExceeded,
+        *,
+        usage: TokenUsage | None = None,
+    ) -> AssistantMessage:
+        return AssistantMessage.from_text(
+            (
                 f"抱歉，本轮工具调用达到安全预算上限（原因：{breach.reason}），"
                 "已自动停止继续重试。请缩小问题范围或重试。"
             ),
-        }
+            stop_reason="stop",
+            usage=usage,
+        )
 
-    # 累加单次响应 TokenUsage（未触发熔断时同步 last_usage）
+    # 累加单次响应 TokenUsage 并同步 last_usage
     def _record_usage(self, usage: object) -> None:
         if isinstance(usage, TokenUsage):
             self.total_tokens += usage.prompt_tokens + usage.completion_tokens
@@ -189,72 +192,113 @@ class _GuardedTurnLLM(LLMClient):
         else:
             self.last_usage = None
 
-    # 同步调用前执行预算核查，触发熔断时不再请求远端并直接返回收束答复
-    def respond(
-        self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        breach = self._check_budget()
-        if breach is not None:
-            self.breach = breach
-            self.last_usage = None
-            return self._fallback_message(breach)
-        self.steps += 1
-        self.last_usage = None
-        msg = self._inner.respond(messages, tools)
-        self._record_usage(self._inner.last_usage)
-        return msg
-
-    # 流式调用前执行预算核查，触发熔断时吐出降级文本与无 tool_calls 的 StreamDone 使循环自然退出
+    # 流式调用前执行预算核查；检测到 length 截断且含破损工具 JSON 时立即就地熔断收束
     def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> Iterator[LLMStreamEvent]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
         breach = self._check_budget()
         if breach is not None:
             self.breach = breach
             self.last_usage = None
             fallback_msg = self._fallback_message(breach)
-            fallback_text = str(fallback_msg["content"])
-            yield TextDelta(text=fallback_text)
-            yield StreamDone(message=fallback_msg, usage=None, ttft_ms=None, latency_ms=0.0)
+            fallback_text = fallback_msg.text
+            yield StreamStart(partial=AssistantMessage())
+            yield TextStart(content_index=0, partial=AssistantMessage())
+            yield TextDelta(content_index=0, text=fallback_text, partial=fallback_msg)
+            yield TextEnd(content_index=0, text=fallback_text, partial=fallback_msg)
+            yield StreamDone(reason="stop", message=fallback_msg, usage=None, ttft_ms=None, latency_ms=0.0)
             return
+
         self.steps += 1
         self.last_usage = None
-        for event in self._inner.stream(messages, tools):
-            if isinstance(event, StreamDone):
-                usage = event.usage if isinstance(event.usage, TokenUsage) else self._inner.last_usage
-                self._record_usage(usage)
-                if event.finish_reason == "length" and _has_truncated_tool_call_json(event.message):
-                    self.truncated_tool_call = True
-            yield event
+        raw_iter = self._inner.stream(context, options)
+        try:
+            for event in raw_iter:
+                if isinstance(event, StreamError):
+                    self.last_usage = None
+                    yield event
+                    return
+                if isinstance(event, StreamDone):
+                    usage = event.usage if isinstance(event.usage, TokenUsage) else self._inner.last_usage
+                    self._record_usage(usage)
+                    if event.reason == "length" and event.message.tool_calls:
+                        self.truncated_tool_call = True
+                        trunc_breach = TurnBudgetExceeded(
+                            "truncated_tool_calls",
+                            "模型输出因长度上限截断导致工具参数 JSON 不完整",
+                        )
+                        self.breach = trunc_breach
+                        fallback_msg = self._fallback_message(trunc_breach, usage=usage)
+                        fallback_text = fallback_msg.text
+                        c_idx = len(event.message.blocks)
+                        yield TextStart(content_index=c_idx, partial=event.message)
+                        yield TextDelta(content_index=c_idx, text=fallback_text, partial=fallback_msg)
+                        yield TextEnd(content_index=c_idx, text=fallback_text, partial=fallback_msg)
+                        yield StreamDone(
+                            reason="stop",
+                            message=fallback_msg,
+                            usage=usage,
+                            ttft_ms=event.ttft_ms,
+                            latency_ms=event.latency_ms,
+                        )
+                        return
+                yield event
+        finally:
+            close_fn = getattr(raw_iter, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    # 同步调用入口：确定性消费 self.stream() 并返回最终 AssistantMessage
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        event_iter = self.stream(context, options)
+        try:
+            for event in event_iter:
+                if isinstance(event, StreamError):
+                    raise RuntimeError(event.error_message)
+                if isinstance(event, StreamDone):
+                    return event.message
+        finally:
+            close_fn = getattr(event_iter, "close", None)
+            if callable(close_fn):
+                close_fn()
+        raise RuntimeError("模型流式响应异常终止，未收到 StreamDone 事件。")
 
 
-# 向消息列表追加对话消息，遇到连续同角色（不含 tool_calls/reasoning_content）时安全合并以防推理模型报错
+# 向中立消息列表追加对话消息，遇到连续同角色纯文本消息时安全合并以防严格交替协议报错
 def _append_alternating_message(
-    messages: list[dict[str, object]],
-    message: dict[str, object],
+    messages: list[Message],
+    message: Message,
 ) -> None:
-    role = str(message.get("role") or "")
-    if (
-        messages
-        and role in {"user", "assistant"}
-        and messages[-1].get("role") == role
-        and "tool_calls" not in messages[-1]
-        and "tool_calls" not in message
-        and "reasoning_content" not in messages[-1]
-        and "reasoning_content" not in message
-    ):
-        prev_content = str(messages[-1].get("content") or "")
-        curr_content = str(message.get("content") or "")
+    if not messages:
+        messages.append(message)
+        return
+    prev = messages[-1]
+    if isinstance(prev, UserMessage) and isinstance(message, UserMessage):
         merged = (
-            f"{prev_content}\n\n{curr_content}"
-            if (prev_content and curr_content)
-            else (prev_content or curr_content)
+            f"{prev.content}\n\n{message.content}"
+            if (prev.content and message.content)
+            else (prev.content or message.content)
         )
-        messages[-1] = {**messages[-1], "content": merged}
+        messages[-1] = UserMessage(content=merged)
+        return
+    if (
+        isinstance(prev, AssistantMessage)
+        and isinstance(message, AssistantMessage)
+        and not prev.tool_calls
+        and not message.tool_calls
+        and not prev.thinking
+        and not message.thinking
+    ):
+        prev_text = prev.text
+        curr_text = message.text
+        merged = f"{prev_text}\n\n{curr_text}" if (prev_text and curr_text) else (prev_text or curr_text)
+        messages[-1] = AssistantMessage.from_text(merged)
         return
     messages.append(message)
 
@@ -269,11 +313,11 @@ class AssistantApp:
         config_path: Path | None = None,
         project_root: Path | None = None,
         tools_config: ToolsConfig | None = None,
-        llm: LLMClient | None = None,
+        llm: ModelInvoker | None = None,
         memory: MemoryStore | None = None,
         state: StateStore | None = None,
         consolidation_policy: ConsolidationPolicy | None = None,
-        consolidator_llm: LLMClient | None = None,
+        consolidator_llm: ModelInvoker | None = None,
         auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
@@ -407,10 +451,10 @@ class AssistantApp:
         return {
             "presets": self.model_presets(),
             "configured": cfg.redacted_dict() if cfg is not None else None,
-            "llm_configured": not isinstance(self.llm, NoopLLMClient),
+            "llm_configured": not isinstance(self.llm, NoopModelClient),
         }
 
-    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 LLMClient（单次编译，失败零污染）
+    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 ModelInvoker（单次编译，失败零污染）
     def reload_llm(
         self,
         model_name: str | None = None,
@@ -566,10 +610,10 @@ class AssistantApp:
                     else:
                         self._chat_locks[chat_id] = (lock, new_refs)
 
-    # 将持久化历史转换为标准追加式消息列表，安全合并异常连续同角色消息，保持前缀字节级稳定以命中 KV Cache
+    # 将持久化历史转换为中立追加式消息列表，安全合并异常连续同角色消息，保持前缀字节级稳定以命中 KV Cache
     @staticmethod
-    def _build_history_messages(history: list[dict[str, object]]) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
+    def _build_history_messages(history: list[dict[str, object]]) -> list[Message]:
+        result: list[Message] = []
         for msg in history:
             role = str(msg.get("role") or "")
             if role not in {"user", "assistant"}:
@@ -577,26 +621,35 @@ class AssistantApp:
             content = str(msg.get("content") or "")
             if len(content) > MAX_HISTORY_ITEM_CHARS:
                 content = content[:MAX_HISTORY_ITEM_CHARS] + "…"
-            _append_alternating_message(result, {"role": role, "content": content})
+            item: Message = (
+                UserMessage(content=content)
+                if role == "user"
+                else AssistantMessage.from_text(content)
+            )
+            _append_alternating_message(result, item)
         return result
 
-    # 组装单条稳定 system 消息（按需尾部拼入已压缩前情摘要）与严格交替的历史及当前提问
-    def _assemble_context_messages(
+    # 组装中立 Context（稳定 system_prompt + 按需拼入前情摘要 + 严格交替历史与当前提问 + 中立工具签名）
+    def _assemble_context(
         self,
         system_prompt: str,
         summary_text: str,
         history: list[dict[str, object]],
         clean_text: str,
-    ) -> list[dict[str, object]]:
+        registry: ToolRegistry,
+    ) -> Context:
         effective_system = (
             f"{system_prompt}\n\n【本会话已压缩前情摘要】\n{summary_text}"
             if summary_text
             else system_prompt
         )
-        messages: list[dict[str, object]] = [{"role": "system", "content": effective_system}]
-        messages.extend(self._build_history_messages(history))
-        _append_alternating_message(messages, {"role": "user", "content": clean_text})
-        return messages
+        messages: list[Message] = self._build_history_messages(history)
+        _append_alternating_message(messages, UserMessage(content=clean_text))
+        return Context(
+            system_prompt=effective_system,
+            messages=tuple(messages),
+            tools=registry.schemas(),
+        )
 
     # 每个自然日首次对话时先执行过期归档，归档成功后再更新日期游标并清理过时会话冻结提示词
     def _maybe_archive_expired(self) -> None:
@@ -630,7 +683,7 @@ class AssistantApp:
             raise ValueError("消息内容不能为空。")
         with self._llm_lock:
             active_llm = self.llm
-        if isinstance(active_llm, NoopLLMClient):
+        if isinstance(active_llm, NoopModelClient):
             raise LLMNotConfigured(
                 "未配置真实大模型（LLM_MODE!=on）。请运行 `uv run python -m personal_assistant setup` 或配置 API Key。"
             )
@@ -670,8 +723,8 @@ class AssistantApp:
                 }
                 system_prompt = self.get_session_system_prompt(chat_id, registry)
                 summary_text = str(compaction.get("summary") or "").strip()
-                messages = self._assemble_context_messages(
-                    system_prompt, summary_text, history, clean_text
+                context = self._assemble_context(
+                    system_prompt, summary_text, history, clean_text, registry
                 )
 
                 traces: list[dict[str, object]] = []
@@ -689,48 +742,53 @@ class AssistantApp:
                     max_repeated_tool_calls=self.max_repeated_tool_calls,
                     clock=self._clock,
                 )
-                for event in iter_react(
-                    guarded_llm,
-                    messages,
-                    registry,
-                    convert_to_llm=None,
-                    tool_context=turn_ctx,
-                ):
-                    if isinstance(event, ToolStart):
-                        meta = registry.metadata(event.tool)
-                        if meta is not None and meta.risk == "network":
-                            turn_ctx["untrusted_tool_seen"] = True
-                        if event.tool == "remember_fact":
-                            fact_used = True
-                        guarded_llm.observe_tool_call(event.tool, event.arguments)
-                    self._emit_event(chat_id, event)
-                    if on_event is not None:
-                        on_event(event)
-                    if isinstance(event, ThinkingDelta) and event.text:
-                        thinking_parts.append(event.text)
-                        yield {"type": "thinking_delta", "text": event.text}
-                    elif isinstance(event, ToolStart):
-                        yield {
-                            "type": "tool_start",
-                            "tool": event.tool,
-                            "arguments": event.arguments,
-                            "call_id": event.call_id,
-                        }
-                    elif isinstance(event, TextDelta):
-                        yield {"type": "text_delta", "text": event.text}
-                    elif isinstance(event, ToolStep):
-                        step_dict: dict[str, object] = {
-                            "tool": event.tool,
-                            "arguments": event.arguments,
-                            "observation": event.observation,
-                            "call_id": event.call_id,
-                            "duration_ms": event.duration_ms,
-                        }
-                        traces.append(step_dict)
-                        yield {"type": "tool_step", **step_dict}
-                    elif isinstance(event, TurnEnd):
-                        turn_ended = True
-                        reply = event.reply
+                with closing(
+                    iter_react(
+                        guarded_llm,
+                        context,
+                        registry,
+                        convert_to_llm=None,
+                        tool_context=turn_ctx,
+                    )
+                ) as react_events:
+                    for event in react_events:
+                        if isinstance(event, ToolStart):
+                            meta = registry.metadata(event.tool)
+                            if meta is not None and meta.risk == "network":
+                                turn_ctx["untrusted_tool_seen"] = True
+                            if event.tool == "remember_fact":
+                                fact_used = True
+                            guarded_llm.observe_tool_call(event.tool, event.arguments)
+                        self._emit_event(chat_id, event)
+                        if on_event is not None:
+                            on_event(event)
+                        if isinstance(event, StreamError):
+                            raise RuntimeError(event.error_message)
+                        if isinstance(event, ThinkingDelta) and event.text:
+                            thinking_parts.append(event.text)
+                            yield {"type": "thinking_delta", "text": event.text}
+                        elif isinstance(event, ToolStart):
+                            yield {
+                                "type": "tool_start",
+                                "tool": event.tool,
+                                "arguments": event.arguments,
+                                "call_id": event.call_id,
+                            }
+                        elif isinstance(event, TextDelta) and event.text:
+                            yield {"type": "text_delta", "text": event.text}
+                        elif isinstance(event, ToolStep):
+                            step_dict: dict[str, object] = {
+                                "tool": event.tool,
+                                "arguments": event.arguments,
+                                "observation": event.observation,
+                                "call_id": event.call_id,
+                                "duration_ms": event.duration_ms,
+                            }
+                            traces.append(step_dict)
+                            yield {"type": "tool_step", **step_dict}
+                        elif isinstance(event, TurnEnd):
+                            turn_ended = True
+                            reply = event.reply
 
                 user_msg_id, assistant_msg_id = self.state.append_turn(chat_id, clean_text, reply)
                 turn_persisted = True
@@ -810,7 +868,7 @@ class AssistantApp:
     def status(self) -> dict[str, object]:
         return {
             "status": "ok",
-            "llm_configured": not isinstance(self.llm, NoopLLMClient),
+            "llm_configured": not isinstance(self.llm, NoopModelClient),
             "memory_files": self.memory.count_files(),
             "messages": self.state.count_messages(),
             "tools": self._tool_registry.names,
@@ -827,7 +885,7 @@ class AssistantApp:
 def build_app(
     data_root: Path | None = None,
     config_root: Path | None = None,
-    llm: LLMClient | None = None,
+    llm: ModelInvoker | None = None,
     *,
     project_root: Path | None = None,
     model_name: str | None = None,

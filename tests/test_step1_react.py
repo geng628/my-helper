@@ -1,21 +1,40 @@
-"""Unit tests for Step 1: minimal ReAct loop, ToolRegistry, and LLM client."""
+"""Unit tests for Step 1: minimal ReAct loop, ToolRegistry, and neutral ModelInvoker."""
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 
 import pytest
 
-from personal_assistant.ai import (
-    LLMClient,
-    LLMNotConfigured,
-    NoopLLMClient,
-    OpenAICompatibleLLM,
-    ToolCall,
-    extract_tool_calls,
-    from_env,
-)
 from personal_assistant.agent.react import ToolStart, ToolStep, TurnEnd, iter_react, run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
+from personal_assistant.ai import (
+    ApiProviderRegistry,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    LLMNotConfigured,
+    ModelClient,
+    ModelProfile,
+    NoopModelClient,
+    OpenAICompletionsProvider,
+    StreamDone,
+    StreamError,
+    StreamOptions,
+    StreamStart,
+    TextBlock,
+    TextDelta,
+    TextEnd,
+    TextStart,
+    ThinkingBlock,
+    TokenUsage,
+    ToolCall,
+    ToolCallEnd,
+    ToolCallStart,
+    ToolResultMessage,
+    UserMessage,
+    from_env,
+)
 
 
 # 构造纯内存演示工具注册表，确保 Layer 1/2 单元测试与 Layer 3 cli.py 零反向耦合
@@ -30,53 +49,90 @@ def _demo_tools() -> ToolRegistry:
     )
 
 
-# 测试用确定性脚本模拟模型
-class ScriptedLLM(LLMClient):
-    """Deterministic fake LLM that snapshots every request and replays scripted replies."""
+# 测试用确定性脚本模拟模型（实现 ModelInvoker 协议）
+class ScriptedLLM:
+    """Deterministic fake ModelInvoker that snapshots every Context and replays scripted replies."""
 
     # 初始化预设响应序列与请求记录列表
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
-        self.requests: list[tuple[list[dict[str, object]], list[dict[str, object]] | None]] = []
+        self.requests: list[Context] = []
+        self.last_usage: TokenUsage | None = None
 
-    # 记录请求快照并弹出下一条预设响应
-    def respond(
+    # 记录请求 Context 快照并按统一事件流回放下一条预设 AssistantMessage
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        self.requests.append(([dict(msg) for msg in messages], tools))
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del options
+        self.requests.append(
+            Context(
+                system_prompt=context.system_prompt,
+                messages=tuple(context.messages),
+                tools=tuple(context.tools),
+            )
+        )
         if not self._responses:
             raise AssertionError("ScriptedLLM ran out of scripted responses")
-        return self._responses.pop(0)
+        msg = self._responses.pop(0)
+        self.last_usage = msg.usage
+        yield StreamStart(partial=AssistantMessage())
+        for idx, block in enumerate(msg.blocks):
+            if isinstance(block, TextBlock):
+                yield TextStart(content_index=idx, partial=AssistantMessage())
+                yield TextDelta(content_index=idx, text=block.text, partial=msg)
+                yield TextEnd(content_index=idx, text=block.text, partial=msg)
+            elif isinstance(block, ToolCall):
+                yield ToolCallStart(content_index=idx, call_id=block.id, name=block.name, partial=msg)
+                yield ToolCallEnd(content_index=idx, tool_call=block, partial=msg)
+        reason = "toolUse" if msg.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=msg, usage=msg.usage)
+
+    # 同步返回下一条预设响应
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        for ev in self.stream(context, options):
+            if isinstance(ev, StreamDone):
+                return ev.message
+        raise AssertionError("ScriptedLLM did not emit StreamDone")
 
 
-# 构造标准 OpenAI 格式工具调用字典
-def _tool_call(call_id: str, name: str, arguments: str) -> dict[str, object]:
-    return {
-        "id": call_id,
-        "type": "function",
-        "function": {"name": name, "arguments": arguments},
-    }
+# 构造仅含单个或多个工具调用的中立 AssistantMessage
+def _tool_msg(*calls: ToolCall, thinking: str = "") -> AssistantMessage:
+    blocks: list[ThinkingBlock | ToolCall] = []
+    if thinking:
+        blocks.append(ThinkingBlock(text=thinking))
+    blocks.extend(calls)
+    return AssistantMessage(blocks=tuple(blocks), stop_reason="toolUse")
 
 
-# 测试无工具调用时直接返回文本并拒绝已废弃的旧参数 on_step
+# 测试无工具调用时直接返回文本、TurnEnd 携带完整轨迹并拒绝已废弃旧参数 on_step
 def test_direct_answer_without_tool_calls() -> None:
-    llm = ScriptedLLM([{"role": "assistant", "content": "你好，有什么可以帮你？"}])
-    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "你好"}]
+    llm = ScriptedLLM([AssistantMessage.from_text("你好，有什么可以帮你？", stop_reason="stop")])
+    ctx = Context(system_prompt="sys", messages=(UserMessage("你好"),))
 
     with pytest.raises(TypeError):
-        run_react(llm, messages, _demo_tools(), on_step=lambda *_: None)  # type: ignore[call-arg]
+        run_react(llm, ctx, _demo_tools(), on_step=lambda *_: None)  # type: ignore[call-arg]
 
-    reply = run_react(llm, messages, _demo_tools())
+    ends: list[TurnEnd] = []
+    reply = run_react(
+        llm,
+        ctx,
+        _demo_tools(),
+        on_event=lambda ev: ends.append(ev) if isinstance(ev, TurnEnd) else None,
+    )
 
     assert reply == "你好，有什么可以帮你？"
     assert len(llm.requests) == 1
-    assert llm.requests[0][1] is not None
-    assert messages[-1] == {"role": "assistant", "content": "你好，有什么可以帮你？"}
+    assert len(llm.requests[0].tools) == 1
+    assert ends and ends[0].messages[-1] == AssistantMessage.from_text("你好，有什么可以帮你？", stop_reason="stop")
 
 
-# 测试单步工具调用 ReAct 循环与 ToolStep 耗时采集
+# 测试单步工具调用 ReAct 循环与 ToolStep 耗时采集及中立 ToolResultMessage 回传
 def test_single_step_react_loop() -> None:
     steps: list[ToolStep] = []
     tools = ToolRegistry(
@@ -89,19 +145,15 @@ def test_single_step_react_loop() -> None:
     )
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("call_1", "lookup_weather", '{"city": "上海"}')],
-            },
-            {"role": "assistant", "content": "上海今天晴，气温 22°C。"},
+            _tool_msg(ToolCall(id="call_1", name="lookup_weather", arguments='{"city": "上海"}')),
+            AssistantMessage.from_text("上海今天晴，气温 22°C。", stop_reason="stop"),
         ]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "上海今天天气怎么样？"}]
+    ctx = Context(messages=(UserMessage("上海今天天气怎么样？"),))
 
     reply = run_react(
         llm,
-        messages,
+        ctx,
         tools,
         on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
@@ -111,12 +163,13 @@ def test_single_step_react_loop() -> None:
         ("lookup_weather", '{"city": "上海"}', "上海：晴，22°C")
     ]
     assert steps[0].duration_ms >= 0.0
-    second_msgs = llm.requests[1][0]
-    assert second_msgs[-1] == {
-        "role": "tool",
-        "tool_call_id": "call_1",
-        "content": "上海：晴，22°C",
-    }
+    second_msgs = llm.requests[1].messages
+    assert second_msgs[-1] == ToolResultMessage(
+        tool_call_id="call_1",
+        tool_name="lookup_weather",
+        content="上海：晴，22°C",
+        is_error=False,
+    )
 
 
 # 测试多步链式工具调用 ReAct 循环
@@ -138,24 +191,16 @@ def test_multi_step_chained_react_loop() -> None:
     )
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("c1", "find_note", '{"topic": "spinlock"}')],
-            },
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("c2", "read_file", '{"path": "notes/spinlock.md"}')],
-            },
-            {"role": "assistant", "content": "根据 notes/spinlock.md，持有自旋锁时禁止 sleep。"},
+            _tool_msg(ToolCall(id="c1", name="find_note", arguments='{"topic": "spinlock"}')),
+            _tool_msg(ToolCall(id="c2", name="read_file", arguments='{"path": "notes/spinlock.md"}')),
+            AssistantMessage.from_text("根据 notes/spinlock.md，持有自旋锁时禁止 sleep。", stop_reason="stop"),
         ]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "自旋锁能 sleep 吗？"}]
+    ctx = Context(messages=(UserMessage("自旋锁能 sleep 吗？"),))
 
     reply = run_react(
         llm,
-        messages,
+        ctx,
         tools,
         on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
@@ -165,7 +210,7 @@ def test_multi_step_chained_react_loop() -> None:
     assert len(llm.requests) == 3
 
 
-# 测试工具错误作为观察结果回传并自愈
+# 测试工具错误作为观察结果回传（is_error=True）并自愈
 def test_tool_error_as_observation_self_healing() -> None:
     steps: list[ToolStep] = []
     tools = ToolRegistry(
@@ -178,27 +223,19 @@ def test_tool_error_as_observation_self_healing() -> None:
     )
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    _tool_call("bad_tool", "nonexistent", "{}"),
-                    _tool_call("bad_json", "add_numbers", "{not-json"),
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("good", "add_numbers", '{"a": "19", "b": "23"}')],
-            },
-            {"role": "assistant", "content": "19 + 23 = 42。"},
+            _tool_msg(
+                ToolCall(id="bad_tool", name="nonexistent", arguments="{}"),
+                ToolCall(id="bad_json", name="add_numbers", arguments="{not-json"),
+            ),
+            _tool_msg(ToolCall(id="good", name="add_numbers", arguments='{"a": "19", "b": "23"}')),
+            AssistantMessage.from_text("19 + 23 = 42。", stop_reason="stop"),
         ]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "算一下 19 加 23"}]
+    ctx = Context(messages=(UserMessage("算一下 19 加 23"),))
 
     reply = run_react(
         llm,
-        messages,
+        ctx,
         tools,
         on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
     )
@@ -207,14 +244,15 @@ def test_tool_error_as_observation_self_healing() -> None:
     assert "未知工具" in steps[0].observation
     assert "JSON 解析失败" in steps[1].observation
     assert steps[2].observation == "42"
+    err_results = [m for m in llm.requests[1].messages if isinstance(m, ToolResultMessage)]
+    assert [r.is_error for r in err_results] == [True, True]
 
 
-# 测试纯 ReAct 循环移除轮次上限与 tools=None 兜底，仅在无 tool_calls 时自然终止且全程保持 tools 前缀恒定
+# 测试纯 ReAct 循环移除轮次上限，仅在无 toolUse 时自然终止且全程保持 tools 前缀恒定
 def test_unbounded_react_loop_stops_only_when_no_tool_calls(tmp_path) -> None:
     import personal_assistant.agent as agent_pkg
     import personal_assistant.agent.react as react_mod
     from evals.agent_eval import evaluate_agent
-    from personal_assistant.agent.react import iter_react
     from personal_assistant.assistant.app import AssistantApp
 
     assert not hasattr(react_mod, "MAX_TOOL_ROUNDS")
@@ -229,20 +267,17 @@ def test_unbounded_react_loop_stops_only_when_no_tool_calls(tmp_path) -> None:
             handler=lambda: "pong",
         )
     )
-    expected_defs = tools.definitions()
+    expected_schemas = tools.schemas()
     llm = ScriptedLLM(
-        [
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call(f"c{i}", "ping", "{}")]}
-            for i in range(1, 7)
-        ]
-        + [{"role": "assistant", "content": "已完成 6 轮连续探测。"}]
+        [_tool_msg(ToolCall(id=f"c{i}", name="ping", arguments="{}")) for i in range(1, 7)]
+        + [AssistantMessage.from_text("已完成 6 轮连续探测。", stop_reason="stop")]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "连续探测直到完成"}]
+    ctx = Context(messages=(UserMessage("连续探测直到完成"),))
 
     with pytest.raises(TypeError):
-        iter_react(llm, messages, tools, max_rounds=4)  # type: ignore[call-arg]
+        iter_react(llm, ctx, tools, max_rounds=4)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
-        run_react(llm, messages, tools, max_rounds=4)  # type: ignore[call-arg]
+        run_react(llm, ctx, tools, max_rounds=4)  # type: ignore[call-arg]
 
     app = AssistantApp(data_root=tmp_path / "app_data", llm=llm)
     try:
@@ -256,51 +291,64 @@ def test_unbounded_react_loop_stops_only_when_no_tool_calls(tmp_path) -> None:
     with pytest.raises(TypeError):
         evaluate_agent(llm, tmp_path / "eval_data", [], max_rounds=4)  # type: ignore[call-arg]
 
+    ends: list[TurnEnd] = []
     reply = run_react(
         llm,
-        messages,
+        ctx,
         tools,
-        on_event=lambda ev: steps.append(ev) if isinstance(ev, ToolStep) else None,
+        on_event=lambda ev: (
+            steps.append(ev)
+            if isinstance(ev, ToolStep)
+            else (ends.append(ev) if isinstance(ev, TurnEnd) else None)
+        ),
     )
 
     assert reply == "已完成 6 轮连续探测。"
     assert len(steps) == 6
     assert len(llm.requests) == 7
-    assert all(req_tools == expected_defs for _, req_tools in llm.requests)
-    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert all(req.tools == expected_schemas for req in llm.requests)
+    tool_msgs = [m for m in ends[0].messages if isinstance(m, ToolResultMessage)]
     assert len(tool_msgs) == 6
-    assert all(m["content"] == "pong" for m in tool_msgs)
+    assert all(m.content == "pong" for m in tool_msgs)
 
 
-# 测试从环境变量构造客户端及 OpenAI 请求负载格式
-def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+# 测试从环境变量构造句柄、OpenAI 翻译器载荷格式与 StreamError 在 iter_react/run_react 中的优雅收束
+def test_model_invoker_from_env_payload_and_stream_error_handling(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_MODE", "off")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     client = from_env()
-    assert isinstance(client, NoopLLMClient)
+    assert isinstance(client, NoopModelClient)
     with pytest.raises(LLMNotConfigured):
-        client.respond([{"role": "user", "content": "hi"}])
+        client.complete(Context(messages=(UserMessage("hi"),)))
 
     captured: dict[str, object] = {}
 
-    # 模拟捕获请求参数的同步 JSON 发送桩
-    def fake_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+    # 模拟捕获请求参数的流式发送桩
+    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
         captured["url"] = url
         captured["payload"] = payload
         captured["headers"] = headers
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        return iter(
+            [
+                'data: {"choices":[{"delta":{"role":"assistant","content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ]
+        )
 
-    real_client = OpenAICompatibleLLM(
-        api_key="sk-test",
-        base_url="https://example.com/v1/",
-        model="demo-model",
-        post_json=fake_post,
+    reg = ApiProviderRegistry()
+    reg.register(OpenAICompletionsProvider(post_stream=fake_post_stream))
+    real_client = ModelClient(
+        profile=ModelProfile(
+            name="demo",
+            api="openai-completions",
+            base_url="https://example.com/v1/",
+            model="demo-model",
+            api_key="sk-test",
+        ),
+        registry=reg,
     )
-    msg = real_client.respond(
-        [{"role": "user", "content": "hi"}],
-        tools=_demo_tools().definitions(),
-    )
-    assert msg == {"role": "assistant", "content": "ok"}
+    msg = real_client.complete(Context(messages=(UserMessage("hi"),), tools=_demo_tools().schemas()))
+    assert msg.text == "ok"
     assert captured["url"] == "https://example.com/v1/chat/completions"
     assert captured["headers"] == {"Authorization": "Bearer sk-test"}
     sent_payload = captured["payload"]
@@ -309,6 +357,26 @@ def test_llm_client_from_env_and_payload(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sent_payload["tool_choice"] == "auto"
     assert json.loads(json.dumps(sent_payload["tools"]))[0]["function"]["name"] == "get_current_time"
 
+    # 验证 iter_react 遇 StreamError 透传事件后立即终止且不发 TurnEnd；run_react 遇 StreamError 抛 RuntimeError
+    class _ErrorLLM:
+        last_usage: TokenUsage | None = None
+
+        # 直接产出 StreamStart 与 StreamError
+        def stream(self, context: Context, options: StreamOptions | None = None) -> Iterator[AssistantMessageEvent]:
+            del context, options
+            err_msg = AssistantMessage(stop_reason="error", error_message="rate limit 429")
+            yield StreamStart(partial=AssistantMessage())
+            yield StreamError(reason="error", message=err_msg, error_message="rate limit 429")
+
+        # 同步接口抛出对应错误
+        def complete(self, context: Context, options: StreamOptions | None = None) -> AssistantMessage:
+            raise RuntimeError("rate limit 429")
+
+    err_events = list(iter_react(_ErrorLLM(), Context(messages=(UserMessage("hi"),)), ToolRegistry()))
+    assert [type(ev) for ev in err_events] == [StreamStart, StreamError]
+    with pytest.raises(RuntimeError, match="rate limit 429"):
+        run_react(_ErrorLLM(), Context(messages=(UserMessage("hi"),)), ToolRegistry())
+
 
 # 测试 default_post_json 对瞬时 TLS/网络抖动自动重试，但对 HTTP 400 客户端错误绝不重试
 def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch) -> None:
@@ -316,10 +384,9 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
     import ssl
     from urllib.error import HTTPError, URLError
 
-    from personal_assistant.ai import client as llm_mod
+    from personal_assistant.ai.providers import http as http_mod
 
-    # 避免单元测试等待真实退避时间
-    monkeypatch.setattr(llm_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
 
     attempts = {"count": 0}
 
@@ -345,8 +412,8 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
 
         return _Resp()
 
-    monkeypatch.setattr(llm_mod, "urlopen", flaky_urlopen)
-    assert llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
+    monkeypatch.setattr(http_mod, "urlopen", flaky_urlopen)
+    assert http_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
     assert attempts["count"] == 3
 
     bad_attempts = {"count": 0}
@@ -356,47 +423,14 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
         bad_attempts["count"] += 1
         raise HTTPError("https://example.com/v1", 400, "Bad Request", {}, io.BytesIO(b"bad"))
 
-    monkeypatch.setattr(llm_mod, "urlopen", bad_request_urlopen)
+    monkeypatch.setattr(http_mod, "urlopen", bad_request_urlopen)
     with pytest.raises(HTTPError):
-        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+        http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert bad_attempts["count"] == 1
 
 
-# 测试 ToolCall 单轨标准 OpenAI wire 契约与 extract_tool_calls 严格校验
-def test_tool_call_contract_and_extract_tool_calls() -> None:
-    tc = ToolCall(id="call_a", name="ping", arguments='{"host": "127.0.0.1"}')
-    wire = tc.to_openai_dict()
-    assert wire == {
-        "id": "call_a",
-        "type": "function",
-        "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'},
-    }
-    assert ToolCall.from_raw(wire) == tc
-    assert ToolCall.from_raw({"id": "c_empty", "type": "function", "function": {"name": "noop", "arguments": ""}}) == ToolCall(
-        id="c_empty",
-        name="noop",
-        arguments="{}",
-    )
-    assert ToolCall.from_raw({"id": "c_none", "type": "function", "function": {"name": "noop", "arguments": None}}) == ToolCall(
-        id="c_none",
-        name="noop",
-        arguments="{}",
-    )
-    for bad_raw in (
-        "invalid-tool-call",
-        tc,
-        {"id": "c_flat", "name": "echo", "arguments": '{"text": "hi"}'},
-        {"id": "c_map", "type": "function", "function": {"name": "echo", "arguments": {"text": "hi"}}},
-    ):
-        with pytest.raises(TypeError):
-            ToolCall.from_raw(bad_raw)
-
-    extracted = extract_tool_calls({"role": "assistant", "tool_calls": [wire]})
-    assert extracted == [tc]
-    assert extract_tool_calls({"role": "assistant", "content": "hi"}) == []
-    assert extract_tool_calls({"role": "assistant", "tool_calls": None}) == []
-
-    # 验证 iter_react 按标准 wire 字典先产出 ToolStart 再执行工具后产出 ToolStep
+# 测试 ToolStart -> 执行 -> ToolStep 顺序与纯中立 AssistantMessage 空回复/思维链保留
+def test_tool_execution_order_and_neutral_message_preservation() -> None:
     exec_order: list[str] = []
     tools = ToolRegistry(
         Tool(
@@ -408,12 +442,15 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
     )
     llm = ScriptedLLM(
         [
-            {"role": "assistant", "content": None, "tool_calls": [wire]},
-            {"role": "assistant", "content": "完成探测"},
+            _tool_msg(ToolCall(id="call_a", name="ping", arguments='{"host": "127.0.0.1"}'), thinking="先探测"),
+            AssistantMessage(
+                blocks=(ThinkingBlock(text="推演细节"), TextBlock(text="  完成探测  ")),
+                stop_reason="stop",
+            ),
         ]
     )
     events: list[object] = []
-    for ev in iter_react(llm, [{"role": "user", "content": "ping"}], tools):
+    for ev in iter_react(llm, Context(messages=(UserMessage("ping"),)), tools):
         if isinstance(ev, ToolStart):
             exec_order.append(f"start:{ev.call_id}")
         elif isinstance(ev, ToolStep):
@@ -422,142 +459,66 @@ def test_tool_call_contract_and_extract_tool_calls() -> None:
 
     assert exec_order == ["start:call_a", "exec:127.0.0.1", "step:call_a"]
     assert ToolStart(tool="ping", arguments='{"host": "127.0.0.1"}', call_id="call_a") in events
-    assert any(isinstance(ev, ToolStep) and ev.call_id == "call_a" for ev in events)
+    end = next(ev for ev in events if isinstance(ev, TurnEnd))
+    assert end.reply == "完成探测"
+    assert isinstance(end.messages[-1], AssistantMessage)
+    assert end.messages[-1].thinking == "推演细节"
 
-    # 验证 arguments=None / 空串的 wire tool_calls 写回 messages 与发往下一轮 LLM 时均已归一化为 "{}"
-    noop_tools = ToolRegistry(Tool(name="ping", description="探测", parameters={}, handler=lambda: "pong"))
-    norm_llm = ScriptedLLM(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "reasoning_content": "先探测",
-                "tool_calls": [
-                    {"id": "wire_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
-                    {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": None}},
-                ],
-            },
-            {"role": "assistant", "content": "归一化完成", "tool_calls": []},
-        ]
-    )
-    norm_msgs: list[dict[str, object]] = [{"role": "user", "content": "探测"}]
-    assert run_react(norm_llm, norm_msgs, noop_tools) == "归一化完成"
-    expected_wire_calls = [
-        {"id": "wire_1", "type": "function", "function": {"name": "ping", "arguments": '{"host": "127.0.0.1"}'}},
-        {"id": "none_2", "type": "function", "function": {"name": "ping", "arguments": "{}"}},
-    ]
-    assert norm_msgs[1] == {
-        "role": "assistant",
-        "content": None,
-        "reasoning_content": "先探测",
-        "tool_calls": expected_wire_calls,
-    }
-    assert norm_llm.requests[1][0][1]["tool_calls"] == expected_wire_calls
-    assert "tool_calls" not in norm_msgs[-1]
+    # 空文本退出不伪造中文兜底
+    empty_llm = ScriptedLLM([AssistantMessage(blocks=(ThinkingBlock(text="空回复前内部推理"),), stop_reason="stop")])
+    assert run_react(empty_llm, Context(messages=(UserMessage("hi"),)), ToolRegistry()) == ""
 
 
-# 测试净化退出消息：移除硬编码中文兜底并保留 assistant_msg 上的 reasoning_content 等扩展字段
-def test_exit_message_purified_and_preserves_extension_fields() -> None:
-    empty_llm = ScriptedLLM(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "reasoning_content": "空回复前的内部推理",
-                "custom_meta": {"source": "model"},
-            }
-        ]
-    )
-    msgs1: list[dict[str, object]] = [{"role": "user", "content": "hi"}]
-    reply1 = run_react(empty_llm, msgs1, ToolRegistry())
-    assert reply1 == ""
-    assert "模型没有返回回复" not in reply1
-    assert msgs1[-1] == {
-        "role": "assistant",
-        "content": "",
-        "reasoning_content": "空回复前的内部推理",
-        "custom_meta": {"source": "model"},
-    }
-
-    text_llm = ScriptedLLM(
-        [
-            {
-                "role": "assistant",
-                "content": "  最终答案  ",
-                "reasoning_content": "推演细节",
-            }
-        ]
-    )
-    msgs2: list[dict[str, object]] = [{"role": "user", "content": "q"}]
-    reply2 = run_react(text_llm, msgs2, ToolRegistry())
-    assert reply2 == "最终答案"
-    assert msgs2[-1] == {
-        "role": "assistant",
-        "content": "最终答案",
-        "reasoning_content": "推演细节",
-    }
-
-
-# 测试单阶段 convert_to_llm 边界转换不污染原消息列表，且已彻底移除冗余 transform_context 参数
-def test_transform_context_and_convert_to_llm_pipeline() -> None:
+# 测试单阶段 convert_to_llm 边界转换面向不可变 Context 工作，且已彻底移除冗余 transform_context 参数
+def test_convert_to_llm_context_transformer_immutability() -> None:
     seen_stages: list[str] = []
     tools = ToolRegistry(
         Tool(name="echo", description="回显", parameters={"v": "值"}, handler=lambda v: f"ok:{v}")
     )
     llm = ScriptedLLM(
         [
-            {"role": "assistant", "content": None, "tool_calls": [_tool_call("c1", "echo", '{"v": "1"}')]},
-            {"role": "assistant", "content": "管道执行完毕"},
+            _tool_msg(ToolCall(id="c1", name="echo", arguments='{"v": "1"}')),
+            AssistantMessage.from_text("管道执行完毕", stop_reason="stop"),
         ]
     )
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": "sys"},
-        {"role": "artifact", "content": "仅前端渲染的卡片对象"},
-        {"role": "user", "content": "请调用 echo"},
-    ]
-    snapshot_before = [dict(m) for m in messages]
-
-    with pytest.raises(TypeError):
-        run_react(llm, messages, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
-    with pytest.raises(TypeError):
-        iter_react(llm, messages, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
-
-    # 单一边界转换：即使在回调内原地修改字典或 pop 键，也绝不污染外部主历史列表
-    def convert_to_llm(ctx: list[dict[str, object]]) -> list[dict[str, object]]:
-        seen_stages.append("convert")
-        ctx[0]["injected"] = "dirty"
-        for msg in ctx:
-            if msg.get("role") == "artifact":
-                msg.pop("content", None)
-        return [m for m in ctx if m.get("role") in {"system", "user", "assistant", "tool"}]
-
-    reply = run_react(
-        llm,
-        messages,
-        tools,
-        convert_to_llm=convert_to_llm,
+    initial_ctx = Context(
+        system_prompt="sys",
+        messages=(UserMessage("请调用 echo"),),
     )
+
+    with pytest.raises(TypeError):
+        run_react(llm, initial_ctx, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        iter_react(llm, initial_ctx, tools, transform_context=lambda x: x)  # type: ignore[call-arg]
+
+    # 上下文边界转换：改写 system_prompt 副本但绝不污染原始 initial_ctx
+    def convert_to_llm(ctx: Context) -> Context:
+        seen_stages.append("convert")
+        return Context(
+            system_prompt=f"{ctx.system_prompt} [transformed]",
+            messages=ctx.messages,
+            tools=ctx.tools,
+        )
+
+    reply = run_react(llm, initial_ctx, tools, convert_to_llm=convert_to_llm)
 
     assert reply == "管道执行完毕"
     assert seen_stages == ["convert", "convert"]
-    assert messages[:3] == snapshot_before
-    assert "injected" not in messages[0]
-    assert messages[1] == {"role": "artifact", "content": "仅前端渲染的卡片对象"}
-    for req_msgs, _ in llm.requests:
-        assert all(m.get("role") in {"system", "user", "assistant", "tool"} for m in req_msgs)
-    assert [m["role"] for m in llm.requests[0][0]] == ["system", "user"]
-    assert [m["role"] for m in llm.requests[1][0]] == ["system", "user", "assistant", "tool"]
+    assert initial_ctx.system_prompt == "sys"
+    assert len(initial_ctx.messages) == 1
+    assert all(req.system_prompt == "sys [transformed]" for req in llm.requests)
+    assert len(llm.requests[0].messages) == 1
+    assert len(llm.requests[1].messages) == 3
 
 
-# 测试 default_post_json 读取响应体中途发生 IncompleteRead/SSLError/ConnectionError 等瞬时异常时退避重试，且对损坏 JSON 不重试；同步 respond 校验 error 帧与空 choices
-def test_sync_post_json_body_read_retry_and_openai_response_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+# 测试 default_post_json 读取响应体中途发生瞬时异常时退避重试且对损坏 JSON 不重试
+def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.MonkeyPatch) -> None:
     import http.client
     import ssl
     from urllib.error import URLError
-    from personal_assistant.ai import OpenAIChatClient, TokenUsage
-    from personal_assistant.ai import client as llm_mod
+    from personal_assistant.ai.providers import http as http_mod
 
-    monkeypatch.setattr(llm_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
 
     # 构造可定制 read() 与退出回调的模拟 HTTP 响应上下文对象
     def _make_resp(read_fn, on_exit=None):
@@ -596,12 +557,11 @@ def test_sync_post_json_body_read_retry_and_openai_response_validation(monkeypat
 
         return _make_resp(_read, on_exit=lambda: read_attempts.__setitem__("closed", read_attempts["closed"] + 1))
 
-    monkeypatch.setattr(llm_mod, "urlopen", flaky_body_urlopen)
-    assert llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
+    monkeypatch.setattr(http_mod, "urlopen", flaky_body_urlopen)
+    assert http_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
     assert read_attempts["count"] == 3
     assert read_attempts["closed"] == 3
 
-    # 验证 read() 抛 ConnectionResetError / TimeoutError / URLError 时同样触发重试并受 max_retries 上限约束
     err_seq = [ConnectionResetError("reset"), TimeoutError("timed out"), URLError("eof")]
     seq_attempts = {"count": 0}
 
@@ -616,57 +576,25 @@ def test_sync_post_json_body_read_retry_and_openai_response_validation(monkeypat
 
         return _make_resp(_read_fail)
 
-    monkeypatch.setattr(llm_mod, "urlopen", exhausted_body_urlopen)
+    monkeypatch.setattr(http_mod, "urlopen", exhausted_body_urlopen)
     with pytest.raises(URLError):
-        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+        http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert seq_attempts["count"] == 3
 
-    # 模拟响应体读取成功但为语法损坏的 JSON：不得盲目重试
     bad_json_attempts = {"count": 0}
 
-    # 返回语法错误 JSON 字节流
+    # 返回语法错误 JSON 字节流：不得盲目重试
     def bad_json_urlopen(request, timeout=60):
         bad_json_attempts["count"] += 1
         return _make_resp(lambda: b"{broken-json")
 
-    monkeypatch.setattr(llm_mod, "urlopen", bad_json_urlopen)
+    monkeypatch.setattr(http_mod, "urlopen", bad_json_urlopen)
     with pytest.raises(json.JSONDecodeError):
-        llm_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
+        http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert bad_json_attempts["count"] == 1
 
-    # 测试 OpenAIChatClient.respond() 在 HTTP 200 error 帧、空 choices、非 dict 响应时抛出清晰 RuntimeError 且清理 last_usage
-    scripted_payloads: list[object] = [
-        {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
-        {"error": {"message": "rate_limit_exceeded", "code": 429}},
-        {"choices": [], "usage": {"prompt_tokens": 99, "completion_tokens": 0}},
-        {"choices": [{"message": "not-a-dict"}]},
-        ["unexpected-list"],
-    ]
-    client = OpenAIChatClient(
-        api_key="sk-test",
-        base_url="https://example.com/v1",
-        model="demo-model",
-        post_json=lambda _u, _p, _h: scripted_payloads.pop(0),  # type: ignore[return-value]
-    )
-    assert client.respond([{"role": "user", "content": "hi"}])["content"] == "ok"
-    assert client.last_usage == TokenUsage(prompt_tokens=10, cached_tokens=0, completion_tokens=2)
 
-    with pytest.raises(RuntimeError, match="模型接口返回错误.*rate_limit_exceeded"):
-        client.respond([{"role": "user", "content": "hi"}])
-    assert client.last_usage is None
-
-    with pytest.raises(RuntimeError, match="choices"):
-        client.respond([{"role": "user", "content": "hi"}])
-    assert client.last_usage is None
-
-    with pytest.raises(RuntimeError, match="message"):
-        client.respond([{"role": "user", "content": "hi"}])
-
-    with pytest.raises(RuntimeError, match="JSON 对象|格式"):
-        client.respond([{"role": "user", "content": "hi"}])
-
-
-# 测试复用同一 ToolRegistry 实例跨多轮调用 run_react/iter_react 透传当轮 tool_context 且隔离自定义子类
+# 测试复用同一 ToolRegistry 实例跨多轮调用 run_react/iter_react 透传当轮 tool_context 且隔离 accept_context=False 工具
 def test_react_forwards_runtime_tool_context_across_turns() -> None:
     from personal_assistant.agent.tools import build_tool
 
@@ -703,22 +631,17 @@ def test_react_forwards_runtime_tool_context_across_turns() -> None:
     # 第 1 轮：仅传必选参数 query 并注入 turn_id=1（同时包含未声明键与同名参数干扰键）
     llm1 = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    _tool_call("c1", "probe_ctx", '{"query": "alpha"}'),
-                    _tool_call("c2", "pure_sub", '{"msg": "hi"}'),
-                ],
-            },
-            {"role": "assistant", "content": "轮次1完成"},
+            _tool_msg(
+                ToolCall(id="c1", name="probe_ctx", arguments='{"query": "alpha"}'),
+                ToolCall(id="c2", name="pure_sub", arguments='{"msg": "hi"}'),
+            ),
+            AssistantMessage.from_text("轮次1完成", stop_reason="stop"),
         ]
     )
-    msgs1: list[dict[str, object]] = [{"role": "user", "content": "r1"}]
     steps1: list[ToolStep] = []
     reply1 = run_react(
         llm1,
-        msgs1,
+        Context(messages=(UserMessage("r1"),)),
         registry,
         on_event=lambda ev: steps1.append(ev) if isinstance(ev, ToolStep) else None,
         tool_context={"turn_id": 1, "unused_ctx": "skip", "query": "HIJACK"},
@@ -730,19 +653,14 @@ def test_react_forwards_runtime_tool_context_across_turns() -> None:
     # 第 2 轮复用同一 registry：切换为 turn_id=2 与新 label，验证不残留上一轮状态
     llm2 = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("c3", "probe_ctx", '{"query": "beta", "limit": 10}')],
-            },
-            {"role": "assistant", "content": "轮次2完成"},
+            _tool_msg(ToolCall(id="c3", name="probe_ctx", arguments='{"query": "beta", "limit": 10}')),
+            AssistantMessage.from_text("轮次2完成", stop_reason="stop"),
         ]
     )
-    msgs2: list[dict[str, object]] = [{"role": "user", "content": "r2"}]
     steps2: list[ToolStep] = []
     reply2 = run_react(
         llm2,
-        msgs2,
+        Context(messages=(UserMessage("r2"),)),
         registry,
         on_event=lambda ev: steps2.append(ev) if isinstance(ev, ToolStep) else None,
         tool_context={"turn_id": 2, "label": "override"},
@@ -753,16 +671,10 @@ def test_react_forwards_runtime_tool_context_across_turns() -> None:
     # 第 3 轮直接消费 iter_react 并省略 tool_context，确认回到初始绑定值且不残留 turn_id=2
     llm3 = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_tool_call("c4", "probe_ctx", '{"query": "gamma"}')],
-            },
-            {"role": "assistant", "content": "轮次3完成"},
+            _tool_msg(ToolCall(id="c4", name="probe_ctx", arguments='{"query": "gamma"}')),
+            AssistantMessage.from_text("轮次3完成", stop_reason="stop"),
         ]
     )
-    msgs3: list[dict[str, object]] = [{"role": "user", "content": "r3"}]
-    events3 = list(iter_react(llm3, msgs3, registry))
+    events3 = list(iter_react(llm3, Context(messages=(UserMessage("r3"),)), registry))
     step3 = next(ev for ev in events3 if isinstance(ev, ToolStep))
     assert step3.observation == "q=gamma|limit=5|turn=None|label=pinned"
-

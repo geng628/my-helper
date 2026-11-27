@@ -1,4 +1,4 @@
-"""三层漏斗架构守卫测试（TDD）：AST 依赖方向校验、类型递进扩展校验与子进程断层独立运行测试。"""
+"""三层漏斗架构守卫测试（TDD）：AST 依赖方向校验、Pi ch04 三层解耦守卫与子进程断层独立运行测试。"""
 from __future__ import annotations
 
 import ast
@@ -65,7 +65,7 @@ def _iter_evals_python_files() -> list[Path]:
     return files
 
 
-# 将包内文件路径转换为标准点分模块名（如 personal_assistant.ai.client 或 evals.cli）
+# 将包内文件路径转换为标准点分模块名（如 personal_assistant.ai.registry 或 evals.cli）
 def _module_name(py_file: Path) -> str:
     rel = py_file.relative_to(REPO_ROOT).with_suffix("")
     parts = list(rel.parts)
@@ -74,12 +74,14 @@ def _module_name(py_file: Path) -> str:
     return ".".join(parts)
 
 
-# 方法 1：AST 依赖漏斗守卫——严禁任何跨层反向依赖、横向串台、产品包依赖 evals/ 与循环依赖
+# 方法 1：AST 依赖漏斗守卫——严禁任何跨层反向依赖、ai 内部三层越界、产品包依赖 evals/ 与循环依赖
 def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
     assert (PKG_ROOT / "ai").is_dir(), "缺少 Layer 1 包 personal_assistant/ai/"
     assert (PKG_ROOT / "agent").is_dir(), "缺少 Layer 2 包 personal_assistant/agent/"
     assert (PKG_ROOT / "assistant").is_dir(), "缺少 Layer 3 包 personal_assistant/assistant/"
     assert not (PKG_ROOT / "eval").exists(), "评测引擎应迁移至顶层 evals/，personal_assistant/ 不得保留 eval/"
+    assert not (PKG_ROOT / "ai" / "types.py").exists(), "旧版 ai/types.py 应已彻底删除"
+    assert not (PKG_ROOT / "ai" / "client.py").exists(), "旧版 ai/client.py 应已彻底删除"
     subpackages = {p.name for p in PKG_ROOT.iterdir() if p.is_dir() and p.name != "__pycache__"}
     assert subpackages == {"ai", "agent", "assistant"}, (
         f"personal_assistant/ 仅允许保留纯净三层产品包，发现多余目录：{sorted(subpackages - {'ai', 'agent', 'assistant'})}"
@@ -89,6 +91,8 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
 
     graph: dict[str, set[str]] = {}
     for py_file in sorted(PKG_ROOT.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
         mod = _module_name(py_file)
         deps = _internal_imports(py_file)
         graph[mod] = deps
@@ -102,12 +106,29 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
                 f"产品包残留旧版 personal_assistant.eval 引用：{mod} -> {dep}"
             )
 
-        # Layer 1 (ai) 绝对不能依赖 agent / assistant / evals
+        # Layer 1 (ai) 绝对不能依赖 agent / assistant / evals，且内部严守 Pi ch04 三层解耦边界
         if mod == "personal_assistant.ai" or mod.startswith("personal_assistant.ai."):
             for dep in deps:
                 assert dep == "personal_assistant.ai" or dep.startswith("personal_assistant.ai."), (
                     f"Layer 1 越权向上依赖：{mod} -> {dep}"
                 )
+            if mod == "personal_assistant.ai.protocol":
+                assert not deps, f"ai/protocol.py 必须零内部依赖，实际：{deps}"
+            elif mod == "personal_assistant.ai.registry":
+                assert deps <= {"personal_assistant.ai.protocol"}, (
+                    f"ai/registry.py 仅允许依赖 ai.protocol，严禁导入具体翻译器实现，实际：{deps}"
+                )
+            elif mod == "personal_assistant.ai.cache":
+                assert deps <= {"personal_assistant.ai.protocol"}, (
+                    f"ai/cache.py 仅允许依赖 ai.protocol，实际：{deps}"
+                )
+            elif mod == "personal_assistant.ai.providers.http":
+                assert not deps, f"ai/providers/http.py 必须零内部依赖，实际：{deps}"
+            elif mod.startswith("personal_assistant.ai.providers."):
+                assert deps <= {
+                    "personal_assistant.ai.protocol",
+                    "personal_assistant.ai.providers.http",
+                }, f"具体翻译器 {mod} 仅允许依赖 protocol 与 providers.http，实际：{deps}"
 
         # Layer 2 (agent) 只能依赖 ai 或 agent，绝不能依赖 assistant / evals
         elif mod == "personal_assistant.agent" or mod.startswith("personal_assistant.agent."):
@@ -174,10 +195,10 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
             dfs(node, [node])
 
 
-# 方法 2：类型递进扩展测试——底层 ToolSchema 不含执行器，中层 Tool 继承扩展，顶层 CommandSpec 叠加业务字段
+# 方法 2：类型递进扩展与零 OpenAI 方言渗透守卫——ToolSchema 纯中立，agent/assistant 零厂商序列化符号
 def test_progressive_type_extension_tool_schema_to_tool() -> None:
-    from personal_assistant.agent.tools import Tool
-    from personal_assistant.ai.types import ToolSchema
+    from personal_assistant.agent.tools import Tool, ToolRegistry
+    from personal_assistant.ai.protocol import ToolCall, ToolSchema
     from personal_assistant.assistant.commands import CommandSpec
 
     schema = ToolSchema(
@@ -187,9 +208,12 @@ def test_progressive_type_extension_tool_schema_to_tool() -> None:
         param_enums={"host": ("localhost",)},
     )
     assert not hasattr(schema, "handler")
-    exported = schema.to_openai_schema()
-    assert exported["function"]["name"] == "ping"
-    assert exported["function"]["parameters"]["properties"]["host"]["enum"] == ["localhost"]
+    assert not hasattr(schema, "to_openai_schema")
+    assert schema.required_names == ("host",)
+
+    tc = ToolCall(id="c1", name="ping", arguments='{"host": "localhost"}')
+    assert not hasattr(tc, "to_openai_dict")
+    assert not hasattr(tc, "from_raw")
 
     assert issubclass(Tool, ToolSchema)
     exec_tool = Tool(
@@ -199,7 +223,7 @@ def test_progressive_type_extension_tool_schema_to_tool() -> None:
         handler=lambda host: f"pong:{host}",
     )
     assert isinstance(exec_tool, ToolSchema)
-    assert exec_tool.to_openai_schema()["function"]["name"] == "ping"
+    assert not hasattr(ToolRegistry, "definitions")
 
     spec = CommandSpec(
         name="hello",
@@ -212,27 +236,49 @@ def test_progressive_type_extension_tool_schema_to_tool() -> None:
     assert isinstance(cmd_tool, Tool)
     assert isinstance(cmd_tool, ToolSchema)
 
+    # 硬守卫：agent/ 与 assistant/ 彻底零残留旧 OpenAI 方言方法名
+    forbidden_openai_syms = ("to_openai_schema", "to_openai_dict", "extract_tool_calls")
+    for sub in ("agent", "assistant"):
+        for py_file in sorted((PKG_ROOT / sub).rglob("*.py")):
+            if "__pycache__" in py_file.parts:
+                continue
+            src = py_file.read_text(encoding="utf-8")
+            for sym in forbidden_openai_syms:
+                assert sym not in src, f"{py_file.relative_to(REPO_ROOT)} 严禁残留旧 OpenAI 符号 {sym!r}"
+
 
 # 方法 3：子进程“可独立使用”测试——逐层剥离上层后，Layer 1 (ai) 与 Layer 1+2 (ai+agent) 均可独立运行，且顶层 evals 可独立调用
 def test_layers_run_independently_in_clean_subprocesses() -> None:
     # 1. 单独使用 Layer 1 (ai)：只导 ai，零加载 agent/assistant/evals
     code_ai = """
 import json, sys
-from personal_assistant.ai import CacheMonitor, OpenAICompatibleLLM, ToolSchema
+from personal_assistant.ai import (
+    ApiProviderRegistry,
+    CacheMonitor,
+    Context,
+    ModelClient,
+    ModelProfile,
+    OpenAICompletionsProvider,
+    ToolSchema,
+    UserMessage,
+)
 
 schema = ToolSchema(name="echo", description="回显", parameters={"text": "内容"})
-def fake_post(url, payload, headers):
-    return {
-        "choices": [{"message": {"role": "assistant", "content": "ok:" + payload["messages"][-1]["content"]}}],
-        "usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 60, "completion_tokens": 5},
-    }
+def fake_stream(url, payload, headers):
+    last_msg = payload["messages"][-1]["content"]
+    yield 'data: ' + json.dumps({"choices": [{"delta": {"role": "assistant", "content": "ok:" + last_msg}}]}) + '\\n'
+    yield 'data: ' + json.dumps({"choices": [], "usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 60, "completion_tokens": 5}}) + '\\n'
+    yield 'data: [DONE]\\n'
 
+reg = ApiProviderRegistry()
+reg.register(OpenAICompletionsProvider(post_stream=fake_stream))
+profile = ModelProfile(name="m", api="openai-completions", base_url="http://x/v1", model="m", api_key="k")
 monitor = CacheMonitor()
-llm = monitor.wrap(OpenAICompatibleLLM(api_key="k", base_url="http://x/v1", model="m", post_json=fake_post), "s1")
-r1 = llm.respond([{"role": "user", "content": "hi"}], tools=[schema.to_openai_schema()])
-r2 = llm.respond([{"role": "user", "content": "hi"}, {"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "next"}], tools=[schema.to_openai_schema()])
+llm = monitor.wrap(ModelClient(profile=profile, registry=reg), session_key="s1")
+r1 = llm.complete(Context(messages=(UserMessage("hi"),), tools=(schema,)))
+r2 = llm.complete(Context(messages=(UserMessage("hi"), r1, UserMessage("next")), tools=(schema,)))
 leaked = [m for m in sys.modules if m == "evals" or m.startswith(("personal_assistant.agent", "personal_assistant.assistant", "personal_assistant.eval", "evals."))]
-print(json.dumps({"reply": r2["content"], "cached": monitor.summary()["cached_tokens"], "leaked": leaked}))
+print(json.dumps({"reply": r2.text, "cached": monitor.summary()["cached_tokens"], "leaked": leaked}))
 """
     res_ai = subprocess.run(
         [sys.executable, "-c", code_ai],
@@ -250,25 +296,29 @@ print(json.dumps({"reply": r2["content"], "cached": monitor.summary()["cached_to
     # 2. 单独使用 Layer 1 + 2 (ai + agent)：跑完全无关业务的计算器 Agent，零加载 assistant/evals
     code_agent = """
 import json, sys
-from personal_assistant.ai import LLMClient
+from personal_assistant.ai import AssistantMessage, Context, StreamDone, ToolCall, UserMessage
 from personal_assistant.agent import ToolRegistry, run_react, tool
 
 @tool(description="两数相乘", parameters={"a": "左操作数", "b": "右操作数"})
 def multiply(a: str, b: str) -> str:
     return str(int(a) * int(b))
 
-class FakeLLM(LLMClient):
+class FakeLLM:
+    last_usage = None
     def __init__(self):
         self.turns = [
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "multiply", "arguments": '{"a": "6", "b": "7"}'}}]},
-            {"role": "assistant", "content": "6 * 7 = 42"},
+            AssistantMessage(blocks=(ToolCall(id="c1", name="multiply", arguments='{"a": "6", "b": "7"}'),), stop_reason="toolUse"),
+            AssistantMessage.from_text("6 * 7 = 42", stop_reason="stop"),
         ]
-    def respond(self, messages, tools=None):
+    def stream(self, context, options=None):
+        msg = self.turns.pop(0)
+        yield StreamDone(reason="toolUse" if msg.tool_calls else "stop", message=msg)
+    def complete(self, context, options=None):
         return self.turns.pop(0)
 
 registry = ToolRegistry(multiply.__agent_tool__)
-msgs = [{"role": "system", "content": "You are a calculator."}, {"role": "user", "content": "6*7?"}]
-reply = run_react(FakeLLM(), msgs, registry)
+ctx = Context(system_prompt="You are a calculator.", messages=(UserMessage("6*7?"),))
+reply = run_react(FakeLLM(), ctx, registry)
 leaked = [m for m in sys.modules if m == "evals" or m.startswith(("personal_assistant.assistant", "personal_assistant.eval", "evals."))]
 print(json.dumps({"reply": reply, "leaked": leaked}))
 """
@@ -315,56 +365,62 @@ print(json.dumps({"has_main": callable(evals.main), "leaked": leaked}))
     assert "Eval mode=search  retriever=fts5_bm25" in res_cli.stdout
 
 
-# 测试 Provider 插件化注册与 ModelProfile 单轨直通分发（支持局部 providers 与显式 register_provider）
-def test_llm_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+# 测试 Slot-4 ApiProvider 翻译器插件加载、局部隔离注册表与全局注册表分发
+def test_api_provider_registry_and_plugin_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from personal_assistant.agent.plugins import PluginManager
-    from personal_assistant.ai.client import LLMClient, from_env, register_provider
+    from personal_assistant.ai import (
+        ApiProviderRegistry,
+        Context,
+        ModelInvoker,
+        UserMessage,
+        from_env,
+        register_api_provider,
+    )
 
     plugin_file = tmp_path / "custom_provider.py"
     plugin_file.write_text(
         "from personal_assistant.agent.plugins import Plugin\n"
-        "from personal_assistant.ai.client import LLMClient\n"
-        "# 测试用假模型客户端\n"
-        "class DummyProviderLLM(LLMClient):\n"
-        "    # 记录模型名\n"
-        "    def __init__(self, model):\n"
-        "        self.model = model\n"
-        "    # 返回带模型名的固定回复\n"
-        "    def respond(self, messages, tools=None):\n"
-        "        return {'role': 'assistant', 'content': f'dummy:{self.model}'}\n"
-        "# 测试用 Provider 实现\n"
-        "class DummyProvider:\n"
-        "    name = 'dummy_test_provider'\n"
-        "    # 直接读取实化 ModelProfile 字段\n"
-        "    def build(self, profile):\n"
-        "        return DummyProviderLLM(profile.model or 'demo')\n"
+        "from personal_assistant.ai import AssistantMessage, StreamDone, StreamStart, TextDelta, TextEnd, TextStart\n"
+        "# 测试用假协议翻译器实现（ApiProvider）\n"
+        "class DummyApiProvider:\n"
+        "    api = 'dummy-test-api'\n"
+        "    # 流式产出带模型名的固定回复\n"
+        "    def stream(self, model, context, options=None):\n"
+        "        text = f'dummy:{model.model}'\n"
+        "        msg = AssistantMessage.from_text(text, stop_reason='stop')\n"
+        "        yield StreamStart(partial=AssistantMessage())\n"
+        "        yield TextStart(content_index=0, partial=AssistantMessage())\n"
+        "        yield TextDelta(content_index=0, text=text, partial=msg)\n"
+        "        yield TextEnd(content_index=0, text=text, partial=msg)\n"
+        "        yield StreamDone(reason='stop', message=msg)\n"
         "# 测试用主板插件子类\n"
         "class DummyProviderPlugin(Plugin):\n"
-        "    plugin_id = 'dummy_test_provider'\n"
-        "    # 注册测试 Provider\n"
+        "    plugin_id = 'dummy-test-api'\n"
+        "    # 注册测试翻译器\n"
         "    def initialize(self):\n"
-        "        self.context.register_provider(DummyProvider())\n",
+        "        self.context.register_provider(DummyApiProvider())\n",
         encoding="utf-8",
     )
 
     providers = PluginManager.from_entries([plugin_file.name], tmp_path).providers
-    assert "dummy_test_provider" in providers
+    assert "dummy-test-api" in providers
 
     monkeypatch.setenv("LLM_MODE", "on")
-    monkeypatch.setenv("LLM_PROVIDER", "dummy_test_provider")
+    monkeypatch.setenv("LLM_API", "dummy-test-api")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "claude-test")
 
-    # 1. 不污染全局 _PROVIDERS 时可直接传入局部 providers 构建
-    local_client = from_env(providers=providers)
-    assert isinstance(local_client, LLMClient)
-    assert local_client.respond([{"role": "user", "content": "hi"}])["content"] == "dummy:claude-test"
+    # 1. 不污染全局默认注册表时可直接传入局部隔离 registry 构建
+    local_reg = ApiProviderRegistry(providers)
+    local_client = from_env(registry=local_reg)
+    assert isinstance(local_client, ModelInvoker)
+    assert local_client.complete(Context(messages=(UserMessage("hi"),))).text == "dummy:claude-test"
 
-    # 2. 显式调用 register_provider 后全局亦可分发
-    register_provider("dummy_test_provider", providers["dummy_test_provider"])
+    # 2. 显式调用 register_api_provider 后全局亦可分发
+    register_api_provider(providers["dummy-test-api"])
     client = from_env()
-    assert isinstance(client, LLMClient)
-    assert client.respond([{"role": "user", "content": "hi"}])["content"] == "dummy:claude-test"
+    assert isinstance(client, ModelInvoker)
+    assert client.complete(Context(messages=(UserMessage("hi"),))).text == "dummy:claude-test"
 
 
 # 验证 AST 依赖提取器能准确捕获产品包反向导入 evals/ 以及 evals/ 反向导入 assistant/cli.py 的各类写法
@@ -402,9 +458,13 @@ def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None
         "web_config",
         "retrieval_config",
         "tool_outputs",
+        "data_root",
+        "consolidator",
     }
     lower_files = sorted(
-        list((PKG_ROOT / "ai").rglob("*.py")) + list((PKG_ROOT / "agent").rglob("*.py"))
+        p
+        for p in list((PKG_ROOT / "ai").rglob("*.py")) + list((PKG_ROOT / "agent").rglob("*.py"))
+        if "__pycache__" not in p.parts
     )
     assert lower_files
     for py_file in lower_files:
@@ -430,14 +490,16 @@ def test_lower_layers_contain_zero_business_literals_or_monkeypatching() -> None
                 )
 
 
-# 方法 5：Issue #83 / #84 硬红线守卫——全仓四棵受管目录树零 type: ignore，无冗余包壳，且 PluginContext 零业务字段泄漏
+# 方法 5：全仓四棵受管目录树零 type: ignore，无冗余包壳，PluginContext 零业务字段泄漏，且 ai 不导出内部 helper
 def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
     from dataclasses import fields
+    from personal_assistant import ai as ai_pkg
     from personal_assistant.agent.plugins import PluginContext
 
     assert not (REPO_ROOT / "plugins" / "tools" / "__init__.py").exists(), (
         "plugins/tools/__init__.py 冗余包壳已删除，不应重新引入"
     )
+    assert not hasattr(ai_pkg, "common_prefix_len"), "ai/__init__.py 不应再导出内部 common_prefix_len"
 
     guarded_trees: dict[str, list[Path]] = {
         "personal_assistant": sorted(p for p in PKG_ROOT.rglob("*.py") if "__pycache__" not in p.parts),
@@ -500,4 +562,3 @@ def test_zero_type_ignore_in_package_and_purified_plugin_context() -> None:
         timeout=15,
     )
     assert json.loads(res_lazy.stdout.strip()) == []
-

@@ -1,4 +1,4 @@
-"""Layer 1 KV 缓存观测模块：统计服务端真实 cached_tokens 命中率与本地前缀复用率。"""
+"""Layer 1 KV 缓存观测模块：面向中立 Context 与 TokenUsage 统计服务端真实命中率与本地前缀复用率。"""
 from __future__ import annotations
 
 import json
@@ -8,30 +8,88 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from fractions import Fraction
 
-from personal_assistant.ai.client import LLMClient
-from personal_assistant.ai.types import LLMStreamEvent, StreamDone, TokenUsage
+from personal_assistant.ai.protocol import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelInvoker,
+    StreamDone,
+    StreamError,
+    StreamOptions,
+    TextBlock,
+    ThinkingBlock,
+    TokenUsage,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
 
 
-# 将单次请求的 tools 与 messages 序列化为逐行稳定文本，便于精确计算最长公共前缀
-def serialize_request(
-    messages: list[dict[str, object]],
-    tools: list[dict[str, object]] | None = None,
-) -> str:
-    lines = [json.dumps({"tools": tools or []}, ensure_ascii=False, sort_keys=True)]
-    for msg in messages:
-        lines.append(json.dumps(msg, ensure_ascii=False, sort_keys=True))
+# 将单条中立消息转为稳定可序列化的规范字典，供前缀复用率计算使用
+def _canonical_message_dict(message: UserMessage | AssistantMessage | ToolResultMessage) -> dict[str, object]:
+    if isinstance(message, UserMessage):
+        return {"role": "user", "content": message.content}
+    if isinstance(message, ToolResultMessage):
+        return {
+            "role": "tool_result",
+            "tool_call_id": message.tool_call_id,
+            "tool_name": message.tool_name,
+            "content": message.content,
+            "is_error": message.is_error,
+        }
+    blocks_out: list[dict[str, object]] = []
+    for block in message.blocks:
+        if isinstance(block, TextBlock):
+            blocks_out.append({"type": "text", "text": block.text})
+        elif isinstance(block, ThinkingBlock):
+            blocks_out.append({"type": "thinking", "text": block.text, "signature": block.signature})
+        elif isinstance(block, ToolCall):
+            blocks_out.append(
+                {
+                    "type": "tool_call",
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.arguments,
+                }
+            )
+    return {"role": "assistant", "blocks": blocks_out}
+
+
+# 将中立 Context（工具签名、系统提示词与消息历史）序列化为逐行稳定文本，便于精确计算最长公共前缀
+def serialize_context(context: Context) -> str:
+    tools_payload = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": dict(tool.parameters),
+            "param_enums": (
+                {k: list(v) for k, v in tool.param_enums.items()}
+                if tool.param_enums is not None
+                else None
+            ),
+            "required": list(tool.required_names),
+        }
+        for tool in context.tools
+    ]
+    lines = [json.dumps({"tools": tools_payload}, ensure_ascii=False, sort_keys=True)]
+    if context.system_prompt:
+        lines.append(
+            json.dumps({"role": "system", "content": context.system_prompt}, ensure_ascii=False, sort_keys=True)
+        )
+    for msg in context.messages:
+        lines.append(json.dumps(_canonical_message_dict(msg), ensure_ascii=False, sort_keys=True))
     return "\n".join(lines) + "\n"
 
 
 # 计算相邻两次序列化请求的最长公共前缀字符数
-def common_prefix_len(prev: str, curr: str) -> int:
+def _common_prefix_len(prev: str, curr: str) -> int:
     for idx, (c1, c2) in enumerate(zip(prev, curr)):
         if c1 != c2:
             return idx
     return min(len(prev), len(curr))
 
 
-# 单次 LLM 调用的缓存观测记录（含本地前缀复用率与可选服务端 TokenUsage）
+# 单次模型调用的缓存观测记录（含本地前缀复用率与可选服务端 TokenUsage）
 @dataclass(frozen=True)
 class CallCacheRecord:
     session_key: str
@@ -124,7 +182,7 @@ class CacheMonitor:
         self._total_warm_calls = 0
         self._total_prefix_rate_sum = Fraction(0)
 
-    # 返回当前窗口内调用记录的只读列表快照，兼容既有下标与迭代契约
+    # 返回当前窗口内调用记录的只读列表快照
     @property
     def records(self) -> list[CallCacheRecord]:
         with self._lock:
@@ -135,7 +193,7 @@ class CacheMonitor:
         with self._lock:
             return self._total_recorded
 
-    # 记录一次成功完成的 LLM 调用并计算其与同会话上一次请求的前缀复用率
+    # 记录一次成功完成的模型调用并计算其与同会话上一次请求的前缀复用率
     def record(
         self,
         session_key: str,
@@ -149,7 +207,7 @@ class CacheMonitor:
                 prefix_len = 0
                 reuse_rate = None
             else:
-                prefix_len = common_prefix_len(prev, serialized)
+                prefix_len = _common_prefix_len(prev, serialized)
                 reuse_rate = round(prefix_len / total, 4)
             if len(self._last_serialized) >= self.max_sessions:
                 self._last_serialized.pop(next(iter(self._last_serialized)))
@@ -199,17 +257,17 @@ class CacheMonitor:
             snapshot = [rec for rec in snapshot if rec.session_key == session_key]
         return summarize_records(snapshot)
 
-    # 包装任意 LLMClient，在不侵入上层循环的前提下自动采集缓存统计
-    def wrap(self, llm: LLMClient, session_key: str = "default") -> "TrackingLLMClient":
-        return TrackingLLMClient(llm, self, session_key=session_key)
+    # 包装任意 ModelInvoker，在不侵入上层循环的前提下自动采集缓存统计
+    def wrap(self, invoker: ModelInvoker, *, session_key: str = "default") -> "TrackingModelClient":
+        return TrackingModelClient(invoker, self, session_key=session_key)
 
 
-# 透明代理客户端：在每次 respond/stream 前后采样请求前缀与服务端 usage
-class TrackingLLMClient(LLMClient):
-    # 绑定底层模型客户端、监控器与所属会话标识
+# 透明代理客户端（实现 ModelInvoker）：在每次 stream/complete 前后采样中立 Context 前缀与服务端 usage
+class TrackingModelClient:
+    # 绑定底层 ModelInvoker、监控器与所属会话标识
     def __init__(
         self,
-        inner: LLMClient,
+        inner: ModelInvoker,
         monitor: CacheMonitor,
         *,
         session_key: str = "default",
@@ -222,42 +280,56 @@ class TrackingLLMClient(LLMClient):
     # 读取当前线程最近一次被监控调用的 Token 统计
     @property
     def last_usage(self) -> TokenUsage | None:
-        return getattr(self._usage_local, "value", None)
+        value = getattr(self._usage_local, "value", None)
+        return value if isinstance(value, TokenUsage) else None
 
     # 设置当前线程最近一次被监控调用的 Token 统计
     @last_usage.setter
     def last_usage(self, value: TokenUsage | None) -> None:
         self._usage_local.value = value
 
-    # 转发请求给底层客户端，并在成功返回后记录本地前缀复用率与服务端 usage
-    def respond(
+    # 流式转发中立上下文给底层模型，并在 StreamDone 时单次记录本地前缀复用率与服务端 usage
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        serialized = serialize_request(messages, tools)
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        serialized = serialize_context(context)
         self.last_usage = None
-        reply = self.inner.respond(messages, tools)
-        raw_usage = self.inner.last_usage
+        raw_iter = self.inner.stream(context, options)
+
+        # 消费底层事件流并在流完成时记录缓存指标，异常或 StreamError 不污染统计
+        def _iter() -> Iterator[AssistantMessageEvent]:
+            recorded = False
+            try:
+                for event in raw_iter:
+                    if isinstance(event, StreamDone) and not recorded:
+                        raw_usage = event.usage if isinstance(event.usage, TokenUsage) else self.inner.last_usage
+                        usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
+                        self.last_usage = usage
+                        self.monitor.record(self.session_key, serialized, usage)
+                        recorded = True
+                    elif isinstance(event, StreamError):
+                        self.last_usage = None
+                    yield event
+            finally:
+                close_fn = getattr(raw_iter, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
+        return _iter()
+
+    # 同步转发中立上下文给底层模型，并在成功返回后记录本地前缀复用率与服务端 usage
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        serialized = serialize_context(context)
+        self.last_usage = None
+        reply = self.inner.complete(context, options)
+        raw_usage = reply.usage if isinstance(reply.usage, TokenUsage) else self.inner.last_usage
         usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
         self.last_usage = usage
         self.monitor.record(self.session_key, serialized, usage)
         return reply
-
-    # 流式转发请求给底层客户端，并在流结束时同步记录本地前缀复用率与服务端 usage
-    def stream(
-        self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> Iterator[LLMStreamEvent]:
-        serialized = serialize_request(messages, tools)
-        self.last_usage = None
-        recorded = False
-        for event in self.inner.stream(messages, tools):
-            if isinstance(event, StreamDone) and not recorded:
-                raw_usage = event.usage if isinstance(event.usage, TokenUsage) else self.inner.last_usage
-                usage = raw_usage if isinstance(raw_usage, TokenUsage) else None
-                self.last_usage = usage
-                self.monitor.record(self.session_key, serialized, usage)
-                recorded = True
-            yield event

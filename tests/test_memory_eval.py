@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.error import URLError
 
@@ -13,25 +14,54 @@ import pytest
 
 from evals import evaluate_memory, judge_answer, load_scenarios, main, write_scenarios_jsonl
 from evals.memory_eval import JUDGE_SYSTEM_PROMPT
-from personal_assistant.ai import LLMClient, NoopLLMClient, OpenAICompatibleLLM, TokenUsage
+from personal_assistant.ai import (
+    ApiProviderRegistry,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelClient,
+    ModelProfile,
+    NoopModelClient,
+    OpenAICompletionsProvider,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
 
 
-# 可按序返回预设消息与 usage 的脚本化假模型，用于确定性测试 memory_eval
-class ScriptedMemoryEvalLLM(LLMClient):
+# 可按序返回预设消息与 usage 的脚本化假模型（实现 ModelInvoker），用于确定性测试 memory_eval
+class ScriptedMemoryEvalLLM:
     # 保存预设回复与可选 usage 队列
-    def __init__(self, responses: list[tuple[dict[str, object], TokenUsage | None]]) -> None:
+    def __init__(self, responses: list[tuple[AssistantMessage, TokenUsage | None]]) -> None:
         self._responses = list(responses)
         self.last_usage: TokenUsage | None = None
 
     # 弹出下一条预设回复并更新 last_usage
-    def respond(
+    def complete(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del context, options
         reply, usage = self._responses.pop(0)
         self.last_usage = usage
         return reply
+
+    # 流式弹出下一条预设回复并更新 last_usage
+    def stream(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        reply = self.complete(context, options)
+        if reply.text:
+            yield TextDelta(content_index=0, text=reply.text, partial=reply)
+        reason = "toolUse" if reply.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=reply, usage=self.last_usage)
 
 
 # 测试 memory_eval 完整流程：多轮聊天 -> 沉淀冲突替换 -> 过期归档 -> 跨会话核验与缓存统计
@@ -83,14 +113,13 @@ def test_evaluate_memory_runs_lifecycle_scenario_and_checks_assertions() -> None
     llm = ScriptedMemoryEvalLLM(
         [
             # chat 1
-            ({"role": "assistant", "content": "明白，端口 9092，明天演练会。"}, TokenUsage(1000, 0, 20)),
+            (AssistantMessage.from_text("明白，端口 9092，明天演练会。", stop_reason="stop"), TokenUsage(1000, 0, 20)),
             # chat 2
-            ({"role": "assistant", "content": "好的。"}, TokenUsage(1100, 960, 10)),
+            (AssistantMessage.from_text("好的。", stop_reason="stop"), TokenUsage(1100, 960, 10)),
             # consolidate
             (
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
+                AssistantMessage.from_text(
+                    json.dumps(
                         {
                             "session_summary": "北极星端口改为 9092。",
                             "memories": [
@@ -107,28 +136,28 @@ def test_evaluate_memory_runs_lifecycle_scenario_and_checks_assertions() -> None
                         },
                         ensure_ascii=False,
                     ),
-                },
+                    stop_reason="stop",
+                ),
                 TokenUsage(900, 0, 80),
             ),
             # ask (s2) -> tool call read_markdown -> final reply
             (
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_markdown",
-                                "arguments": '{"path": "data/memory/projects.md", "start_line": "1", "end_line": "20"}',
-                            },
-                        }
-                    ],
-                },
+                AssistantMessage(
+                    blocks=(
+                        ToolCall(
+                            id="c1",
+                            name="read_markdown",
+                            arguments='{"path": "data/memory/projects.md", "start_line": "1", "end_line": "20"}',
+                        ),
+                    ),
+                    stop_reason="toolUse",
+                ),
                 TokenUsage(1200, 768, 25),
             ),
-            ({"role": "assistant", "content": "北极星当前端口是 9092，目前没有待办演练会记录。"}, TokenUsage(1300, 1152, 25)),
+            (
+                AssistantMessage.from_text("北极星当前端口是 9092，目前没有待办演练会记录。", stop_reason="stop"),
+                TokenUsage(1300, 1152, 25),
+            ),
         ]
     )
 
@@ -162,7 +191,7 @@ def test_evaluate_memory_faithfully_reports_failures() -> None:
         }
     ]
     llm = ScriptedMemoryEvalLLM(
-        [({"role": "assistant", "content": "你的显示器是 Dell U2723QE。"}, None)]
+        [(AssistantMessage.from_text("你的显示器是 Dell U2723QE。", stop_reason="stop"), None)]
     )
     report = evaluate_memory(llm, scenarios, git_commit="fail-sha")
     assert report["summary"]["passed_scenarios"] == 0
@@ -235,23 +264,22 @@ def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() 
 
     # 拦截 ask 阶段的 system prompt 以验证 today 时钟确实生效
     class ClockCapturingLLM(ScriptedMemoryEvalLLM):
-        # 记录非沉淀阶段的 system prompt 并返回预设回复
-        def respond(
+        # 记录带工具的前台调用 system prompt 并返回预设回复
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            if tools:
-                seen_ask_system_prompts.append(str(messages[0].get("content") or ""))
-            return super().respond(messages, tools)
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            if context.tools:
+                seen_ask_system_prompts.append(context.system_prompt)
+            return super().complete(context, options)
 
     agent_llm = ClockCapturingLLM(
         [
             # consolidate
             (
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
+                AssistantMessage.from_text(
+                    json.dumps(
                         {
                             "session_summary": "User updated 5K personal best to 25:50.",
                             "memories": [
@@ -266,30 +294,21 @@ def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() 
                             ],
                         }
                     ),
-                },
+                    stop_reason="stop",
+                ),
                 TokenUsage(500, 0, 60),
             ),
             # ask -> search_markdown
             (
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "type": "function",
-                            "function": {
-                                "name": "search_markdown",
-                                "arguments": '{"query": "5K", "root": "data/memory"}',
-                            },
-                        }
-                    ],
-                },
+                AssistantMessage(
+                    blocks=(ToolCall(id="c1", name="search_markdown", arguments='{"query": "5K", "root": "data/memory"}'),),
+                    stop_reason="toolUse",
+                ),
                 TokenUsage(900, 512, 20),
             ),
             # ask -> final reply
             (
-                {"role": "assistant", "content": "Your personal best 5K time is 25:50."},
+                AssistantMessage.from_text("Your personal best 5K time is 25:50.", stop_reason="stop"),
                 TokenUsage(1050, 896, 20),
             ),
         ]
@@ -298,10 +317,10 @@ def test_evaluate_memory_supports_seed_history_today_categories_and_llm_judge() 
     judge_llm = ScriptedMemoryEvalLLM(
         [
             (
-                {
-                    "role": "assistant",
-                    "content": '{"correct": true, "reason": "Answer matches 25:50 exactly."}',
-                },
+                AssistantMessage.from_text(
+                    '{"correct": true, "reason": "Answer matches 25:50 exactly."}',
+                    stop_reason="stop",
+                ),
                 TokenUsage(300, 0, 15),
             )
         ]
@@ -338,10 +357,10 @@ def test_evaluate_memory_records_judge_failure() -> None:
         }
     ]
     agent_llm = ScriptedMemoryEvalLLM(
-        [({"role": "assistant", "content": "You bought three cows from Peter."}, None)]
+        [(AssistantMessage.from_text("You bought three cows from Peter.", stop_reason="stop"), None)]
     )
     judge_llm = ScriptedMemoryEvalLLM(
-        [({"role": "assistant", "content": '{"correct": false, "reason": "Hallucinated instead of abstaining."}'}, None)]
+        [(AssistantMessage.from_text('{"correct": false, "reason": "Hallucinated instead of abstaining."}', stop_reason="stop"), None)]
     )
     report = evaluate_memory(agent_llm, scenarios, judge_llm=judge_llm, git_commit="judge-fail")
     assert report["summary"]["passed_scenarios"] == 0
@@ -368,7 +387,7 @@ def test_evaluate_memory_reports_progress_in_order() -> None:
     ]
     llm = ScriptedMemoryEvalLLM(
         [
-            ({"role": "assistant", "content": f"ok-{idx}"}, TokenUsage(100 + idx, 50, 10))
+            (AssistantMessage.from_text(f"ok-{idx}", stop_reason="stop"), TokenUsage(100 + idx, 50, 10))
             for idx in range(3)
         ]
     )
@@ -392,25 +411,24 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
     consolidate_calls = 0
 
     # 根据请求内容区分沉淀调用与 QA 问答调用的确定性假模型
-    class SharedGroupMockLLM(LLMClient):
+    class SharedGroupMockLLM:
         # 初始化最近一次 usage 记录
         def __init__(self) -> None:
             self.last_usage: TokenUsage | None = None
 
         # 沉淀阶段写入 pets.md；QA1 故意调 remember_fact 写入隔离标记；QA2 仅读 pets.md 验证无串台
-        def respond(
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
             nonlocal consolidate_calls
-            sys_text = str(messages[0].get("content") or "")
-            if tools is None and "后台记忆整理器" in sys_text:
+            if not context.tools and "后台记忆整理器" in context.system_prompt:
                 consolidate_calls += 1
                 self.last_usage = TokenUsage(prompt_tokens=400, cached_tokens=0, completion_tokens=50)
-                return {
-                    "role": "assistant",
-                    "content": json.dumps(
+                return AssistantMessage.from_text(
+                    json.dumps(
                         {
                             "session_summary": "用户养了一只叫 Max 的金毛。",
                             "memories": [
@@ -424,27 +442,33 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
                         },
                         ensure_ascii=False,
                     ),
-                }
+                    stop_reason="stop",
+                )
 
-            last_role = str(messages[-1].get("role") or "")
+            last_msg = context.messages[-1] if context.messages else None
             user_prompt = next(
-                (str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"),
+                (m.content for m in reversed(context.messages) if isinstance(m, UserMessage)),
                 "",
             )
             self.last_usage = TokenUsage(prompt_tokens=300, cached_tokens=150, completion_tokens=20)
-            if "QA1_MUTATE" in user_prompt and last_role == "user":
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_mut",
-                            "type": "function",
-                            "function": {"name": "remember_fact", "arguments": "{}"},
-                        }
-                    ],
-                }
-            return {"role": "assistant", "content": "The golden retriever is named Max."}
+            if "QA1_MUTATE" in user_prompt and isinstance(last_msg, UserMessage):
+                return AssistantMessage(
+                    blocks=(ToolCall(id="call_mut", name="remember_fact", arguments="{}"),),
+                    stop_reason="toolUse",
+                )
+            return AssistantMessage.from_text("The golden retriever is named Max.", stop_reason="stop")
+
+        # 流式接口复用 complete
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            msg = self.complete(context, options)
+            if msg.text:
+                yield TextDelta(content_index=0, text=msg.text, partial=msg)
+            reason = "toolUse" if msg.tool_calls else "stop"
+            yield StreamDone(reason=reason, message=msg, usage=self.last_usage)
 
     setup_steps = [
         {
@@ -543,19 +567,19 @@ def test_evaluate_memory_shared_group_consolidates_once_and_isolates_each_qa(tmp
 
 # 测试 judge_answer 与 JUDGE_SYSTEM_PROMPT 在 is_abstention=True 下允许有效前提纠偏而不误判为编造
 def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() -> None:
-    captured_messages: list[list[dict[str, object]]] = []
+    captured_contexts: list[Context] = []
 
-    # 捕获传给 judge_llm 的完整消息列表并按序返回预设判决
+    # 捕获传给 judge_llm 的完整 Context 并按序返回预设判决
     class CapturingJudgeLLM(ScriptedMemoryEvalLLM):
-        # 校验未传工具并记录 system/user 请求消息
-        def respond(
+        # 校验未传工具并记录 Context
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            assert tools is None
-            captured_messages.append(list(messages))
-            return super().respond(messages, tools)
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            assert not context.tools
+            captured_contexts.append(context)
+            return super().complete(context, options)
 
     question = "When did Caroline go camping?"
     expected_answer = "Not enough information / not mentioned in the conversation (do not answer 'last year')."
@@ -565,17 +589,17 @@ def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() ->
     judge_llm = CapturingJudgeLLM(
         [
             (
-                {
-                    "role": "assistant",
-                    "content": '{"correct": true, "reason": "Valid premise correction: Caroline has no camping record and Melanie\'s family is noted from memory."}',
-                },
+                AssistantMessage.from_text(
+                    '{"correct": true, "reason": "Valid premise correction: Caroline has no camping record and Melanie\'s family is noted from memory."}',
+                    stop_reason="stop",
+                ),
                 TokenUsage(260, 0, 24),
             ),
             (
-                {
-                    "role": "assistant",
-                    "content": '{"correct": false, "reason": "Adopted the false premise about Caroline."}',
-                },
+                AssistantMessage.from_text(
+                    '{"correct": false, "reason": "Adopted the false premise about Caroline."}',
+                    stop_reason="stop",
+                ),
                 TokenUsage(250, 0, 18),
             ),
         ]
@@ -607,18 +631,18 @@ def test_judge_answer_prompts_allow_valid_premise_correction_for_abstention() ->
         "reason": "Adopted the false premise about Caroline.",
     }
 
-    assert len(captured_messages) == 2
-    for call_msgs, expected_reply in zip(captured_messages, [correction_reply, fabricated_reply], strict=True):
-        assert len(call_msgs) == 2
-        assert call_msgs[0] == {"role": "system", "content": JUDGE_SYSTEM_PROMPT}
-        assert call_msgs[1]["role"] == "user"
-        user_payload = str(call_msgs[1]["content"])
+    assert len(captured_contexts) == 2
+    for ctx, expected_reply in zip(captured_contexts, [correction_reply, fabricated_reply], strict=True):
+        assert ctx.system_prompt == JUDGE_SYSTEM_PROMPT
+        assert len(ctx.messages) == 1
+        assert isinstance(ctx.messages[0], UserMessage)
+        user_payload = ctx.messages[0].content
         assert f"Question: {question}" in user_payload
         assert f"Reference Answer: {expected_answer}" in user_payload
         assert "is_abstention: true" in user_payload
         assert f"Assistant Reply: {expected_reply}" in user_payload
 
-    system_prompt = str(captured_messages[0][0]["content"])
+    system_prompt = captured_contexts[0].system_prompt
 
     # 规则 1 对正常问答（is_abstention=false）保持原有严格事实校验不变
     assert (
@@ -660,7 +684,7 @@ def _mock_choice_resp(content: str | None, prompt: int, cached: int, completion:
     }
 
 
-# 将测试用 /choices 字典转换为标准 OpenAI SSE 行流，供 OpenAICompatibleLLM.stream() 真流式并发测试复用
+# 将测试用 /choices 字典转换为标准 OpenAI SSE 行流，供 OpenAICompletionsProvider 真流式并发测试复用
 def _mock_sse_from_choice_resp(resp: dict[str, object]) -> list[str]:
     choices = resp["choices"]
     assert isinstance(choices, list)
@@ -686,7 +710,7 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         with pytest.raises(ValueError, match="workers"):
             evaluate_memory(ScriptedMemoryEvalLLM([]), [], workers=bad)  # type: ignore[arg-type]
 
-    # 1. 4 场景共享单个 OpenAICompatibleLLM 真并发（Barrier(4) 强证）且逆序完成仍严格按原序输出
+    # 1. 4 场景共享单个 ModelClient 真并发（Barrier(4) 强证）且逆序完成仍严格按原序输出
     scenarios = [
         {"id": f"sc-{i}", "category": "extraction", "steps": [{"action": "ask", "chat_id": f"c-{i}", "message": f"q #{i}", "must_include": ["nonexistent"] if i == 1 else [f"ok-{i}"]}]}
         for i in range(4)
@@ -695,6 +719,7 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
 
     # 通过 Barrier(4) 与逆序休眠迫使 sc-3 先完、sc-0 后完
     def concurrent_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+        del url, headers
         msgs = payload["messages"]
         assert isinstance(msgs, list)
         idx = int(str(msgs[-1]["content"]).split("#")[-1])
@@ -702,11 +727,17 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         time.sleep((3 - idx) * 0.03)
         return _mock_choice_resp(f"ok-{idx}", 200 + idx, 50 + idx, 10 + idx)
 
-    shared_llm = OpenAICompatibleLLM(
-        api_key="sk-test",
-        base_url="https://example.com/v1",
-        model="demo-model",
-        post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(concurrent_post(u, p, h))),
+    reg1 = ApiProviderRegistry()
+    reg1.register(OpenAICompletionsProvider(post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(concurrent_post(u, p, h)))))
+    shared_llm = ModelClient(
+        profile=ModelProfile(
+            name="demo",
+            api="openai-completions",
+            base_url="https://example.com/v1",
+            model="demo-model",
+            api_key="sk-test",
+        ),
+        registry=reg1,
     )
     main_thread = threading.current_thread()
     progress_events: list[tuple[int, int, str, threading.Thread]] = []
@@ -760,6 +791,7 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
 
     # 处理共享前置沉淀与 3 路并发 QA 请求的模拟 POST
     def shared_post(url: str, payload: dict[str, object], headers: dict[str, str]) -> dict[str, object]:
+        del url, headers
         nonlocal consolidate_calls
         msgs = payload["messages"]
         assert isinstance(msgs, list)
@@ -777,13 +809,18 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
                 return _mock_choice_resp(None, 300, 0, 15, tool_calls=[{"id": "call-qa0", "type": "function", "function": {"name": "remember_fact", "arguments": "{}"}}])
         return _mock_choice_resp("Alice's dog is named Max.", 310, 120, 12)
 
+    reg2 = ApiProviderRegistry()
+    reg2.register(OpenAICompletionsProvider(post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(shared_post(u, p, h)))))
     shared_report = evaluate_memory(
-        OpenAICompatibleLLM(
-            api_key="sk-test",
-            base_url="https://example.com/v1",
-            model="demo-model",
-            post_json=shared_post,
-            post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(shared_post(u, p, h))),
+        ModelClient(
+            profile=ModelProfile(
+                name="demo",
+                api="openai-completions",
+                base_url="https://example.com/v1",
+                model="demo-model",
+                api_key="sk-test",
+            ),
+            registry=reg2,
         ),
         shared_scenarios,
         workers=3,
@@ -839,7 +876,7 @@ def test_evaluate_memory_records_judge_metadata() -> None:
     # 带 model 属性的脚本化假模型，便于验证 judge.model 记录
     class NamedScriptedLLM(ScriptedMemoryEvalLLM):
         # 初始化模型名称与预设回复队列
-        def __init__(self, model: str, responses: list[tuple[dict[str, object], TokenUsage | None]]) -> None:
+        def __init__(self, model: str, responses: list[tuple[AssistantMessage, TokenUsage | None]]) -> None:
             super().__init__(responses)
             self.model = model
 
@@ -852,7 +889,7 @@ def test_evaluate_memory_records_judge_metadata() -> None:
     ]
 
     rep_none = evaluate_memory(
-        NamedScriptedLLM("agent-m", [({"role": "assistant", "content": "ok"}, None)]),
+        NamedScriptedLLM("agent-m", [(AssistantMessage.from_text("ok", stop_reason="stop"), None)]),
         scenarios,
         judge_llm=None,
         git_commit="meta-1",
@@ -866,9 +903,9 @@ def test_evaluate_memory_records_judge_metadata() -> None:
     }
 
     rep_noop = evaluate_memory(
-        NamedScriptedLLM("agent-m", [({"role": "assistant", "content": "ok"}, None)]),
+        NamedScriptedLLM("agent-m", [(AssistantMessage.from_text("ok", stop_reason="stop"), None)]),
         scenarios,
-        judge_llm=NoopLLMClient(),
+        judge_llm=NoopModelClient(),
         git_commit="meta-2",
     )
     assert rep_noop["judge"] == {
@@ -879,7 +916,7 @@ def test_evaluate_memory_records_judge_metadata() -> None:
         "prompt_sha256": None,
     }
 
-    self_llm = NamedScriptedLLM("deepseek-chat", [({"role": "assistant", "content": "ok"}, None)])
+    self_llm = NamedScriptedLLM("deepseek-chat", [(AssistantMessage.from_text("ok", stop_reason="stop"), None)])
     rep_self = evaluate_memory(self_llm, scenarios, judge_llm=self_llm, git_commit="meta-3")
     assert rep_self["judge"] == {
         "enabled": True,
@@ -889,7 +926,7 @@ def test_evaluate_memory_records_judge_metadata() -> None:
         "prompt_sha256": JUDGE_PROMPT_SHA256,
     }
 
-    agent_llm = NamedScriptedLLM("deepseek-reasoner", [({"role": "assistant", "content": "ok"}, None)])
+    agent_llm = NamedScriptedLLM("deepseek-reasoner", [(AssistantMessage.from_text("ok", stop_reason="stop"), None)])
     judge_llm = NamedScriptedLLM("deepseek-chat", [])
     rep_sep = evaluate_memory(agent_llm, scenarios, judge_llm=judge_llm, git_commit="meta-4")
     assert rep_sep["judge"] == {
@@ -904,21 +941,25 @@ def test_evaluate_memory_records_judge_metadata() -> None:
 # 测试单场景与 shared_setup 异常容错隔离：并发中单题抛网络/运行时异常不拖垮其余场景，KeyboardInterrupt 照常抛出
 def test_evaluate_memory_isolates_scenario_and_shared_setup_exceptions() -> None:
     # 根据消息关键词按需抛出指定异常的并发假模型
-    class FaultyScenarioLLM(LLMClient):
+    class FaultyScenarioLLM:
+        last_usage: TokenUsage | None = None
+
         # 按场景内容决定返回正常答案、触发沉淀失败或抛出网络异常
-        def respond(
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            sys_text = str(messages[0].get("content") or "")
-            joined = "\n".join(str(m.get("content") or "") for m in messages)
-            if tools is None and "后台记忆整理器" in sys_text:
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
+            joined = "\n".join(
+                m.content if isinstance(m, UserMessage) else (m.text if isinstance(m, AssistantMessage) else m.content)
+                for m in context.messages
+            )
+            if not context.tools and "后台记忆整理器" in context.system_prompt:
                 if "FAIL_SETUP" in joined:
                     raise RuntimeError("shared setup boom")
-                return {
-                    "role": "assistant",
-                    "content": json.dumps(
+                return AssistantMessage.from_text(
+                    json.dumps(
                         {
                             "session_summary": "ok",
                             "memories": [
@@ -931,12 +972,24 @@ def test_evaluate_memory_isolates_scenario_and_shared_setup_exceptions() -> None
                             ],
                         }
                     ),
-                }
+                    stop_reason="stop",
+                )
             if "RAISE_URL_ERROR" in joined:
                 raise URLError("temporary network glitch")
             if "RAISE_KB_INT" in joined:
                 raise KeyboardInterrupt("user aborted")
-            return {"role": "assistant", "content": "ok-reply"}
+            return AssistantMessage.from_text("ok-reply", stop_reason="stop")
+
+        # 流式入口复用 complete
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            msg = self.complete(context, options)
+            if msg.text:
+                yield TextDelta(content_index=0, text=msg.text, partial=msg)
+            yield StreamDone(reason="stop", message=msg)
 
     scenarios = [
         {"id": "sc-ok-1", "category": "extraction", "steps": [{"action": "ask", "message": "hello 1", "must_include": ["ok-reply"]}]},
@@ -1023,8 +1076,8 @@ def test_lexical_word_boundary_and_tightened_memory_scenarios() -> None:
     # 1. Google/good 不应误命中 Go，900 不应误命中 90
     false_pos_llm = ScriptedMemoryEvalLLM(
         [
-            ({"role": "assistant", "content": "Google 的 good 方案，企业微信通知，90 天，Parquet。"}, None),
-            ({"role": "assistant", "content": "采用 Go 语言，企业微信通知，900 天，Parquet。"}, None),
+            (AssistantMessage.from_text("Google 的 good 方案，企业微信通知，90 天，Parquet。", stop_reason="stop"), None),
+            (AssistantMessage.from_text("采用 Go 语言，企业微信通知，900 天，Parquet。", stop_reason="stop"), None),
         ]
     )
     rep_go_fail = evaluate_memory(false_pos_llm, scenarios, git_commit="wb-1")
@@ -1038,7 +1091,7 @@ def test_lexical_word_boundary_and_tightened_memory_scenarios() -> None:
     # 2. 中文紧贴边界（如 Go语言 / 90天）与企业微信全称应正常通过
     valid_llm = ScriptedMemoryEvalLLM(
         [
-            ({"role": "assistant", "content": "采用Go语言编写，接入企业微信机器人，冷数据归档90天，格式为Parquet。"}, None),
+            (AssistantMessage.from_text("采用Go语言编写，接入企业微信机器人，冷数据归档90天，格式为Parquet。", stop_reason="stop"), None),
         ]
     )
     rep_pass = evaluate_memory(valid_llm, scenarios, git_commit="wb-3")
@@ -1091,30 +1144,47 @@ def test_memory_eval_uses_dual_model_consolidator_and_cli_loads_tools_config_onc
     cons_calls: list[str] = []
 
     # 仅处理前台问答，若误入沉淀提示词则直接报错
-    class MainOnlyLLM(LLMClient):
+    class MainOnlyLLM:
+        last_usage: TokenUsage | None = None
+
         # 记录前台问答请求并返回预设答复
-        def respond(
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            assert "后台记忆整理器" not in str(messages[0].get("content") or "")
-            main_calls.append(str(messages[-1].get("content") or ""))
-            return {"role": "assistant", "content": "星云端口为 7788。"}
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
+            assert "后台记忆整理器" not in context.system_prompt
+            last = context.messages[-1]
+            assert isinstance(last, UserMessage)
+            main_calls.append(last.content)
+            return AssistantMessage.from_text("星云端口为 7788。", stop_reason="stop")
+
+        # 流式入口复用 complete
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            msg = self.complete(context, options)
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+            yield StreamDone(reason="stop", message=msg)
 
     # 仅处理后台记忆沉淀，验证 consolidate 步骤真正经由 app.consolidator 调用双模型
-    class ConsolidatorOnlyLLM(LLMClient):
+    class ConsolidatorOnlyLLM:
+        last_usage: TokenUsage | None = None
+
         # 记录沉淀请求并返回结构化 JSON 记忆操作
-        def respond(
+        def complete(
             self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            assert "后台记忆整理器" in str(messages[0].get("content") or "")
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
+            assert "后台记忆整理器" in context.system_prompt
             cons_calls.append("consolidate")
-            return {
-                "role": "assistant",
-                "content": json.dumps(
+            return AssistantMessage.from_text(
+                json.dumps(
                     {
                         "session_summary": "星云服务监听端口 7788。",
                         "memories": [
@@ -1128,7 +1198,17 @@ def test_memory_eval_uses_dual_model_consolidator_and_cli_loads_tools_config_onc
                     },
                     ensure_ascii=False,
                 ),
-            }
+                stop_reason="stop",
+            )
+
+        # 流式入口复用 complete
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            msg = self.complete(context, options)
+            yield StreamDone(reason="stop", message=msg)
 
     scenarios = [
         {
@@ -1200,5 +1280,6 @@ def test_memory_eval_uses_dual_model_consolidator_and_cli_loads_tools_config_onc
     assert load_count == 1
     assert isinstance(captured_kwargs.get("tools_config"), ToolsConfig)
     cons_obj = captured_kwargs.get("consolidator_llm")
-    assert isinstance(cons_obj, OpenAICompatibleLLM)
+    assert isinstance(cons_obj, ModelClient)
+    assert cons_obj.api == "openai-completions"
     assert cons_obj.model == "deepseek-chat"

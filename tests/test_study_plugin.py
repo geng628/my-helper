@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -10,25 +11,49 @@ import pytest
 
 from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.agent.tools import ToolMetadata
-from personal_assistant.ai import LLMClient
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
 from personal_assistant.assistant.memory import MemoryStore
 
 
-# 测试用脚本化模拟模型
-class ScriptedStudyLLM(LLMClient):
+# 测试用脚本化模拟模型（实现 ModelInvoker）
+class ScriptedStudyLLM:
     # 初始化预设回复序列
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
+        self.last_usage: TokenUsage | None = None
 
-    # 弹出并返回下一条预设回复
-    def respond(
+    # 流式弹出并返回下一条预设回复
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del context, options
+        msg = self._responses.pop(0)
+        if msg.text:
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+        reason = "toolUse" if msg.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=msg, usage=msg.usage)
+
+    # 同步弹出并返回下一条预设回复
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del context, options
         return self._responses.pop(0)
 
 
@@ -434,31 +459,27 @@ def test_security_validation_symlink_escape_and_concurrent_writes(
 def test_assistant_app_integrates_study_plugin_end_to_end(tmp_path: Path) -> None:
     llm = ScriptedStudyLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_study_save",
-                        "type": "function",
-                        "function": {
-                            "name": "save_study_card",
-                            "arguments": json.dumps(
-                                {
-                                    "topic": "algorithms",
-                                    "concept": "二分查找边界",
-                                    "summary": "左闭右开区间 [l, r) 下终止条件为 l < r。",
-                                    "grade": "good",
-                                }
-                            ),
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": "已为你记录「二分查找边界」学习卡片，明天（2026-11-27）记得复习。",
-            },
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="call_study_save",
+                        name="save_study_card",
+                        arguments=json.dumps(
+                            {
+                                "topic": "algorithms",
+                                "concept": "二分查找边界",
+                                "summary": "左闭右开区间 [l, r) 下终止条件为 l < r。",
+                                "grade": "good",
+                            }
+                        ),
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text(
+                "已为你记录「二分查找边界」学习卡片，明天（2026-11-27）记得复习。",
+                stop_reason="stop",
+            ),
         ]
     )
     app = AssistantApp(

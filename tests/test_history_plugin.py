@@ -6,6 +6,7 @@ import json
 import shutil
 import sqlite3
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -13,7 +14,16 @@ import pytest
 
 from personal_assistant.agent.plugins import Plugin, PluginManager
 from personal_assistant.agent.tools import ToolMetadata
-from personal_assistant.ai import LLMClient
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
@@ -21,21 +31,44 @@ from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.prompts import SYSTEM_PROMPT
 
 
-# 测试用脚本化模拟模型
-class ScriptedHistoryLLM(LLMClient):
-    # 保存预设回复序列并记录每次收到的消息上下文
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+# 测试用脚本化模拟模型（实现 ModelInvoker）
+class ScriptedHistoryLLM:
+    # 保存预设回复序列并记录每次收到的 Context
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
-        self.requests: list[list[dict[str, object]]] = []
+        self.requests: list[Context] = []
+        self.last_usage: TokenUsage | None = None
 
-    # 记录请求并弹出下一条预设回复
-    def respond(
+    # 记录请求并以流式事件弹出下一条预设回复
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        self.requests.append([dict(m) for m in messages])
-        return self._responses.pop(0)
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del options
+        self.requests.append(
+            Context(
+                system_prompt=context.system_prompt,
+                messages=tuple(context.messages),
+                tools=tuple(context.tools),
+            )
+        )
+        msg = self._responses.pop(0)
+        if msg.text:
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+        reason = "toolUse" if msg.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=msg, usage=msg.usage)
+
+    # 同步弹出下一条预设回复
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        for ev in self.stream(context, options):
+            if isinstance(ev, StreamDone):
+                return ev.message
+        raise AssertionError("ScriptedHistoryLLM did not emit StreamDone")
 
 
 # 测试插件发现、ToolsConfig 白名单门控、单参数契约及对 chat_history.sqlite3 的只读零侵入边界
@@ -43,7 +76,7 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
     assert len(manager.plugins) == 5
     assert all(isinstance(p, Plugin) for p in manager.plugins)
-    assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "openai_reasoning", "telemetry"}
+    assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "openai-reasoning", "telemetry"}
     assert "search_chat_history" in {t.name for t in manager.build_tools()}
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
@@ -227,24 +260,20 @@ def test_assistant_app_react_uses_search_chat_history_with_turn_isolation(tmp_pa
 
     llm = ScriptedHistoryLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_hist",
-                        "type": "function",
-                        "function": {
-                            "name": "search_chat_history",
-                            "arguments": '{"query": "木工书 Christopher Schwarz"}',
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": "我之前为你推荐过《The Anarchist's Tool Chest》（作者 Christopher Schwarz）。",
-            },
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="call_hist",
+                        name="search_chat_history",
+                        arguments='{"query": "木工书 Christopher Schwarz"}',
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text(
+                "我之前为你推荐过《The Anarchist's Tool Chest》（作者 Christopher Schwarz）。",
+                stop_reason="stop",
+            ),
         ]
     )
     app = AssistantApp(
@@ -328,36 +357,28 @@ def test_history_lru_eviction_lease_pinning_and_concurrency(tmp_path: Path) -> N
 def test_assistant_app_multi_turn_reuses_incremental_history_index(tmp_path: Path) -> None:
     llm = ScriptedHistoryLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "t1_call",
-                        "type": "function",
-                        "function": {
-                            "name": "search_chat_history",
-                            "arguments": '{"query": "HeliosFirstMilestone"}',
-                        },
-                    }
-                ],
-            },
-            {"role": "assistant", "content": "第1轮已查到 HeliosFirstMilestone。"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "t2_call",
-                        "type": "function",
-                        "function": {
-                            "name": "search_chat_history",
-                            "arguments": '{"query": "HeliosSecondMilestone"}',
-                        },
-                    }
-                ],
-            },
-            {"role": "assistant", "content": "第2轮已查到 HeliosSecondMilestone。"},
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="t1_call",
+                        name="search_chat_history",
+                        arguments='{"query": "HeliosFirstMilestone"}',
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text("第1轮已查到 HeliosFirstMilestone。", stop_reason="stop"),
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="t2_call",
+                        name="search_chat_history",
+                        arguments='{"query": "HeliosSecondMilestone"}',
+                    ),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text("第2轮已查到 HeliosSecondMilestone。", stop_reason="stop"),
         ]
     )
     app = AssistantApp(

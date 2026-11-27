@@ -23,8 +23,7 @@ from personal_assistant.agent.tools import (
     extract_tool,
     is_tool,
 )
-from personal_assistant.ai.client import LLMClient, ProviderFactory
-from personal_assistant.ai.types import ModelProfile, TokenUsage
+from personal_assistant.ai.protocol import ApiProvider, TokenUsage
 
 
 # 通用后台任务完成事件：供上层广播异步任务耗时与 Token 开销，不侵入微内核业务实现
@@ -73,18 +72,9 @@ class ConfigCompilerProtocol(Protocol):
         model: str = "",
         base_url: str = "",
         name: str = "",
-        provider: str = "",
+        api: str = "",
         temperature: float = 0.2,
     ) -> str: ...
-
-
-# 内层子协议 4：大模型客户端驱动极简协议（单轨直通已实化的 ModelProfile）
-@runtime_checkable
-class LLMProviderProtocol(Protocol):
-    name: str
-
-    # 根据已解析密钥的 ModelProfile 构建 LLMClient 实例
-    def build(self, profile: ModelProfile) -> LLMClient: ...
 
 
 # 内层子协议 5：运行期可观测器极简协议（微内核仅按 session_key 广播事件与导出快照）
@@ -126,26 +116,27 @@ def _register_slot_factory(
         raise TypeError(f"{label}必须实现 {protocol_cls.__name__} 或可调用工厂：{clean_name}")
 
 
-# 校验并向主板插槽注册单实例强类型协议对象（供配置编译器与模型驱动插槽共用）
+# 校验并向主板插槽注册单实例强类型协议对象（供配置编译器与协议翻译器插槽共用）
 def _register_named_protocol(
     slot: dict[str, Any],
     item: Any,
     protocol_cls: type[object],
     label: str,
     *,
-    transform: Callable[[Any], Any] | None = None,
+    key_attr: str = "name",
     case_insensitive: bool = False,
 ) -> None:
     if not isinstance(item, protocol_cls):
         raise TypeError(f"{label}必须实现 {protocol_cls.__name__}：{item!r}")
-    clean_name = item.name.strip()
+    raw_name = getattr(item, key_attr, "")
+    clean_name = str(raw_name or "").strip()
     if case_insensitive:
         clean_name = clean_name.lower()
     if not clean_name:
         raise ValueError(f"{label}名称不能为空。")
     if clean_name in slot:
         raise ValueError(f"{label}名称重复：{clean_name}")
-    slot[clean_name] = transform(item) if transform is not None else item
+    slot[clean_name] = item
 
 
 # 插件主板通用上下文（PluginContext）：零业务字段泄漏，仅承载通用根路径、配置、绑定字典与 5 个标准插槽
@@ -157,7 +148,7 @@ class PluginContext:
     tool_specs: list[Tool] = field(default_factory=list)
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
-    providers: dict[str, ProviderFactory] = field(default_factory=dict)
+    providers: dict[str, ApiProvider] = field(default_factory=dict)
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
 
     # 插槽 1：向主板登记单个工具（裸 Tool 实例首次解析函数签名，绑定初始上下文并拦截重名）
@@ -217,14 +208,14 @@ class PluginContext:
     def register_compiler(self, compiler: ConfigCompilerProtocol) -> None:
         _register_named_protocol(self.compilers, compiler, ConfigCompilerProtocol, "配置编译器插件")
 
-    # 插槽 4：向主板注册大模型客户端驱动子协议实现（仅接受 LLMProviderProtocol 实例，名称统一小写归一化）
-    def register_provider(self, provider: LLMProviderProtocol) -> None:
+    # 插槽 4：向主板注册 Layer 1 ApiProvider 协议翻译器实例（按 provider.api 小写归一化登记）
+    def register_provider(self, provider: ApiProvider) -> None:
         _register_named_protocol(
             self.providers,
             provider,
-            LLMProviderProtocol,
-            "模型 Provider 插件",
-            transform=lambda p: p.build,
+            ApiProvider,
+            "协议翻译器插件",
+            key_attr="api",
             case_insensitive=True,
         )
 
@@ -350,7 +341,7 @@ def _initialize_modules(modules: Iterable[ModuleType], context: PluginContext) -
 @dataclass(frozen=True)
 class PluginManager(ToolsetProvider):
     retrievers: dict[str, RetrieverFactory] = field(default_factory=dict)
-    providers: dict[str, ProviderFactory] = field(default_factory=dict)
+    providers: dict[str, ApiProvider] = field(default_factory=dict)
     compilers: dict[str, ConfigCompilerProtocol] = field(default_factory=dict)
     observers: dict[str, ObserverFactory] = field(default_factory=dict)
     plugins: tuple[Plugin, ...] = ()

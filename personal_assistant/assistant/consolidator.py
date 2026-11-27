@@ -11,8 +11,7 @@ from datetime import date
 from time import perf_counter
 
 from personal_assistant.agent.plugins import TaskEvent
-from personal_assistant.ai.client import LLMClient, NoopLLMClient
-from personal_assistant.ai.types import TokenUsage
+from personal_assistant.ai import Context, ModelInvoker, NoopModelClient, TokenUsage, UserMessage
 from personal_assistant.assistant.common import format_date_with_weekday, today_shanghai
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.memory import MemoryStore
@@ -121,12 +120,12 @@ def _format_transcript(batch: list[dict[str, object]], max_item_chars: int = 100
 
 # 纯同步记忆沉淀与上下文压缩核心（不绑定线程，未来可直接挂载到独立 worker）
 class MemoryConsolidator:
-    # 绑定状态存储、Markdown 记忆库、大模型客户端、触发策略与可选逻辑时钟
+    # 绑定状态存储、Markdown 记忆库、模型调用句柄、触发策略与可选逻辑时钟
     def __init__(
         self,
         state: StateStore,
         memory: MemoryStore,
-        llm: LLMClient,
+        llm: ModelInvoker,
         *,
         policy: ConsolidationPolicy | None = None,
         today_fn: Callable[[], date] | None = None,
@@ -136,6 +135,13 @@ class MemoryConsolidator:
         self.llm = llm
         self.policy = policy or ConsolidationPolicy()
         self._today_fn = today_fn
+        self._usage_local = threading.local()
+
+    # 读取当前线程最近一次沉淀调用记录的 TokenUsage（隔离热重载与并发调用）
+    @property
+    def last_usage(self) -> TokenUsage | None:
+        value = getattr(self._usage_local, "value", None)
+        return value if isinstance(value, TokenUsage) else None
 
     # 检查指定会话是否达到沉淀阈值；若达到则返回（旧摘要，待沉淀旧消息批次），否则返回 None
     def select_batch(self, chat_id: str) -> tuple[str, list[dict[str, object]]] | None:
@@ -173,7 +179,9 @@ class MemoryConsolidator:
         *,
         today: date | None = None,
     ) -> ConsolidationResult | None:
-        if isinstance(self.llm, NoopLLMClient):
+        llm = self.llm
+        self._usage_local.value = None
+        if isinstance(llm, NoopModelClient):
             return None
         selected = self.select_batch(chat_id)
         if selected is None:
@@ -198,13 +206,15 @@ class MemoryConsolidator:
             f"【已有前情摘要】\n{existing_summary or '（无）'}\n\n"
             f"【待沉淀与压缩的早期对话（共 {len(batch)} 条）】\n{transcript}"
         )
-        messages: list[dict[str, object]] = [
-            {"role": "system", "content": CONSOLIDATION_SYSTEM_PROMPT},
-            {"role": "user", "content": user_payload},
-        ]
+        context = Context(
+            system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
+            messages=(UserMessage(content=user_payload),),
+        )
 
-        reply_msg = self.llm.respond(messages, tools=None)
-        parsed = _parse_json_object(str(reply_msg.get("content") or ""))
+        reply_msg = llm.complete(context)
+        raw_usage = reply_msg.usage if isinstance(reply_msg.usage, TokenUsage) else llm.last_usage
+        self._usage_local.value = raw_usage if isinstance(raw_usage, TokenUsage) else None
+        parsed = _parse_json_object(reply_msg.text)
 
         summary = str(parsed.get("session_summary") or "").strip()
         if not summary:
@@ -299,7 +309,7 @@ class BackgroundConsolidator:
         *,
         on_complete: Callable[[ConsolidationResult], None] | None = None,
     ) -> bool:
-        if isinstance(self.consolidator.llm, NoopLLMClient):
+        if isinstance(self.consolidator.llm, NoopModelClient):
             return False
         with self._lock:
             if chat_id in self._in_flight or self._is_in_cooldown(chat_id):
@@ -353,7 +363,7 @@ class BackgroundConsolidator:
         finally:
             try:
                 if self.on_event is not None and (result is not None or err_text is not None):
-                    raw_usage = self.consolidator.llm.last_usage
+                    raw_usage = self.consolidator.last_usage
                     details = (
                         {
                             "compacted_messages": result.compacted_messages,

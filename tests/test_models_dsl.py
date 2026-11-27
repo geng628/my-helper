@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import json
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from personal_assistant.agent.plugins import PluginManager
 from personal_assistant.ai import (
-    LLMClient,
-    ModelProfile,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelClient,
     ModelsConfig,
-    OpenAICompatibleLLM,
+    StreamDone,
+    StreamOptions,
+    TokenUsage,
 )
 from personal_assistant.assistant.app import build_app
 from personal_assistant.assistant.commands import ToolsConfig
@@ -22,22 +27,32 @@ from personal_assistant.assistant.memory import MemoryStore
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-# 测试插件发现器自动加载 plugins/models_dsl.py 中的 models_dsl 编译器并编译多模型配置
+# 测试插件发现器自动加载 plugins/models_dsl.py 中的 models_dsl 编译器并编译多模型配置（含 reasoning/max_tokens/cache_retention）
 def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
     compilers = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers
     assert "models_dsl" in compilers
     compiler = compilers["models_dsl"]
 
     dsl = """
-    # 极简模型配置：直接填 api_key 即可用，无需用户折腾环境变量
+    # 极简模型配置：统一使用单一路由键 api，直接填 api_key 即可用
     default deepseek
 
     model deepseek {
-      provider openai_compatible
+      api      openai-completions
       base_url https://api.deepseek.com/v1
       model    deepseek-chat
       api_key  sk-live-secret-9876543210
       temp     0.2
+    }
+
+    model claude {
+      api             anthropic-messages
+      base_url        https://api.anthropic.com
+      model           claude-sonnet-4-5
+      api_key         sk-ant-demo
+      max_tokens      8192
+      reasoning       medium
+      cache_retention long
     }
 
     model local_qwen {
@@ -49,11 +64,15 @@ def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
     """
     compiled = compiler.compile(dsl, "models.dsl")
     assert compiled["default"] == "deepseek"
-    assert set(compiled["models"].keys()) == {"deepseek", "local_qwen"}
-    assert compiled["models"]["deepseek"]["api_key"] == "sk-live-secret-9876543210"
-    assert compiled["models"]["deepseek"]["temperature"] == 0.2
-    assert compiled["models"]["local_qwen"]["provider"] == "openai_compatible"
-    assert compiled["models"]["local_qwen"]["key_env"] == "OLLAMA_API_KEY"
+    assert set(compiled["models"].keys()) == {"deepseek", "claude", "local_qwen"}  # type: ignore[union-attr]
+    assert compiled["models"]["deepseek"]["api_key"] == "sk-live-secret-9876543210"  # type: ignore[index]
+    assert compiled["models"]["deepseek"]["temperature"] == 0.2  # type: ignore[index]
+    assert compiled["models"]["claude"]["api"] == "anthropic-messages"  # type: ignore[index]
+    assert compiled["models"]["claude"]["max_tokens"] == 8192  # type: ignore[index]
+    assert compiled["models"]["claude"]["reasoning"] == "medium"  # type: ignore[index]
+    assert compiled["models"]["claude"]["cache_retention"] == "long"  # type: ignore[index]
+    assert compiled["models"]["local_qwen"]["api"] == "openai-completions"  # type: ignore[index]
+    assert compiled["models"]["local_qwen"]["key_env"] == "OLLAMA_API_KEY"  # type: ignore[index]
 
     # 单模型省略 default 时自动设为默认模型
     single = compiler.compile(
@@ -67,18 +86,25 @@ def test_models_dsl_plugin_compiles_plaintext_key_and_key_env() -> None:
     redacted = cfg.redacted_dict()
     dumped = json.dumps(redacted, ensure_ascii=False)
     assert "sk-live-secret-9876543210" not in dumped
-    assert redacted["models"]["deepseek"]["api_key_configured"] is True
+    assert "sk-ant-demo" not in dumped
+    assert redacted["models"]["deepseek"]["api_key_configured"] is True  # type: ignore[index]
+    assert redacted["models"]["claude"]["reasoning"] == "medium"  # type: ignore[index]
 
 
-# 测试 DSL 编译器对语法错误、未知字段、重复定义、无效 URL/温度与悬空 default 给出精确行列报错
+# 测试 DSL 编译器对语法错误、未知字段（含已废弃 provider）、重复定义、无效 URL/温度与悬空 default 给出精确行列报错
 def test_models_dsl_reports_precise_syntax_and_semantic_errors() -> None:
     compiler = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers["models_dsl"]
 
-    # 未知字段
+    # 未知字段（含已废弃的旧 provider 关键字）
     with pytest.raises(ValueError, match="第 3 行"):
         compiler.compile(
             "model a {\n  base_url https://x.com/v1\n  bogus 123\n  model m\n}\n",
             "bad.dsl",
+        )
+    with pytest.raises(ValueError, match="未知字段 'provider'"):
+        compiler.compile(
+            "model a {\n  provider openai-completions\n  base_url https://x.com/v1\n  model m\n}\n",
+            "bad_old.dsl",
         )
 
     # default 指向不存在的模型
@@ -96,11 +122,17 @@ def test_models_dsl_reports_precise_syntax_and_semantic_errors() -> None:
             "bad.dsl",
         )
 
-    # 非法 base_url 与越界 temperature
+    # 非法 base_url、越界 temperature、非法 reasoning / max_tokens / cache_retention
     with pytest.raises(ValueError, match="http"):
         compiler.compile("model a {\n  base_url ftp://x.com\n  model m\n}\n", "bad.dsl")
     with pytest.raises(ValueError, match="0"):
         compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n  temp 3.5\n}\n", "bad.dsl")
+    with pytest.raises(ValueError, match="reasoning"):
+        compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n  reasoning turbo\n}\n", "bad.dsl")
+    with pytest.raises(ValueError, match="max_tokens"):
+        compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n  max_tokens 0\n}\n", "bad.dsl")
+    with pytest.raises(ValueError, match="cache_retention"):
+        compiler.compile("model a {\n  base_url https://x.com/v1\n  model m\n  cache_retention forever\n}\n", "bad.dsl")
 
     # 缺少右花括号
     with pytest.raises(ValueError, match="}"):
@@ -160,20 +192,21 @@ def test_tools_config_compiles_models_dsl_chmod_600_and_builds_llm(
 
     # 按默认与显式 --model 名称构造客户端，零环境变量即可生效
     llm_default = tcfg.build_llm(cfg_dir)
-    assert isinstance(llm_default, OpenAICompatibleLLM)
-    assert llm_default.api_key == "sk-user-direct-key-12345"
+    assert isinstance(llm_default, ModelClient)
+    assert llm_default.profile.api == "openai-completions"
+    assert llm_default.profile.api_key == "sk-user-direct-key-12345"
     assert llm_default.model == "deepseek-chat"
-    assert llm_default.temperature == 0.3
+    assert llm_default.profile.temperature == 0.3
 
     llm_backup = tcfg.build_llm(cfg_dir, model_name="backup")
-    assert isinstance(llm_backup, OpenAICompatibleLLM)
+    assert isinstance(llm_backup, ModelClient)
     assert llm_backup.model == "qwen2.5:7b"
 
     # 删掉 models.dsl 后，核心不靠插件也能直接加载已编译的 models.json
     (cfg_dir / "models.dsl").unlink()
     llm_from_json = tcfg.build_llm(cfg_dir)
-    assert isinstance(llm_from_json, OpenAICompatibleLLM)
-    assert llm_from_json.api_key == "sk-user-direct-key-12345"
+    assert isinstance(llm_from_json, ModelClient)
+    assert llm_from_json.profile.api_key == "sk-user-direct-key-12345"
 
     # build_app 也能自动接管并避免 status() 暴露明文密钥
     app = build_app(data_root=tmp_path / "data", config_root=cfg_dir, project_root=REPO_ROOT)
@@ -217,54 +250,73 @@ def test_system_owned_leak_prevention_gitignore_and_tool_sandboxes(tmp_path: Pat
     assert "敏感" in res_json or "拒绝" in res_json or "禁止" in res_json
 
 
-# 测试极简一行预设语法（免写大括号、网址、provider、temp），支持中英文厂商别名与本地免密钥 Ollama
+# 测试极简一行预设语法（含 anthropic/gemini/reasoner/中英文别名/免密钥 ollama）与自动生成配置
 def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
     compiler = PluginManager.from_entries(["plugins"], REPO_ROOT).compilers["models_dsl"]
     dsl = """
-    # 非程序员极简写法：一行自动补全网址、默认模型、provider 与 temperature
+    # 非程序员极简写法：一行自动补全网址、默认模型、api 协议与 temperature
     use deepseek sk-ds-one-line
     add reasoner sk-r1-one-line
+    add claude sk-ant-one-line
+    add gemini sk-gem-one-line
     add 通义千问 sk-qwen-one-line
     add ollama
     add openai gpt-4o sk-oa-override
     """
     compiled = compiler.compile(dsl, "simple.dsl")
+    models = compiled["models"]
+    assert isinstance(models, dict)
     assert compiled["default"] == "deepseek"
-    assert compiled["models"]["deepseek"]["provider"] == "openai_compatible"
-    assert compiled["models"]["deepseek"]["base_url"] == "https://api.deepseek.com/v1"
-    assert compiled["models"]["deepseek"]["model"] == "deepseek-chat"
-    assert compiled["models"]["deepseek"]["api_key"] == "sk-ds-one-line"
-    assert compiled["models"]["deepseek_reasoner"]["provider"] == "openai_reasoning"
-    assert compiled["models"]["deepseek_reasoner"]["base_url"] == "https://api.deepseek.com/v1"
-    assert compiled["models"]["deepseek_reasoner"]["model"] == "deepseek-reasoner"
-    assert compiled["models"]["deepseek_reasoner"]["api_key"] == "sk-r1-one-line"
-    assert compiled["models"]["qwen"]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert compiled["models"]["qwen"]["model"] == "qwen-plus"
-    assert compiled["models"]["ollama"]["base_url"] == "http://127.0.0.1:11434/v1"
-    assert compiled["models"]["ollama"]["api_key"] == "ollama"
-    assert compiled["models"]["openai"]["model"] == "gpt-4o"
-    assert compiled["models"]["openai"]["api_key"] == "sk-oa-override"
+    assert models["deepseek"]["api"] == "openai-completions"
+    assert models["deepseek"]["base_url"] == "https://api.deepseek.com/v1"
+    assert models["deepseek"]["model"] == "deepseek-chat"
+    assert models["deepseek"]["api_key"] == "sk-ds-one-line"
+    assert models["deepseek-reasoner"]["api"] == "openai-reasoning"
+    assert models["deepseek-reasoner"]["base_url"] == "https://api.deepseek.com/v1"
+    assert models["deepseek-reasoner"]["model"] == "deepseek-reasoner"
+    assert models["deepseek-reasoner"]["api_key"] == "sk-r1-one-line"
+    assert models["anthropic"]["api"] == "anthropic-messages"
+    assert models["anthropic"]["base_url"] == "https://api.anthropic.com"
+    assert models["anthropic"]["model"] == "claude-sonnet-4-5"
+    assert models["anthropic"]["api_key"] == "sk-ant-one-line"
+    assert models["gemini"]["api"] == "google-generative-ai"
+    assert models["gemini"]["base_url"] == "https://generativelanguage.googleapis.com"
+    assert models["gemini"]["model"] == "gemini-2.5-flash"
+    assert models["gemini"]["api_key"] == "sk-gem-one-line"
+    assert models["qwen"]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert models["qwen"]["model"] == "qwen-plus"
+    assert models["ollama"]["base_url"] == "http://127.0.0.1:11434/v1"
+    assert models["ollama"]["api_key"] == "ollama"
+    assert models["openai"]["model"] == "gpt-4o"
+    assert models["openai"]["api_key"] == "sk-oa-override"
 
-    # 自定义接口覆写 reasoner 预设或显式传入 provider 时均须保留 provider，且拒绝换行与非法名称注入
+    # 自定义接口覆写 reasoner 预设或显式传入 api / reasoning / max_tokens / cache_retention 时均须准确保留并防注入
     custom_r1 = compiler.render(
         preset="reasoner",
         api_key="sk-r1-proxy",
         base_url="https://proxy.example.com/v1",
     )
-    assert "provider openai_reasoning" in custom_r1
-    assert compiler.compile(custom_r1, "custom_r1.dsl")["models"]["deepseek_reasoner"]["provider"] == "openai_reasoning"
-    custom_provider_dsl = compiler.render(
+    assert "api openai-reasoning" in custom_r1
+    assert compiler.compile(custom_r1, "custom_r1.dsl")["models"]["deepseek-reasoner"]["api"] == "openai-reasoning"  # type: ignore[index]
+    custom_api_dsl = compiler.render(
         preset="custom",
-        provider="openai_reasoning",
-        api_key="sk-r1-custom",
-        base_url="https://proxy.example.com/v1",
-        model="r1-proxy",
-        name="my_r1",
+        api="anthropic-messages",
+        api_key="sk-ant-custom",
+        base_url="https://proxy.example.com",
+        model="claude-sonnet-4-5",
+        name="my_claude",
+        reasoning="high",
+        max_tokens=12000,
+        cache_retention="long",
     )
-    assert compiler.compile(custom_provider_dsl, "custom_prov.dsl")["models"]["my_r1"]["provider"] == "openai_reasoning"
+    compiled_custom = compiler.compile(custom_api_dsl, "custom_api.dsl")
+    assert compiled_custom["models"]["my_claude"]["api"] == "anthropic-messages"  # type: ignore[index]
+    assert compiled_custom["models"]["my_claude"]["reasoning"] == "high"  # type: ignore[index]
+    assert compiled_custom["models"]["my_claude"]["max_tokens"] == 12000  # type: ignore[index]
+    assert compiled_custom["models"]["my_claude"]["cache_retention"] == "long"  # type: ignore[index]
     with pytest.raises(ValueError, match="换行"):
         compiler.render(preset="deepseek", api_key="sk-ok\nuse ollama")
     with pytest.raises(ValueError, match="模型名称"):
@@ -296,8 +348,8 @@ def test_models_dsl_one_line_preset_sugar_and_auto_generation(tmp_path: Path, mo
         assert saved["default"] == "deepseek"
         assert "sk-auto-generated-key" not in json.dumps(saved, ensure_ascii=False)
         assert app.status()["llm_configured"] is True
-        assert isinstance(app.llm, OpenAICompatibleLLM)
-        assert app.llm.api_key == "sk-auto-generated-key"
+        assert isinstance(app.llm, ModelClient)
+        assert app.llm.profile.api_key == "sk-auto-generated-key"
         assert app.consolidator.llm is app.llm
         assert stat.S_IMODE((cfg_dir / "models.dsl").stat().st_mode) == 0o600
         assert stat.S_IMODE((cfg_dir / "models.json").stat().st_mode) == 0o600
@@ -351,7 +403,7 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
     consolidator ds
     """
     compiled = compiler.compile(dsl, "dual.dsl")
-    assert compiled["default"] == "deepseek_reasoner"
+    assert compiled["default"] == "deepseek-reasoner"
     assert compiled["roles"] == {"consolidator": "deepseek"}
 
     cfg = ModelsConfig.from_dict(compiled)
@@ -366,7 +418,7 @@ def test_models_config_and_dsl_support_consolidator_slot() -> None:
         "default reasoner\nconsolidator ds\nadd reasoner sk-r1\nadd deepseek sk-ds\n",
         "alias.dsl",
     )
-    assert compiled_alias_def["default"] == "deepseek_reasoner"
+    assert compiled_alias_def["default"] == "deepseek-reasoner"
     assert compiled_alias_def["roles"] == {"consolidator": "deepseek"}
 
     # 未配置命名角色时 ModelsConfig.roles 为空字典
@@ -464,7 +516,8 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "nonexistent_env_slot")
     app_isolated = build_app(data_root=tmp_path / "d2a", config_root=cfg_dir, project_root=REPO_ROOT)
     try:
-        assert type(app_isolated.llm).__name__ == "OpenAIReasoningLLM"
+        assert isinstance(app_isolated.llm, ModelClient)
+        assert app_isolated.llm.api == "openai-reasoning"
         assert app_isolated.consolidator.llm is app_isolated.llm
     finally:
         app_isolated.close()
@@ -475,19 +528,21 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     (env_only_cfg_dir / "tools.json").write_text(tools_json.read_text(encoding="utf-8"), encoding="utf-8")
     monkeypatch.setenv("LLM_MODE", "on")
     monkeypatch.setenv("LLM_API_KEY", "sk-env-shared")
-    monkeypatch.setenv("LLM_PROVIDER", "openai_reasoning")
+    monkeypatch.setenv("LLM_API", "openai-reasoning")
     monkeypatch.setenv("LLM_MODEL", "deepseek-reasoner")
     monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "qwen")
     app_env = build_app(data_root=tmp_path / "d2b", config_root=env_only_cfg_dir, project_root=REPO_ROOT)
     try:
-        assert type(app_env.llm).__name__ == "OpenAIReasoningLLM"
-        assert isinstance(app_env.consolidator.llm, OpenAICompatibleLLM)
+        assert isinstance(app_env.llm, ModelClient)
+        assert app_env.llm.api == "openai-reasoning"
+        assert isinstance(app_env.consolidator.llm, ModelClient)
+        assert app_env.consolidator.llm.api == "openai-completions"
         assert app_env.consolidator.llm.model == "qwen-plus"
     finally:
         app_env.close()
     monkeypatch.delenv("LLM_MODE", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_API", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("LLM_CONSOLIDATOR_MODEL", raising=False)
 
@@ -501,9 +556,11 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     )
     app_dsl = build_app(data_root=tmp_path / "d3", config_root=cfg_dir, project_root=REPO_ROOT)
     try:
-        assert app_dsl.llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
+        assert isinstance(app_dsl.llm, ModelClient)
+        assert app_dsl.llm.model == "deepseek-reasoner"
         assert app_dsl.consolidator.llm is not app_dsl.llm
-        assert isinstance(app_dsl.consolidator.llm, OpenAICompatibleLLM)
+        assert isinstance(app_dsl.consolidator.llm, ModelClient)
+        assert app_dsl.consolidator.llm.api == "openai-completions"
         assert app_dsl.consolidator.llm.model == "deepseek-chat"
 
         # 4. reload_llm 热重载时同步刷新主模型与后台沉淀模型，且失败时保持原运行实例零污染
@@ -515,7 +572,8 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
             encoding="utf-8",
         )
         app_dsl.reload_llm()
-        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+        assert isinstance(app_dsl.consolidator.llm, ModelClient)
+        assert app_dsl.consolidator.llm.model == "qwen-plus"
 
         prev_llm = app_dsl.llm
         prev_cons_llm = app_dsl.consolidator.llm
@@ -526,14 +584,14 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
         assert app_dsl._consolidator_model is None
 
         app_dsl.reload_llm(model_name="deepseek", consolidator_model="qwen")
-        assert app_dsl.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
-        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+        assert isinstance(app_dsl.llm, ModelClient) and app_dsl.llm.model == "deepseek-chat"
+        assert isinstance(app_dsl.consolidator.llm, ModelClient) and app_dsl.consolidator.llm.model == "qwen-plus"
 
         # reload_llm(consolidator_model="") 可清空显式覆盖；configure_model() 切单模型时同样必须清空残留槽位
         app_dsl.reload_llm(consolidator_model="")
         assert app_dsl._consolidator_model is None
         app_dsl.reload_llm(consolidator_model="qwen")
-        assert app_dsl.consolidator.llm.model == "qwen-plus"  # type: ignore[attr-defined]
+        assert isinstance(app_dsl.consolidator.llm, ModelClient) and app_dsl.consolidator.llm.model == "qwen-plus"
         app_dsl.configure_model(preset="deepseek", api_key="sk-single-reset")
         assert app_dsl._consolidator_model is None
         assert app_dsl.consolidator.llm is app_dsl.llm
@@ -557,16 +615,32 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
         consolidator_model="deepseek",
     )
     try:
-        assert app_override.consolidator.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
+        assert isinstance(app_override.consolidator.llm, ModelClient)
+        assert app_override.consolidator.llm.model == "deepseek-chat"
     finally:
         app_override.close()
 
     # 6. 显式注入 llm= Mock（且未传 consolidator_model）时，绝不穿透读取宿主 models.dsl 或 LLM_CONSOLIDATOR_MODEL
-    # 占位测试模型，验证热重载与 Mock 隔离
-    class _FixedLLM(LLMClient):
-        # 返回固定应答
-        def respond(self, messages, tools=None):
-            return {"role": "assistant", "content": "fixed"}
+    class _FixedLLM:
+        last_usage: TokenUsage | None = None
+
+        # 流式返回固定应答
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del context, options
+            yield StreamDone(reason="stop", message=AssistantMessage.from_text("fixed", stop_reason="stop"))
+
+        # 同步返回固定应答
+        def complete(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del context, options
+            return AssistantMessage.from_text("fixed", stop_reason="stop")
 
     fixed_main = _FixedLLM()
     monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "deepseek")
@@ -604,9 +678,9 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     monkeypatch.setenv("LLM_CONSOLIDATOR_MODEL", "deepseek-chat")
     app_no_cfg = AssistantApp(data_root=tmp_path / "d6")
     try:
-        assert app_no_cfg.llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
+        assert isinstance(app_no_cfg.llm, ModelClient) and app_no_cfg.llm.model == "deepseek-reasoner"
         assert app_no_cfg.consolidator.llm is not app_no_cfg.llm
-        assert app_no_cfg.consolidator.llm.model == "deepseek-chat"  # type: ignore[attr-defined]
+        assert isinstance(app_no_cfg.consolidator.llm, ModelClient) and app_no_cfg.consolidator.llm.model == "deepseek-chat"
     finally:
         app_no_cfg.close()
 
@@ -660,18 +734,39 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     assert captured_web["model_name"] == "reasoner"
     assert captured_web["consolidator_model"] == "qwen"
 
-    # 9. 确认 ConfigCompilerProtocol.render 保持零业务名泄漏，ModelsDSLCompiler.render 以可选默认参数兼容协议并对齐底层函数
+    # 9. 确认 ConfigCompilerProtocol.render 保持零业务名泄漏且统一使用 api，ModelsDSLCompiler.render 与底层对齐
     import inspect
     from personal_assistant.agent.plugins import ConfigCompilerProtocol
-    from plugins.models_dsl import ModelsDSLCompiler, render_models_dsl
+    from plugins.models_dsl import DSLCompileError, ModelsDSLCompiler, compile_models_dsl, render_models_dsl
 
     proto_sig = inspect.signature(ConfigCompilerProtocol.render)
     impl_sig = inspect.signature(ModelsDSLCompiler.render)
     proto_params = list(proto_sig.parameters)[1:]
     impl_params = list(impl_sig.parameters)[1:]
     fn_params = list(inspect.signature(render_models_dsl).parameters)
+    assert "api" in proto_params
+    assert "provider" not in proto_params
     assert "consolidator" not in proto_params
     assert impl_params[: len(proto_params)] == proto_params
     assert impl_params == fn_params
     for extra_name in impl_params[len(proto_params) :]:
         assert impl_sig.parameters[extra_name].default is not inspect.Parameter.empty
+
+    # 10. 确认 render_models_dsl 预设快路径不丢弃自定义 name 与 ollama api_key，且拦截非法 name/temperature 及空 model/api
+    named_dsl = render_models_dsl(preset="deepseek", api_key="sk-1", name="work_ds")
+    compiled_named = ModelsConfig.from_dict(compile_models_dsl(named_dsl))
+    assert compiled_named.default == "work_ds"
+    assert "work_ds" in compiled_named.models
+
+    ollama_key_dsl = render_models_dsl(preset="ollama", model="llama3", api_key="sk-proxy")
+    compiled_ollama = ModelsConfig.from_dict(compile_models_dsl(ollama_key_dsl))
+    assert compiled_ollama.get_profile("ollama").api_key == "sk-proxy"
+
+    with pytest.raises(ValueError, match="模型名称"):
+        render_models_dsl(preset="deepseek", api_key="sk-1", name="bad\nuse ollama")
+    with pytest.raises(ValueError, match="temperature"):
+        render_models_dsl(preset="deepseek", api_key="sk-1", temperature=float("nan"))
+    with pytest.raises(DSLCompileError, match="model 名称不能为空"):
+        compile_models_dsl('model m {\n  base_url "https://api.example.com/v1"\n  model ""\n  api_key "sk-1"\n}\n')
+    with pytest.raises(DSLCompileError, match="api 名称不能为空"):
+        compile_models_dsl('model m {\n  api ""\n  base_url "https://api.example.com/v1"\n  model "m1"\n  api_key "sk-1"\n}\n')
