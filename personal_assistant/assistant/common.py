@@ -6,6 +6,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ DEFAULT_SOFT_WRAP_CHARS = 1000
 DEFAULT_OFFLOAD_MAX_FILES = 20
 DEFAULT_OFFLOAD_TTL_SECONDS = 24 * 3600
 _OFFLOAD_CAP_NOTICE = "…（原始输出超过落盘上限，后续字节未保存）"
+_OFFLOAD_LOCK = threading.Lock()
 
 
 # 获取当前北京时间（Asia/Shanghai 带时区 datetime）
@@ -201,7 +203,7 @@ def _cleanup_offload_dir(
                 pass
 
 
-# 将超长工具输出原子落盘到目标目录并触发懒清理，返回实际文件名
+# 将超长工具输出在互斥锁保护下原子落盘到目标目录并触发懒清理，避免并发写入与清理互删
 def _write_offload_file(
     target_dir: Path,
     *,
@@ -210,19 +212,20 @@ def _write_offload_file(
     max_files: int,
     ttl_seconds: float,
 ) -> str:
-    target_dir.mkdir(parents=True, exist_ok=True)
     payload = content.encode("utf-8")
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     digest = hashlib.sha256(payload).hexdigest()[:8]
-    filename = f"{stamp}-{_sanitize_tag(tag)}-{digest}.txt"
-    atomic_write_text(target_dir / filename, content)
-    _cleanup_offload_dir(
-        target_dir,
-        keep_name=filename,
-        max_files=max_files,
-        ttl_seconds=ttl_seconds,
-    )
-    return filename
+    with _OFFLOAD_LOCK:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        filename = f"{stamp}-{_sanitize_tag(tag)}-{digest}.txt"
+        atomic_write_text(target_dir / filename, content)
+        _cleanup_offload_dir(
+            target_dir,
+            keep_name=filename,
+            max_files=max_files,
+            ttl_seconds=ttl_seconds,
+        )
+        return filename
 
 
 # 按 UTF-8 字节上限安全截取文本前缀，不切碎多字节字符

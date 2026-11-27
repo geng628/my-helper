@@ -187,11 +187,11 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ### 3.2 Layer 2：通用 ReAct 内核与统一插件主板（`personal_assistant/agent/`）
 
 1. **工具类型递进扩展与注册表（[../personal_assistant/agent/tools.py](../personal_assistant/agent/tools.py)）**：
-   - `Tool(ToolSchema)` 保持纯值对象（以 `kw_only=True` 承载 `handler`、`metadata`、`accepted_context_keys` 与 `always_on`），通过 `bind_tool_context()` 显式绑定动态执行上下文；`build_tool()` 在构造期解析一次函数签名，自动根据 Python 默认参数收窄 `ToolSchema.required` 并登记可接受的执行期上下文键，不使用动态 `type()` 造类或 `object.__setattr__`；
-   - `ToolRegistry` 维护全集 `_all_tools` 与激活视图 `_tools`（受白名单 `allowed_names` 或 `always_on` 控制），`schemas()` 仅导出中立 `ToolSchema` 元组（零厂商格式字典），经 `execute(..., context=...)` 注入当前回合上下文，并将参数校验或运行异常统一转化为 `"错误：..."` 观察回传模型。
-2. **单层 ReAct 循环（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：
-   - `iter_react()` / `run_react()` 进入循环前固定中立 `active_tools = tuple(context.tools) if context.tools else tools.schemas()`，每步组装不可变 `Context` 并按需经 `convert_to_llm: ContextTransformer` 非破坏性投影后透传可选 `options: StreamOptions` 调用 `llm.stream(llm_ctx, options)`，透传全部 12 种 `AssistantMessageEvent`；
-   - 遇 `StreamError` 立即收敛退出（`run_react` 转抛 `RuntimeError`）；当 `done.reason != "toolUse" or not assistant_msg.tool_calls` 时产出 `TurnEnd(reply, total_ms, messages)` 自然结束；否则依次发出 `ToolStart`、执行强类型 `ToolCall` 并产出 `ToolStep`、追加中立 `ToolResultMessage(tool_call_id, tool_name, content, is_error)` 继续下一轮。
+   - `Tool(ToolSchema)` 保持纯值对象（以 `kw_only=True` 承载 `handler`、`metadata`、`accepted_context_keys` 与 `always_on`），其中 `ToolMetadata(risk, always_on, parallel=False)` 默认关闭并发（绝不泄漏至 `ToolSchema` 线协议），仅对经线程安全审计的只读/锁保护工具显式标记 `parallel=True`（如内存 FTS5 带 `RLock`、学习卡片读带 `_STUDY_LOCK`、`fetch_webpage` 的 TOAST 落盘与清理由 `common._OFFLOAD_LOCK` 串行化）；通过 `bind_tool_context()` 显式绑定动态执行上下文，`build_tool()` 在构造期解析一次函数签名，自动根据 Python 默认参数收窄 `ToolSchema.required` 并登记可接受的执行期上下文键，不使用动态 `type()` 造类或 `object.__setattr__`；
+   - `ToolRegistry` 维护全集 `_all_tools` 与激活视图 `_tools`（受白名单 `allowed_names` 或 `always_on` 控制），提供 `is_parallel(name)` 仅向已激活并发工具放行，`schemas()` 仅导出中立 `ToolSchema` 元组（零厂商格式字典），经 `execute(..., context=...)` 注入当前回合上下文，并将参数校验或运行异常统一转化为 `"错误：..."` 观察回传模型。
+2. **单层 ReAct 循环与分批并发执行（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：
+   - `iter_react()` / `run_react()` 进入循环前校验正整数 `max_parallel_tools`（默认 `DEFAULT_MAX_PARALLEL_TOOLS=4`）并固定中立 `active_tools = tuple(context.tools) if context.tools else tools.schemas()`，每步组装不可变 `Context` 并按需经 `convert_to_llm: ContextTransformer` 非破坏性投影后透传可选 `options: StreamOptions` 调用 `llm.stream(llm_ctx, options)`，透传全部 12 种 `AssistantMessageEvent`；
+   - 遇 `StreamError` 立即收敛退出（`run_react` 转抛 `RuntimeError`）；当 `done.reason != "toolUse" or not assistant_msg.tool_calls` 时产出 `TurnEnd(reply, total_ms, messages)` 自然结束；否则经 `_split_tool_batches()` 将连续 `parallel=True` 调用合并为并发批、将写/执行/未知工具作为单条串行路障，每批先在主线程按原序发出 `ToolStart`，单条或串行批内联执行、多条并发批以只读 `MappingProxyType` 快照隔离 `tool_context` 经标准库有界 `ThreadPoolExecutor` 并发执行（异常中止时 `cancel_futures=True` 取消未启动排队项并等待在途线程收口），完成后**严格按模型发射原序**产出 `ToolStep`（`TelemetryObserver` 中 `tool_ms` 记为累计工具执行时长、`overhead_ms` 非负截断）并追加中立 `ToolResultMessage(tool_call_id, tool_name, content, is_error)`，确保确定性 KV Cache 前缀与安全污染标记不变量守恒。
 3. **统一插件主板（[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)）**：
    - `PluginManager` 显式扫描配置入口模块并按 `Plugin(ABC)` 子类收集实例化，向零业务字段的 `PluginContext`（仅含 `project_root`、`config`、`bindings` 与五大强类型插槽 `tool_specs` / `retrievers` / `compilers` / `providers` / `observers`）注册扩展；
    - Slot 4 直接复刻 Layer 1 `ApiProvider` 宪法（`register_provider(provider: ApiProvider)` 按 `provider.api` 小写归一化登记）；`ConfigCompilerProtocol.render` 采用纯通用显式强类型具名参数（含 `api: str = ""`，插件实现 `ModelsDSLCompiler.render` 可按需以带默认值可选参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务名）；
@@ -260,7 +260,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `219 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `225 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 零内部依赖）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

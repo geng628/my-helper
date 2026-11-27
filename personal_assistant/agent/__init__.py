@@ -12,6 +12,7 @@ from personal_assistant.agent.plugins import (
     TaskEvent,
 )
 from personal_assistant.agent.react import (
+    DEFAULT_MAX_PARALLEL_TOOLS,
     AgentEvent,
     ContextTransformer,
     ToolStart,
@@ -36,6 +37,7 @@ __all__ = [
     "AgentEvent",
     "ConfigCompilerProtocol",
     "ContextTransformer",
+    "DEFAULT_MAX_PARALLEL_TOOLS",
     "ObserverFactory",
     "ObserverProtocol",
     "Plugin",

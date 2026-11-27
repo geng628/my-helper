@@ -10,11 +10,12 @@ from dataclasses import dataclass, field, replace
 from personal_assistant.ai.protocol import ToolSchema
 
 
-# 工具治理元数据：记录风险级别（read / write / exec / network）与是否常驻激活（always_on）
+# 工具治理元数据：记录风险级别（read / write / exec / network）、是否常驻激活（always_on）与是否允许同轮并发只读执行（parallel）
 @dataclass(frozen=True)
 class ToolMetadata:
     risk: str = "read"
     always_on: bool = False
+    parallel: bool = False
 
 
 # 按工具接受键白名单与非空约束过滤上下文参数，绝不覆盖模型声明参数
@@ -73,6 +74,7 @@ def build_tool(
     required: Iterable[str] | None = None,
     risk: str = "read",
     always_on: bool = False,
+    parallel: bool = False,
     accept_context: bool = True,
     context: Mapping[str, object] | None = None,
 ) -> Tool:
@@ -126,7 +128,7 @@ def build_tool(
         handler=fn,
         param_enums=param_enums,
         required=resolved_required,
-        metadata=ToolMetadata(risk=risk, always_on=always_on),
+        metadata=ToolMetadata(risk=risk, always_on=always_on, parallel=bool(parallel)),
         bound_kwargs=bound_context,
         accepted_context_keys=accepted_keys,
     )
@@ -175,6 +177,7 @@ def tool(
     required: Iterable[str] | None = None,
     risk: str = "read",
     always_on: bool = False,
+    parallel: bool = False,
 ) -> Callable[[Callable[..., str]], Callable[..., str]]:
     # 为被装饰函数构造 Tool 实例并挂载到 __agent_tool__
     def decorator(fn: Callable[..., str]) -> Callable[..., str]:
@@ -187,6 +190,7 @@ def tool(
             required=required,
             risk=risk,
             always_on=always_on,
+            parallel=parallel,
         )
         setattr(fn, "__agent_tool__", spec)
         return fn
@@ -254,10 +258,15 @@ class ToolRegistry:
     ) -> None:
         provider.register_into(self, context=context)
 
-    # 直接从单一真源 _all_tools 查询指定工具的治理元数据（risk / always_on）
+    # 直接从单一真源 _all_tools 查询指定工具的治理元数据（risk / always_on / parallel）
     def metadata(self, name: str) -> ToolMetadata | None:
         item = self._all_tools.get(name)
         return item.metadata if item is not None else None
+
+    # 判断指定已激活工具是否声明允许同轮并发只读执行（未激活或未知工具默认按串行安全处理）
+    def is_parallel(self, name: str) -> bool:
+        item = self._tools.get(name)
+        return bool(item is not None and item.metadata.parallel)
 
     # 返回当前已激活（在白名单内或 always_on）的所有工具名称列表
     @property

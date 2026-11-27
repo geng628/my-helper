@@ -575,6 +575,7 @@ def execute_web_search(
     description="联网搜索实时信息、最新技术文档或公开网页，返回排名前几条的标题、链接与摘要。",
     parameters={"query": "搜索关键词，例如 'Python 3.14 新特性'"},
     risk="network",
+    parallel=True,
 )
 def web_search(query: str, *, web_config: Mapping[str, object] | None = None) -> str:
     return execute_web_search(query, WebPolicy.from_dict(web_config))
@@ -589,6 +590,7 @@ def web_search(query: str, *, web_config: Mapping[str, object] | None = None) ->
     ),
     parameters={"url": "完整的公开 http/https 网址"},
     risk="network",
+    parallel=True,
 )
 def fetch_webpage(
     url: str, *, offload_dir: Path | None = None, web_config: Mapping[str, object] | None = None

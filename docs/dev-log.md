@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `219 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `225 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -230,7 +230,7 @@
   - 实模评测口径：本次仅为 `OpenAIReasoningProvider` 归属层迁移，未改动线协议行为，沿用表四 `1b421d2` `v2-neutral` 实模基线。
 - **已知边界与下一步**：四大核心协议（`openai-completions` / `openai-reasoning` / `anthropic-messages` / `google-generative-ai`）现均在 Layer 1 开箱可用；后续新增私有或小众模型厂商继续沿 Slot 4 单点扩展即可。
 
-### [2026-11-27] 全链路 KV Cache 架构升级：动静分离、按块裁剪、空闲 TTL、非破坏性投影与失配归因（Issue `#95`，本次提交）
+### [2026-11-27] 全链路 KV Cache 架构升级：动静分离、按块裁剪、空闲 TTL、非破坏性投影与失配归因（Issue `#95`，Commit `93a12ce`）
 - **背景与目标**：消除多轮对话与长工具链中 4 处会主动击穿 Prefix / KV Cache 的结构性问题（日期与摘要混入 `system_prompt`、超窗逐条滑窗、Layer 2 未透传 `StreamOptions` 与未激活 `convert_to_llm`、`CacheMonitor` 缺少失配定位与上下文构成统计），并同步放开 [../AGENTS.md](../AGENTS.md) 中“非必要不动 `react.py`”的硬性约束（保留 Layer 2 零业务耦合与零厂商方言红线）。
 - **核心改动**：
   - **Layer 1（[../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py)、[../personal_assistant/ai/__init__.py](../personal_assistant/ai/__init__.py)）**：新增 `context_composition(context)` 与段级前缀对比 `_locate_prefix_break`，为 `CallCacheRecord` / `CacheMonitor.summary()` 增量追加 `break_section`（`cold_start` / `append` / `tools` / `system` / `message[i]:role`）、`prefix_breaks`、`last_break_section`、`last_composition`，`TrackingModelClient` 优先消费 `StreamOptions.session_id`；
@@ -241,7 +241,19 @@
   - 单元测试：`209 passed → 219 passed`（含 10 项全链路 KV Cache 架构、边界回归与 `ContextAssembler` 信源隔离测试及三层依赖守卫全绿）；
   - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测（`9a9d000`，即抽离 `context.py` 与追加 `<system-reminder>` 围栏前同机制提交，`evals/memory_scenarios.jsonl` 16 场景，`deepseek-chat`，`v2-neutral` Judge，`--workers 4`）：通过率 **`16/16 (100.0%)`**（较 `1b421d2` `15/16 = 93.8%` 提升，6/6 类别全过），`kv-cache-efficiency` 服务端 KV 命中 **`90.63%`**（终轮 **`93.39%`**，`prefix_breaks=0`，`last_break_section="append"`）、`rolling-multi-compaction` 两次压缩后终轮服务端 KV 命中 **`87.44%`**（本地前缀复用 `87.91%`，`last_break_section="append"`），16 场景并发总口径服务端命中 `72.85%`（4 并发冷启动摊薄）、本地前缀复用 `90.12%`；表四 `1b421d2` 历史实模基线保持原样不篡改。
-- **已知边界与下一步**：紧接着推进 PR 2——在 `tools.py` 与 `react.py` 实现「并行只读工具 + 写工具串行路障 + 按模型原序提交」（借鉴 Akashic ADR `0079`）。
+- **已知边界与下一步**：紧接着推进 PR 2——在 `tools.py` 与 `react.py` 实现「并行只读工具 + 写工具串行路障 + 按模型原序提交」（见下方 Issue `#97`）。
+
+### [2026-11-27] 并行只读工具执行、写工具串行路障与按模型原序提交（Issue `#97`，本次提交）
+- **背景与目标**：消除单轮模型并发发出多个只读/无状态网络工具调用时的串行耗时叠加，同时守住写操作一致性、同轮网络污染阻断 `save_rule` 安全不变量与确定性 KV Cache 前缀顺序。
+- **核心改动**：
+  - **Layer 2（[../personal_assistant/agent/tools.py](../personal_assistant/agent/tools.py)、[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)、[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)、[../personal_assistant/agent/__init__.py](../personal_assistant/agent/__init__.py)）**：`ToolMetadata`、`build_tool()` 与 `@tool()` 新增 `parallel: bool = False`（默认安全串行，不泄漏至 `ToolSchema`），`ToolRegistry` 新增 `is_parallel(name)`；`iter_react()` / `run_react()` 新增 `max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS`（默认 `4`，即时正整数校验），通过 `_split_tool_batches()` 与 `_execute_tool_batch()` 对连续并发只读调用经标准库有界 `ThreadPoolExecutor`（异常中止时 `cancel_futures=True` 且等待在途线程退出）与只读 `MappingProxyType` 上下文快照并发执行（单条/串行/`max_parallel_tools=1` 主线程内联零线程开销），写/执行/未知工具作为串行路障，完成后严格按模型发射原序产出 `ToolStep` 与 `ToolResultMessage`；
+  - **全量工具线程安全审计、TOAST 并发锁加固与标注（[../personal_assistant/assistant/common.py](../personal_assistant/assistant/common.py) 等）**：为 `common._write_offload_file()` 增加 `_OFFLOAD_LOCK` 互斥锁保护并发落盘与懒清理（防止多路并发 `fetch_webpage` 互删临时文件）；为经审计确认线程安全的 9 个只读/锁保护工具标记 `parallel=True`（`list_files`、`search_markdown`、`read_markdown`、`get_current_time`、`add_numbers`、`search_chat_history`、`web_search`、`fetch_webpage`、`list_due_reviews`），写/执行工具（`write_file`、`remember_fact`、`save_rule`、`save_study_card`、`run_command`、`cmd_*`）保持 `parallel=False`；
+  - **测试与文档**：新增 [../tests/test_parallel_tools.py](../tests/test_parallel_tools.py)（`threading.Barrier` 真实并发重叠、`Event` 确定性验证快调用不抢跑原序提交、`[r1, r2, w1, r3, r4]` 写路障、`[save_rule, network, save_rule]` 写前放行与写后安全拦截、并发上限 `max_parallel_tools` 峰值校验、只读 `MappingProxyType` 隔离、并发 TOAST 落盘互斥、异常隔离、即时参数校验与五只读工具并发烟测），更新相关旧测试与三份主文档。
+- **验证与同口径对比（`93a12ce` → 本次提交）**：
+  - 单元测试：`219 passed → 225 passed`（100% 通过）；
+  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；演示脚本通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
+  - 实模评测口径：本次仅优化单轮多只读工具并发调度并严格保持与串行一致的 `ToolResultMessage` 发射顺序，未改动任何提示词、检索或记忆语义，沿用 `9a9d000` / `1b421d2` 实模基线。
+- **已知边界与下一步**：默认单批并发上限 `max_parallel_tools=4`（可通过 `iter_react`/`run_react` 覆盖或设 `1` 退回单线程）；两项高杠杆借鉴改造（KV Cache 架构 + 只读并发调度）至此均已闭环。
 
 ---
 

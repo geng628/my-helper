@@ -73,8 +73,8 @@ def test_study_plugin_discovery_allowlist_and_schema_isolation(tmp_path: Path) -
     )
     assert "save_study_card" in registry.names
     assert "list_due_reviews" in registry.names
-    assert registry.metadata("save_study_card") == ToolMetadata(risk="write", always_on=False)
-    assert registry.metadata("list_due_reviews") == ToolMetadata(risk="read", always_on=False)
+    assert registry.metadata("save_study_card") == ToolMetadata(risk="write", always_on=False, parallel=False)
+    assert registry.metadata("list_due_reviews") == ToolMetadata(risk="read", always_on=False, parallel=True)
 
     save_tool = next(t for t in registry if t.name == "save_study_card")
     list_tool = next(t for t in registry if t.name == "list_due_reviews")

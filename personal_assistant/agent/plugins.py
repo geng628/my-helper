@@ -174,6 +174,7 @@ class PluginContext:
                 param_enums=raw_tool.param_enums,
                 risk=resolved_meta.risk,
                 always_on=resolved_meta.always_on,
+                parallel=resolved_meta.parallel,
                 context=raw_tool.bound_kwargs,
             )
         init_bindings = {"project_root": self.project_root, **self.bindings}

@@ -340,15 +340,17 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
         registry = app.tools
 
         # 1. 内核内置工具、插件工具与固定命令全部收敛为纯净 Tool 值对象（type(t) is Tool）
-        for tool_name, expected_risk in (
-            ("read_markdown", "read"),
-            ("write_file", "write"),
-            ("run_command", "exec"),
-            ("cmd_git_status", "exec"),
+        for tool_name, expected_risk, expected_parallel in (
+            ("read_markdown", "read", True),
+            ("write_file", "write", False),
+            ("run_command", "exec", False),
+            ("cmd_git_status", "exec", False),
         ):
             item = registry._tools[tool_name]
             assert type(item) is Tool
-            assert registry.metadata(tool_name) == ToolMetadata(risk=expected_risk, always_on=False)
+            assert registry.metadata(tool_name) == ToolMetadata(
+                risk=expected_risk, always_on=False, parallel=expected_parallel
+            )
 
         # 2. @tool 装饰函数可直接传给 ToolRegistry.__init__ / register，always_on=True 在注册时立即激活
         @tool(description="常驻心跳", always_on=True)
