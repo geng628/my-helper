@@ -6,6 +6,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from urllib.error import HTTPError
+from urllib.parse import quote
 
 from personal_assistant.ai.protocol import (
     THINKING_BUDGETS,
@@ -47,7 +48,7 @@ from personal_assistant.ai.providers.http import (
 )
 
 
-# 将中立 ToolSchema 翻译为 Gemini functionDeclarations 条目
+# 将中立 ToolSchema 翻译为 Gemini functionDeclarations 条目（零参数工具省略空 OBJECT.properties 防 400）
 def _translate_tool_declaration(schema: ToolSchema) -> dict[str, object]:
     properties: dict[str, dict[str, object]] = {}
     for param, desc in schema.parameters.items():
@@ -55,15 +56,19 @@ def _translate_tool_declaration(schema: ToolSchema) -> dict[str, object]:
         if schema.param_enums and param in schema.param_enums:
             prop["enum"] = list(schema.param_enums[param])
         properties[param] = prop
-    return {
+    decl: dict[str, object] = {
         "name": schema.name,
         "description": schema.description,
-        "parameters": {
+    }
+    if properties:
+        params: dict[str, object] = {
             "type": "OBJECT",
             "properties": properties,
-            "required": list(schema.required_names),
-        },
-    }
+        }
+        if schema.required_names:
+            params["required"] = list(schema.required_names)
+        decl["parameters"] = params
+    return decl
 
 
 # 将工具调用 JSON 字符串安全解析为参数字典
@@ -152,8 +157,10 @@ class GoogleGenAIProvider:
         options: StreamOptions | None,
     ) -> tuple[str, dict[str, object], dict[str, str]]:
         base = model.base_url.rstrip("/")
-        prefix = base if base.endswith("/v1beta") else f"{base}/v1beta"
-        url = f"{prefix}/models/{model.model}:streamGenerateContent?alt=sse"
+        prefix = base if base.endswith(("/v1beta", "/v1", "/v1alpha")) else f"{base}/v1beta"
+        raw_model = model.model.strip()
+        model_id = raw_model[len("models/") :] if raw_model.startswith("models/") else raw_model
+        url = f"{prefix}/models/{quote(model_id, safe='')}:streamGenerateContent?alt=sse"
 
         gen_cfg: dict[str, object] = {}
         temp = options.temperature if (options is not None and options.temperature is not None) else model.temperature
@@ -161,7 +168,7 @@ class GoogleGenAIProvider:
         max_tok = options.max_tokens if (options is not None and options.max_tokens is not None) else model.max_tokens
         if max_tok is not None:
             gen_cfg["maxOutputTokens"] = max_tok
-        reasoning = options.reasoning if options is not None else model.reasoning
+        reasoning = options.reasoning if (options is not None and options.reasoning is not None) else model.reasoning
         if reasoning != "off":
             clamped = clamp_thinking_level(reasoning, ("minimal", "low", "medium", "high", "xhigh"))
             gen_cfg["thinkingConfig"] = {
@@ -211,13 +218,14 @@ class GoogleGenAIProvider:
         def snapshot() -> AssistantMessage:
             return AssistantMessage(blocks=tuple(blocks))
 
-        # 闭合当前打开的思维链内容块并产出 ThinkingEnd
+        # 闭合当前打开的思维链内容块并产出 ThinkingEnd（同步清零当前块签名防泄漏至后续块）
         def close_thinking() -> Iterator[AssistantMessageEvent]:
-            nonlocal thinking_open
+            nonlocal thinking_open, thinking_sig
             if thinking_open and thinking_idx is not None:
                 full = "".join(thinking_buf)
                 blocks[thinking_idx] = ThinkingBlock(text=full, signature=thinking_sig)
                 thinking_open = False
+                thinking_sig = ""
                 yield ThinkingEnd(content_index=thinking_idx, text=full, partial=snapshot())
 
         # 闭合当前打开的正文内容块并产出 TextEnd

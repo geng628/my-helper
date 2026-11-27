@@ -89,7 +89,7 @@ def _parse_tool_input(raw_arguments: str) -> dict[str, object]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-# 将中立消息序列翻译为 Anthropic messages 列表（合并连续 ToolResultMessage 并按策略对末条 user 打缓存断点）
+# 将中立消息序列翻译为 Anthropic messages 列表（跳过空文本/空助手消息，合并相邻同角色并按策略打缓存断点）
 def _serialize_messages(
     context: Context,
     cache_control: dict[str, object] | None,
@@ -97,7 +97,12 @@ def _serialize_messages(
     wire: list[dict[str, object]] = []
     for msg in context.messages:
         if isinstance(msg, UserMessage):
-            block: dict[str, object] = {"type": "text", "text": msg.content}
+            if not msg.content:
+                if wire and wire[-1]["role"] == "user":
+                    continue
+                block: dict[str, object] = {"type": "text", "text": " "}
+            else:
+                block = {"type": "text", "text": msg.content}
             if wire and wire[-1]["role"] == "user":
                 content_list = wire[-1]["content"]
                 assert isinstance(content_list, list)
@@ -129,8 +134,13 @@ def _serialize_messages(
                         }
                     )
             if not content_blocks:
-                content_blocks.append({"type": "text", "text": ""})
-            wire.append({"role": "assistant", "content": content_blocks})
+                continue
+            if wire and wire[-1]["role"] == "assistant":
+                prev_blocks = wire[-1]["content"]
+                assert isinstance(prev_blocks, list)
+                prev_blocks.extend(content_blocks)
+            else:
+                wire.append({"role": "assistant", "content": content_blocks})
         elif isinstance(msg, ToolResultMessage):
             tr_block: dict[str, object] = {
                 "type": "tool_result",
@@ -149,8 +159,14 @@ def _serialize_messages(
         for entry in reversed(wire):
             if entry["role"] == "user":
                 blocks = entry["content"]
-                if isinstance(blocks, list) and blocks and isinstance(blocks[-1], dict):
-                    blocks[-1]["cache_control"] = dict(cache_control)
+                if isinstance(blocks, list):
+                    for candidate in reversed(blocks):
+                        if not isinstance(candidate, dict):
+                            continue
+                        if candidate.get("type") == "text" and not str(candidate.get("text") or "").strip():
+                            continue
+                        candidate["cache_control"] = dict(cache_control)
+                        break
                 break
     return wire
 
@@ -189,10 +205,14 @@ class AnthropicMessagesProvider:
     ) -> tuple[str, dict[str, object], dict[str, str]]:
         base = model.base_url.rstrip("/")
         url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
-        retention = options.cache_retention if options is not None else model.cache_retention
+        retention = (
+            options.cache_retention
+            if (options is not None and options.cache_retention is not None)
+            else model.cache_retention
+        )
         cc = _cache_control(retention)
 
-        reasoning = options.reasoning if options is not None else model.reasoning
+        reasoning = options.reasoning if (options is not None and options.reasoning is not None) else model.reasoning
         max_tokens = options.max_tokens if (options is not None and options.max_tokens is not None) else model.max_tokens
 
         payload: dict[str, object] = {
@@ -226,7 +246,7 @@ class AnthropicMessagesProvider:
         else:
             temp = options.temperature if (options is not None and options.temperature is not None) else model.temperature
             payload["max_tokens"] = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
-            payload["temperature"] = temp
+            payload["temperature"] = min(1.0, max(0.0, temp))
 
         headers = {
             "x-api-key": model.api_key,
@@ -443,13 +463,13 @@ class AnthropicMessagesProvider:
                     raw_usage = data.get("usage")
                     if isinstance(raw_usage, dict):
                         saw_usage = True
-                        if "output_tokens" in raw_usage:
+                        if raw_usage.get("output_tokens") is not None:
                             output_tokens = non_negative_int(raw_usage.get("output_tokens"))
-                        if "input_tokens" in raw_usage:
+                        if raw_usage.get("input_tokens") is not None:
                             input_tokens = non_negative_int(raw_usage.get("input_tokens"))
-                        if "cache_read_input_tokens" in raw_usage:
+                        if raw_usage.get("cache_read_input_tokens") is not None:
                             cache_read = non_negative_int(raw_usage.get("cache_read_input_tokens"))
-                        if "cache_creation_input_tokens" in raw_usage:
+                        if raw_usage.get("cache_creation_input_tokens") is not None:
                             cache_creation = non_negative_int(raw_usage.get("cache_creation_input_tokens"))
                     continue
 

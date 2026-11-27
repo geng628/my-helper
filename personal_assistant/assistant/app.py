@@ -89,18 +89,6 @@ def _canonical_tool_args(raw_arguments: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-# 检查助手消息的 tool_calls 参数是否为非法/截断 JSON（用于 StreamDone(reason="length") 熔断判定）
-def _has_truncated_tool_call_json(message: AssistantMessage) -> bool:
-    for call in message.tool_calls:
-        try:
-            parsed = json.loads(call.arguments or "{}")
-        except (json.JSONDecodeError, TypeError):
-            return True
-        if not isinstance(parsed, dict):
-            return True
-    return False
-
-
 # 当未压缩活跃消息超出常规滑窗上限时，在字符与条数总预算内自适应保留更早消息，防止沉淀滞后静默丢上下文
 def _select_adaptive_history(
     active_all: list[dict[str, object]],
@@ -235,7 +223,7 @@ class _GuardedTurnLLM:
                 if isinstance(event, StreamDone):
                     usage = event.usage if isinstance(event.usage, TokenUsage) else self._inner.last_usage
                     self._record_usage(usage)
-                    if event.reason == "length" and _has_truncated_tool_call_json(event.message):
+                    if event.reason == "length" and event.message.tool_calls:
                         self.truncated_tool_call = True
                         trunc_breach = TurnBudgetExceeded(
                             "truncated_tool_calls",
@@ -244,7 +232,10 @@ class _GuardedTurnLLM:
                         self.breach = trunc_breach
                         fallback_msg = self._fallback_message(trunc_breach, usage=usage)
                         fallback_text = fallback_msg.text
-                        yield TextDelta(content_index=0, text=fallback_text, partial=fallback_msg)
+                        c_idx = len(event.message.blocks)
+                        yield TextStart(content_index=c_idx, partial=event.message)
+                        yield TextDelta(content_index=c_idx, text=fallback_text, partial=fallback_msg)
+                        yield TextEnd(content_index=c_idx, text=fallback_text, partial=fallback_msg)
                         yield StreamDone(
                             reason="stop",
                             message=fallback_msg,
@@ -751,50 +742,53 @@ class AssistantApp:
                     max_repeated_tool_calls=self.max_repeated_tool_calls,
                     clock=self._clock,
                 )
-                for event in iter_react(
-                    guarded_llm,
-                    context,
-                    registry,
-                    convert_to_llm=None,
-                    tool_context=turn_ctx,
-                ):
-                    if isinstance(event, ToolStart):
-                        meta = registry.metadata(event.tool)
-                        if meta is not None and meta.risk == "network":
-                            turn_ctx["untrusted_tool_seen"] = True
-                        if event.tool == "remember_fact":
-                            fact_used = True
-                        guarded_llm.observe_tool_call(event.tool, event.arguments)
-                    self._emit_event(chat_id, event)
-                    if on_event is not None:
-                        on_event(event)
-                    if isinstance(event, StreamError):
-                        raise RuntimeError(event.error_message)
-                    if isinstance(event, ThinkingDelta) and event.text:
-                        thinking_parts.append(event.text)
-                        yield {"type": "thinking_delta", "text": event.text}
-                    elif isinstance(event, ToolStart):
-                        yield {
-                            "type": "tool_start",
-                            "tool": event.tool,
-                            "arguments": event.arguments,
-                            "call_id": event.call_id,
-                        }
-                    elif isinstance(event, TextDelta) and event.text:
-                        yield {"type": "text_delta", "text": event.text}
-                    elif isinstance(event, ToolStep):
-                        step_dict: dict[str, object] = {
-                            "tool": event.tool,
-                            "arguments": event.arguments,
-                            "observation": event.observation,
-                            "call_id": event.call_id,
-                            "duration_ms": event.duration_ms,
-                        }
-                        traces.append(step_dict)
-                        yield {"type": "tool_step", **step_dict}
-                    elif isinstance(event, TurnEnd):
-                        turn_ended = True
-                        reply = event.reply
+                with closing(
+                    iter_react(
+                        guarded_llm,
+                        context,
+                        registry,
+                        convert_to_llm=None,
+                        tool_context=turn_ctx,
+                    )
+                ) as react_events:
+                    for event in react_events:
+                        if isinstance(event, ToolStart):
+                            meta = registry.metadata(event.tool)
+                            if meta is not None and meta.risk == "network":
+                                turn_ctx["untrusted_tool_seen"] = True
+                            if event.tool == "remember_fact":
+                                fact_used = True
+                            guarded_llm.observe_tool_call(event.tool, event.arguments)
+                        self._emit_event(chat_id, event)
+                        if on_event is not None:
+                            on_event(event)
+                        if isinstance(event, StreamError):
+                            raise RuntimeError(event.error_message)
+                        if isinstance(event, ThinkingDelta) and event.text:
+                            thinking_parts.append(event.text)
+                            yield {"type": "thinking_delta", "text": event.text}
+                        elif isinstance(event, ToolStart):
+                            yield {
+                                "type": "tool_start",
+                                "tool": event.tool,
+                                "arguments": event.arguments,
+                                "call_id": event.call_id,
+                            }
+                        elif isinstance(event, TextDelta) and event.text:
+                            yield {"type": "text_delta", "text": event.text}
+                        elif isinstance(event, ToolStep):
+                            step_dict: dict[str, object] = {
+                                "tool": event.tool,
+                                "arguments": event.arguments,
+                                "observation": event.observation,
+                                "call_id": event.call_id,
+                                "duration_ms": event.duration_ms,
+                            }
+                            traces.append(step_dict)
+                            yield {"type": "tool_step", **step_dict}
+                        elif isinstance(event, TurnEnd):
+                            turn_ended = True
+                            reply = event.reply
 
                 user_msg_id, assistant_msg_id = self.state.append_turn(chat_id, clean_text, reply)
                 turn_persisted = True

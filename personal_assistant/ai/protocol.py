@@ -27,13 +27,15 @@ THINKING_BUDGETS: dict[ThinkingLevel, int] = {
 }
 
 
-# 按 Pi ch04 规则将目标思考级别夹紧到模型支持的级别集合（先向上找、找不到再向下找）
+# 按 Pi ch04 规则将目标思考级别夹紧到模型支持的级别集合（off 恒返回 off；其余先向上找、找不到再向下找）
 def clamp_thinking_level(
     level: ThinkingLevel,
     supported: Sequence[ThinkingLevel],
 ) -> ThinkingLevel:
     if level not in THINKING_LEVELS:
         raise ValueError(f"非法的思考级别：{level!r}")
+    if level == "off":
+        return "off"
     supported_set = {item for item in supported if item in THINKING_LEVELS}
     if not supported_set:
         return "off"
@@ -168,13 +170,13 @@ class Context:
     tools: Sequence[ToolSchema] = ()
 
 
-# 统一模型流式调用选项（温度、最大输出长度、思考级别、缓存保留策略与会话标识）
+# 统一模型流式调用选项（各字段默认 None 表示沿用 ModelProfile 配置，显式传值即可单次覆写）
 @dataclass(frozen=True)
 class StreamOptions:
     temperature: float | None = None
     max_tokens: int | None = None
-    reasoning: ThinkingLevel = "off"
-    cache_retention: CacheRetention = "short"
+    reasoning: ThinkingLevel | None = None
+    cache_retention: CacheRetention | None = None
     session_id: str | None = None
 
 
@@ -425,10 +427,11 @@ class ModelProfile:
             cache_retention=cache_retention,
         )
 
-    # 解析实际可用的 API Key（优先使用直写的 api_key，其次读取 key_env 对应的环境变量）
+    # 解析实际可用的 API Key（优先使用直写的非空 api_key，其次读取 key_env 对应的环境变量）
     def resolve_api_key(self, env: Mapping[str, str] | None = None) -> str:
-        if self.api_key:
-            return self.api_key
+        inline_key = self.api_key.strip()
+        if inline_key:
+            return inline_key
         if self.key_env:
             source = os.environ if env is None else env
             return str(source.get(self.key_env, "")).strip()
@@ -437,7 +440,7 @@ class ModelProfile:
     # 输出完全脱敏的展示字典，严禁暴露任何明文 api_key
     def redacted_dict(self, env: Mapping[str, str] | None = None) -> dict[str, object]:
         resolved = self.resolve_api_key(env)
-        if self.api_key:
+        if self.api_key.strip():
             key_source = "inline"
         elif self.key_env:
             key_source = f"env:{self.key_env}"

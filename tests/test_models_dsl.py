@@ -737,7 +737,7 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     # 9. 确认 ConfigCompilerProtocol.render 保持零业务名泄漏且统一使用 api，ModelsDSLCompiler.render 与底层对齐
     import inspect
     from personal_assistant.agent.plugins import ConfigCompilerProtocol
-    from plugins.models_dsl import ModelsDSLCompiler, render_models_dsl
+    from plugins.models_dsl import DSLCompileError, ModelsDSLCompiler, compile_models_dsl, render_models_dsl
 
     proto_sig = inspect.signature(ConfigCompilerProtocol.render)
     impl_sig = inspect.signature(ModelsDSLCompiler.render)
@@ -751,3 +751,22 @@ def test_tools_config_and_app_dual_model_consolidator_slot_and_reload(
     assert impl_params == fn_params
     for extra_name in impl_params[len(proto_params) :]:
         assert impl_sig.parameters[extra_name].default is not inspect.Parameter.empty
+
+    # 10. 确认 render_models_dsl 预设快路径不丢弃自定义 name 与 ollama api_key，且拦截非法 name/temperature 及空 model/api
+    named_dsl = render_models_dsl(preset="deepseek", api_key="sk-1", name="work_ds")
+    compiled_named = ModelsConfig.from_dict(compile_models_dsl(named_dsl))
+    assert compiled_named.default == "work_ds"
+    assert "work_ds" in compiled_named.models
+
+    ollama_key_dsl = render_models_dsl(preset="ollama", model="llama3", api_key="sk-proxy")
+    compiled_ollama = ModelsConfig.from_dict(compile_models_dsl(ollama_key_dsl))
+    assert compiled_ollama.get_profile("ollama").api_key == "sk-proxy"
+
+    with pytest.raises(ValueError, match="模型名称"):
+        render_models_dsl(preset="deepseek", api_key="sk-1", name="bad\nuse ollama")
+    with pytest.raises(ValueError, match="temperature"):
+        render_models_dsl(preset="deepseek", api_key="sk-1", temperature=float("nan"))
+    with pytest.raises(DSLCompileError, match="model 名称不能为空"):
+        compile_models_dsl('model m {\n  base_url "https://api.example.com/v1"\n  model ""\n  api_key "sk-1"\n}\n')
+    with pytest.raises(DSLCompileError, match="api 名称不能为空"):
+        compile_models_dsl('model m {\n  api ""\n  base_url "https://api.example.com/v1"\n  model "m1"\n  api_key "sk-1"\n}\n')

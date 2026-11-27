@@ -141,8 +141,8 @@ def _merge_stream_options(
     else:
         temperature = options.temperature if options.temperature is not None else model.temperature
         max_tokens = options.max_tokens if options.max_tokens is not None else model.max_tokens
-        reasoning = options.reasoning if options.reasoning != "off" else model.reasoning
-        cache_retention = options.cache_retention if options.cache_retention != "short" else model.cache_retention
+        reasoning = options.reasoning if options.reasoning is not None else model.reasoning
+        cache_retention = options.cache_retention if options.cache_retention is not None else model.cache_retention
         session_id = options.session_id
 
     if reasoning != "off" and max_tokens is None:

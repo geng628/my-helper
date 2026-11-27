@@ -585,7 +585,7 @@ def test_google_genai_provider_request_sse_and_errors() -> None:
     for secret in ("abc", "sk-123", "ant99", "g99", "q99", "AIzaSyAbCdEf123456"):
         assert secret not in redacted
 
-    # 5. 验证通用 iter_sse_events 同时兼容标准空行分隔、多行 data 拼接与无空行紧凑流
+    # 5. 验证通用 iter_sse_events 同时兼容标准空行分隔、多行 data 拼接、无空行紧凑流与提前中断关流
     parsed_sse = list(
         iter_sse_events(
             [
@@ -600,3 +600,139 @@ def test_google_genai_provider_request_sse_and_errors() -> None:
         )
     )
     assert parsed_sse == [("msg", '{"a":\n1}'), ("", '{"b": 2}'), ("", "[DONE]")]
+
+    sse_closed: list[bool] = []
+
+    # 追踪提前关闭时底层 SSE 行生成器是否确定性清理
+    def _closing_lines() -> Iterator[str]:
+        try:
+            yield 'data: {"k": 1}\n'
+            yield "\n"
+            yield 'data: {"k": 2}\n'
+            yield "\n"
+        finally:
+            sse_closed.append(True)
+
+    sse_iter = iter_sse_events(_closing_lines())
+    assert next(sse_iter) == ("", '{"k": 1}')
+    sse_iter.close()
+    assert sse_closed == [True]
+
+
+# 测试审查补齐的实网线协议细节：Gemini 零参工具与 URL 归一化、Anthropic null usage/非空文本块/温度夹紧、StreamOptions 覆写与 URL 密钥脱敏
+def test_provider_wire_protocol_edge_cases_and_stream_options_override() -> None:
+    import io
+    from urllib.error import HTTPError
+
+    from personal_assistant.ai.providers.http import format_http_error
+    from personal_assistant.ai.registry import _merge_stream_options
+
+    # 1. Gemini：零参数工具省略空 OBJECT.properties；剥离 models/ 前缀、URL 编码且尊重 /v1 与 /v1alpha
+    gem_url_calls: list[tuple[str, dict[str, object]]] = []
+
+    # 捕获 Gemini 请求地址与载荷并返回最小终止流
+    def _cap_gem(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        gem_url_calls.append((url, payload))
+        return iter(['data: {"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n'])
+
+    gem_provider = GoogleGenAIProvider(post_stream=_cap_gem)
+    gem_model = ModelProfile(
+        name="gem_v1",
+        api="google-generative-ai",
+        base_url="https://generativelanguage.googleapis.com/v1",
+        model="models/gemini-2.5-flash",
+        api_key="AIzaSyEdgeTestKey123456",
+        reasoning="high",
+    )
+    gem_ctx = Context(
+        messages=(UserMessage("现在几点"),),
+        tools=(
+            ToolSchema(name="get_current_time", description="获取时间", parameters={}),
+            ToolSchema(name="echo", description="回显", parameters={"msg": "消息"}, required=()),
+        ),
+    )
+    list(gem_provider.stream(gem_model, gem_ctx, StreamOptions(temperature=0.4)))
+    gem_url, gem_payload = gem_url_calls[0]
+    assert gem_url == "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    decls = gem_payload["tools"][0]["functionDeclarations"]  # type: ignore[index]
+    assert "parameters" not in decls[0]
+    assert "required" not in decls[1]["parameters"]
+    # 仅传 temperature 时不抹掉 model.reasoning="high"
+    assert "thinkingConfig" in gem_payload["generationConfig"]  # type: ignore[operator]
+
+    # 2. Anthropic：message_delta.usage 含 null 时保留 message_start 的输入与缓存 token；绝不发空文本块；temperature 夹紧 <=1.0
+    anth_captured: dict[str, object] = {}
+
+    # 模拟真实 Anthropic SSE（message_delta.usage 含 null 输入字段）
+    def _cap_anth(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        anth_captured["payload"] = payload
+        return iter(
+            [
+                "event: message_start\n",
+                'data: {"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":300,"cache_creation_input_tokens":50}}}\n',
+                "\n",
+                "event: content_block_start\n",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+                "\n",
+                "event: content_block_delta\n",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"答复"}}\n',
+                "\n",
+                "event: content_block_stop\n",
+                'data: {"type":"content_block_stop","index":0}\n',
+                "\n",
+                "event: message_delta\n",
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":null,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":18}}\n',
+                "\n",
+                "event: message_stop\n",
+                'data: {"type":"message_stop"}\n',
+                "\n",
+            ]
+        )
+
+    anth_model = ModelProfile(
+        name="claude_edge",
+        api="anthropic-messages",
+        base_url="https://api.anthropic.com",
+        model="claude-sonnet-4-5",
+        api_key="sk-ant-edge",
+        temperature=1.8,
+        reasoning="high",
+        cache_retention="long",
+    )
+    anth_ctx = Context(
+        messages=(
+            UserMessage("第一句"),
+            AssistantMessage(blocks=(ThinkingBlock(text="无签名旧思考"),)),
+            UserMessage("第二句"),
+        ),
+    )
+    # 显式传 reasoning="off", cache_retention="short" 必须真正覆写 model 默认的 high/long
+    merged_override = _merge_stream_options(anth_model, StreamOptions(reasoning="off", cache_retention="short"))
+    assert merged_override.reasoning == "off"
+    assert merged_override.cache_retention == "short"
+
+    anth_evs = list(AnthropicMessagesProvider(post_stream=_cap_anth).stream(anth_model, anth_ctx, merged_override))
+    anth_payload = anth_captured["payload"]
+    assert isinstance(anth_payload, dict)
+    assert anth_payload["temperature"] == 1.0
+    assert "thinking" not in anth_payload
+    for wire_msg in anth_payload["messages"]:  # type: ignore[union-attr]
+        for blk in wire_msg["content"]:
+            if blk.get("type") == "text":
+                assert blk["text"] != ""
+    anth_done = anth_evs[-1]
+    assert isinstance(anth_done, StreamDone)
+    assert anth_done.usage == TokenUsage(prompt_tokens=470, cached_tokens=300, completion_tokens=18)
+
+    # 3. format_http_error 空响应体时仍必须脱敏 error.url 中的 ?key=... 及 JSON 引号形式头密钥
+    raw_err = HTTPError(
+        "https://generativelanguage.googleapis.com/v1beta/models/m:stream?key=AIzaSyUrlSecret999",
+        403,
+        "Forbidden",
+        {},
+        io.BytesIO(b""),
+    )
+    fmt_err, _ = format_http_error(raw_err)
+    assert "AIzaSyUrlSecret999" not in str(fmt_err.url)
+    assert "proxy-secret-xyz" not in redact_error_tokens('{"x-api-key": "proxy-secret-xyz"}')
+    assert clamp_thinking_level("off", ("low", "medium", "high")) == "off"

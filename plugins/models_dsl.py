@@ -150,11 +150,16 @@ def render_models_dsl(
     clean_key = api_key.strip()
     clean_model = model.strip()
     clean_url = base_url.strip()
+    clean_name = name.strip(" \t").lower()
     clean_api = api.strip(" \t").lower()
     clean_consolidator = consolidator.strip(" \t")
     clean_reasoning = reasoning.strip(" \t").lower()
     clean_cache = cache_retention.strip(" \t").lower()
 
+    if clean_name and not _MODEL_NAME_RE.fullmatch(clean_name):
+        raise ValueError(f"模型名称 {clean_name!r} 仅允许字母、数字、下划线、点或连字符。")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or not (0.0 <= float(temperature) <= 2.0):
+        raise ValueError(f"temperature 必须是 [0, 2] 之间的有限数字：{temperature!r}")
     if clean_consolidator and not _MODEL_NAME_RE.fullmatch(clean_consolidator):
         raise ValueError(f"模型名称 {clean_consolidator!r} 仅允许字母、数字、下划线、点或连字符。")
     if clean_reasoning and clean_reasoning not in THINKING_LEVELS:
@@ -167,6 +172,7 @@ def render_models_dsl(
     final_api = clean_api or (matched.api if matched else "openai-completions")
     has_advanced = bool(
         clean_url
+        or (matched is not None and clean_name and clean_name != matched.id)
         or (matched is not None and final_api != matched.api)
         or temperature != 0.2
         or (clean_reasoning and clean_reasoning != "off")
@@ -182,6 +188,11 @@ def render_models_dsl(
                 use_line = f"use {matched.id} {_format_dsl_value(clean_model)} {_format_dsl_value(clean_key)}\n"
             else:
                 use_line = f"use {matched.id} {_format_dsl_value(clean_key)}\n"
+        elif clean_key and clean_key != "ollama":
+            use_line = (
+                f"use {matched.id} {_format_dsl_value(clean_model or matched.default_model)} "
+                f"{_format_dsl_value(clean_key)}\n"
+            )
         elif clean_model and clean_model != matched.default_model:
             use_line = f"use {matched.id} {_format_dsl_value(clean_model)}\n"
         else:
@@ -191,7 +202,7 @@ def render_models_dsl(
         return f"{header}{use_line}"
 
     # 自定义接口或高级覆盖模式：生成清晰的标准 model 块
-    profile_name = (name.strip(" \t") or (matched.id if matched else "custom")).lower()
+    profile_name = clean_name or (matched.id if matched else "custom")
     if not _MODEL_NAME_RE.fullmatch(profile_name):
         raise ValueError(f"模型名称 {profile_name!r} 仅允许字母、数字、下划线、点或连字符。")
     final_url = clean_url or (matched.base_url if matched else "")
@@ -629,8 +640,17 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
                 col=url_col,
             )
 
-        model_id = decl.fields["model"][0]
-        api_name = decl.fields["api"][0].lower() if "api" in decl.fields else "openai-completions"
+        raw_model_id, m_id_line, m_id_col = decl.fields["model"]
+        model_id = raw_model_id.strip()
+        if not model_id:
+            raise DSLCompileError("model 名称不能为空。", source=source, line=m_id_line, col=m_id_col)
+        if "api" in decl.fields:
+            raw_api, api_line, api_col = decl.fields["api"]
+            api_name = raw_api.strip().lower()
+            if not api_name:
+                raise DSLCompileError("api 名称不能为空。", source=source, line=api_line, col=api_col)
+        else:
+            api_name = "openai-completions"
 
         temperature = 0.2
         if "temperature" in decl.fields:

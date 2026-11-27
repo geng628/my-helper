@@ -62,8 +62,10 @@ def _stream_llm_round(
             yield event
             if isinstance(event, StreamDone):
                 done = event
-            elif isinstance(event, StreamError):
+                break
+            if isinstance(event, StreamError):
                 err = event
+                break
     finally:
         close_fn = getattr(event_iter, "close", None)
         if callable(close_fn):

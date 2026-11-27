@@ -182,7 +182,7 @@ class OpenAICompletionsProvider:
         max_tok = options.max_tokens if (options is not None and options.max_tokens is not None) else model.max_tokens
         if max_tok is not None:
             extra["max_tokens"] = max_tok
-        reasoning = options.reasoning if options is not None else model.reasoning
+        reasoning = options.reasoning if (options is not None and options.reasoning is not None) else model.reasoning
         if reasoning != "off":
             extra["reasoning_effort"] = clamp_thinking_level(reasoning, ("low", "medium", "high"))
         return extra

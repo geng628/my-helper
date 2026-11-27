@@ -25,8 +25,8 @@ _TRANSIENT_HTTP_ERRORS = (
 )
 _BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]+")
-_ANTHROPIC_KEY_RE = re.compile(r"(?i)(x-api-key\s*[:=]\s*)[A-Za-z0-9._~+/=-]+")
-_GOOG_HEADER_KEY_RE = re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)[A-Za-z0-9._~+/=-]+")
+_ANTHROPIC_KEY_RE = re.compile(r"""(?i)(x-api-key["']?\s*[:=]\s*["']?)[A-Za-z0-9._~+/=-]+""")
+_GOOG_HEADER_KEY_RE = re.compile(r"""(?i)(x-goog-api-key["']?\s*[:=]\s*["']?)[A-Za-z0-9._~+/=-]+""")
 _GOOG_AIZA_RE = re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{8,}")
 _QUERY_KEY_RE = re.compile(r"(?i)([?&]key=)[A-Za-z0-9._~%-]+")
 _MAX_HTTP_ERROR_BODY_BYTES = 1024
@@ -74,9 +74,10 @@ def format_http_error(error: HTTPError) -> tuple[HTTPError, str]:
         msg = f"{orig_reason} | {clean_body}" if orig_reason else clean_body
     else:
         msg = orig_reason
-    if not clean_body and msg == raw_reason:
+    raw_url = str(error.url or "")
+    safe_url = redact_error_tokens(raw_url)
+    if not clean_body and msg == raw_reason and safe_url == raw_url:
         return error, orig_reason
-    safe_url = redact_error_tokens(str(error.url or ""))
     return HTTPError(safe_url, error.code, msg, error.headers, None), f"{orig_reason} {clean_body}".strip()
 
 
@@ -199,48 +200,53 @@ def _is_complete_sse_payload(text: str) -> bool:
         return False
 
 
-# 通用 SSE 行流解析器：兼容标准空行分隔事件、多行 data 拼接及无空行紧凑 JSON data 帧，产出 (event_name, data_payload)
+# 通用 SSE 行流解析器：兼容标准空行分隔、多行 data 拼接及紧凑 JSON 帧，退出/异常时确定性关闭内层流
 def iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     event_name = ""
     data_lines: list[str] = []
 
-    for raw_line in lines:
-        line = raw_line.rstrip("\r\n")
-        if line == "":
-            if data_lines:
-                payload = "\n".join(data_lines).strip()
-                if payload:
-                    yield event_name, payload
-            event_name = ""
-            data_lines = []
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("event:"):
-            if data_lines:
-                payload = "\n".join(data_lines).strip()
-                if payload:
-                    yield event_name, payload
-                data_lines = []
-            event_name = line[6:].strip()
-            continue
-        if line.startswith("data:"):
-            val = line[5:]
-            if val.startswith(" "):
-                val = val[1:]
-            if not val.strip() and not data_lines:
-                continue
-            if data_lines:
-                prev = "\n".join(data_lines)
-                if _is_complete_sse_payload(prev) or val.strip() == "[DONE]":
-                    payload = prev.strip()
+    try:
+        for raw_line in lines:
+            line = raw_line.rstrip("\r\n")
+            if line == "":
+                if data_lines:
+                    payload = "\n".join(data_lines).strip()
                     if payload:
                         yield event_name, payload
-                    event_name = ""
+                event_name = ""
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                if data_lines:
+                    payload = "\n".join(data_lines).strip()
+                    if payload:
+                        yield event_name, payload
                     data_lines = []
-            data_lines.append(val)
+                event_name = line[6:].strip()
+                continue
+            if line.startswith("data:"):
+                val = line[5:]
+                if val.startswith(" "):
+                    val = val[1:]
+                if not val.strip() and not data_lines:
+                    continue
+                if data_lines:
+                    prev = "\n".join(data_lines)
+                    if _is_complete_sse_payload(prev) or val.strip() == "[DONE]":
+                        payload = prev.strip()
+                        if payload:
+                            yield event_name, payload
+                        event_name = ""
+                        data_lines = []
+                data_lines.append(val)
 
-    if data_lines:
-        payload = "\n".join(data_lines).strip()
-        if payload:
-            yield event_name, payload
+        if data_lines:
+            payload = "\n".join(data_lines).strip()
+            if payload:
+                yield event_name, payload
+    finally:
+        close_fn = getattr(lines, "close", None)
+        if callable(close_fn):
+            close_fn()
