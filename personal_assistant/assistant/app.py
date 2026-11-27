@@ -274,10 +274,10 @@ class AssistantApp:
         self.max_repeated_tool_calls = require_positive_int(
             max_repeated_tool_calls, "max_repeated_tool_calls"
         )
-        self.prompt_cache_ttl_seconds = require_non_negative_float(
+        validated_ttl = require_non_negative_float(
             prompt_cache_ttl_seconds, "prompt_cache_ttl_seconds"
         )
-        self.max_turn_context_chars = require_positive_int(
+        validated_fold_chars = require_positive_int(
             max_turn_context_chars, "max_turn_context_chars"
         )
         self._clock: Callable[[], float] = clock or time.monotonic
@@ -335,8 +335,8 @@ class AssistantApp:
         self._llm_lock = threading.RLock()
         self.context_assembler = ContextAssembler(
             self.memory,
-            prompt_cache_ttl_seconds=self.prompt_cache_ttl_seconds,
-            max_turn_context_chars=self.max_turn_context_chars,
+            prompt_cache_ttl_seconds=validated_ttl,
+            max_turn_context_chars=validated_fold_chars,
             clock=self._clock,
         )
         self._chat_locks_guard = threading.Lock()
@@ -511,6 +511,30 @@ class AssistantApp:
     @property
     def tools(self) -> ToolRegistry:
         return self._tool_registry
+
+    # 读取当前系统前缀缓存空闲 TTL（秒，单一事实来源位于 ContextAssembler）
+    @property
+    def prompt_cache_ttl_seconds(self) -> float:
+        return self.context_assembler.prompt_cache_ttl_seconds
+
+    # 动态更新系统前缀缓存空闲 TTL（秒，写入前校验非负有限数）
+    @prompt_cache_ttl_seconds.setter
+    def prompt_cache_ttl_seconds(self, value: float) -> None:
+        self.context_assembler.prompt_cache_ttl_seconds = require_non_negative_float(
+            value, "prompt_cache_ttl_seconds"
+        )
+
+    # 读取单轮上下文折叠触发高水位字符阈值（单一事实来源位于 ContextAssembler）
+    @property
+    def max_turn_context_chars(self) -> int:
+        return self.context_assembler.max_turn_context_chars
+
+    # 动态更新单轮上下文折叠触发高水位字符阈值（写入前校验正整数）
+    @max_turn_context_chars.setter
+    def max_turn_context_chars(self, value: int) -> None:
+        self.context_assembler.max_turn_context_chars = require_positive_int(
+            value, "max_turn_context_chars"
+        )
 
     # 拼装纯静态/低频系统提示词（委托 ContextAssembler，不含逐日日期与动态摘要）
     def build_system_prompt(self, registry: ToolRegistry) -> str:

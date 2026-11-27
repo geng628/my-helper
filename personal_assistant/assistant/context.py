@@ -182,6 +182,13 @@ def _message_char_len(msg: Message) -> int:
     return total
 
 
+# 严格校验参数为非负整数（>= 0 且拒绝布尔值）
+def _require_non_negative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} 必须是非负整数。")
+    return value
+
+
 # 轮内粘性高水位非破坏性上下文投影器（接入 react.iter_react 的 convert_to_llm 钩子）：带动态滞回水位防抖，绝不放大原输出
 class TurnContextProjector:
     # 初始化触发高水位字符阈值、动态下次触发水位、尾部原文保护条数与单条大输出折叠阈值
@@ -193,11 +200,11 @@ class TurnContextProjector:
         min_result_chars: int = DEFAULT_FOLD_MIN_RESULT_CHARS,
         preview_chars: int = DEFAULT_FOLD_PREVIEW_CHARS,
     ) -> None:
-        self._trigger_chars = trigger_chars
-        self._next_trigger_chars = trigger_chars
-        self._keep_tail_messages = keep_tail_messages
-        self._min_result_chars = min_result_chars
-        self._preview_chars = preview_chars
+        self._trigger_chars = require_positive_int(trigger_chars, "trigger_chars")
+        self._next_trigger_chars = self._trigger_chars
+        self._keep_tail_messages = _require_non_negative_int(keep_tail_messages, "keep_tail_messages")
+        self._min_result_chars = _require_non_negative_int(min_result_chars, "min_result_chars")
+        self._preview_chars = _require_non_negative_int(preview_chars, "preview_chars")
         self._folded_until = 0
 
     # 将单条超长 ToolResultMessage 确定性地投影为紧凑卡片（仅提取有界 TOAST 回读指针，并严格保证折叠后更短）
@@ -242,7 +249,7 @@ class TurnContextProjector:
 
         total_chars = sum(_message_char_len(m) for m in msgs)
         if total_chars > self._next_trigger_chars:
-            cutoff = max(0, len(msgs) - self._keep_tail_messages)
+            cutoff = min(len(msgs), max(0, len(msgs) - self._keep_tail_messages))
             if cutoff > self._folded_until:
                 newly_folded = False
                 for idx in range(self._folded_until, cutoff):
@@ -306,9 +313,9 @@ class ContextAssembler:
 
     # 获取指定会话冻结的系统提示词：热聊期（空闲 < TTL）死锁复用，空闲超时后零代价刷新最新记忆索引
     def get_session_system_prompt(self, chat_id: str, registry: ToolRegistry) -> str:
-        now = self._clock()
         cap = self._session_cap()
         with self._lock:
+            now = self._clock()
             cached = self._session_prompts.pop(chat_id, None)
             if (
                 cached is not None
@@ -338,26 +345,25 @@ class ContextAssembler:
         with self._lock:
             self._history_trim_floors.pop(chat_id, None)
 
-    # 每个自然日首次对话时执行过期归档；仅在实际归档改动了记忆文件时才清空冻结前缀，无过期时零击穿缓存
+    # 每个自然日首次对话时原子执行过期归档：持锁防止并发跨午夜读到过期旧前缀，并单调推进日期防迟到线程回退
     def maybe_archive_expired(self, today: date) -> dict[str, int]:
         today_str = today.isoformat()
         with self._lock:
-            if self._last_archive_day == today_str:
+            if self._last_archive_day >= today_str:
                 return {}
-        archived = self._memory.archive_expired_memories(today=today)
-        with self._lock:
+            archived = self._memory.archive_expired_memories(today=today)
             if archived:
                 self._session_prompts.clear()
-            if self._last_archive_day != today_str:
-                self._last_archive_day = today_str
-        return archived
+            self._last_archive_day = max(self._last_archive_day, today_str)
+            return archived
 
-    # 按会话粘性边界裁剪活跃历史并按真 LRU 刷新命中会话热度（防止热会话在上限淘汰时被提前逐出）
+    # 按会话粘性边界裁剪活跃历史并按真 LRU 刷新命中会话热度（全程持锁避免并发后台回调清空 floor 时被旧结果覆写）
     def select_history(
         self,
         chat_id: str,
         active_all: list[dict[str, object]],
     ) -> list[dict[str, object]]:
+        cap = self._session_cap()
         with self._lock:
             existing = self._history_trim_floors.pop(chat_id, None)
             if existing is not None:
@@ -365,15 +371,13 @@ class ContextAssembler:
                 floor_id = existing
             else:
                 floor_id = 0
-        selected, new_floor = select_chunked_history(active_all, floor_id=floor_id)
-        if new_floor != floor_id:
-            cap = self._session_cap()
-            with self._lock:
+            selected, new_floor = select_chunked_history(active_all, floor_id=floor_id)
+            if new_floor != floor_id:
                 self._history_trim_floors.pop(chat_id, None)
                 while len(self._history_trim_floors) >= cap:
                     self._history_trim_floors.pop(next(iter(self._history_trim_floors)))
                 self._history_trim_floors[chat_id] = new_floor
-        return selected
+            return selected
 
     # 按变化频率分层组装中立 Context：静态 system 前缀 -> <system-reminder> 隔离前情摘要 + 稳定历史 -> 带日期信封的当前提问
     def assemble(

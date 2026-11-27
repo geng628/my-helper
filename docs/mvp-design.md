@@ -36,8 +36,10 @@ flowchart TD
     Entry --> App["应用编排与回合预算层 AssistantApp (assistant/app.py)"]
 
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
-        App --> Prompts["系统提示词与规则边界声明 (assistant/prompts.py)"]
-        App --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        App --> Ctx["上下文与 KV Cache 装配引擎 ContextAssembler (assistant/context.py)"]
+        Ctx --> Prompts["提示词模板与 <system-reminder> 隔离 (assistant/prompts.py)"]
+        Ctx --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        App --> Mem
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与指数退避压缩 (assistant/consolidator.py)"]
         App --> Cfg["总配置与多协议模型装配 ToolsConfig (assistant/commands.py)"]
@@ -119,7 +121,7 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
+│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
@@ -139,7 +141,7 @@ my_helper_v2/
 ```text
 data/
 ├── memory/
-│   ├── MEMORY.md                      # 限长记忆目录索引（前 100 行 / 4000 字符，会话内按自然日冻结）
+│   ├── MEMORY.md                      # 限长记忆目录索引（前 100 行 / 4000 字符，会话内按 5 分钟空闲 TTL 冻结）
 │   ├── facts.md                       # remember_fact 追加的原始事实（流式轮内 turn# 暂存 -> 提交后升级 msg#）
 │   ├── <topic>.md                     # 后台沉淀按主题组织的长期记忆（支持 add/merge/replace/remove）
 │   ├── rules/                         # 行为规则（每条一个 .md，摘要注入系统前缀；受外部网络工具污染锁死与非越权提示守卫保护）
@@ -258,7 +260,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `209 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `219 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 零内部依赖）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

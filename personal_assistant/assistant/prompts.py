@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date
 from typing import TYPE_CHECKING
 
@@ -10,7 +11,10 @@ from personal_assistant.assistant.common import format_date_with_weekday, today_
 if TYPE_CHECKING:
     from personal_assistant.assistant.memory import MemoryStore
 
-_REMINDER_TAG_RE = re.compile(r"(?i)<\s*(/?)\s*system-reminder\b([^>]*)>")
+_REMINDER_TAG_RE = re.compile(
+    r"(?i)[<\uff1c]\s*([/\uff0f]*)\s*system[-\u2010-\u2015\u2212\uff0d]reminder\b"
+    r"(?:((?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:\"[^\"<\uff1c]*\"|'[^'<\uff1c]*'|[^\s<>\uff1c\uff1e\"']+))?)*\s*[/\uff0f]*\s*)[>\uff1e]|([/\uff0f]*)[>\uff1e]?)"
+)
 
 SYSTEM_PROMPT = (
     "你是用户的个人助手，用简洁自然的中文交流。\n"
@@ -44,9 +48,18 @@ def format_system_prompt(
     return "\n\n".join(parts)
 
 
-# 消毒嵌入 <system-reminder> 的正文，阻断闭合标签逃逸信源围栏
+# 消毒嵌入 <system-reminder> 的正文：剥离零宽 Cf 格式符并中和未闭合/多斜杠/全角/变体标签以阻断围栏逃逸
 def _sanitize_reminder_body(text: str) -> str:
-    return _REMINDER_TAG_RE.sub(lambda m: f"[{m.group(1)}system-reminder{m.group(2)}]", text)
+    cleaned = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+    # 将单个匹配到的 <system-reminder...> 或未闭合标签统一改写为方括号惰性文本
+    def _replace(match: re.Match[str]) -> str:
+        slashes = match.group(1).replace("\uff0f", "/")
+        attrs = match.group(2) if match.group(2) is not None else (match.group(3) or "")
+        attrs = attrs.replace("\uff0f", "/")
+        return f"[{slashes}system-reminder{attrs}]"
+
+    return _REMINDER_TAG_RE.sub(_replace, cleaned)
 
 
 # 为已压缩前情摘要包裹 <system-reminder> 信源与权限隔离围栏，防止摘要与历史用户消息混淆或越权
