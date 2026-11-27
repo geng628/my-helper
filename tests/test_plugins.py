@@ -633,7 +633,7 @@ class CounterObserverPlugin(Plugin):
     finally:
         app.close()
 
-    # 3. 验证项目自带 5 个真实插件在真实 config/tools.json 下多轮调用同样只初始化一次
+    # 3. 验证项目自带 4 个真实插件在真实 config/tools.json 下多轮调用同样只初始化一次
     real_cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
     for msg_id in (1, 3, 5):
         reg = real_cfg.build_registry(data_root=tmp_path / "real", tool_context={"before_msg_id": msg_id})

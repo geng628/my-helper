@@ -105,9 +105,8 @@ def test_builtin_openai_reasoning_provider_registers_and_builds_llm(
         app.close()
 
 
-# 测试 OpenAIReasoningProvider 的请求报文规则（禁发 temperature、跨轮剥离/轮内透传 reasoning_content）与 12 事件流解析
+# 测试 OpenAIReasoningProvider 的请求报文规则（禁发 temperature/reasoning_effort、显式透传 max_tokens、跨轮剥离/轮内透传 reasoning_content）与 12 事件流解析
 def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
-
     captured_requests: list[dict[str, object]] = []
     stream_attempts = 0
 
@@ -143,6 +142,8 @@ def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
         base_url="https://api.deepseek.com/v1/",
         model="deepseek-reasoner",
         api_key="sk-wire-test",
+        reasoning="high",
+        max_tokens=4096,
     )
     client = ModelClient(profile=profile, registry=reg)
 
@@ -176,6 +177,7 @@ def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
     sent_payload = captured_requests[-1]
     assert "temperature" not in sent_payload
     assert "reasoning_effort" not in sent_payload
+    assert sent_payload["max_tokens"] == 4096
     wire_msgs = sent_payload["messages"]
     assert isinstance(wire_msgs, list)
 

@@ -293,7 +293,7 @@ monitor = CacheMonitor()
 llm = monitor.wrap(ModelClient(profile=profile, registry=reg), session_key="s1")
 r1 = llm.complete(Context(messages=(UserMessage("hi"),), tools=(schema,)))
 r2 = llm.complete(Context(messages=(UserMessage("hi"), r1, UserMessage("next")), tools=(schema,)))
-leaked = [m for m in sys.modules if m == "evals" or m.startswith(("personal_assistant.agent", "personal_assistant.assistant", "personal_assistant.eval", "evals."))]
+leaked = [m for m in sys.modules if m in {"evals", "plugins"} or m.startswith(("personal_assistant.agent", "personal_assistant.assistant", "personal_assistant.eval", "evals.", "plugins."))]
 print(json.dumps({"reply": r2.text, "cached": monitor.summary()["cached_tokens"], "leaked": leaked}))
 """
     res_ai = subprocess.run(

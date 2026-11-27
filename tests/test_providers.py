@@ -1,4 +1,4 @@
-"""Layer 1 Pi ch04 三层翻译架构专项单元测试：覆盖协议契约、注册表、OpenAI / Anthropic / Gemini 原生翻译器。"""
+"""Layer 1 Pi ch04 三层翻译架构专项单元测试：覆盖协议契约、注册表、OpenAI / DeepSeek 推理 / Anthropic / Gemini 四大原生翻译器。"""
 from __future__ import annotations
 
 import io

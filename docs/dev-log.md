@@ -57,7 +57,7 @@
 - **决策**：主线采用零依赖中英双语分词 + SQLite FTS5 BM25，不内置重型本地向量模型依赖。
 - **权衡**：单跳精确事实与显式时间线检索延迟仅数毫秒且可解释性强；但面对零词面重叠的同义改写与跨会话隐式多跳问题（如 LoCoMo Search 的 `multi-hop` 与 `open-domain` 子类）存在明确词面上限。
 
-### ADR-6：对标 Pi ch04 落地三层模型调用翻译架构，彻底清除上层 OpenAI 字典渗透（`d833400`）
+### ADR-6：对标 Pi ch04 落地三层模型调用翻译架构，彻底清除上层 OpenAI 字典渗透（`d833400`；`#93` 收编第 4 套内建推理翻译器）
 - **背景**：早期 `ai/types.py` 与 `ai/client.py` 将 OpenAI Chat Completions 字典格式（`to_openai_schema`、`to_openai_dict`、`extract_tool_calls`、裸 `dict` 消息列表）直接暴露给 Layer 2 `react.py` 与 Layer 3 `app.py`/`consolidator.py`，导致接入原生 Anthropic Messages（`system` 块、`cache_control`、`tool_use`/`tool_result`、带签名 `thinking`）或原生 Google Gemini（`systemInstruction`/`contents`/`parts`/`functionDeclarations`/`functionResponse`）时阻力极大且无法跨厂商热切换。
 - **决策**：采取**零兼容一次性切换**，按 Pi ch04 将 `personal_assistant/ai/` 拆为 `protocol.py`（中立 `Context`/`Message`/`ToolSchema` + 12 种规范流事件 + `ApiProvider` 宪法）← `registry.py`（`stream`/`stream_simple`/`complete` 统一前台 + `ApiProviderRegistry` 通讯录 + `ModelClient`）← `providers/`（共享 `http.py` + OpenAI / DeepSeek 推理 / Anthropic / Gemini 四大原生翻译器）；`ModelProfile` 与 `models.dsl` 统一使用单一路由键 `api`，Layer 2 Slot 4 直接复刻 `ApiProvider`。
 - **收益与权衡**：同一条对话轨迹可在中途跨 4 种异构协议无损热切换，新增第 5 套任意私有协议仅需编写 1 个 `ApiProvider` 翻译器 + 1 行注册 + `models.dsl` 配置，上层 `agent/`、`assistant/`、`cache.py`、`telemetry.py` 均 0 行改动；代价是废弃旧 `provider` 字段与 OpenAI 字典接口（单轨零双轨包袱）。
