@@ -5,8 +5,19 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 from personal_assistant.agent import ObserverProtocol, PluginManager, TaskEvent, ToolStep, TurnEnd
-from personal_assistant.ai import LLMClient, StreamDone, TextDelta, TokenUsage
+from personal_assistant.ai import (
+    AssistantMessage,
+    Context,
+    StreamDone,
+    StreamError,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+    ToolResultMessage,
+)
 from personal_assistant.assistant.app import AssistantApp
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT
@@ -45,7 +56,7 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
     assert len(observers_on) == 1
     assert isinstance(observers_on[0], ObserverProtocol)
     assert observers_on[0].name == "telemetry"
-    assert observers_on[0].config.max_sessions == 5
+    assert observers_on[0].config.max_sessions == 5  # type: ignore[attr-defined]
 
     cfg_off = tmp_path / "tools_off.json"
     cfg_off.write_text(
@@ -64,7 +75,7 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
         data_root=tmp_path / "data_off",
         config_path=cfg_off,
         project_root=REPO_ROOT,
-        llm=ScriptedStreamLLM([{"role": "assistant", "content": "已关闭遥测"}]),
+        llm=ScriptedStreamLLM([AssistantMessage.from_text("已关闭遥测", stop_reason="stop")]),
     )
     try:
         assert app_off.observers == ()
@@ -74,7 +85,7 @@ def test_telemetry_plugin_discovery_and_config_toggle(tmp_path: Path) -> None:
         app_off.close()
 
 
-# 测试分阶段耗时拆解（ttft/llm/tool/overhead）、会话与前后台隔离及有界 MRU 游标
+# 测试分阶段耗时拆解（ttft/llm/tool/overhead）、会话与前后台隔离、StreamError 清理及有界 MRU 游标
 def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     obs = TelemetryObserver(TelemetryConfig(max_sessions=4))
     assert not hasattr(obs, "recent_turns")
@@ -84,7 +95,8 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     obs.on_event(
         "main",
         StreamDone(
-            message={"role": "assistant", "content": None},
+            reason="toolUse",
+            message=AssistantMessage(stop_reason="toolUse"),
             usage=TokenUsage(prompt_tokens=100, cached_tokens=60, completion_tokens=20),
             ttft_ms=120.0,
             latency_ms=300.0,
@@ -94,11 +106,12 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
         "main",
         ToolStep(tool="list_files", arguments="{}", observation="ok", duration_ms=45.5),
     )
-    obs.on_event("main", TextDelta(text="好"))
+    obs.on_event("main", TextDelta(content_index=0, text="好"))
     obs.on_event(
         "main",
         StreamDone(
-            message={"role": "assistant", "content": "好"},
+            reason="stop",
+            message=AssistantMessage.from_text("好", stop_reason="stop"),
             usage=TokenUsage(prompt_tokens=150, cached_tokens=120, completion_tokens=10),
             ttft_ms=80.0,
             latency_ms=200.0,
@@ -108,6 +121,7 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
 
     snap_main = obs.snapshot(session_key="main")
     last_turn = snap_main["last_turn"]
+    assert isinstance(last_turn, dict)
     assert last_turn["ttft_ms"] == 120.0
     assert last_turn["llm_ms"] == 500.0
     assert last_turn["tool_ms"] == 45.5
@@ -124,7 +138,8 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     obs.on_event(
         "s1",
         StreamDone(
-            message={"role": "assistant", "content": None},
+            reason="toolUse",
+            message=AssistantMessage(stop_reason="toolUse"),
             usage=TokenUsage(prompt_tokens=40, cached_tokens=10, completion_tokens=5),
             ttft_ms=20.0,
             latency_ms=50.0,
@@ -134,7 +149,8 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     obs.on_event(
         "s2",
         StreamDone(
-            message={"role": "assistant", "content": "s2回复"},
+            reason="stop",
+            message=AssistantMessage.from_text("s2回复", stop_reason="stop"),
             usage=TokenUsage(prompt_tokens=80, cached_tokens=40, completion_tokens=8),
             ttft_ms=15.0,
             latency_ms=30.0,
@@ -153,7 +169,8 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     obs.on_event(
         "s1",
         StreamDone(
-            message={"role": "assistant", "content": "s1完成"},
+            reason="stop",
+            message=AssistantMessage.from_text("s1完成", stop_reason="stop"),
             usage=TokenUsage(prompt_tokens=60, cached_tokens=20, completion_tokens=6),
             ttft_ms=10.0,
             latency_ms=40.0,
@@ -163,34 +180,53 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
 
     snap_s1 = obs.snapshot(session_key="s1")
     snap_s2 = obs.snapshot(session_key="s2")
-    assert snap_s1["session"]["turns"] == 1
-    assert snap_s1["session"]["tool_calls"] == 1
-    assert snap_s1["session"]["llm_ms"] == 90.0
-    assert snap_s1["session"]["prompt_tokens"] == 100
-    assert snap_s2["session"]["turns"] == 1
-    assert snap_s2["session"]["tool_calls"] == 0
-    assert snap_s2["session"]["prompt_tokens"] == 80
-    assert snap_s1["background"]["runs"] == 1
-    assert snap_s1["background"]["prompt_tokens"] == 90
+    assert snap_s1["session"]["turns"] == 1  # type: ignore[index]
+    assert snap_s1["session"]["tool_calls"] == 1  # type: ignore[index]
+    assert snap_s1["session"]["llm_ms"] == 90.0  # type: ignore[index]
+    assert snap_s1["session"]["prompt_tokens"] == 100  # type: ignore[index]
+    assert snap_s2["session"]["turns"] == 1  # type: ignore[index]
+    assert snap_s2["session"]["tool_calls"] == 0  # type: ignore[index]
+    assert snap_s2["session"]["prompt_tokens"] == 80  # type: ignore[index]
+    assert snap_s1["background"]["runs"] == 1  # type: ignore[index]
+    assert snap_s1["background"]["prompt_tokens"] == 90  # type: ignore[index]
 
-    # 3. 验证有界 MRU（max_sessions=4）、snapshot 单调游标与非负配置防错
-    # 先对已存在的 main 触发一次 TurnEnd 刷新 MRU，再新增 3 个会话淘汰较久未活跃的 s1/s2
-    obs.on_event("main", StreamDone(message={"role": "assistant", "content": "refresh"}, ttft_ms=-3.0, latency_ms=-5.0))
+    # 3. StreamError 立即清理该会话 _in_flight，不污染后续正常回合
+    obs.on_event(
+        "s-stream-err",
+        StreamDone(
+            reason="toolUse",
+            message=AssistantMessage(stop_reason="toolUse"),
+            usage=TokenUsage(prompt_tokens=555, cached_tokens=0, completion_tokens=10),
+            ttft_ms=99.0,
+            latency_ms=120.0,
+        ),
+    )
+    obs.on_event(
+        "s-stream-err",
+        StreamError(reason="error", message=AssistantMessage(stop_reason="error"), error_message="upstream 502"),
+    )
+    assert "s-stream-err" not in obs._in_flight
+
+    # 4. 验证有界 MRU（max_sessions=4）、snapshot 单调游标与非负配置防错
+    obs.on_event(
+        "main",
+        StreamDone(reason="stop", message=AssistantMessage.from_text("refresh", stop_reason="stop"), ttft_ms=-3.0, latency_ms=-5.0),
+    )
     obs.on_event("main", ToolStep(tool="noop", arguments="{}", observation="ok", duration_ms=-2.0))
     obs.on_event("main", TurnEnd(reply="refresh", total_ms=10.0))
-    assert obs.snapshot(session_key="main")["last_turn"]["ttft_ms"] == 0.0
-    assert obs.snapshot(session_key="main")["last_turn"]["llm_ms"] == 0.0
-    assert obs.snapshot(session_key="main")["last_turn"]["tool_ms"] == 0.0
+    assert obs.snapshot(session_key="main")["last_turn"]["ttft_ms"] == 0.0  # type: ignore[index]
+    assert obs.snapshot(session_key="main")["last_turn"]["llm_ms"] == 0.0  # type: ignore[index]
+    assert obs.snapshot(session_key="main")["last_turn"]["tool_ms"] == 0.0  # type: ignore[index]
 
     for idx in range(3):
         sk = f"extra-{idx}"
-        obs.on_event(sk, StreamDone(message={"role": "assistant", "content": "ok"}, latency_ms=10.0))
+        obs.on_event(sk, StreamDone(reason="stop", message=AssistantMessage.from_text("ok", stop_reason="stop"), latency_ms=10.0))
         obs.on_event(sk, TurnEnd(reply="ok", total_ms=12.0))
 
     final_snap = obs.snapshot()
     assert final_snap["cursor"] == 7
     assert final_snap["task_cursor"] == 1
-    assert final_snap["totals"]["turns"] == 7
+    assert final_snap["totals"]["turns"] == 7  # type: ignore[index]
     assert len(obs._sessions) == 4 and "main" in obs._sessions
 
     # 未收到 TurnEnd 的进行中会话超过 max_sessions 时也必须有界淘汰
@@ -201,7 +237,6 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
     # 非法/布尔配置安全回退默认值，直接构造 0 抛出 ValueError
     bad_cfg = TelemetryConfig.from_dict({"max_sessions": True})
     assert bad_cfg == TelemetryConfig(max_sessions=256)
-    import pytest
     with pytest.raises(ValueError):
         TelemetryConfig(max_sessions=0)
 
@@ -209,28 +244,26 @@ def test_telemetry_stage_latency_session_isolation_and_bounded_window() -> None:
 # 测试 AssistantApp 真实配置自动装配 telemetry 插件并采集工具回合与后台沉淀指标
 def test_assistant_app_end_to_end_telemetry_and_consolidation(tmp_path: Path) -> None:
     # 区分主对话工具调用、工具后总结及后台记忆沉淀响应
-    def dynamic_reply(self: LLMClient, messages: list[dict[str, object]], _tools: object) -> dict[str, object]:
-        if "session_summary" in str(messages[0].get("content") or ""):
-            self.last_usage = TokenUsage(prompt_tokens=90, cached_tokens=30, completion_tokens=20)
-            return {
-                "role": "assistant",
-                "content": json.dumps({"session_summary": "已查询当前时间", "memories": []}, ensure_ascii=False),
-            }
-        if messages[-1].get("role") == "tool":
-            self.last_usage = TokenUsage(prompt_tokens=110, cached_tokens=50, completion_tokens=12)
-            return {"role": "assistant", "content": "现在时间已查到。"}
-        self.last_usage = TokenUsage(prompt_tokens=70, cached_tokens=20, completion_tokens=8)
-        return {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "get_current_time", "arguments": "{}"},
-                }
-            ],
-        }
+    def dynamic_reply(self: ScriptedStreamLLM, ctx: Context) -> AssistantMessage:
+        if "session_summary" in ctx.system_prompt:
+            usage = TokenUsage(prompt_tokens=90, cached_tokens=30, completion_tokens=20)
+            self.last_usage = usage
+            return AssistantMessage.from_text(
+                json.dumps({"session_summary": "已查询当前时间", "memories": []}, ensure_ascii=False),
+                stop_reason="stop",
+                usage=usage,
+            )
+        if ctx.messages and isinstance(ctx.messages[-1], ToolResultMessage):
+            usage = TokenUsage(prompt_tokens=110, cached_tokens=50, completion_tokens=12)
+            self.last_usage = usage
+            return AssistantMessage.from_text("现在时间已查到。", stop_reason="stop", usage=usage)
+        usage = TokenUsage(prompt_tokens=70, cached_tokens=20, completion_tokens=8)
+        self.last_usage = usage
+        return AssistantMessage(
+            blocks=(ToolCall(id="call-1", name="get_current_time", arguments="{}"),),
+            stop_reason="toolUse",
+            usage=usage,
+        )
 
     policy = ConsolidationPolicy(
         max_active_messages=2,
@@ -247,7 +280,7 @@ def test_assistant_app_end_to_end_telemetry_and_consolidation(tmp_path: Path) ->
     )
     try:
         res = app.chat("现在几点？", chat_id="web")
-        last_turn = res["telemetry"]["telemetry"]["last_turn"]
+        last_turn = res["telemetry"]["telemetry"]["last_turn"]  # type: ignore[index]
         assert last_turn["tool_calls"] == 1
         assert last_turn["tools"] == ["get_current_time"]
         assert last_turn["llm_calls"] == 2
@@ -256,7 +289,7 @@ def test_assistant_app_end_to_end_telemetry_and_consolidation(tmp_path: Path) ->
         app.wait_for_consolidation(timeout=5.0)
         st = app.status()
         assert st["observers"] == ["telemetry"]
-        bg = st["telemetry"]["telemetry"]["background"]
+        bg = st["telemetry"]["telemetry"]["background"]  # type: ignore[index]
         assert bg["runs"] == 1
         assert bg["failures"] == 0
         assert bg["last_duration_ms"] >= 0.0
@@ -281,7 +314,8 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
             obs.on_event(
                 sk,
                 StreamDone(
-                    message={"role": "assistant", "content": "ok"},
+                    reason="stop",
+                    message=AssistantMessage.from_text("ok", stop_reason="stop"),
                     usage=TokenUsage(prompt_tokens=10, cached_tokens=4, completion_tokens=2),
                     ttft_ms=5.0,
                     latency_ms=10.0,
@@ -314,7 +348,8 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
     abort_obs.on_event(
         "s-err",
         StreamDone(
-            message={"role": "assistant", "content": ""},
+            reason="toolUse",
+            message=AssistantMessage(stop_reason="toolUse"),
             usage=TokenUsage(prompt_tokens=999, cached_tokens=0, completion_tokens=50),
             ttft_ms=500.0,
             latency_ms=1800.0,
@@ -328,7 +363,8 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
     abort_obs.on_event(
         "s-err",
         StreamDone(
-            message={"role": "assistant", "content": "ok"},
+            reason="stop",
+            message=AssistantMessage.from_text("ok", stop_reason="stop"),
             usage=TokenUsage(prompt_tokens=20, cached_tokens=5, completion_tokens=3),
             ttft_ms=12.0,
             latency_ms=30.0,
@@ -336,19 +372,20 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
     )
     abort_obs.on_event("s-err", TurnEnd(reply="ok", total_ms=35.0))
     clean_snap = abort_obs.snapshot(session_key="s-err")
-    assert clean_snap["last_turn"]["prompt_tokens"] == 20
-    assert clean_snap["last_turn"]["llm_calls"] == 1
-    assert clean_snap["last_turn"]["tool_calls"] == 0
-    assert clean_snap["last_turn"]["ttft_ms"] == 12.0
-    assert clean_snap["background"]["runs"] == 0
+    assert clean_snap["last_turn"]["prompt_tokens"] == 20  # type: ignore[index]
+    assert clean_snap["last_turn"]["llm_calls"] == 1  # type: ignore[index]
+    assert clean_snap["last_turn"]["tool_calls"] == 0  # type: ignore[index]
+    assert clean_snap["last_turn"]["ttft_ms"] == 12.0  # type: ignore[index]
+    assert clean_snap["background"]["runs"] == 0  # type: ignore[index]
 
     # 验证进入 iter_react 前（如读取系统提示词阶段）抛异常时，原异常正常透出绝不被 UnboundLocalError 掩盖
     import tempfile
-    from pathlib import Path
-    import pytest
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        err_app = AssistantApp(data_root=Path(tmpdir) / "d", llm=ScriptedStreamLLM(lambda _m, _t: {"role": "assistant", "content": "x"}))
+        err_app = AssistantApp(
+            data_root=Path(tmpdir) / "d",
+            llm=ScriptedStreamLLM(lambda _self, _ctx: AssistantMessage.from_text("x", stop_reason="stop")),
+        )
         try:
             # 模拟系统提示词构造前阶段抛异常
             def _boom_prompt(_chat_id: str, _reg: object) -> str:
@@ -360,8 +397,8 @@ def test_telemetry_thread_safety_under_concurrent_load() -> None:
         finally:
             err_app.close()
     assert snap["task_cursor"] == total_turns
-    assert snap["totals"]["turns"] == total_turns
-    assert snap["totals"]["prompt_tokens"] == total_turns * 10
-    assert snap["background"]["runs"] == total_turns
-    assert snap["background"]["failures"] == threads_n
-    assert snap["background"]["prompt_tokens"] == (total_turns - threads_n) * 20
+    assert snap["totals"]["turns"] == total_turns  # type: ignore[index]
+    assert snap["totals"]["prompt_tokens"] == total_turns * 10  # type: ignore[index]
+    assert snap["background"]["runs"] == total_turns  # type: ignore[index]
+    assert snap["background"]["failures"] == threads_n  # type: ignore[index]
+    assert snap["background"]["prompt_tokens"] == (total_turns - threads_n) * 20  # type: ignore[index]

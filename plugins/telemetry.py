@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TypeVar
 
 from personal_assistant.agent import Plugin, RuntimeEvent, TaskEvent, ToolStep, TurnEnd
-from personal_assistant.ai import StreamDone, TokenUsage
+from personal_assistant.ai import StreamDone, StreamError, TokenUsage
 
 OBSERVER_NAME = "telemetry"
 _T = TypeVar("_T")
@@ -174,11 +174,14 @@ class TelemetryObserver:
         self._sessions: dict[str, _CumulativeStats] = {}
         self._totals = _CumulativeStats()
 
-    # 接收微内核按 session_key 广播的运行期事件并归集分阶段指标
+    # 接收微内核按 session_key 广播的运行期事件并归集分阶段指标（遇 StreamError 自动清理在途状态）
     def on_event(self, session_key: str, event: RuntimeEvent) -> None:
-        if not isinstance(event, (StreamDone, ToolStep, TurnEnd, TaskEvent)):
+        if not isinstance(event, (StreamDone, StreamError, ToolStep, TurnEnd, TaskEvent)):
             return
         with self._lock:
+            if isinstance(event, StreamError):
+                self._in_flight.pop(session_key, None)
+                return
             if isinstance(event, (StreamDone, ToolStep)):
                 acc = _touch_bounded(self._in_flight, session_key, _InFlightTurn, self.config.max_sessions)
                 if isinstance(event, StreamDone):

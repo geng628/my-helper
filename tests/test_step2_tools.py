@@ -8,23 +8,28 @@ from pathlib import Path
 import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
-from personal_assistant.ai import LLMClient
-from personal_assistant.agent.react import run_react
+from personal_assistant.ai import AssistantMessage, Context, StreamDone, ToolCall, UserMessage
+from personal_assistant.agent.react import TurnEnd, run_react
 from personal_assistant.agent.tools import Tool, ToolRegistry
 
 
-# 测试用脚本化模拟模型
-class ScriptedLLM(LLMClient):
+# 测试用脚本化模拟模型（实现 ModelInvoker）
+class ScriptedLLM:
+    last_usage = None
+
     # 初始化预设回复序列
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
 
-    # 弹出并返回下一条预设回复
-    def respond(
-        self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+    # 流式弹出下一条预设中立回复
+    def stream(self, context: Context, options=None):
+        del context, options
+        msg = self._responses.pop(0)
+        yield StreamDone(reason="toolUse" if msg.tool_calls else "stop", message=msg)
+
+    # 同步返回下一条预设中立回复
+    def complete(self, context: Context, options=None) -> AssistantMessage:
+        del context, options
         return self._responses.pop(0)
 
 
@@ -36,7 +41,7 @@ def test_registry_allowlist_filters_schemas_and_blocks_calls() -> None:
     registry = ToolRegistry(read_tool, secret_tool, allowed_names=["read_note"])
 
     assert registry.names == ["read_note"]
-    assert [d["function"]["name"] for d in registry.definitions()] == ["read_note"]
+    assert [s.name for s in registry.schemas()] == ["read_note"]
     assert registry.execute("read_note", '{"path": "a.md"}') == "content:a.md"
     blocked = registry.execute("delete_all", "{}")
     assert "不在白名单中" in blocked
@@ -161,8 +166,8 @@ def test_command_runner_sanitizes_env_validates_params_and_truncates(
 
     # Disabled command is excluded
     assert registry.names == ["cmd_show_mode", "cmd_long_out"]
-    schema = registry.definitions()[0]["function"]["parameters"]["properties"]["mode"]
-    assert schema["enum"] == ["fast", "safe"]
+    first_schema = registry.schemas()[0]
+    assert first_schema.param_enums == {"mode": ("fast", "safe")}
 
     truncated = registry.execute("cmd_long_out", "{}")
     assert "输出已截断" in truncated
@@ -228,24 +233,22 @@ def test_command_runner_handles_timeout_and_react_integration(tmp_path: Path) ->
 
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_cmd",
-                        "type": "function",
-                        "function": {"name": "cmd_greet", "arguments": '{"target": "GitHub"}'},
-                    }
-                ],
-            },
-            {"role": "assistant", "content": "命令返回了 hello GitHub。"},
+            AssistantMessage(
+                blocks=(ToolCall(id="call_cmd", name="cmd_greet", arguments='{"target": "GitHub"}'),),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text("命令返回了 hello GitHub。", stop_reason="stop"),
         ]
     )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "跟 GitHub 打个招呼"}]
-    reply = run_react(llm, messages, registry)
+    ends: list[TurnEnd] = []
+    reply = run_react(
+        llm,
+        Context(messages=(UserMessage("跟 GitHub 打个招呼"),)),
+        registry,
+        on_event=lambda ev: ends.append(ev) if isinstance(ev, TurnEnd) else None,
+    )
     assert reply == "命令返回了 hello GitHub。"
-    assert "hello GitHub" in str(messages[-2]["content"])
+    assert "hello GitHub" in ends[0].messages[-2].content  # type: ignore[union-attr]
 
 
 # 测试工具参数校验兼容模型直接传入数字（如 start_line: 1），同时依然拒绝布尔值与空串
@@ -361,17 +364,18 @@ def test_unified_tool_registry_converges_builtin_plugin_and_command_subclasses(
         app.close()
 
 
-# 测试 ToolSchema.required 精确导出与 4 位置参数构造兼容
+# 测试 ToolSchema.required_names 精确导出、零 OpenAI 方法泄漏与 4 位置参数构造兼容
 def test_tool_schema_required_export_and_positional_compat() -> None:
-    from personal_assistant.ai.types import ToolSchema
+    from personal_assistant.ai.protocol import ToolSchema
 
-    # 1. required=None 时保持导出全部参数列表
+    # 1. required=None 时保持导出全部参数元组
     schema_all = ToolSchema(
         name="search",
         description="搜索",
         parameters={"query": "词", "root": "目录"},
     )
-    assert schema_all.to_openai_schema()["function"]["parameters"]["required"] == ["query", "root"]
+    assert schema_all.required_names == ("query", "root")
+    assert not hasattr(schema_all, "to_openai_schema")
 
     # 2. 显式 required 按 parameters 声明顺序裁剪导出
     schema_sub = ToolSchema(
@@ -380,21 +384,21 @@ def test_tool_schema_required_export_and_positional_compat() -> None:
         parameters={"query": "词", "root": "目录", "mode": "模式"},
         required=("mode", "query"),
     )
-    assert schema_sub.to_openai_schema()["function"]["parameters"]["required"] == ["query", "mode"]
+    assert schema_sub.required_names == ("query", "mode")
 
-    # 3. 全部参数可选时 required=() 导出空列表
+    # 3. 全部参数可选时 required=() 导出空元组
     schema_opt = ToolSchema(
         name="list_items",
         description="列举",
         parameters={"root": "目录"},
         required=(),
     )
-    assert schema_opt.to_openai_schema()["function"]["parameters"]["required"] == []
+    assert schema_opt.required_names == ()
 
     # 4. 4 位置参数构造 Tool("name", "desc", {"p": "d"}, fn) 保持完全兼容
     pos_tool = Tool("echo", "回显", {"p": "参数"}, lambda p: f"ok:{p}")
     assert pos_tool.run(p="hi") == "ok:hi"
-    assert pos_tool.to_openai_schema()["function"]["parameters"]["required"] == ["p"]
+    assert pos_tool.required_names == ("p",)
 
 
 # 测试 build_tool 自动识别带默认值可选参数、CommandSpec 全必填与零动态造类/猴子补丁
@@ -426,7 +430,7 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
     assert built.metadata == ToolMetadata(risk="read", always_on=True)
     assert built.required == ("query",)
     assert built.accepted_context_keys == frozenset({"turn_id"})
-    assert built.to_openai_schema()["function"]["parameters"]["required"] == ["query"]
+    assert built.required_names == ("query",)
 
     # 显式传入 required 覆盖自动推断（按 parameters 声明顺序保留）
     explicit = build_tool(
@@ -436,7 +440,7 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
         required=("limit", "query"),
     )
     assert explicit.required == ("query", "limit")
-    assert explicit.to_openai_schema()["function"]["parameters"]["required"] == ["query", "limit"]
+    assert explicit.required_names == ("query", "limit")
 
     # 含 **kwargs 的函数接受任意上下文键（accepted_context_keys=None）
     def flex_fn(query: str, **extra: object) -> str:
@@ -458,7 +462,7 @@ def test_build_tool_infers_required_and_accepted_context_keys(tmp_path: Path) ->
     assert type(cmd_tool) is Tool
     assert cmd_tool.required == ("mode",)
     assert cmd_tool.accepted_context_keys == frozenset()
-    assert cmd_tool.to_openai_schema()["function"]["parameters"]["required"] == ["mode"]
+    assert cmd_tool.required_names == ("mode",)
 
 
 # 测试 ToolRegistry.execute 对可选参数省略/null 生效默认值，并严厉拦截非法参数

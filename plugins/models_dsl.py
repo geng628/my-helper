@@ -1,15 +1,30 @@
-"""极简模型配置 DSL 外部编译插件（零第三方依赖）：支持一行预设语法（免写网址/大括号）与完整块语法。"""
+"""极简模型配置 DSL 外部编译插件（零第三方依赖）：支持一行预设语法与完整块语法，统一路由键 api。"""
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
 from personal_assistant.agent.plugins import Plugin
+from personal_assistant.ai.protocol import CACHE_RETENTIONS, THINKING_LEVELS
 
 COMPILER_NAME = "models_dsl"
 
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
-_ALLOWED_FIELDS = frozenset({"provider", "base_url", "model", "api_key", "key_env", "temp", "temperature"})
+_ALLOWED_FIELDS = frozenset(
+    {
+        "api",
+        "base_url",
+        "model",
+        "api_key",
+        "key_env",
+        "temp",
+        "temperature",
+        "max_tokens",
+        "reasoning",
+        "cache_retention",
+    }
+)
 
 
 # 内置主流大模型厂商预设：普通用户只需选名字 + 填密钥，网址/默认模型/协议由系统自动补全
@@ -21,7 +36,7 @@ class ModelPreset:
     default_model: str
     needs_key: bool = True
     aliases: tuple[str, ...] = ()
-    provider: str = "openai_compatible"
+    api: str = "openai-completions"
 
     # 导出给终端向导与网页下拉框使用的展示字典
     def to_dict(self) -> dict[str, object]:
@@ -31,7 +46,7 @@ class ModelPreset:
             "base_url": self.base_url,
             "default_model": self.default_model,
             "needs_key": self.needs_key,
-            "provider": self.provider,
+            "api": self.api,
             "aliases": list(self.aliases),
         }
 
@@ -39,13 +54,31 @@ class ModelPreset:
 MODEL_PRESETS: tuple[ModelPreset, ...] = (
     ModelPreset("deepseek", "DeepSeek（推荐）", "https://api.deepseek.com/v1", "deepseek-chat", True, ("ds",)),
     ModelPreset(
-        "deepseek_reasoner",
+        "deepseek-reasoner",
         "DeepSeek Reasoner (R1 深度推理)",
         "https://api.deepseek.com/v1",
         "deepseek-reasoner",
         True,
-        ("ds-r1", "reasoner", "r1"),
-        "openai_reasoning",
+        ("deepseek_reasoner", "ds-r1", "reasoner", "r1"),
+        "openai-reasoning",
+    ),
+    ModelPreset(
+        "anthropic",
+        "Anthropic Claude",
+        "https://api.anthropic.com",
+        "claude-sonnet-4-5",
+        True,
+        ("claude",),
+        "anthropic-messages",
+    ),
+    ModelPreset(
+        "gemini",
+        "Google Gemini",
+        "https://generativelanguage.googleapis.com",
+        "gemini-2.5-flash",
+        True,
+        ("google",),
+        "google-generative-ai",
     ),
     ModelPreset(
         "qwen",
@@ -97,7 +130,7 @@ def _format_dsl_value(value: str) -> str:
     return clean
 
 
-# 根据小白向导/网页表单输入自动生成极简可读的 models.dsl 文本
+# 根据向导/网页表单输入自动生成极简可读的 models.dsl 文本
 def render_models_dsl(
     *,
     preset: str,
@@ -105,22 +138,43 @@ def render_models_dsl(
     model: str = "",
     base_url: str = "",
     name: str = "",
-    provider: str = "",
+    api: str = "",
     temperature: float = 0.2,
     consolidator: str = "",
+    reasoning: str = "",
+    max_tokens: int | None = None,
+    cache_retention: str = "",
 ) -> str:
     header = "# 由 My Helper 自动生成（已默认 .gitignore + 0600 权限 + 沙箱屏蔽保护）\n"
     matched = resolve_preset(preset)
     clean_key = api_key.strip()
     clean_model = model.strip()
     clean_url = base_url.strip()
-    clean_provider = provider.strip(" \t").lower()
+    clean_api = api.strip(" \t").lower()
     clean_consolidator = consolidator.strip(" \t")
+    clean_reasoning = reasoning.strip(" \t").lower()
+    clean_cache = cache_retention.strip(" \t").lower()
+
     if clean_consolidator and not _MODEL_NAME_RE.fullmatch(clean_consolidator):
         raise ValueError(f"模型名称 {clean_consolidator!r} 仅允许字母、数字、下划线、点或连字符。")
-    final_provider = clean_provider or (matched.provider if matched else "openai_compatible")
+    if clean_reasoning and clean_reasoning not in THINKING_LEVELS:
+        raise ValueError(f"非法的思考级别 reasoning={clean_reasoning!r}（允许：{'、'.join(THINKING_LEVELS)}）。")
+    if clean_cache and clean_cache not in CACHE_RETENTIONS:
+        raise ValueError(f"非法的缓存策略 cache_retention={clean_cache!r}（允许：{'、'.join(CACHE_RETENTIONS)}）。")
+    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1):
+        raise ValueError("max_tokens 必须是正整数。")
 
-    if matched is not None and not clean_url and final_provider == matched.provider and temperature == 0.2:
+    final_api = clean_api or (matched.api if matched else "openai-completions")
+    has_advanced = bool(
+        clean_url
+        or (matched is not None and final_api != matched.api)
+        or temperature != 0.2
+        or (clean_reasoning and clean_reasoning != "off")
+        or max_tokens is not None
+        or (clean_cache and clean_cache != "short")
+    )
+
+    if matched is not None and not has_advanced:
         if matched.needs_key:
             if not clean_key:
                 raise ValueError(f"使用 {matched.label} 需要填写 API Key。")
@@ -159,8 +213,8 @@ def render_models_dsl(
             f"model {profile_name} {{",
         ]
     )
-    if final_provider != "openai_compatible":
-        lines.append(f"  provider {_format_dsl_value(final_provider)}")
+    if final_api != "openai-completions":
+        lines.append(f"  api {_format_dsl_value(final_api)}")
     lines.extend(
         [
             f"  base_url {_format_dsl_value(final_url)}",
@@ -171,6 +225,12 @@ def render_models_dsl(
         lines.append(f"  api_key  {_format_dsl_value(final_key)}")
     if temperature != 0.2:
         lines.append(f"  temp     {temperature}")
+    if max_tokens is not None:
+        lines.append(f"  max_tokens {max_tokens}")
+    if clean_reasoning and clean_reasoning != "off":
+        lines.append(f"  reasoning {clean_reasoning}")
+    if clean_cache and clean_cache != "short":
+        lines.append(f"  cache_retention {clean_cache}")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -459,7 +519,7 @@ class _DSLParser:
                 key_loc = (args[1].line, args[1].col)
 
         fields: dict[str, tuple[str, int, int]] = {
-            "provider": (preset.provider, preset_tok.line, preset_tok.col),
+            "api": (preset.api, preset_tok.line, preset_tok.col),
             "base_url": (preset.base_url, preset_tok.line, preset_tok.col),
             "model": (model_val, model_loc[0], model_loc[1]),
             "api_key": (api_key_val, key_loc[0], key_loc[1]),
@@ -570,7 +630,7 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
             )
 
         model_id = decl.fields["model"][0]
-        provider = decl.fields["provider"][0].lower() if "provider" in decl.fields else "openai_compatible"
+        api_name = decl.fields["api"][0].lower() if "api" in decl.fields else "openai-completions"
 
         temperature = 0.2
         if "temperature" in decl.fields:
@@ -584,16 +644,16 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
                     line=t_line,
                     col=t_col,
                 ) from error
-            if not (0.0 <= temperature <= 2.0):
+            if not math.isfinite(temperature) or not (0.0 <= temperature <= 2.0):
                 raise DSLCompileError(
-                    f"temp/temperature 必须在 [0, 2] 之间：{temperature}",
+                    f"temp/temperature 必须在 [0, 2] 之间且为有限数：{temperature}",
                     source=source,
                     line=t_line,
                     col=t_col,
                 )
 
         entry: dict[str, object] = {
-            "provider": provider,
+            "api": api_name,
             "base_url": base_url,
             "model": model_id,
             "temperature": temperature,
@@ -602,6 +662,47 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
             entry["api_key"] = decl.fields["api_key"][0]
         if "key_env" in decl.fields:
             entry["key_env"] = decl.fields["key_env"][0]
+        if "max_tokens" in decl.fields:
+            raw_max, m_line, m_col = decl.fields["max_tokens"]
+            try:
+                max_tok = int(raw_max)
+            except ValueError as error:
+                raise DSLCompileError(
+                    f"max_tokens 必须是正整数：{raw_max!r}",
+                    source=source,
+                    line=m_line,
+                    col=m_col,
+                ) from error
+            if max_tok < 1:
+                raise DSLCompileError(
+                    f"max_tokens 必须大于等于 1：{max_tok}",
+                    source=source,
+                    line=m_line,
+                    col=m_col,
+                )
+            entry["max_tokens"] = max_tok
+        if "reasoning" in decl.fields:
+            raw_reasoning, r_line, r_col = decl.fields["reasoning"]
+            norm_reasoning = raw_reasoning.strip().lower()
+            if norm_reasoning not in THINKING_LEVELS:
+                raise DSLCompileError(
+                    f"reasoning 取值非法：{raw_reasoning!r}（允许：{'、'.join(THINKING_LEVELS)}）。",
+                    source=source,
+                    line=r_line,
+                    col=r_col,
+                )
+            entry["reasoning"] = norm_reasoning
+        if "cache_retention" in decl.fields:
+            raw_cache, c_line, c_col = decl.fields["cache_retention"]
+            norm_cache = raw_cache.strip().lower()
+            if norm_cache not in CACHE_RETENTIONS:
+                raise DSLCompileError(
+                    f"cache_retention 取值非法：{raw_cache!r}（允许：{'、'.join(CACHE_RETENTIONS)}）。",
+                    source=source,
+                    line=c_line,
+                    col=c_col,
+                )
+            entry["cache_retention"] = norm_cache
         emitted_models[decl.name] = entry
 
     if program.default_model is not None:
@@ -658,9 +759,12 @@ class ModelsDSLCompiler:
         model: str = "",
         base_url: str = "",
         name: str = "",
-        provider: str = "",
+        api: str = "",
         temperature: float = 0.2,
         consolidator: str = "",
+        reasoning: str = "",
+        max_tokens: int | None = None,
+        cache_retention: str = "",
     ) -> str:
         return render_models_dsl(
             preset=preset,
@@ -668,9 +772,12 @@ class ModelsDSLCompiler:
             model=model,
             base_url=base_url,
             name=name,
-            provider=provider,
+            api=api,
             temperature=temperature,
             consolidator=consolidator,
+            reasoning=reasoning,
+            max_tokens=max_tokens,
+            cache_retention=cache_retention,
         )
 
 

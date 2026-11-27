@@ -1,7 +1,6 @@
 """Layer 2 公共导出接口（对标 pi-agent-core）：仅依赖 ai 层，提供统一插件主板（Plugin + PluginContext）与内层极简子协议。"""
 from personal_assistant.agent.plugins import (
     ConfigCompilerProtocol,
-    LLMProviderProtocol,
     ObserverFactory,
     ObserverProtocol,
     Plugin,
@@ -14,6 +13,7 @@ from personal_assistant.agent.plugins import (
 )
 from personal_assistant.agent.react import (
     AgentEvent,
+    ContextTransformer,
     ToolStart,
     ToolStep,
     TurnEnd,
@@ -35,7 +35,7 @@ from personal_assistant.agent.tools import (
 __all__ = [
     "AgentEvent",
     "ConfigCompilerProtocol",
-    "LLMProviderProtocol",
+    "ContextTransformer",
     "ObserverFactory",
     "ObserverProtocol",
     "Plugin",

@@ -3,34 +3,65 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from personal_assistant.agent.plugins import (
     ConfigCompilerProtocol,
-    LLMProviderProtocol,
     Plugin,
     PluginContext,
     PluginManager,
 )
-from personal_assistant.agent.react import run_react
-from personal_assistant.ai import LLMClient, ModelProfile
+from personal_assistant.agent.react import TurnEnd, iter_react, run_react
+from personal_assistant.ai import (
+    ApiProvider,
+    ApiProviderRegistry,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelClient,
+    ModelProfile,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+    from_model_profile,
+)
 from personal_assistant.assistant.commands import ToolsConfig
 
 
-# 测试用脚本化模拟模型
-class ScriptedLLM(LLMClient):
+# 测试用脚本化模拟模型（实现 ModelInvoker）
+class ScriptedLLM:
     # 初始化预设回复序列
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
+        self.last_usage: TokenUsage | None = None
 
-    # 弹出并返回下一条预设回复
-    def respond(
+    # 弹出并以规范流式事件返回下一条预设回复
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del context, options
+        msg = self._responses.pop(0)
+        if msg.text:
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+        reason = "toolUse" if msg.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=msg, usage=msg.usage)
+
+    # 同步弹出并返回下一条预设回复
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del context, options
         return self._responses.pop(0)
 
 
@@ -190,29 +221,24 @@ class MathPlugin(Plugin):
     cfg = ToolsConfig.load(cfg_path, project_root=tmp_path)
     registry = cfg.build_registry()
 
-    llm = ScriptedLLM(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_mul",
-                        "type": "function",
-                        "function": {"name": "multiply", "arguments": '{"x": "6", "y": "7"}'},
-                    }
-                ],
-            },
-            {"role": "assistant", "content": "6 乘以 7 等于 42。"},
-        ]
-    )
-    messages: list[dict[str, object]] = [{"role": "user", "content": "6 乘 7 等于多少？"}]
-    reply = run_react(llm, messages, registry)
-    assert reply == "6 乘以 7 等于 42。"
-    assert messages[-2]["content"] == "42"
+    responses = [
+        AssistantMessage(
+            blocks=(ToolCall(id="call_mul", name="multiply", arguments='{"x": "6", "y": "7"}'),),
+            stop_reason="toolUse",
+        ),
+        AssistantMessage.from_text("6 乘以 7 等于 42。", stop_reason="stop"),
+    ]
+    ctx = Context(messages=(UserMessage("6 乘 7 等于多少？"),))
+    events = list(iter_react(ScriptedLLM(responses), ctx, registry))
+    end = events[-1]
+    assert isinstance(end, TurnEnd)
+    assert end.reply == "6 乘以 7 等于 42。"
+    assert isinstance(end.messages[-2], ToolResultMessage)
+    assert end.messages[-2].content == "42"
+    assert run_react(ScriptedLLM(responses), ctx, registry) == "6 乘以 7 等于 42。"
 
 
-# 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽
+# 测试外层统一主板基类 Plugin(ABC)（5 个同级插件）与内层全部 5 个子协议插槽（Slot 4 直用 Layer 1 ApiProvider）
 def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     from personal_assistant.agent.plugins import (
         ObserverProtocol,
@@ -235,7 +261,7 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
         "tools",
         "fts5_bm25",
         "models_dsl",
-        "openai_reasoning",
+        "openai-reasoning",
         "telemetry",
     }
     assert {type(p).__name__ for p in manager.plugins} == {
@@ -267,22 +293,28 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols() -> None:
     compiled = manager.compilers["models_dsl"].compile("use ollama", "models.dsl")
     assert compiled["default"] == "ollama"
 
-    # 5. 内层子协议 4：LLMProviderProtocol（单轨直通实化 ModelProfile）
+    # 5. 内层子协议 4：Layer 1 ApiProvider 统一宪法（不再重复定义 LLMProviderProtocol）
     reasoning_provider = OpenAIReasoningProvider()
-    assert isinstance(reasoning_provider, LLMProviderProtocol)
+    assert isinstance(reasoning_provider, ApiProvider)
+    assert reasoning_provider.api == "openai-reasoning"
     assert not callable(reasoning_provider)
-    assert "openai_reasoning" in manager.providers
-    reasoning_client = manager.providers["openai_reasoning"](
+    assert "openai-reasoning" in manager.providers
+    assert isinstance(manager.providers["openai-reasoning"], ApiProvider)
+
+    reg = ApiProviderRegistry()
+    reg.register(manager.providers["openai-reasoning"])
+    reasoning_client = from_model_profile(
         ModelProfile(
             name="r1",
-            provider="openai_reasoning",
+            api="openai-reasoning",
             base_url="https://api.deepseek.com/v1",
             model="deepseek-reasoner",
             api_key="sk-slot4-test",
-        )
+        ),
+        registry=reg,
     )
-    assert isinstance(reasoning_client, LLMClient)
-    assert type(reasoning_client).__name__ == "OpenAIReasoningLLM"
+    assert isinstance(reasoning_client, ModelClient)
+    assert reasoning_client.api == "openai-reasoning"
 
     # 6. 内层子协议 5：ObserverProtocol（AssistantApp 只认 on_event / snapshot）
     obs = manager.observers["telemetry"]({})
@@ -332,7 +364,7 @@ compile_config = lambda text, source="": {}
     assert legacy_mgr.providers == {}
     assert legacy_mgr.compilers == {}
 
-    # 3. 已清理的历史别名、薄壳与死接口不再存在于公开包与底层模块
+    # 3. 已清理的历史别名、薄壳、重复协议与死接口不再存在于公开包与底层模块
     for sym in (
         "load_plugins",
         "load_plugin_tools",
@@ -340,6 +372,7 @@ compile_config = lambda text, source="": {}
         "load_plugin_providers",
         "load_plugin_compilers",
         "ConfigCompiler",
+        "LLMProviderProtocol",
         "_AutoScriptPlugin",
     ):
         assert not hasattr(agent_pkg, sym), f"agent_pkg 仍残留 {sym}"
@@ -550,30 +583,12 @@ class CounterObserverPlugin(Plugin):
     # 2. 跨多轮 AssistantApp.chat() 与 status()：initialize() 仍严格保持单次加载语义，before_msg_id 逐轮递增
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "c1", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r1"}'}}
-                ],
-            },
-            {"role": "assistant", "content": "第1轮完成"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "c2", "type": "function", "function": {"name": "peek_turn_ctx", "arguments": '{"tag": "r2"}'}}
-                ],
-            },
-            {"role": "assistant", "content": "第2轮完成"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "c3", "type": "function", "function": {"name": "peek_explicit_tool", "arguments": "{}"}}
-                ],
-            },
-            {"role": "assistant", "content": "第3轮完成"},
+            AssistantMessage(blocks=(ToolCall(id="c1", name="peek_turn_ctx", arguments='{"tag": "r1"}'),), stop_reason="toolUse"),
+            AssistantMessage.from_text("第1轮完成", stop_reason="stop"),
+            AssistantMessage(blocks=(ToolCall(id="c2", name="peek_turn_ctx", arguments='{"tag": "r2"}'),), stop_reason="toolUse"),
+            AssistantMessage.from_text("第2轮完成", stop_reason="stop"),
+            AssistantMessage(blocks=(ToolCall(id="c3", name="peek_explicit_tool", arguments="{}"),), stop_reason="toolUse"),
+            AssistantMessage.from_text("第3轮完成", stop_reason="stop"),
         ]
     )
     app = AssistantApp(data_root=tmp_path / "app_data", config_path=cfg_path, project_root=tmp_path, llm=llm)
@@ -589,9 +604,9 @@ class CounterObserverPlugin(Plugin):
 
         assert app_mod.TOOL_INIT_CALLS == 2
         assert app_mod.OBSERVER_INIT_CALLS == 2
-        assert t1["tool_calls"][0]["observation"] == "r1:1:chat_history.sqlite3"
-        assert t2["tool_calls"][0]["observation"] == "r2:3:chat_history.sqlite3"
-        assert t3["tool_calls"][0]["observation"] == "explicit:5"
+        assert t1["tool_calls"][0]["observation"] == "r1:1:chat_history.sqlite3"  # type: ignore[index]
+        assert t2["tool_calls"][0]["observation"] == "r2:3:chat_history.sqlite3"  # type: ignore[index]
+        assert t3["tool_calls"][0]["observation"] == "explicit:5"  # type: ignore[index]
     finally:
         app.close()
 
@@ -830,54 +845,51 @@ def second_fn() -> str:
         ctx_dup.register_tools_from_module(dup_mod)
 
 
-# 测试 Provider 插件插槽与 from_model_profile 局部 providers 映射均统一小写归一化
+# 测试 Slot 4 ApiProvider 插槽与 ApiProviderRegistry 均统一小写归一化并拒绝大小写冲突
 def test_provider_registration_and_local_lookup_case_insensitive(tmp_path: Path) -> None:
-    from personal_assistant.ai import LLMClient, ModelProfile, from_model_profile
-
-    # 测试用最小 LLM 客户端
-    class _DummyClient(LLMClient):
-        # 记录已解析的 ModelProfile
-        def __init__(self, profile: ModelProfile) -> None:
-            self.profile = profile
-
-        # 返回固定响应
-        def respond(
-            self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
-            return {"role": "assistant", "content": self.profile.model}
-
-    # 测试用大写名称 Provider 实现
+    # 测试用大写名称 ApiProvider 翻译器实现
     class _MixedCaseProvider:
-        name = "Anthropic"
+        api = "Custom-Proto"
 
-        # 构造最小客户端
-        def build(self, profile: ModelProfile) -> LLMClient:
-            return _DummyClient(profile)
+        # 产出包含模型名的单条完成事件
+        def stream(
+            self,
+            model: ModelProfile,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del context, options
+            yield StreamDone(reason="stop", message=AssistantMessage.from_text(model.model, stop_reason="stop"))
 
-    # 测试用同义全大写冲突 Provider 实现
+    # 测试用同义全大写冲突 ApiProvider 实现
     class _UpperProvider:
-        name = "ANTHROPIC"
+        api = "CUSTOM-PROTO"
 
-        # 构造最小客户端
-        def build(self, profile: ModelProfile) -> LLMClient:
-            return _DummyClient(profile)
+        # 空流占位
+        def stream(
+            self,
+            model: ModelProfile,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del model, context, options
+            yield StreamDone(reason="stop", message=AssistantMessage.from_text("dup", stop_reason="stop"))
 
     ctx = PluginContext(project_root=tmp_path)
     ctx.register_provider(_MixedCaseProvider())
-    assert "anthropic" in ctx.providers
+    assert "custom-proto" in ctx.providers
     with pytest.raises(ValueError, match="名称重复"):
         ctx.register_provider(_UpperProvider())
 
-    prof = ModelProfile.from_dict(
-        "claude",
-        {"provider": "Anthropic", "base_url": "https://api.example.com/v1", "model": "claude-x", "api_key": "sk-test"},
-    )
-    client_from_ctx = from_model_profile(prof, providers=ctx.providers)
-    assert isinstance(client_from_ctx, _DummyClient)
-    assert client_from_ctx.profile.provider == "anthropic"
+    reg = ApiProviderRegistry()
+    for provider in ctx.providers.values():
+        reg.register(provider)
 
-    client_from_mixed = from_model_profile(prof, providers={"Anthropic": _MixedCaseProvider().build})
-    assert isinstance(client_from_mixed, _DummyClient)
-    assert client_from_mixed.profile.model == "claude-x"
+    prof = ModelProfile.from_dict(
+        "custom_m",
+        {"api": "Custom-Proto", "base_url": "https://api.example.com/v1", "model": "demo-x", "api_key": "sk-test"},
+    )
+    client_from_ctx = from_model_profile(prof, registry=reg)
+    assert isinstance(client_from_ctx, ModelClient)
+    assert client_from_ctx.profile.api == "custom-proto"
+    assert client_from_ctx.complete(Context(messages=(UserMessage("hi"),))).text == "demo-x"

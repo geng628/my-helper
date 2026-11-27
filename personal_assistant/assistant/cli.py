@@ -9,10 +9,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep
-from personal_assistant.ai import TextDelta, ThinkingDelta
-from personal_assistant.ai.cache import format_cache_summary
-from personal_assistant.ai.client import LLMClient, LLMNotConfigured, NoopLLMClient
-from personal_assistant.ai.types import ModelsConfig
+from personal_assistant.ai import (
+    LLMNotConfigured,
+    ModelInvoker,
+    ModelsConfig,
+    NoopModelClient,
+    TextDelta,
+    ThinkingDelta,
+    format_cache_summary,
+)
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
@@ -94,7 +99,7 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
 def run_repl(
     app: AssistantApp | None = None,
     *,
-    llm: LLMClient | None = None,
+    llm: ModelInvoker | None = None,
     chat_id: str = "cli",
 ) -> None:
     owned = app is None
@@ -237,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
             consolidator_model=args.consolidator_model,
         )
         try:
-            if isinstance(app.llm, NoopLLMClient):
+            if isinstance(app.llm, NoopModelClient):
                 print("提示：当前尚未配置大模型。运行 `uv run python -m personal_assistant setup` 可 10 秒零代码一键配置。")
             run_repl(app)
         finally:

@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 
-from personal_assistant.ai.types import ToolSchema
+from personal_assistant.ai.protocol import ToolSchema
 
 
 # 工具治理元数据：记录风险级别（read / write / exec / network）与是否常驻激活（always_on）
@@ -268,9 +268,18 @@ class ToolRegistry:
     def __iter__(self) -> Iterator[Tool]:
         return iter(self._tools.values())
 
-    # 将当前已激活工具导出为标准 OpenAI function-calling Schema 列表
-    def definitions(self) -> list[dict[str, object]]:
-        return [item.to_openai_schema() for item in self._tools.values()]
+    # 导出当前已激活工具的中立 ToolSchema 元组（不含任何厂商协议格式与本地执行逻辑）
+    def schemas(self) -> tuple[ToolSchema, ...]:
+        return tuple(
+            ToolSchema(
+                name=item.name,
+                description=item.description,
+                parameters=dict(item.parameters),
+                param_enums=dict(item.param_enums) if item.param_enums is not None else None,
+                required=item.required,
+            )
+            for item in self._tools.values()
+        )
 
     # 按名称并携带可选执行期上下文运行已激活工具；参数或执行错误统一转为文本回传模型自愈
     def execute(

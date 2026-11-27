@@ -2,27 +2,58 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from evals import evaluate_agent, evaluate_search, load_cases, main
-from personal_assistant.ai import LLMClient
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelClient,
+    ModelInvoker,
+    ModelProfile,
+    StreamDone,
+    StreamOptions,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+    ToolResultMessage,
+    available_api_providers,
+    register_api_provider,
+)
 from personal_assistant.assistant.memory import MemoryStore
 
 
-# 预录回复的假模型，用于确定性测试端到端 Agent 评测器
-class ScriptedLLM(LLMClient):
+# 预录回复的假模型（实现 ModelInvoker），用于确定性测试端到端 Agent 评测器
+class ScriptedLLM:
     # 保存预设回复队列
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[AssistantMessage]) -> None:
         self._responses = list(responses)
+        self.last_usage: TokenUsage | None = None
 
-    # 按序弹出下一条预设回复
-    def respond(
+    # 流式按序弹出下一条预设回复
+    def stream(
         self,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del context, options
+        msg = self._responses.pop(0)
+        if msg.text:
+            yield TextDelta(content_index=0, text=msg.text, partial=msg)
+        reason = "toolUse" if msg.tool_calls else "stop"
+        yield StreamDone(reason=reason, message=msg, usage=msg.usage)
+
+    # 同步按序弹出下一条预设回复
+    def complete(
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        del context, options
         return self._responses.pop(0)
 
 
@@ -103,26 +134,18 @@ def test_agent_eval_isolates_data_dir_and_records_tool_trace(tmp_path: Path) -> 
     ]
     llm = ScriptedLLM(
         [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "search_markdown",
-                            "arguments": '{"query": "固定 argv 注入", "root": "data/memory"}',
-                        },
-                    },
-                    {
-                        "id": "call_2",
-                        "type": "function",
-                        "function": {"name": "remember_fact", "arguments": "{}"},
-                    },
-                ],
-            },
-            {"role": "assistant", "content": "规范指出应使用固定 argv 防止注入。"},
+            AssistantMessage(
+                blocks=(
+                    ToolCall(
+                        id="call_1",
+                        name="search_markdown",
+                        arguments='{"query": "固定 argv 注入", "root": "data/memory"}',
+                    ),
+                    ToolCall(id="call_2", name="remember_fact", arguments="{}"),
+                ),
+                stop_reason="toolUse",
+            ),
+            AssistantMessage.from_text("规范指出应使用固定 argv 防止注入。", stop_reason="stop"),
         ]
     )
 
@@ -248,54 +271,64 @@ def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
     seen_observations: list[str] = []
 
     # 录制系统提示词并触发 search_markdown 核实逻辑日期 today 与 fts5_bm25 检索插件同时生效
-    class TemporalSpyLLM(LLMClient):
+    class TemporalSpyLLM:
+        last_usage: TokenUsage | None = None
+
         # 初始化调用计数
         def __init__(self) -> None:
             self._step = 0
 
         # 首轮查询冬季压测演练与旧版评审会，次轮汇总观察结果
-        def respond(
-            self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
+        def _reply_for(self, context: Context) -> AssistantMessage:
             self._step += 1
             if self._step == 1:
-                seen_prompts.append(str(messages[0].get("content") or ""))
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_active",
-                            "type": "function",
-                            "function": {
-                                "name": "search_markdown",
-                                "arguments": '{"query": "冬季压测演练", "root": "data/memory"}',
-                            },
-                        },
-                        {
-                            "id": "call_expired",
-                            "type": "function",
-                            "function": {
-                                "name": "search_markdown",
-                                "arguments": '{"query": "旧版架构评审会", "root": "data/memory"}',
-                            },
-                        },
-                        {
-                            "id": "call_toast",
-                            "type": "function",
-                            "function": {
-                                "name": "run_command",
-                                "arguments": '{"command": "cat personal_assistant/assistant/memory.py"}',
-                            },
-                        },
-                    ],
-                }
-            for msg in messages:
-                if msg.get("role") == "tool":
-                    seen_observations.append(str(msg.get("content") or ""))
-            return {"role": "assistant", "content": "冬季压测演练有效，旧版架构评审会已过期。"}
+                seen_prompts.append(context.system_prompt)
+                return AssistantMessage(
+                    blocks=(
+                        ToolCall(
+                            id="call_active",
+                            name="search_markdown",
+                            arguments='{"query": "冬季压测演练", "root": "data/memory"}',
+                        ),
+                        ToolCall(
+                            id="call_expired",
+                            name="search_markdown",
+                            arguments='{"query": "旧版架构评审会", "root": "data/memory"}',
+                        ),
+                        ToolCall(
+                            id="call_toast",
+                            name="run_command",
+                            arguments='{"command": "cat personal_assistant/assistant/memory.py"}',
+                        ),
+                    ),
+                    stop_reason="toolUse",
+                )
+            for msg in context.messages:
+                if isinstance(msg, ToolResultMessage):
+                    seen_observations.append(msg.content)
+            return AssistantMessage.from_text("冬季压测演练有效，旧版架构评审会已过期。", stop_reason="stop")
+
+        # 流式返回当前步骤结果
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del options
+            msg = self._reply_for(context)
+            if msg.text:
+                yield TextDelta(content_index=0, text=msg.text, partial=msg)
+            reason = "toolUse" if msg.tool_calls else "stop"
+            yield StreamDone(reason=reason, message=msg)
+
+        # 同步返回当前步骤结果
+        def complete(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
+            return self._reply_for(context)
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
     before_repo_offloads = (
@@ -343,15 +376,11 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import os
-    from personal_assistant.ai import OpenAIChatClient, OpenAICompatibleLLM
-    from personal_assistant.ai import client as client_mod
     from personal_assistant.assistant.commands import ToolsConfig
     from personal_assistant.assistant.common import REPO_ROOT
 
-    # 隔离宿主 .env 与全局 _PROVIDERS 引用，模拟干净 CLI 进程且退出后零泄漏
+    # 隔离宿主 .env，模拟干净 CLI 进程
     monkeypatch.setattr("evals.cli.load_dotenv", lambda *_a, **_kw: None)
-    isolated_providers = {k: v for k, v in client_mod._PROVIDERS.items() if k != "openai_reasoning"}
-    monkeypatch.setattr(client_mod, "_PROVIDERS", isolated_providers)
 
     # 在仓库外临时目录放置独立 tools.json（验证非 repo/config 层级下仍能回退加载仓库 plugins）
     ext_cfg_dir = tmp_path / "ext_cfg"
@@ -370,51 +399,52 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
         encoding="utf-8",
     )
 
-    captured_agent: list[LLMClient] = []
+    captured_agent: list[ModelInvoker] = []
     monkeypatch.setattr(
         "evals.cli.evaluate_agent",
         lambda llm, *_a, **_kw: captured_agent.append(llm)
         or {"mode": "agent", "git_commit": "t", "summary": {}, "failures": [], "cases": []},
     )
-    captured_mem: list[tuple[LLMClient, LLMClient | None]] = []
+    captured_mem: list[tuple[ModelInvoker, ModelInvoker | None]] = []
     monkeypatch.setattr(
         "evals.cli.evaluate_memory",
         lambda llm, _sc, **kw: captured_mem.append((llm, kw.get("judge_llm")))
         or {"mode": "memory", "git_commit": "t", "summary": {}, "failures": [], "scenarios": []},
     )
 
-    # 1. 环境变量模式：外部 --config 自动注册 Slot-4，--model / --judge-model 支持预设别名（reasoner / deepseek）
+    # 1. 环境变量模式：外部 --config 自动装配 Slot-4 翻译器注册表，--model 支持预设别名（reasoner / deepseek）
     monkeypatch.setenv("LLM_MODE", "on")
     monkeypatch.setenv("LLM_API_KEY", "sk-eval-cli-test")
     monkeypatch.setenv("LLM_BASE_URL", "https://proxy.example.com/v1")
     monkeypatch.setenv("LLM_MODEL", "deepseek-chat")
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_API", raising=False)
 
     assert main(["--mode", "agent", "--config", str(ext_tools_json), "--cases", str(agent_cases), "--model", "reasoner"]) == 0
-    assert isinstance(captured_agent[-1], OpenAIChatClient)
-    assert type(captured_agent[-1]).__name__ == "OpenAIReasoningLLM"
-    assert captured_agent[-1].model == "deepseek-reasoner"  # type: ignore[attr-defined]
-    assert captured_agent[-1].base_url == "https://proxy.example.com/v1"  # type: ignore[attr-defined]
+    assert isinstance(captured_agent[-1], ModelClient)
+    assert captured_agent[-1].api == "openai-reasoning"
+    assert captured_agent[-1].model == "deepseek-reasoner"
+    assert captured_agent[-1].profile.base_url == "https://proxy.example.com/v1"
 
-    # 2. 即使环境中设了 LLM_PROVIDER=openai_reasoning，--judge-model deepseek 仍按预设自身协议构造 OpenAICompatibleLLM
-    isolated_providers.pop("openai_reasoning", None)
-    monkeypatch.setenv("LLM_PROVIDER", "openai_reasoning")
+    # 2. 即使环境中设了 LLM_API=openai-reasoning，--judge-model deepseek 仍按预设自身协议构造 openai-completions
+    monkeypatch.setenv("LLM_API", "openai-reasoning")
     monkeypatch.setenv("LLM_MODEL", "deepseek-reasoner")
     assert (
         main(["--mode", "memory", "--config", str(ext_tools_json), "--cases", str(mem_cases), "--judge-model", "deepseek"])
         == 0
     )
     eval_llm, judge_llm = captured_mem[-1]
-    assert type(eval_llm).__name__ == "OpenAIReasoningLLM"
-    assert eval_llm.model == "deepseek-reasoner"  # type: ignore[attr-defined]
-    assert isinstance(judge_llm, OpenAICompatibleLLM)
+    assert isinstance(eval_llm, ModelClient)
+    assert eval_llm.api == "openai-reasoning"
+    assert eval_llm.model == "deepseek-reasoner"
+    assert isinstance(judge_llm, ModelClient)
+    assert judge_llm.api == "openai-completions"
     assert judge_llm.model == "deepseek-chat"
-    assert judge_llm.api_key == "sk-eval-cli-test"
-    assert judge_llm.base_url == "https://proxy.example.com/v1"
-    assert os.environ["LLM_PROVIDER"] == "openai_reasoning"
+    assert judge_llm.profile.api_key == "sk-eval-cli-test"
+    assert judge_llm.profile.base_url == "https://proxy.example.com/v1"
+    assert os.environ["LLM_API"] == "openai-reasoning"
     assert os.environ["LLM_MODEL"] == "deepseek-reasoner"
 
-    # 3. 非预设自定义模型名绝不偷偷篡改当前 LLM_PROVIDER（无暗箱 or "openai_compatible" 劫持）
+    # 3. 非预设自定义模型名绝不偷偷篡改当前 LLM_API
     assert (
         main(
             [
@@ -432,10 +462,9 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
         )
         == 0
     )
-    assert type(captured_mem[-1][0]).__name__ == "OpenAIReasoningLLM"
-    assert captured_mem[-1][0].model == "custom-r1-v2"  # type: ignore[attr-defined]
-    assert type(captured_mem[-1][1]).__name__ == "OpenAIReasoningLLM"
-    assert captured_mem[-1][1].model == "custom-r1-judge"  # type: ignore[attr-defined]
+    m_eval, m_judge = captured_mem[-1]
+    assert isinstance(m_eval, ModelClient) and m_eval.api == "openai-reasoning" and m_eval.model == "custom-r1-v2"
+    assert isinstance(m_judge, ModelClient) and m_judge.api == "openai-reasoning" and m_judge.model == "custom-r1-judge"
 
     # 4. default_model 匹配、缺省 base_url 补全、ollama 免密钥补全与缺失 tools.json 降级路径
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
@@ -457,25 +486,25 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
         == 0
     )
     dm_eval, dm_judge = captured_mem[-1]
-    assert type(dm_eval).__name__ == "OpenAIReasoningLLM"
-    assert dm_eval.base_url == "https://api.deepseek.com/v1"  # type: ignore[attr-defined]
-    assert isinstance(dm_judge, OpenAICompatibleLLM)
-    assert dm_judge.base_url == "https://api.deepseek.com/v1"
+    assert isinstance(dm_eval, ModelClient) and dm_eval.api == "openai-reasoning"
+    assert dm_eval.profile.base_url == "https://api.deepseek.com/v1"
+    assert isinstance(dm_judge, ModelClient) and dm_judge.api == "openai-completions"
+    assert dm_judge.profile.base_url == "https://api.deepseek.com/v1"
 
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     assert main(["--mode", "agent", "--config", str(ext_tools_json), "--cases", str(agent_cases), "--model", "ollama"]) == 0
-    assert isinstance(captured_agent[-1], OpenAICompatibleLLM)
-    assert captured_agent[-1].base_url == "http://127.0.0.1:11434/v1"
+    assert isinstance(captured_agent[-1], ModelClient)
+    assert captured_agent[-1].profile.base_url == "http://127.0.0.1:11434/v1"
     assert captured_agent[-1].model == "qwen2.5:7b"
-    assert captured_agent[-1].api_key == "ollama"
+    assert captured_agent[-1].profile.api_key == "ollama"
 
     monkeypatch.setenv("LLM_API_KEY", "sk-fallback")
-    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("LLM_API", "openai-completions")
     missing_cfg = tmp_path / "missing_tools.json"
     assert main(["--mode", "agent", "--config", str(missing_cfg), "--cases", str(agent_cases)]) == 0
-    assert isinstance(captured_agent[-1], OpenAICompatibleLLM)
+    assert isinstance(captured_agent[-1], ModelClient) and captured_agent[-1].api == "openai-completions"
     assert main(["--mode", "agent", "--config", str(missing_cfg), "--cases", str(agent_cases), "--model", "m-override"]) == 0
-    assert captured_agent[-1].model == "m-override"  # type: ignore[attr-defined]
+    assert isinstance(captured_agent[-1], ModelClient) and captured_agent[-1].model == "m-override"
 
     # 5. 空白 --judge-model 视为未传（复用待测模型）；--no-judge 优先关闭 Judge
     assert main(["--mode", "memory", "--config", str(ext_tools_json), "--cases", str(mem_cases), "--judge-model", "   "]) == 0
@@ -498,7 +527,7 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_API", raising=False)
     (ext_cfg_dir / "models.dsl").write_text(
         "use deepseek sk-dsl-chat\n"
         "add reasoner sk-dsl-r1\n"
@@ -527,16 +556,16 @@ def test_eval_cli_unifies_build_llm_with_models_dsl_presets_and_judge_model(
         == 0
     )
     dsl_eval_llm, dsl_judge_llm = captured_mem[-1]
-    assert type(dsl_eval_llm).__name__ == "OpenAIReasoningLLM"
-    assert dsl_eval_llm.api_key == "sk-dsl-r1"  # type: ignore[attr-defined]
-    assert isinstance(dsl_judge_llm, OpenAICompatibleLLM)
-    assert dsl_judge_llm.api_key == "sk-dsl-chat"
+    assert isinstance(dsl_eval_llm, ModelClient) and dsl_eval_llm.api == "openai-reasoning"
+    assert dsl_eval_llm.profile.api_key == "sk-dsl-r1"
+    assert isinstance(dsl_judge_llm, ModelClient) and dsl_judge_llm.api == "openai-completions"
+    assert dsl_judge_llm.profile.api_key == "sk-dsl-chat"
 
     tcfg = ToolsConfig.load(ext_tools_json, project_root=REPO_ROOT)
     assert tcfg._match_preset("   ") is None
     env_llm = tcfg.build_llm(ext_cfg_dir, model_name="env_backed", env={"CUSTOM_DSL_KEY": "sk-passed-via-env"})
-    assert isinstance(env_llm, OpenAICompatibleLLM)
-    assert env_llm.api_key == "sk-passed-via-env"
+    assert isinstance(env_llm, ModelClient)
+    assert env_llm.profile.api_key == "sk-passed-via-env"
 
 
 # 测试 agent_eval 逐题沙箱隔离（目录/记忆/规则/KV缓存不串台）与生产一致的 tool_names 系统提示词
@@ -546,74 +575,71 @@ def test_agent_eval_isolates_per_case_sandbox_prompt_and_cache(tmp_path: Path) -
     (data_dir / "memory" / "MEMORY.md").write_text("# 记忆索引\n- [projects](data/memory/projects.md)\n", encoding="utf-8")
     (data_dir / "memory" / "projects.md").write_text("# 项目\n- 基线项目状态正常。\n", encoding="utf-8")
 
-    # 录制两道题各自的 system prompt 与第二题读到的文件清单，验证题间完全隔离
     seen_system_prompts: list[str] = []
     case2_observations: list[str] = []
 
     # 捕获每道题请求体并模拟第一题写入污染、第二题读取文件检查隔离
-    class IsolatingAgentLLM(LLMClient):
+    class IsolatingAgentLLM:
+        last_usage: TokenUsage | None = None
+
         # 初始化轮次计数
         def __init__(self) -> None:
             self._turn = 0
 
         # 第一题调用 write_file/remember_fact/save_rule；第二题调用 list_files 核查隔离环境
-        def respond(
-            self,
-            messages: list[dict[str, object]],
-            tools: list[dict[str, object]] | None = None,
-        ) -> dict[str, object]:
+        def _reply_for(self, context: Context) -> AssistantMessage:
             self._turn += 1
-            if messages and messages[0].get("role") == "system":
-                if not any(m.get("role") == "tool" for m in messages):
-                    seen_system_prompts.append(str(messages[0].get("content") or ""))
+            if context.system_prompt and not any(isinstance(m, ToolResultMessage) for m in context.messages):
+                seen_system_prompts.append(context.system_prompt)
             if self._turn == 1:
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "w1",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": '{"path": "data/workspace/leak.txt", "content": "leaked", "mode": "create"}',
-                            },
-                        },
-                        {
-                            "id": "r1",
-                            "type": "function",
-                            "function": {"name": "remember_fact", "arguments": "{}"},
-                        },
-                        {
-                            "id": "s1",
-                            "type": "function",
-                            "function": {"name": "save_rule", "arguments": '{"statement": "LEAKED_RULE_MARKER"}'},
-                        },
-                    ],
-                }
+                return AssistantMessage(
+                    blocks=(
+                        ToolCall(
+                            id="w1",
+                            name="write_file",
+                            arguments='{"path": "data/workspace/leak.txt", "content": "leaked", "mode": "create"}',
+                        ),
+                        ToolCall(id="r1", name="remember_fact", arguments="{}"),
+                        ToolCall(id="s1", name="save_rule", arguments='{"statement": "LEAKED_RULE_MARKER"}'),
+                    ),
+                    stop_reason="toolUse",
+                )
             if self._turn == 2:
-                return {"role": "assistant", "content": "第一题已完成写入。"}
+                return AssistantMessage.from_text("第一题已完成写入。", stop_reason="stop")
             if self._turn == 3:
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "l1",
-                            "type": "function",
-                            "function": {"name": "list_files", "arguments": '{"root": "data/memory", "pattern": "*"}'},
-                        },
-                        {
-                            "id": "l2",
-                            "type": "function",
-                            "function": {"name": "list_files", "arguments": '{"root": "data/workspace", "pattern": "*"}'},
-                        },
-                    ],
-                }
-            for msg in messages:
-                if msg.get("role") == "tool":
-                    case2_observations.append(str(msg.get("content") or ""))
-            return {"role": "assistant", "content": "第二题环境干净。"}
+                return AssistantMessage(
+                    blocks=(
+                        ToolCall(id="l1", name="list_files", arguments='{"root": "data/memory", "pattern": "*"}'),
+                        ToolCall(id="l2", name="list_files", arguments='{"root": "data/workspace", "pattern": "*"}'),
+                    ),
+                    stop_reason="toolUse",
+                )
+            for msg in context.messages:
+                if isinstance(msg, ToolResultMessage):
+                    case2_observations.append(msg.content)
+            return AssistantMessage.from_text("第二题环境干净。", stop_reason="stop")
+
+        # 流式返回当前步骤结果
+        def stream(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del options
+            msg = self._reply_for(context)
+            if msg.text:
+                yield TextDelta(content_index=0, text=msg.text, partial=msg)
+            reason = "toolUse" if msg.tool_calls else "stop"
+            yield StreamDone(reason=reason, message=msg)
+
+        # 同步返回当前步骤结果
+        def complete(
+            self,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> AssistantMessage:
+            del options
+            return self._reply_for(context)
 
     cases = [
         {"id": "case-mutate", "query": "CASE1_LEAK_FACT", "answerable": True, "expected_sources": [], "expected_tools": ["write_file"]},
@@ -644,8 +670,8 @@ def test_agent_eval_isolates_per_case_sandbox_prompt_and_cache(tmp_path: Path) -
     ]
     cold_llm = ScriptedLLM(
         [
-            {"role": "assistant", "content": "a1"},
-            {"role": "assistant", "content": "a2"},
+            AssistantMessage.from_text("a1", stop_reason="stop"),
+            AssistantMessage.from_text("a2", stop_reason="stop"),
         ]
     )
     cold_report = evaluate_agent(cold_llm, data_dir, single_turn_cases, git_commit="cold-sha")
@@ -704,6 +730,8 @@ def test_eval_cli_fail_under_threshold_gate(tmp_path: Path, monkeypatch: pytest.
                 str(data_dir),
                 "--cases",
                 str(search_cases),
+                "--output",
+                str(out_report),
                 "--fail-under",
                 "0.5",
             ]
@@ -724,29 +752,40 @@ def test_eval_cli_fail_under_threshold_gate(tmp_path: Path, monkeypatch: pytest.
     assert main(["--mode", "memory", "--cases", str(mem_cases), "--no-judge", "--fail-under", "0.75"]) == 0
 
 
-# 测试 conftest 宿主机隔离第一段：向 _PROVIDERS 注册脏 Provider 且从临时 .env 加载变量，确保下个测试零残留
+# 测试 conftest 宿主机隔离第一段：向全局 ApiProviderRegistry 注册脏翻译器并加载临时 .env，确保下个测试零残留
 def test_conftest_isolation_step1_mutates_providers_and_loads_tmp_dotenv(tmp_path: Path) -> None:
-    from personal_assistant.ai import client as client_mod
+    import os
     from personal_assistant.assistant.common import load_dotenv
 
-    client_mod.register_provider("ephemeral_conftest_leak", lambda _env: None)  # type: ignore[arg-type,return-value]
-    assert "ephemeral_conftest_leak" in client_mod.available_providers()
+    # 临时注册的假翻译器以检验 conftest 注册表还原
+    class _EphemeralProvider:
+        api = "ephemeral-conftest-leak"
+
+        # 产出空流
+        def stream(
+            self,
+            model: ModelProfile,
+            context: Context,
+            options: StreamOptions | None = None,
+        ) -> Iterator[AssistantMessageEvent]:
+            del model, context, options
+            yield StreamDone(reason="stop", message=AssistantMessage.from_text("ok", stop_reason="stop"))
+
+    register_api_provider(_EphemeralProvider())
+    assert "ephemeral-conftest-leak" in available_api_providers()
 
     tmp_env = tmp_path / ".env"
     tmp_env.write_text("LLM_MODE=on\nLLM_API_KEY=sk-tmp-dotenv\n", encoding="utf-8")
     load_dotenv(tmp_env)
-    import os
-
     assert os.environ["LLM_API_KEY"] == "sk-tmp-dotenv"
 
 
-# 测试 conftest 宿主机隔离第二段：验证上个测试的 _PROVIDERS 与环境变量已自动还原，且仓库真实 .env 被拦截
+# 测试 conftest 宿主机隔离第二段：验证上个测试的全局注册表与环境变量已自动还原，且仓库真实 .env 被拦截
 def test_conftest_isolation_step2_verifies_clean_state_and_repo_dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
-    from personal_assistant.ai import client as client_mod
     from personal_assistant.assistant import common as common_mod
 
-    assert "ephemeral_conftest_leak" not in client_mod.available_providers()
+    assert "ephemeral-conftest-leak" not in available_api_providers()
     assert "LLM_API_KEY" not in os.environ
     assert "LLM_MODE" not in os.environ
 
