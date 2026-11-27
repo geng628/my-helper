@@ -3,18 +3,24 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 import pytest
 
+from personal_assistant.agent import ToolRegistry, TurnEnd, iter_react, tool
 from personal_assistant.ai import (
     AnthropicMessagesProvider,
     ApiProviderRegistry,
     AssistantMessage,
+    CacheMonitor,
     Context,
     GoogleGenAIProvider,
     LLMNotConfigured,
+    Message,
+    ModelClient,
     ModelProfile,
     NoopModelClient,
     OpenAICompletionsProvider,
@@ -48,6 +54,13 @@ from personal_assistant.ai import (
     stream_simple,
 )
 from personal_assistant.ai.providers.http import redact_error_tokens
+from personal_assistant.assistant.app import build_app
+from personal_assistant.assistant.builtin_tools import MemoryToolsetProvider
+from personal_assistant.assistant.common import REPO_ROOT
+from personal_assistant.assistant.memory import MemoryStore
+from plugins.reasoning_provider import API_NAME as REASONING_API_NAME
+from plugins.reasoning_provider import OpenAIReasoningProvider
+from plugins.telemetry import TelemetryObserver
 
 
 # 测试语义思考级别夹紧规则（先向上找、找不到再向下找）与 ModelProfile.from_dict 严格校验
@@ -736,3 +749,648 @@ def test_provider_wire_protocol_edge_cases_and_stream_options_override() -> None
     assert "AIzaSyUrlSecret999" not in str(fmt_err.url)
     assert "proxy-secret-xyz" not in redact_error_tokens('{"x-api-key": "proxy-secret-xyz"}')
     assert clamp_thinking_level("off", ("low", "medium", "high")) == "off"
+
+
+# 端到端跨协议热切换契约测试：同一条对话历史轨迹依次无缝穿越 Anthropic / OpenAI / Gemini / Reasoner 再回到 Anthropic
+def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> None:
+    memory = MemoryStore(tmp_path / "data")
+    registry = ToolRegistry(allowed_names=["remember_fact", "search_markdown", "add_numbers"])
+    registry.register_provider(MemoryToolsetProvider(memory))
+
+    # 自定义两数相加工具，验证真实工具执行观察在跨协议往返中保持无损
+    @tool(description="将两个整数相加并返回结果", parameters={"a": "加数 A", "b": "加数 B"})
+    def add_numbers(a: str, b: str) -> str:
+        return str(int(a) + int(b))
+
+    registry.register(add_numbers)
+
+    # 1. 四套真实翻译器仅注入伪造 SSE 流并记录每次发往上游的完整载荷
+    anth_payloads: list[dict[str, object]] = []
+    anth_streams: list[list[str]] = [
+        # Round 1 Step 1：Anthropic 产出带签名的 ThinkingBlock + 文本 + remember_fact 工具调用
+        [
+            "event: message_start\n",
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":150,"cache_read_input_tokens":0,"cache_creation_input_tokens":50,"output_tokens":1}}}\n',
+            "\n",
+            "event: content_block_start\n",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n',
+            "\n",
+            "event: content_block_delta\n",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先记下用户的偏好"}}\n',
+            "\n",
+            "event: content_block_delta\n",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_anth_r1"}}\n',
+            "\n",
+            "event: content_block_stop\n",
+            'data: {"type":"content_block_stop","index":0}\n',
+            "\n",
+            "event: content_block_start\n",
+            'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n',
+            "\n",
+            "event: content_block_delta\n",
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"好的，我来记下。"}}\n',
+            "\n",
+            "event: content_block_stop\n",
+            'data: {"type":"content_block_stop","index":1}\n',
+            "\n",
+            "event: content_block_start\n",
+            'data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"anth_tc_1","name":"remember_fact","input":{}}}\n',
+            "\n",
+            "event: content_block_stop\n",
+            'data: {"type":"content_block_stop","index":2}\n',
+            "\n",
+            "event: message_delta\n",
+            'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}\n',
+            "\n",
+            "event: message_stop\n",
+            'data: {"type":"message_stop"}\n',
+            "\n",
+        ],
+        # Round 1 Step 2：Anthropic 收到 tool_result 后给出本轮最终回复
+        [
+            "event: message_start\n",
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":1}}}\n',
+            "\n",
+            "event: content_block_start\n",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+            "\n",
+            "event: content_block_delta\n",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"已记住你偏好深色主题。"}}\n',
+            "\n",
+            "event: content_block_stop\n",
+            'data: {"type":"content_block_stop","index":0}\n',
+            "\n",
+            "event: message_delta\n",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}\n',
+            "\n",
+            "event: message_stop\n",
+            'data: {"type":"message_stop"}\n',
+            "\n",
+        ],
+        # Round 5 Step 1：切回 Anthropic 验证跳过 Gemini / Reasoner 无签名思考且零空文本块
+        [
+            "event: message_start\n",
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":700,"cache_creation_input_tokens":0,"output_tokens":1}}}\n',
+            "\n",
+            "event: content_block_start\n",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+            "\n",
+            "event: content_block_delta\n",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"跨四协议轨迹确认无误。"}}\n',
+            "\n",
+            "event: content_block_stop\n",
+            'data: {"type":"content_block_stop","index":0}\n',
+            "\n",
+            "event: message_delta\n",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}\n',
+            "\n",
+            "event: message_stop\n",
+            'data: {"type":"message_stop"}\n',
+            "\n",
+        ],
+    ]
+
+    # 捕获 Anthropic 上游请求载荷并返回预设原生 SSE 帧
+    def _fake_anth_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        del url, headers
+        anth_payloads.append(payload)
+        return iter(anth_streams.pop(0))
+
+    oa_payloads: list[dict[str, object]] = []
+    oa_streams: list[list[str]] = [
+        # Round 2 Step 1：OpenAI Completions 发起 add_numbers 工具调用
+        [
+            'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"我来计算"}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"oa_tc_1","type":"function","function":{"name":"add_numbers","arguments":"{\\"a\\":\\"6\\",\\"b\\":\\"7\\"}"}}]}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":380,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens":25}}\n',
+            "data: [DONE]\n",
+        ],
+        # Round 2 Step 2：OpenAI Completions 收到工具结果 13 后作答
+        [
+            'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"6 + 7 = 13。"}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":440,"prompt_tokens_details":{"cached_tokens":320},"completion_tokens":18}}\n',
+            "data: [DONE]\n",
+        ],
+    ]
+
+    # 捕获 OpenAI Completions 上游请求载荷并返回预设 SSE 帧
+    def _fake_oa_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        del url, headers
+        oa_payloads.append(payload)
+        return iter(oa_streams.pop(0))
+
+    gem_payloads: list[dict[str, object]] = []
+    gem_streams: list[list[str]] = [
+        # Round 3 Step 1：Google Gemini 产出原生 thought 与 search_markdown 函数调用
+        [
+            'data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"去记忆库检索用户偏好"},{"functionCall":{"id":"gem_tc_1","name":"search_markdown","args":{"query":"深色主题"}}}]}}],"usageMetadata":{"promptTokenCount":520,"cachedContentTokenCount":350,"candidatesTokenCount":20,"thoughtsTokenCount":15}}\n\n',
+        ],
+        # Round 3 Step 2：Google Gemini 收到 functionResponse 后作答
+        [
+            'data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"已找到深色主题记忆"},{"text":"查到了，你偏好深色主题。"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":610,"cachedContentTokenCount":450,"candidatesTokenCount":25,"thoughtsTokenCount":10}}\n\n',
+        ],
+    ]
+
+    # 捕获 Gemini 上游请求载荷并返回预设原生 SSE 帧
+    def _fake_gem_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        del url, headers
+        gem_payloads.append(payload)
+        return iter(gem_streams.pop(0))
+
+    r1_payloads: list[dict[str, object]] = []
+    r1_streams: list[list[str]] = [
+        # Round 4 Step 1：OpenAI Reasoning 产出 reasoning_content + add_numbers 工具调用
+        [
+            'data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先算 13 加 29"}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"r1_tc_1","type":"function","function":{"name":"add_numbers","arguments":"{\\"a\\":\\"13\\",\\"b\\":\\"29\\"}"}}]}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":700,"prompt_cache_hit_tokens":512,"completion_tokens":40}}\n',
+            "data: [DONE]\n",
+        ],
+        # Round 4 Step 2：OpenAI Reasoning 收到工具结果 42 后给出总结
+        [
+            'data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"核对最终结果"}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{"content":"13 + 29 = 42，偏好已核实。"}}]}\n',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":780,"prompt_cache_hit_tokens":640,"completion_tokens":32}}\n',
+            "data: [DONE]\n",
+        ],
+    ]
+
+    # 捕获 OpenAI Reasoning 上游请求载荷并返回预设 SSE 帧
+    def _fake_r1_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+        del url, headers
+        r1_payloads.append(payload)
+        return iter(r1_streams.pop(0))
+
+    local_reg = ApiProviderRegistry()
+    local_reg.register(AnthropicMessagesProvider(post_stream=_fake_anth_stream))
+    local_reg.register(OpenAICompletionsProvider(post_stream=_fake_oa_stream))
+    local_reg.register(GoogleGenAIProvider(post_stream=_fake_gem_stream))
+    local_reg.register(OpenAIReasoningProvider(post_stream=_fake_r1_stream))
+
+    profiles = {
+        "anthropic": ModelProfile(
+            name="claude",
+            api="anthropic-messages",
+            base_url="https://api.anthropic.com",
+            model="claude-sonnet-4-5",
+            api_key="sk-ant-swap",
+            reasoning="low",
+            cache_retention="short",
+        ),
+        "openai": ModelProfile(
+            name="gpt",
+            api="openai-completions",
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o",
+            api_key="sk-oa-swap",
+            reasoning="medium",
+        ),
+        "gemini": ModelProfile(
+            name="gem",
+            api="google-generative-ai",
+            base_url="https://generativelanguage.googleapis.com",
+            model="gemini-2.5-flash",
+            api_key="AIzaSySwapTestKey123456",
+            reasoning="low",
+        ),
+        "reasoner": ModelProfile(
+            name="r1",
+            api=REASONING_API_NAME,
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+            api_key="sk-r1-swap",
+        ),
+    }
+
+    monitor = CacheMonitor()
+    observer = TelemetryObserver()
+    session_key = "hot-swap-session"
+    system_prompt = "你是一个跨协议无缝协作的个人助手。"
+    trajectory: list[Message] = []
+
+    # 沿同一条中立对话轨迹热切换目标协议并执行一轮完整 iter_react 推理与观测
+    def _run_round(provider_key: str, user_text: str) -> str:
+        trajectory.append(UserMessage(content=user_text))
+        client = ModelClient(profile=profiles[provider_key], registry=local_reg)
+        tracked = monitor.wrap(client, session_key=session_key)
+        ctx = Context(system_prompt=system_prompt, messages=tuple(trajectory), tools=registry.schemas())
+        reply = ""
+        for ev in iter_react(tracked, ctx, registry, tool_context={"user_text": user_text}):
+            observer.on_event(session_key, ev)
+            if isinstance(ev, TurnEnd):
+                reply = ev.reply
+                trajectory[:] = list(ev.messages)
+        return reply
+
+    # Round 1：Anthropic（带签名思考 + 真实 remember_fact 工具写入 facts.md）
+    r1_reply = _run_round("anthropic", "请记住我偏好深色主题")
+    assert r1_reply == "已记住你偏好深色主题。"
+    assert "偏好深色主题" in (tmp_path / "data" / "memory" / "facts.md").read_text(encoding="utf-8")
+    assert anth_payloads[0]["system"] == [
+        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+    ]
+    anth_r1_tools = anth_payloads[0]["tools"]
+    assert isinstance(anth_r1_tools, list) and all("input_schema" in t for t in anth_r1_tools)
+    anth_step2_msgs = anth_payloads[1]["messages"]
+    assert isinstance(anth_step2_msgs, list)
+    assert anth_step2_msgs[1]["content"][0] == {
+        "type": "thinking",
+        "thinking": "先记下用户的偏好",
+        "signature": "sig_anth_r1",
+    }
+    assert anth_step2_msgs[2]["content"][0]["type"] == "tool_result"
+    r1_last = observer.snapshot(session_key=session_key)["last_turn"]
+    assert isinstance(r1_last, dict) and r1_last["tools"] == ["remember_fact"]
+
+    # Round 2：热切换至 OpenAI Completions（接收 Anthropic 产出的中立轨迹 + 执行真实 add_numbers）
+    r2_reply = _run_round("openai", "帮我算一下 6 加 7")
+    assert r2_reply == "6 + 7 = 13。"
+    oa_step1_msgs = oa_payloads[0]["messages"]
+    assert isinstance(oa_step1_msgs, list)
+    assert [m["role"] for m in oa_step1_msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert oa_step1_msgs[2]["tool_calls"][0]["id"] == "anth_tc_1"
+    assert oa_step1_msgs[2]["tool_calls"][0]["function"]["name"] == "remember_fact"
+    assert oa_step1_msgs[3]["tool_call_id"] == "anth_tc_1"
+    assert "facts.md" in str(oa_step1_msgs[3]["content"])
+    assert all("reasoning_content" not in m for m in oa_step1_msgs)
+    oa_step2_msgs = oa_payloads[1]["messages"]
+    assert isinstance(oa_step2_msgs, list)
+    assert oa_step2_msgs[-1] == {"role": "tool", "tool_call_id": "oa_tc_1", "content": "13"}
+    r2_last = observer.snapshot(session_key=session_key)["last_turn"]
+    assert isinstance(r2_last, dict) and r2_last["tools"] == ["add_numbers"]
+
+    # Round 3：热切换至 Google Gemini（接收 Anthropic + OpenAI 轨迹，校验 model/parts/functionResponse + 真实 search_markdown）
+    r3_reply = _run_round("gemini", "查一下我刚才记了什么偏好")
+    assert r3_reply == "查到了，你偏好深色主题。"
+    gem_step1_payload = gem_payloads[0]
+    assert gem_step1_payload["systemInstruction"] == {"parts": [{"text": system_prompt}]}
+    gem_tools = gem_step1_payload["tools"]
+    assert isinstance(gem_tools, list)
+    gem_decls = gem_tools[0]["functionDeclarations"]
+    remember_decl = next(d for d in gem_decls if d["name"] == "remember_fact")
+    assert "parameters" not in remember_decl
+    gem_contents = gem_step1_payload["contents"]
+    assert isinstance(gem_contents, list)
+    assert [c["role"] for c in gem_contents] == [
+        "user",
+        "model",
+        "user",
+        "model",
+        "user",
+        "model",
+        "user",
+        "model",
+        "user",
+    ]
+    assert gem_contents[1]["parts"][0] == {
+        "thought": True,
+        "text": "先记下用户的偏好",
+        "thoughtSignature": "sig_anth_r1",
+    }
+    assert gem_contents[5]["parts"][1] == {"functionCall": {"name": "add_numbers", "args": {"a": "6", "b": "7"}}}
+    assert gem_contents[6]["parts"][0] == {
+        "functionResponse": {"name": "add_numbers", "response": {"result": "13"}}
+    }
+    # Step 2 收到真实 search_markdown 命中的 facts.md 内容
+    gem_step2_contents = gem_payloads[1]["contents"]
+    assert isinstance(gem_step2_contents, list)
+    gem_fr = gem_step2_contents[-1]["parts"][0]["functionResponse"]
+    assert gem_fr["name"] == "search_markdown"
+    assert "偏好深色主题" in str(gem_fr["response"]["result"])
+    r3_last = observer.snapshot(session_key=session_key)["last_turn"]
+    assert isinstance(r3_last, dict) and r3_last["tools"] == ["search_markdown"]
+
+    # Round 4：热切换至 OpenAI Reasoning（接收前 3 厂商轨迹，校验跨轮剥离旧思维链、轮内续传当前 reasoning_content）
+    r4_reply = _run_round("reasoner", "再算一下 13 加 29")
+    assert r4_reply == "13 + 29 = 42，偏好已核实。"
+    assert "temperature" not in r1_payloads[0]
+    r1_step1_msgs = r1_payloads[0]["messages"]
+    assert isinstance(r1_step1_msgs, list)
+    assert all("reasoning_content" not in m for m in r1_step1_msgs)
+    assert any(
+        m.get("role") == "tool" and m.get("tool_call_id") == "gem_tc_1" and "偏好深色主题" in str(m.get("content"))
+        for m in r1_step1_msgs
+    )
+    r1_step2_msgs = r1_payloads[1]["messages"]
+    assert isinstance(r1_step2_msgs, list)
+    # 跨轮历史中的旧 assistant 消息不带 reasoning_content；仅当前轮工具调用消息携带本轮 reasoning_content
+    reasoning_msgs = [m for m in r1_step2_msgs if "reasoning_content" in m]
+    assert len(reasoning_msgs) == 1
+    assert reasoning_msgs[0]["reasoning_content"] == "先算 13 加 29"
+    assert r1_step2_msgs[-1] == {"role": "tool", "tool_call_id": "r1_tc_1", "content": "42"}
+    r4_last = observer.snapshot(session_key=session_key)["last_turn"]
+    assert isinstance(r4_last, dict) and r4_last["tools"] == ["add_numbers"]
+
+    # Round 5：切回 Anthropic，验证跨协议无签名思考（来自 Gemini / Reasoner）被安全跳过、有签名思考保留且绝不发出空文本块
+    r5_reply = _run_round("anthropic", "最后确认一下前面所有记录")
+    assert r5_reply == "跨四协议轨迹确认无误。"
+    anth_r5_msgs = anth_payloads[2]["messages"]
+    assert isinstance(anth_r5_msgs, list)
+    thinking_blocks_sent: list[dict[str, object]] = []
+    for wire_msg in anth_r5_msgs:
+        content_list = wire_msg["content"]
+        assert isinstance(content_list, list) and len(content_list) > 0
+        for blk in content_list:
+            if blk.get("type") == "text":
+                assert blk["text"] != ""
+            if blk.get("type") == "thinking":
+                assert blk.get("signature")
+                thinking_blocks_sent.append(blk)
+    # 仅有 Round 1 Anthropic 自带签名的思考块被保留，Gemini / Reasoner 的无签名思考全部跳过
+    assert thinking_blocks_sent == [
+        {"type": "thinking", "thinking": "先记下用户的偏好", "signature": "sig_anth_r1"}
+    ]
+
+    # 2. 验证同一套 CacheMonitor 与 TelemetryObserver 全程跨 4 协议统计完全一致
+    cache_summary = monitor.summary(session_key=session_key)
+    assert cache_summary["llm_calls"] == 9
+    assert cache_summary["warm_calls"] == 8
+    assert isinstance(cache_summary["mean_prefix_reuse_rate"], float)
+    assert cache_summary["mean_prefix_reuse_rate"] > 0.5
+    assert cache_summary["prompt_tokens"] == 4750
+    assert cache_summary["cached_tokens"] == 3428
+    assert cache_summary["completion_tokens"] == 255
+
+    obs_snap = observer.snapshot(session_key=session_key)
+    assert obs_snap["cursor"] == 5
+    totals = obs_snap["totals"]
+    assert isinstance(totals, dict)
+    assert totals["turns"] == 5
+    assert totals["llm_calls"] == 9
+    assert totals["tool_calls"] == 4
+    assert totals["prompt_tokens"] == 4750
+    assert totals["cached_tokens"] == 3428
+    assert totals["completion_tokens"] == 255
+
+
+# 单点扩展契约测试：新增第 5 套私有协议（custom-acme-rpc）仅需 1 个 Slot 4 翻译器插件 + models.dsl，零核心改动跑通全链路
+def test_new_fifth_protocol_extension_requires_only_one_translator_and_registration(tmp_path: Path) -> None:
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    shutil.copy2(REPO_ROOT / "plugins" / "models_dsl.py", plugins_dir / "models_dsl.py")
+    shutil.copy2(REPO_ROOT / "plugins" / "telemetry.py", plugins_dir / "telemetry.py")
+
+    # 动态写入全新的第 5 套私有协议翻译器（Slot 4 主板插件）
+    (plugins_dir / "acme_provider.py").write_text(
+        '''"""第 5 套虚构私有协议翻译器插件（custom-acme-rpc）：验证零核心改动单点扩展。"""
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+from personal_assistant.agent.plugins import Plugin
+from personal_assistant.ai import (
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    ModelProfile,
+    StreamDone,
+    StreamError,
+    StreamOptions,
+    StreamStart,
+    TextBlock,
+    TextDelta,
+    TextEnd,
+    TextStart,
+    ThinkingBlock,
+    ThinkingDelta,
+    ThinkingEnd,
+    ThinkingStart,
+    TokenUsage,
+    ToolCall,
+    ToolCallDelta,
+    ToolCallEnd,
+    ToolCallStart,
+)
+
+
+# 虚构 ACME RPC 协议翻译器：产出全部 12 种规范流事件，覆盖正常工具流、上游 StreamError 与恢复对话
+class AcmeRpcProvider:
+    api = "custom-acme-rpc"
+
+    # 初始化调用计数器与上下文/选项捕获列表
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.recorded_contexts: list[Context] = []
+        self.recorded_options: list[StreamOptions | None] = []
+
+    # 产出规范 12 事件流（第 1 轮记忆工具调用成功 -> 第 2 轮工具后遇 StreamError -> 第 3 轮恢复正常）
+    def stream(
+        self,
+        model: ModelProfile,
+        context: Context,
+        options: StreamOptions | None = None,
+    ) -> Iterator[AssistantMessageEvent]:
+        del model
+        self.call_count += 1
+        self.recorded_contexts.append(context)
+        self.recorded_options.append(options)
+        step = self.call_count
+
+        yield StreamStart(partial=AssistantMessage())
+
+        if step == 1:
+            think = ThinkingBlock(text="ACME 正在规划记忆写入")
+            tc = ToolCall(id="acme_tc_1", name="remember_fact", arguments="{}")
+            msg = AssistantMessage(blocks=(think, tc), stop_reason="toolUse", usage=TokenUsage(120, 0, 20))
+            yield ThinkingStart(content_index=0, partial=AssistantMessage())
+            yield ThinkingDelta(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+            yield ThinkingEnd(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+            yield ToolCallStart(content_index=1, call_id=tc.id, name=tc.name, partial=AssistantMessage(blocks=(think,)))
+            yield ToolCallDelta(content_index=1, delta="{}", partial=msg)
+            yield ToolCallEnd(content_index=1, tool_call=tc, partial=msg)
+            yield StreamDone(reason="toolUse", message=msg, usage=msg.usage, ttft_ms=5.0, latency_ms=12.0)
+            return
+
+        if step == 2:
+            think = ThinkingBlock(text="已收到工具观察")
+            text = TextBlock(text="ACME 已记住项目代号北极星。")
+            msg = AssistantMessage(blocks=(think, text), stop_reason="stop", usage=TokenUsage(180, 120, 15))
+            yield ThinkingStart(content_index=0, partial=AssistantMessage())
+            yield ThinkingDelta(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+            yield ThinkingEnd(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+            yield TextStart(content_index=1, partial=AssistantMessage(blocks=(think,)))
+            yield TextDelta(content_index=1, text=text.text, partial=msg)
+            yield TextEnd(content_index=1, text=text.text, partial=msg)
+            yield StreamDone(reason="stop", message=msg, usage=msg.usage, ttft_ms=4.0, latency_ms=10.0)
+            return
+
+        if step == 3:
+            tc = ToolCall(id="acme_tc_2", name="remember_fact", arguments="{}")
+            msg = AssistantMessage(blocks=(tc,), stop_reason="toolUse", usage=TokenUsage(220, 160, 18))
+            yield ToolCallStart(content_index=0, call_id=tc.id, name=tc.name, partial=AssistantMessage())
+            yield ToolCallDelta(content_index=0, delta="{}", partial=msg)
+            yield ToolCallEnd(content_index=0, tool_call=tc, partial=msg)
+            yield StreamDone(reason="toolUse", message=msg, usage=msg.usage, ttft_ms=3.0, latency_ms=9.0)
+            return
+
+        if step == 4:
+            err_msg = AssistantMessage(stop_reason="error", error_message="ACME RPC 503 upstream overloaded")
+            yield StreamError(
+                reason="error",
+                message=err_msg,
+                error_message="ACME RPC 503 upstream overloaded",
+                latency_ms=6.0,
+            )
+            return
+
+        think = ThinkingBlock(text="确认 ACME 连接已恢复")
+        text = TextBlock(text="ACME 协议已恢复正常。")
+        msg = AssistantMessage(blocks=(think, text), stop_reason="stop", usage=TokenUsage(250, 180, 12))
+        yield ThinkingStart(content_index=0, partial=AssistantMessage())
+        yield ThinkingDelta(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+        yield ThinkingEnd(content_index=0, text=think.text, partial=AssistantMessage(blocks=(think,)))
+        yield TextStart(content_index=1, partial=AssistantMessage(blocks=(think,)))
+        yield TextDelta(content_index=1, text=text.text, partial=msg)
+        yield TextEnd(content_index=1, text=text.text, partial=msg)
+        yield StreamDone(reason="stop", message=msg, usage=msg.usage, ttft_ms=2.0, latency_ms=8.0)
+
+
+# ACME 私有协议主板插件：经 Slot 4 register_provider 单点接入
+class AcmeProviderPlugin(Plugin):
+    plugin_id = "custom-acme-rpc"
+
+    # 注册第 5 套私有协议翻译器
+    def initialize(self) -> None:
+        self.context.register_provider(AcmeRpcProvider())
+''',
+        encoding="utf-8",
+    )
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "tools.json").write_text(
+        json.dumps(
+            {
+                "enabled_tools": ["remember_fact", "search_markdown", "read_markdown"],
+                "plugins": ["plugins"],
+                "telemetry": {"enabled": True, "max_sessions": 16},
+                "files": {"read_roots": ["data/memory", "data/workspace"], "write_root": "data/workspace"},
+                "commands": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (cfg_dir / "models.dsl").write_text(
+        "default acme\n\n"
+        "model acme {\n"
+        "  api             custom-acme-rpc\n"
+        "  base_url        https://rpc.acme.example/v1\n"
+        "  model           acme-v1\n"
+        "  api_key         acme-secret-key\n"
+        "  max_tokens      4096\n"
+        "  reasoning       medium\n"
+        "  cache_retention long\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    app = build_app(
+        data_root=tmp_path / "data",
+        config_root=cfg_dir,
+        project_root=tmp_path,
+        auto_consolidate=False,
+    )
+    try:
+        # 1. 确认由 models.dsl + Slot 4 插件自动装配，且未污染进程全局默认注册表
+        assert "custom-acme-rpc" in app.tools_config.plugin_manager.providers
+        assert "custom-acme-rpc" not in available_api_providers()
+        assert isinstance(app.llm, ModelClient)
+        assert app.llm.api == "custom-acme-rpc"
+        assert app.llm.model == "acme-v1"
+        acme_provider = app.tools_config.plugin_manager.providers["custom-acme-rpc"]
+
+        # 2. Turn 1：思考流 + 真实 remember_fact 工具调用 + 正常落库与观测
+        frames1 = list(app.stream_chat("请记住项目代号是北极星", chat_id="acme-chat"))
+        assert [f["text"] for f in frames1 if f["type"] == "thinking_delta"] == [
+            "ACME 正在规划记忆写入",
+            "已收到工具观察",
+        ]
+        assert any(f["type"] == "tool_start" and f["tool"] == "remember_fact" for f in frames1)
+        assert any(f["type"] == "tool_step" and f["tool"] == "remember_fact" for f in frames1)
+        done1 = next(f for f in frames1 if f["type"] == "done")
+        assert done1["reply"] == "ACME 已记住项目代号北极星。"
+        assert done1["thinking"] == "ACME 正在规划记忆写入已收到工具观察"
+
+        facts_path = tmp_path / "data" / "memory" / "facts.md"
+        facts_after_t1 = facts_path.read_text(encoding="utf-8")
+        assert "项目代号是北极星" in facts_after_t1
+        assert "(msg#" in facts_after_t1
+        assert "(turn#" not in facts_after_t1
+        assert len(app.state.active_messages("acme-chat")) == 2
+
+        # 3. Turn 2：Step 1 写暂存事实，Step 2 触发 StreamError -> 必须完整回滚消息与暂存事实、不污染遥测
+        with pytest.raises(RuntimeError, match="ACME RPC 503 upstream overloaded"):
+            list(app.stream_chat("请记住这条脏事实必须回滚", chat_id="acme-chat"))
+
+        assert len(app.state.active_messages("acme-chat")) == 2
+        facts_after_t2 = facts_path.read_text(encoding="utf-8")
+        assert "这条脏事实必须回滚" not in facts_after_t2
+        assert "(turn#" not in facts_after_t2
+        obs_after_t2 = app.observers[0].snapshot(session_key="acme-chat")
+        assert obs_after_t2["cursor"] == 1
+        sess_after_t2 = obs_after_t2["session"]
+        assert isinstance(sess_after_t2, dict)
+        assert sess_after_t2["turns"] == 1
+        assert sess_after_t2["llm_calls"] == 2
+        assert sess_after_t2["tool_calls"] == 1
+        # StreamError 步骤不写入 CacheMonitor（此时仅记录 Turn 1 的 2 次成功调用 + Turn 2 Step 1 的 1 次成功调用）
+        assert app.cache_monitor.summary(session_key="acme-chat")["llm_calls"] == 3
+
+        # 4. Turn 3：正常恢复对话，校验历史无脏消息且遥测精确仅含 Turn 3 指标
+        res3 = app.chat("现在恢复正常了吗？", chat_id="acme-chat")
+        assert res3["reply"] == "ACME 协议已恢复正常。"
+        assert res3["thinking"] == "确认 ACME 连接已恢复"
+
+        persisted = app.state.active_messages("acme-chat")
+        assert [m["content"] for m in persisted] == [
+            "请记住项目代号是北极星",
+            "ACME 已记住项目代号北极星。",
+            "现在恢复正常了吗？",
+            "ACME 协议已恢复正常。",
+        ]
+
+        # 验证 Turn 3 传给翻译器的中立 Context 无任何 Turn 2 残留，且 StreamOptions 继承 models.dsl 配置
+        recorded_contexts = getattr(acme_provider, "recorded_contexts")
+        recorded_options = getattr(acme_provider, "recorded_options")
+        t3_msgs = recorded_contexts[-1].messages
+        assert t3_msgs == (
+            UserMessage("请记住项目代号是北极星"),
+            AssistantMessage.from_text("ACME 已记住项目代号北极星。"),
+            UserMessage("现在恢复正常了吗？"),
+        )
+        assert recorded_options[-1] == StreamOptions(
+            temperature=0.2,
+            max_tokens=4096,
+            reasoning="medium",
+            cache_retention="long",
+            session_id=None,
+        )
+
+        # 验证 Turn 3 遥测未被失败 Turn 2 污染，且 CacheMonitor 记录完整 4 次成功调用
+        assert app.cache_monitor.summary(session_key="acme-chat")["llm_calls"] == 4
+        t3_tel_root = res3["telemetry"]
+        assert isinstance(t3_tel_root, dict)
+        t3_tel = t3_tel_root["telemetry"]
+        assert isinstance(t3_tel, dict)
+        t3_last = t3_tel["last_turn"]
+        assert isinstance(t3_last, dict)
+        assert t3_last["seq"] == 2
+        assert t3_last["llm_calls"] == 1
+        assert t3_last["tool_calls"] == 0
+        assert t3_last["prompt_tokens"] == 250
+        assert t3_last["cached_tokens"] == 180
+        assert t3_last["completion_tokens"] == 12
+        t3_totals = t3_tel["totals"]
+        assert isinstance(t3_totals, dict)
+        assert t3_totals["turns"] == 2
+        assert t3_totals["llm_calls"] == 3
+        assert t3_totals["tool_calls"] == 1
+        assert t3_totals["prompt_tokens"] == 550
+    finally:
+        app.close()

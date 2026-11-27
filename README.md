@@ -1,6 +1,6 @@
 # My Helper v2
 
-一个零第三方运行依赖的纯 Python 个人与学习 AI Agent。项目以借鉴 Pi 洋葱模型的三层单向依赖微内核（`ai ← agent ← assistant`）为底座，在外层通过插件协议叠加纯 Markdown 长期记忆生命周期、可折叠流式推导视图、间隔重复学习卡片与前后台双模型分槽。生产代码仅使用 Python 3.12+ 标准库，`pytest` 仅作开发测试依赖。
+一个零第三方运行依赖的纯 Python 个人与学习 AI Agent。项目以借鉴 Pi 洋葱模型的三层单向依赖微内核（`ai ← agent ← assistant`）为底座，并在 Layer 1 `ai/` 内部完整落地 **Pi ch04 三层模型调用翻译架构**（统一前台 ← 12 事件中立协议 ← 多厂商原生翻译器），在外层通过插件协议叠加纯 Markdown 长期记忆生命周期、可折叠流式推导视图、间隔重复学习卡片与前后台双模型分槽。生产代码仅使用 Python 3.12+ 标准库，`pytest` 仅作开发测试依赖。
 
 > 系统设计与工程权衡详见 [docs/mvp-design.md](docs/mvp-design.md)；当前架构基线、踩坑根因、去泄漏评测总账与迭代记录详见 [docs/dev-log.md](docs/dev-log.md) 与 [AGENTS.md](AGENTS.md)。
 
@@ -8,17 +8,21 @@
 
 ## 架构概览
 
-1. **三层单向依赖漏斗（`ai ← agent ← assistant`）**：
-   - **Layer 1 `personal_assistant/ai/`**：零内部依赖的 LLM 传输客户端、`ModelProfile` 直通工厂（`from_model_profile`）、通用命名角色配置 `ModelsConfig.roles`、SSE 流式解析与按会话隔离的有界 KV Cache 观测。
-   - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/` 的通用单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`）与零业务字段 `PluginContext` 统一插件主板，不含业务路径、具体插件名或配置段硬编码。
-   - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入）。
-   - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图、业务字面量扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
+1. **三层单向依赖漏斗（`ai ← agent ← assistant`）与 Layer 1 三层模型翻译架构**：
+   - **Layer 1 `personal_assistant/ai/`**（零向上依赖，内部遵循 Pi ch04 三层解耦）：
+     - **第二层·事件与契约协议层**（[personal_assistant/ai/protocol.py](personal_assistant/ai/protocol.py)）：零内部依赖，定义厂商中立的 `Context` / `Message`（`UserMessage`、`AssistantMessage`、`ToolResultMessage`）/ `ToolSchema` / `ToolCall`、12 种统一流式事件（`StreamStart`、`TextStart/Delta/End`、`ThinkingStart/Delta/End`、`ToolCallStart/Delta/End`、`StreamDone`、`StreamError`）、语义思考级别 `ThinkingLevel` 与缓存保留策略 `CacheRetention`、单一路由键 `api` 的 `ModelProfile`、通用命名角色表 `ModelsConfig.roles`、翻译器入职宪法 `ApiProvider` 与前台句柄协议 `ModelInvoker`。
+     - **第一层·统一前台与通讯录**（[personal_assistant/ai/registry.py](personal_assistant/ai/registry.py)）：仅依赖 `protocol.py` 零感知具体翻译器，提供 `stream()` / `stream_simple()` / `complete()` 统一入口、线程安全可隔离拷贝的 `ApiProviderRegistry` 通讯录、`ModelClient` / `NoopModelClient` 与直通工厂 `from_model_profile()` / `from_env()`。
+     - **第三层·原生协议翻译器**（[personal_assistant/ai/providers/](personal_assistant/ai/providers/)）：共享标准库重试/脱敏/通用 SSE 底座 `http.py`，内置三大原生翻译器——`openai_completions.py`（`openai-completions`）、`anthropic_messages.py`（`anthropic-messages`，支持 Prompt Caching 断点与带签名 Extended Thinking）、`google_genai.py`（`google-generative-ai`，支持 `systemInstruction`/`functionDeclarations`/`thinkingConfig`）；接入任意全新模型厂商协议只需编写 **1 个 `ApiProvider` 翻译器 + 注册到通讯录（或 Slot 4 插件）+ 在 `models.dsl` 配 `api`**，上层零改动。
+     - **中立 KV Cache 观测**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)）：基于中立 `Context` 序列化（`serialize_context`）与 `TrackingModelClient` 统计服务端真实命中率与本地前缀复用率，跨协议热切换时统计连续无断层。
+   - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 协议）。
+   - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入），全程面向中立 `Context` / `Message` / `ModelInvoker` 编排。
+   - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言符号扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
 2. **极简单层 ReAct 内核 + 外层安全预算**：
-   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为 30 余行单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `extract_tool_calls(assistant_msg)` 为空作为自然终止信号，并提供单步 `convert_to_llm` 边界转换钩子与执行期 `tool_context` 注入。
-   - 防死循环与成本控制由 Layer 3 `AssistantApp` 的 `_GuardedTurnLLM` 在外层实施（默认单轮上限 `24` 步、`250,000` Token、`180s` 墙钟、连续 `3` 次等价工具调用熔断及 `finish_reason="length"` 截断工具调用熔断），兼顾内核简洁性与运行期有界性。
+   - 面向个人伴读与学习辅导场景，[personal_assistant/agent/react.py](personal_assistant/agent/react.py) 保持为极简单层 `while True` 循环（`iter_react()` / `run_react()`），仅以 `done.reason != "toolUse" or not assistant_msg.tool_calls` 作为自然终止信号，遇 `StreamError` 透传退出（`run_react()` 转抛 `RuntimeError`），并提供单步 `convert_to_llm: ContextTransformer` 边界转换钩子与执行期 `tool_context` 注入。
+   - 防死循环与成本控制由 Layer 3 `AssistantApp` 的 `_GuardedTurnLLM`（实现 `ModelInvoker`）在外层实施（默认单轮上限 `24` 步、`250,000` Token、`180s` 墙钟、连续 `3` 次等价工具调用熔断及 `StreamDone.reason == "length"` 截断工具调用熔断），兼顾内核简洁性与运行期有界性。
 3. **学习助手叠加能力（零微内核侵入）**：
-   - **流式推导视图**：通过 `ThinkingDelta` 与 `ToolStart` 事件，在 CLI 与本地网页端实时展示可折叠的推理过程与慢工具执行状态，同时保持落库历史仅含纯净问答正文。
-   - **前后台双模型分槽**：支持在 `config/models.dsl` 中配置 `consolidator <模型名>`（编译至通用角色映射 `ModelsConfig.roles["consolidator"]`），前台使用推理模型（如 `deepseek-reasoner`）讲题推导，后台使用轻量对话模型（如 `deepseek-chat`）执行结构化记忆沉淀。
+   - **流式推导视图与跨协议热切换**：通过 12 种规范流事件（含 `ThinkingDelta`、`TextDelta`）与 `ToolStart` 事件，在 CLI 与本地网页端实时展示可折叠的推理过程与慢工具执行状态；同一条中立对话轨迹支持跨 `anthropic-messages` / `openai-completions` / `google-generative-ai` / `openai-reasoning` 无缝热切换，落库历史始终仅含纯净问答正文。
+   - **前后台双模型分槽**：支持在 `config/models.dsl` 中配置 `consolidator <模型名>`（编译至通用角色映射 `ModelsConfig.roles["consolidator"]`），前台使用推理或旗舰模型（如 `deepseek-reasoner`、`anthropic`、`gemini`）讲题推导，后台使用轻量对话模型（如 `deepseek-chat`）执行结构化记忆沉淀。
    - **纯 Markdown 间隔复习卡片**：通过外围插件 [plugins/tools/study_tools.py](plugins/tools/study_tools.py) 提供 `save_study_card` 与 `list_due_reviews`，在 `data/workspace/study/` 下维护人类可读的复习卡片与调度计划。
 
 ---
@@ -29,22 +33,22 @@
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
   2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`）外挂双语 BM25 索引，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
-  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL 编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`，不向 Layer 2 泄漏业务角色名）。
-  4. **模型协议插槽 `LLMProviderProtocol`**：[plugins/reasoning_provider.py](plugins/reasoning_provider.py)（`openai_reasoning`），经 `ModelProfile` 直通工厂（`from_model_profile`）构造客户端，处理轮内 `reasoning_content` 续传与跨轮剥离。
-  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件。
+  3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
+  4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，[plugins/reasoning_provider.py](plugins/reasoning_provider.py) 注册 `OpenAIReasoningProvider`（`api="openai-reasoning"`），继承 `OpenAICompletionsProvider` 处理轮内 `reasoning_content` 续传与跨轮剥离；`ToolsConfig.build_provider_registry()` 将插件翻译器与内建三大翻译器合并为应用级隔离副本，不污染进程全局注册表。
+  5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
 - `AssistantApp` 在启动期构建一次常驻 `_tool_registry`，每轮通过 `bind_tool_context` / `tool_context` 注入动态回合上下文；`build_tool()` 自动从 Python 默认参数推断精简 `ToolSchema.required`。
 
 ### 2. KV Cache 友好的 Markdown 记忆、原子会话快照与沉淀韧性
 - **前缀冻结**：`data/memory/MEMORY.md` 限制为前 100 行 / 4000 字符索引，与 `rules/` 摘要按 `(today_str, chat_id)` 在会话内冻结于 `system` 前缀，跨自然日自动刷新。
-- **记忆生命周期与轮内暂存**：`remember_fact` 轮内先写入 `(turn#<tag>)` 暂存行，回合成功落库后升级为 `(msg#<id>)`，流中断时自动回滚；后台沉淀支持 `add` / `merge` / `replace` / `remove`，被替换或删除的旧事实软退休至 `data/memory/archive/YYYY-MM.md`（热检索默认隔离归档目录）。
+- **记忆生命周期与轮内暂存**：`remember_fact` 轮内先写入 `(turn#<tag>)` 暂存行，回合成功落库后升级为 `(msg#<id>)`，流中断或 `StreamError` 时自动回滚；后台沉淀支持 `add` / `merge` / `replace` / `remove`，被替换或删除的旧事实软退休至 `data/memory/archive/YYYY-MM.md`（热检索默认隔离归档目录）。
 - **成对原子落库与自适应滑窗**：`StateStore.append_turn()` 单事务成对写入问答消息，`get_context_snapshot()` 单锁原子读取压缩摘要与活跃历史二元组；当后台沉淀繁忙或处于指数退避（默认 `2s` 起步至 `256s`，上限 `300s`）导致未压缩消息超过 `20` 条时，活跃窗口在 `60` 条 / `24,000` 字符上限内自动拓宽保留未压缩上下文，单次沉淀批次上限 `24` 条并在写锁内保护前台在途 `(turn#...)` 事实不被覆盖。
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
-- **APFS Unicode 折叠与 Inode 文件隔离**：零内部依赖的 [personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合轻量单层受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验，阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
-- **语法级只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行语法级逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及冒号引用/解引用/裸对象哈希，无显式文件时自动补 `--stat`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
-- **直连 `http.client` + TLS/DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` + TLS SNI/证书校验直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
-- **本地 Web 服务防护**：[scripts/web_chat.py](scripts/web_chat.py) 校验 `Host`、`Origin`、`Sec-Fetch-Site` 与单一 `Content-Type: application/json`，下发 CSP / `nosniff` / `DENY` 响应头，支持非回环绑定下的常量时间 Bearer Token 鉴权；密钥配置文件纳入 `.gitignore` 并以 `0600` 权限原子写入。
+- **APFS Unicode 折叠与 Inode 文件隔离**：零内部依赖的 [personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验（统一覆盖文件读写、`list_files` 列举与 `LinearRetriever`/`FTS5Retriever` 搜索遍历），阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
+- **语法级只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`find` 使用独立只读表达式白名单（绝不因 `--` 放过 `-exec`/`-delete` 并禁 `-L`/`-H`）；`ls`/`wc`/`rg` 封堵解引用与大小写绕过；`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行语法级逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及冒号引用/解引用/裸对象哈希，无显式文件时自动补 `--stat`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
+- **直连 `http.client` + TLS/DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` + TLS SNI/证书校验直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口，自动处理非 ASCII URL 百分号与 IDNA 编码，每次阻塞读前刷新 socket 剩余截止超时），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
+- **本地 Web 服务防护**：[scripts/web_chat.py](scripts/web_chat.py) 校验 `Host`、`Origin`、`Sec-Fetch-Site` 与单一 `Content-Type: application/json`，下发 CSP / `nosniff` / `DENY` 响应头，支持非回环绑定下静态首页壳与 `/api/*` 常量时间 Bearer Token 鉴权；密钥配置文件纳入 `.gitignore` 并以 `0600` 权限原子写入。
 
 ---
 
@@ -56,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全守卫（202 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（209 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -83,12 +87,26 @@ uv run python -m personal_assistant chat
 uv run python scripts/web_chat.py --open
 ```
 
-也可以直接复制 [config/models.example.dsl](config/models.example.dsl) 为 `config/models.dsl` 手写双模型配置：
+也可以直接复制 [config/models.example.dsl](config/models.example.dsl) 为 `config/models.dsl`，支持一行多厂商预设与高级 `model { api ... }` 块语法：
 
 ```text
-use reasoner sk-你的DeepSeek密钥
+# 一行预设（内置 deepseek / deepseek-reasoner / anthropic / gemini / qwen / kimi / glm / openai / siliconflow / ollama）
+use deepseek-reasoner sk-你的DeepSeek密钥
 add deepseek sk-你的DeepSeek密钥
+add anthropic sk-ant-你的Anthropic密钥
+add gemini AIza你的Gemini密钥
 consolidator deepseek
+
+# 高级块语法：显式声明 api 协议、思考级别 reasoning、缓存保留 cache_retention 与 max_tokens
+model claude_deep {
+  api             anthropic-messages
+  base_url        https://api.anthropic.com
+  model           claude-sonnet-4-5
+  api_key         sk-ant-你的Anthropic密钥
+  max_tokens      8192
+  reasoning       medium
+  cache_retention long
+}
 ```
 
 ### 运行实模评测
@@ -150,7 +168,7 @@ uv run python -m evals --mode memory \
 my_helper_v2/
 ├── config/
 │   ├── tools.json                     # 工具白名单、插件路径与各模块安全策略配置
-│   └── models.example.dsl             # 模型配置 DSL 示例（use / add / default / consolidator）
+│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / api）
 ├── plugins/
 │   ├── tools/                         # Tool(ToolSchema) 工具子包（由 ToolsPlugin 扫描加载）
 │   │   ├── plugin.py                  # ToolsPlugin(Plugin)
@@ -160,12 +178,20 @@ my_helper_v2/
 │   │   ├── history_tools.py           # 只读增量 SQLite FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习卡片与间隔复习插件（save_study_card / list_due_reviews）
 │   ├── fts5_retriever.py              # RetrieverProtocol：SQLite FTS5 + BM25 双语检索
-│   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器
-│   ├── reasoning_provider.py          # LLMProviderProtocol：reasoning_content 推理模型协议
+│   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/reasoning/cache_retention）
+│   ├── reasoning_provider.py          # ApiProvider：openai-reasoning 推理模型协议翻译器
 │   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
-│   ├── ai/                            # Layer 1：types.py / client.py / cache.py
-│   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
+│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测）：
+│   │   ├── protocol.py                #   第二层·事件与契约协议（Context/Message/12 事件/ApiProvider）
+│   │   ├── registry.py                #   第一层·统一前台（stream/stream_simple/complete）与通讯录注册表
+│   │   ├── providers/                 #   第三层·原生协议翻译器：
+│   │   │   ├── http.py                #     共享标准库重试/脱敏/通用 SSE 传输底座
+│   │   │   ├── openai_completions.py  #     openai-completions 翻译器
+│   │   │   ├── anthropic_messages.py  #     anthropic-messages 原生翻译器（缓存断点/扩展思考）
+│   │   │   └── google_genai.py        #     google-generative-ai 原生翻译器（思考/函数调用）
+│   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
+│   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
 │                                      #          memory.py / builtin_tools.py / memory_lifecycle.py /
 │                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
@@ -174,7 +200,7 @@ my_helper_v2/
 │   ├── web_chat.py                    # 本地 HTTP/SSE 服务
 │   └── web_ui.html                    # 原生 HTML/JS 流式教学界面
 ├── evals/                             # 顶层评测包（search / agent / memory / download）
-├── tests/                             # 确定性单测、conftest.py 宿主隔离与架构/红队守卫
+├── tests/                             # 确定性单测、conftest.py 宿主隔离、跨协议契约测试与架构/红队守卫
 ├── docs/
 │   ├── mvp-design.md                  # 架构设计、工程权衡与安全边界文档
 │   └── dev-log.md                     # 当前基线、ADRs、排坑记录与演进日志
