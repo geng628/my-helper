@@ -207,6 +207,10 @@ class FilesPolicy:
         stop_roots = [proj, data, *(r.parent for r in all_roots)]
         return stop_roots, collect_protected_inodes(scan_roots, self.reject_segments)
 
+    # 返回当前策略与数据目录下的受保护文件 (st_dev, st_ino) 集合，供目录列举与全文检索防硬链接绕过
+    def protected_inodes(self, data_root: Path) -> set[tuple[int, int]]:
+        return self._protected_context(data_root)[1]
+
     # 安全解析相对路径：校验读写白名单、拒绝 .. 穿越、敏感段与越权软链接
     def resolve_path(
         self,

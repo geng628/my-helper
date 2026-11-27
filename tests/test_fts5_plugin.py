@@ -170,6 +170,15 @@ def test_fts5_retriever_temporal_expiry_archive_and_incremental_sync(tmp_path: P
     assert updated_hits and "星链遥测新里程碑" in updated_hits[0].snippet
     assert memory.search_hits("旧版迁移评审会", today=date(2026, 10, 10)) == []
 
+    # 高频主题词出现在 >=10 条目中绝大多数行（SQLite FTS5 BM25 IDF 钳位到 ~1e-6）时仍须命中且正分排序
+    atlas_file = memory.memory_dir / "projects.md"
+    atlas_file.write_text(
+        "# 项目\n" + "".join(f"- [2026-11-22] Atlas 子任务 {i} 使用 Go 服务。\n" for i in range(12)),
+        encoding="utf-8",
+    )
+    atlas_hits = memory.search_hits("Atlas", today=date(2026, 11, 22))
+    assert atlas_hits and atlas_hits[0].score > 0.0 and "Atlas" in atlas_hits[0].snippet
+
 
 # 测试 AssistantApp 与 eval CLI 支持按配置或 --retriever 参数无缝切换 fts5_bm25 与 linear
 def test_app_and_eval_cli_integrate_fts5_plugin(tmp_path: Path) -> None:

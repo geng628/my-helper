@@ -83,7 +83,14 @@ _BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]+")
 _MAX_HTTP_ERROR_BODY_BYTES = 1024
 _STREAM_OPTIONS_MARKERS = ("stream_options", "include_usage")
-_CONTEXT_LIMIT_MARKERS = ("context_length", "maximum context", "tokens")
+_CONTEXT_LIMIT_MARKERS = (
+    "context_length",
+    "maximum context",
+    "too many tokens",
+    "token limit",
+    "max_tokens",
+    "maximum token",
+)
 
 
 # 脱敏 HTTP 错误文本中的疑似 Bearer 或 sk- 令牌，防止错误透出泄漏密钥
@@ -92,14 +99,20 @@ def _redact_error_tokens(text: str) -> str:
     return _SK_SECRET_RE.sub("sk-***", masked)
 
 
-# 纯函数读取最多 1024 字节 HTTPError 响应体并脱敏，构造零猴子补丁的新 HTTPError 与组合诊断文本
+# 纯函数读取最多 1024 字节 HTTPError 响应体、确定性关闭底层流并脱敏，构造零猴子补丁的新 HTTPError（已格式化时幂等复用）
 def _format_http_error(error: HTTPError) -> tuple[HTTPError, str]:
-    orig_reason = _redact_error_tokens(str(error.reason or "").strip())
+    raw_reason = str(error.reason or "").strip()
+    orig_reason = _redact_error_tokens(raw_reason)
     body = ""
     try:
         raw = error.read(_MAX_HTTP_ERROR_BODY_BYTES)
     except (OSError, ValueError, AttributeError):
         raw = b""
+    finally:
+        try:
+            error.close()
+        except (OSError, ValueError, AttributeError):
+            pass
     if isinstance(raw, (bytes, bytearray)):
         body = raw.decode("utf-8", errors="replace").strip()
     elif isinstance(raw, str):
@@ -109,6 +122,8 @@ def _format_http_error(error: HTTPError) -> tuple[HTTPError, str]:
         msg = f"{orig_reason} | {clean_body}" if orig_reason else clean_body
     else:
         msg = orig_reason
+    if not clean_body and msg == raw_reason:
+        return error, orig_reason
     return HTTPError(error.url, error.code, msg, error.headers, None), f"{orig_reason} {clean_body}".strip()
 
 
@@ -164,11 +179,17 @@ def _post_with_retry(
         except HTTPError as error:
             if (error.code < 500 and error.code != 429) or attempt >= max_retries:
                 formatted_error, _ = _format_http_error(error)
+                if formatted_error is error:
+                    raise
                 raise formatted_error from error
             if error.code == 429:
                 retry_after = _parse_retry_after_seconds(error.headers)
                 if retry_after is not None:
                     delay = retry_after
+            try:
+                error.close()
+            except (OSError, ValueError, AttributeError):
+                pass
         except _TRANSIENT_HTTP_ERRORS:
             if attempt >= max_retries:
                 raise
@@ -352,6 +373,8 @@ def _open_openai_stream(
     except HTTPError as error:
         formatted_error, error_text = _format_http_error(error)
         if error.code != 400 or yielded_any or "stream_options" not in payload or not _is_stream_options_incompat(error_text):
+            if formatted_error is error:
+                raise
             raise formatted_error from error
         if on_stream_options_unsupported is not None:
             on_stream_options_unsupported()
@@ -360,6 +383,8 @@ def _open_openai_stream(
             yield from post_stream(url, fallback_payload, headers)
         except HTTPError as retry_error:
             formatted_retry, _ = _format_http_error(retry_error)
+            if formatted_retry is retry_error:
+                raise
             raise formatted_retry from retry_error
 
 

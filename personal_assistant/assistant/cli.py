@@ -122,6 +122,12 @@ def run_repl(
             except LLMNotConfigured as error:
                 print(f"助手> {error}")
                 continue
+            except KeyboardInterrupt:
+                print("\n助手> 已中断本轮回复。")
+                continue
+            except Exception as error:  # noqa: BLE001
+                print(f"\n助手> 本轮请求出错：{error}")
+                continue
             finish(str(result.get("reply", "")))
             cache_info = result.get("cache")
             if isinstance(cache_info, dict) and cache_info.get("llm_calls"):
@@ -145,49 +151,52 @@ def run_setup_wizard(
     cfg_dir = config_dir.resolve()
     tools_json = cfg_dir / "tools.json"
     tcfg = ToolsConfig.load(tools_json, project_root=project_root)
-    presets = tcfg.model_presets()
-
-    print_fn("=== My Helper 一键模型配置向导（零代码，10 秒配好）===")
-    for idx, item in enumerate(presets, start=1):
-        print_fn(f"  {idx}. {item['label']}（默认模型：{item['default_model']}）")
-    custom_idx = len(presets) + 1
-    print_fn(f"  {custom_idx}. 自定义 OpenAI 兼容接口（手动填写网址与模型名）")
-
-    raw_choice = input_fn(f"请选择编号 [1-{custom_idx}]（直接回车默认选 1）：").strip() or "1"
     try:
-        choice = int(raw_choice)
-    except ValueError as error:
-        raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。") from error
-    if not (1 <= choice <= custom_idx):
-        raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。")
+        presets = tcfg.model_presets()
 
-    if choice == custom_idx:
-        name = input_fn("给这个模型起个简短名字（如 my_model）：").strip() or "custom"
-        base_url = input_fn("接口地址（例如 https://api.deepseek.com/v1）：").strip()
-        model = input_fn("模型名称（例如 deepseek-chat）：").strip()
-        api_key = secret_fn("API Key（输入不回显，自动本地加密权限保存）：").strip()
-        saved = tcfg.save_model_setup(
-            cfg_dir, preset="custom", name=name, base_url=base_url, model=model, api_key=api_key
-        )
-    else:
-        picked = presets[choice - 1]
-        api_key = ""
-        if picked["needs_key"]:
-            api_key = secret_fn(f"请粘贴 {picked['label']} 的 API Key（输入不回显）：").strip()
-            if not api_key:
-                raise ValueError("API Key 不能为空。")
-        model = input_fn(f"模型名（直接回车使用默认 {picked['default_model']}）：").strip()
-        saved = tcfg.save_model_setup(
-            cfg_dir,
-            preset=str(picked["id"]),
-            api_key=api_key,
-            model=model,
-        )
+        print_fn("=== My Helper 一键模型配置向导（零代码，10 秒配好）===")
+        for idx, item in enumerate(presets, start=1):
+            print_fn(f"  {idx}. {item['label']}（默认模型：{item['default_model']}）")
+        custom_idx = len(presets) + 1
+        print_fn(f"  {custom_idx}. 自定义 OpenAI 兼容接口（手动填写网址与模型名）")
 
-    print_fn(f"\n配置已自动生成：{cfg_dir / 'models.dsl'} 与 {cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 与沙箱自动保护）")
-    print_fn(json.dumps(saved.redacted_dict(), ensure_ascii=False, indent=2))
-    print_fn("现在可以直接运行 `uv run python -m personal_assistant chat` 开始对话！")
-    return saved
+        raw_choice = input_fn(f"请选择编号 [1-{custom_idx}]（直接回车默认选 1）：").strip() or "1"
+        try:
+            choice = int(raw_choice)
+        except ValueError as error:
+            raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。") from error
+        if not (1 <= choice <= custom_idx):
+            raise ValueError(f"请输入 1 到 {custom_idx} 之间的数字。")
+
+        if choice == custom_idx:
+            name = input_fn("给这个模型起个简短名字（如 my_model）：").strip() or "custom"
+            base_url = input_fn("接口地址（例如 https://api.deepseek.com/v1）：").strip()
+            model = input_fn("模型名称（例如 deepseek-chat）：").strip()
+            api_key = secret_fn("API Key（输入不回显，自动本地加密权限保存）：").strip()
+            saved = tcfg.save_model_setup(
+                cfg_dir, preset="custom", name=name, base_url=base_url, model=model, api_key=api_key
+            )
+        else:
+            picked = presets[choice - 1]
+            api_key = ""
+            if picked["needs_key"]:
+                api_key = secret_fn(f"请粘贴 {picked['label']} 的 API Key（输入不回显）：").strip()
+                if not api_key:
+                    raise ValueError("API Key 不能为空。")
+            model = input_fn(f"模型名（直接回车使用默认 {picked['default_model']}）：").strip()
+            saved = tcfg.save_model_setup(
+                cfg_dir,
+                preset=str(picked["id"]),
+                api_key=api_key,
+                model=model,
+            )
+
+        print_fn(f"\n配置已自动生成：{cfg_dir / 'models.dsl'} 与 {cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 与沙箱自动保护）")
+        print_fn(json.dumps(saved.redacted_dict(), ensure_ascii=False, indent=2))
+        print_fn("现在可以直接运行 `uv run python -m personal_assistant chat` 开始对话！")
+        return saved
+    finally:
+        tcfg.plugin_manager.terminate_all()
 
 
 # 命令行总入口：加载 .env 并解析子命令（支持 setup 一键向导、chat 对话与 compile-config 编译）
@@ -210,13 +219,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "compile-config":
         tools_json = cfg_dir / "tools.json"
         tcfg = ToolsConfig.load(tools_json, project_root=cfg_dir.parent)
-        compiled = tcfg.load_models_config(cfg_dir, write_json=True)
-        if compiled is None:
-            print(f"未在 {cfg_dir} 下找到 models.dsl 或 models.json（运行 `uv run python -m personal_assistant setup` 可 10 秒自动生成）。")
+        try:
+            compiled = tcfg.load_models_config(cfg_dir, write_json=True)
+            if compiled is None:
+                print(f"未在 {cfg_dir} 下找到 models.dsl 或 models.json（运行 `uv run python -m personal_assistant setup` 可 10 秒自动生成）。")
+                return
+            print(f"已编译并写入：{cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 保护）")
+            print(json.dumps(compiled.redacted_dict(), ensure_ascii=False, indent=2))
             return
-        print(f"已编译并写入：{cfg_dir / 'models.json'}（权限 0600，已由 .gitignore 保护）")
-        print(json.dumps(compiled.redacted_dict(), ensure_ascii=False, indent=2))
-        return
+        finally:
+            tcfg.plugin_manager.terminate_all()
     if args.command in (None, "chat"):
         app = build_app(
             data_root=Path(args.data) if args.data else None,
@@ -224,6 +236,9 @@ def main(argv: list[str] | None = None) -> None:
             model_name=args.model,
             consolidator_model=args.consolidator_model,
         )
-        if isinstance(app.llm, NoopLLMClient):
-            print("提示：当前尚未配置大模型。运行 `uv run python -m personal_assistant setup` 可 10 秒零代码一键配置。")
-        run_repl(app)
+        try:
+            if isinstance(app.llm, NoopLLMClient):
+                print("提示：当前尚未配置大模型。运行 `uv run python -m personal_assistant setup` 可 10 秒零代码一键配置。")
+            run_repl(app)
+        finally:
+            app.close()

@@ -796,6 +796,9 @@ def test_web_ui_fetch_headers_and_allowed_targets_rules() -> None:
     assert len(post_fetches) == 3
     for snippet in post_fetches:
         assert "application/json" in snippet, f"POST fetch 缺少 application/json 请求头：{snippet}"
+    assert "auth_fetch(" in html and "Authorization" in html
+    assert "advancedOptions.open = true" in html
+    assert "AbortController" in html
 
     # 未压缩 IPv6 字面量自动按 RFC 5952 规范化为压缩格式
     assert _parse_bind_host("[0:0:0:0:0:0:0:1]") == ("::1", True)
@@ -999,7 +1002,11 @@ def test_web_chat_security_headers_sse_closing_non_loopback_warn_and_bearer_auth
     auth_thread.start()
     try:
         auth_base = f"http://127.0.0.1:{auth_srv.server_port}"
-        for path in ("/", "/api/status"):
+        # 静态首页 HTML 壳不含用户数据，允许浏览器免认证加载再由前端携带 Bearer Token 访问 /api/*
+        with urlopen(Request(f"{auth_base}/"), timeout=5) as index_resp:
+            assert index_resp.status == 200
+            assert "text/html" in (index_resp.headers.get("Content-Type") or "")
+        for path in ("/api/status", "/api/memory", "/api/models", "/api/history"):
             with pytest.raises(HTTPError) as no_tok_err:
                 urlopen(Request(f"{auth_base}{path}"), timeout=5)
             assert no_tok_err.value.code == 401

@@ -31,7 +31,17 @@ DEFAULT_ALLOWED_EXECUTABLES = ("ls", "find", "grep", "rg", "wc", "head", "tail",
 DEFAULT_GIT_SUBCOMMANDS = ("status", "log", "diff", "show", "branch", "rev-parse")
 _MAX_CAPTURE_BYTES = 1024 * 1024
 
-DANGEROUS_FIND_FLAGS = frozenset("-exec -execdir -ok -okdir -delete -fls -fprint -fprint0 -fprintf -files0-from -f".split())
+FIND_BOOL_PRIMARIES = frozenset(
+    "-P -print -print0 -ls -depth -empty -false -true -not ! -a -and -o -or -xdev -mount ( ) ,".split()
+)
+FIND_VALUE_PRIMARIES = frozenset(
+    "-name -iname -path -ipath -wholename -iwholename -regex -iregex -type -maxdepth -mindepth "
+    "-size -mtime -mmin -ctime -cmin -atime -amin -perm -links -inum -newer".split()
+)
+FIND_PATTERN_PRIMARIES = frozenset("-name -iname -path -ipath -wholename -iwholename".split())
+WC_SHORT_BOOL = frozenset("lwcmL")
+WC_LONG_BOOL = frozenset("--lines --words --bytes --chars --max-line-length --version --help".split())
+LS_FORBIDDEN_LONG = frozenset("--dereference --dereference-command-line --dereference-command-line-symlink-to-dir".split())
 GIT_DIFF_SUMMARY_FLAGS = frozenset({"--stat", "--name-only", "--name-status"})
 GIT_SHOW_SUMMARY_FLAGS = GIT_DIFF_SUMMARY_FLAGS | frozenset({"-s", "--no-patch"})
 GIT_SIMPLE_FLAGS: dict[str, frozenset[str]] = {
@@ -466,18 +476,69 @@ def _parse_search_args(exe: str, args: list[str], policy: ShellPolicy) -> tuple[
     return (len(args) if dd_idx is None else dd_idx), is_recursive, only_example
 
 
+# 严格校验只读 find 参数：绝不因 -- 跳过表达式原语检查，拦截 -exec/-delete/-L/-H 与敏感路径匹配
+def _validate_find_args(args: list[str], policy: ShellPolicy, *, protected_ctx: ProtectedCtx) -> None:
+    idx = 0
+    seen_expr = False
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            if seen_expr:
+                raise ValueError("find 不支持在表达式中再次使用 --。")
+            idx += 1
+            continue
+        if tok in FIND_BOOL_PRIMARIES:
+            if tok != "-P":
+                seen_expr = True
+            idx += 1
+            continue
+        if tok in FIND_VALUE_PRIMARIES:
+            seen_expr = True
+            if idx + 1 >= len(args):
+                raise ValueError(f"find 选项缺少参数值：{tok}")
+            val = args[idx + 1]
+            if tok in FIND_PATTERN_PRIMARIES:
+                if _matches_sensitive_glob(val, policy.reject_segments):
+                    raise ValueError(f"find 禁止匹配受保护路径模式：{val}")
+                rel_pat = Path(val.replace("\\", "/"))
+                if ".." in rel_pat.parts:
+                    raise ValueError(f"find 禁止路径穿越模式：{val}")
+                for part in rel_pat.parts:
+                    if not any(ch in part for ch in "*?[") and is_sensitive_segment(part, policy.reject_segments):
+                        raise ValueError(f"find 禁止匹配受保护路径：{part}")
+            elif tok == "-newer":
+                _validate_path_candidate(val, policy, protected_ctx=protected_ctx)
+            idx += 2
+            continue
+        if tok.startswith("-") and tok != "-":
+            raise ValueError(f"find 仅允许只读查询选项，禁止使用危险选项：{tok}")
+        if seen_expr:
+            raise ValueError(f"find 表达式中存在未识别参数：{tok}")
+        _validate_path_candidate(tok, policy, protected_ctx=protected_ctx)
+        idx += 1
+
+
 # 校验通用白名单命令（ls/find/cat/wc/date 等）的选项与路径参数
 def _validate_generic_args(exe: str, args: list[str], policy: ShellPolicy) -> None:
     protected_ctx = _protected_inode_context(policy)
+    if exe == "find":
+        _validate_find_args(args, policy, protected_ctx=protected_ctx)
+        return
     after_dd = False
     for arg in args:
         if arg == "--" and not after_dd:
             after_dd = True
         elif not after_dd and arg.startswith("-") and arg != "-":
-            if exe == "find" and (
-                arg in DANGEROUS_FIND_FLAGS or arg.startswith("-files0-from") or (arg.startswith("-f") and arg != "-false")
-            ):
-                raise ValueError(f"find 禁止使用危险选项：{arg}")
+            if exe == "ls":
+                if arg in LS_FORBIDDEN_LONG or (not arg.startswith("--") and any(ch in "LH" for ch in arg[1:])):
+                    raise ValueError(f"ls 禁止跟随符号链接选项：{arg}")
+            if exe == "wc":
+                if arg.startswith("--"):
+                    if arg not in WC_LONG_BOOL:
+                        raise ValueError(f"wc 仅允许只读统计选项，禁止使用：{arg}")
+                elif not arg[1:] or any(ch not in WC_SHORT_BOOL for ch in arg[1:]):
+                    raise ValueError(f"wc 仅允许只读统计短选项，禁止使用：{arg}")
+                continue
             if exe == "date" and ((not arg.startswith("--") and "f" in arg[1:]) or arg == "--file" or arg.startswith("--file=")):
                 raise ValueError(f"date 禁止从文件读取输入：{arg}")
             if arg.startswith("--"):
@@ -508,7 +569,7 @@ def _augment_safe_argv(argv: list[str], policy: ShellPolicy) -> list[str]:
             *((".git",) if ".git" not in policy.reject_segments else ()),
             *((".env.*",) if add_env else ()),
         )
-        fmts = ("--exclude={}", "--exclude-dir={}") if exe == "grep" else ("--glob=!{}", "--glob=!**/{}/**")
+        fmts = ("--exclude={}", "--exclude-dir={}") if exe == "grep" else ("--iglob=!{}", "--iglob=!**/{}/**")
         return [exe, *args[:insert_at], *(fmt.format(seg) for seg in pats for fmt in fmts), *args[insert_at:]]
 
     if exe == "pytest":

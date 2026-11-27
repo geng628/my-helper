@@ -544,9 +544,9 @@ def test_shell_plugin_blocks_attached_short_flags_git_colon_refs_and_env_variant
     assert aug_grep_dd.index("--include=*.py") < aug_grep_dd.index("--exclude=.env.*") < aug_grep_dd.index("--")
 
     aug_rg = _augment_safe_argv(["rg", "-n", "foo", "."], policy)
-    assert aug_rg.index("-n") < aug_rg.index("foo") < aug_rg.index("--glob=!.env.*")
-    assert "--glob=!.git" in aug_rg
-    assert "--glob=!**/.git/**" in aug_rg
+    assert aug_rg.index("-n") < aug_rg.index("foo") < aug_rg.index("--iglob=!.env.*")
+    assert "--iglob=!.git" in aug_rg
+    assert "--iglob=!**/.git/**" in aug_rg
 
     # 验证 wc --files0-from 与安全路径通配符 tests/*.py 行为
     wc_policy = ShellPolicy(project_root=tmp_path, cwd=tmp_path, allowed_executables=("wc",))
@@ -763,6 +763,32 @@ def test_shell_plugin_unicode_inode_strict_git_isolated_home_and_killpg(tmp_path
     orphan_out = execute_safe_command("sh -c 'sleep 10 >/dev/stdout 2>&1 & echo parent_done'", policy)
     assert time.monotonic() - t_spawn < 1.3
     assert "parent_done" in orphan_out
+
+    # 6. find -- 后不得绕过 -exec/-delete，禁止 find/ls -L/-H 跟随软链，wc 仅放行只读白名单，rg 大小写不敏感排除
+    bypass_policy = ShellPolicy(
+        project_root=tmp_path,
+        cwd=tmp_path,
+        allowed_executables=("find", "ls", "wc", "rg"),
+        timeout=2.0,
+    )
+    for bad_cmd in (
+        "find -- . -delete",
+        "find -- . -maxdepth 0 -exec id {} +",
+        "find -- . -execdir echo hi +",
+        "find -L . -maxdepth 1",
+        "find -H . -maxdepth 1",
+        "ls -L .",
+        "ls -RL .",
+        "ls --dereference .",
+        "wc --f=.env",
+        "wc --files0=.env",
+    ):
+        bad_out = execute_safe_command(bad_cmd, bypass_policy)
+        assert bad_out.startswith("错误："), f"应拦截但放行：{bad_cmd!r} -> {bad_out!r}"
+    assert "退出码：0" in execute_safe_command("find -- . -maxdepth 1 -name '*.md'", bypass_policy)
+    assert "退出码：0" in execute_safe_command("wc -l README.md", bypass_policy)
+    rg_argv = shell_mod._augment_safe_argv(["rg", "hello", "."], bypass_policy)
+    assert any(tok.startswith("--iglob=!") for tok in rg_argv)
 
     fast_overflow = execute_safe_command("sh -c 'head -c 1100000 /dev/zero'", policy)
     assert fast_overflow.startswith("错误：") and "上限" in fast_overflow

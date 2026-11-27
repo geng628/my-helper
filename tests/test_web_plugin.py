@@ -528,6 +528,17 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
         )
         assert json.loads(semi_raw.decode("utf-8"))["path"] == "/matrix;v=1.2?k=v"
 
+        # 验证含中文等非 ASCII 字符的 URL 路径与查询串可自动百分号编码正常抓取，不再抛 UnicodeEncodeError
+        _, _, zh_raw = wt._default_http_get(
+            f"http://rebind.example:{srv.server_port}/词条/中文?q=你好",
+            {},
+            5.0,
+            4096,
+            resolve_dns=make_resolver("93.184.216.34"),
+        )
+        zh_path = json.loads(zh_raw.decode("utf-8"))["path"]
+        assert "%E8%AF%8D%E6%9D%A1" in zh_path and "q=%E4%BD%A0%E5%A5%BD" in zh_path
+
         # 3b. 跨域重定向时剥离 Authorization 与 X-Subscription-Token
         received_headers.clear()
         received_paths.clear()
@@ -615,7 +626,15 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
         srv.server_close()
         srv_thread.join(timeout=3.0)
 
-    # 4. 慢速滴水响应必须在总时长 Deadline 内中止（防止无限挂起）
+    # 4. 慢速滴水响应必须在总时长 Deadline 内中止，并在每次读取前动态刷新套接字超时
+    seen_timeouts: list[float] = []
+
+    # 记录 settimeout 调用的假套接字
+    class _FakeSock:
+        # 记录剩余超时秒数
+        def settimeout(self, val: float) -> None:
+            seen_timeouts.append(val)
+
     # 返回固定分块字节并模拟慢速滴水的假响应对象
     class _SlowDripResp:
         # 每次 read1 休眠后仅吐出 1 字节
@@ -628,9 +647,26 @@ def test_web_plugin_ssrf_ipv6_dns_pinning_proxy_redirect_deadline_and_charset(
             return self.read1(n)
 
     with pytest.raises(TimeoutError):
-        wt._read_body_with_deadline(_SlowDripResp(), max_bytes=1024 * 1024, deadline=time.monotonic() + 0.12)
+        wt._read_body_with_deadline(
+            _SlowDripResp(), max_bytes=1024 * 1024, deadline=time.monotonic() + 0.12, sock=_FakeSock()
+        )
+    assert len(seen_timeouts) >= 2 and seen_timeouts[-1] < seen_timeouts[0]
 
-    # 5. _extract_charset 通过 codecs.lookup 校验合法文本编码，未知或伪编码回退 utf-8
+    # 5. DuckDuckGo 备用分支（href 位于 class="result__a" 之前）不得把 URL 与标题解包写反
+    swapped_ddg_html = (
+        '<a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.python.org%2F3%2F" class="result__a">'
+        'Python Official Docs</a><div class="result__snippet">Python docs snippet</div>'
+    )
+    ddg_items = wt.parse_duckduckgo_html(swapped_ddg_html, limit=5)
+    assert ddg_items == [
+        {
+            "title": "Python Official Docs",
+            "url": "https://docs.python.org/3/",
+            "snippet": "Python docs snippet",
+        }
+    ]
+
+    # 6. _extract_charset 通过 codecs.lookup 校验合法文本编码，未知或伪编码回退 utf-8
     assert wt._extract_charset("text/html; charset=gbk") == "gbk"
     assert wt._extract_charset("text/html; charset=rot13") == "utf-8"
     assert wt._extract_charset("text/html; charset=base64") == "utf-8"

@@ -624,13 +624,18 @@ def test_files_policy_unicode_casefold_symlink_and_inode_protection(tmp_path: Pa
     with pytest.raises(ValueError):
         memory.resolve_path("data/memory/to_state/nonexistent.md", write=False)
 
-    # Inode 收集与硬链接/别名穿透拦截
+    # Inode 收集与硬链接/别名穿透拦截（覆盖 read_markdown、list_files 与 search_markdown）
     protected = collect_protected_inodes((tmp_path, config_dir, data_root))
     hardlink = data_root / "workspace" / "hardlink.txt"
     os.link(config_dir / "models.json", hardlink)
     assert hits_protected_inode(hardlink, (tmp_path, data_root), protected) is True
     with pytest.raises(ValueError):
         memory.resolve_path("data/workspace/hardlink.txt", write=False)
+    listed_ws = memory.list_files("data/workspace", "*")
+    assert "hardlink.txt" not in listed_ws
+    assert memory.search_hits("secret", root="data/workspace") == []
+    search_ws = memory.search_markdown("secret", root="data/workspace")
+    assert search_ws.startswith("未在") and "hardlink.txt" not in search_ws
 
 
 # 测试 save_rule 防间接提示词注入（untrusted_tool_seen 阻断、正常放行）与 prompts.py 非指令数据围栏声明

@@ -213,15 +213,37 @@ def _extract_charset(content_type: str) -> str:
     return info.name if getattr(info, "_is_text_encoding", True) else "utf-8"
 
 
-# 在总截止时间与最大字节数约束内分块读取响应体，防御慢速滴水挂起
-def _read_body_with_deadline(resp: object, max_bytes: int, deadline: float) -> bytes:
+# 将 URL 路径与查询串编码为 ASCII 安全请求行（支持含中文等非 ASCII 字符的公开网页地址）
+def _encode_request_target(path: str, query: str) -> str:
+    safe_path = quote(path or "/", safe="/:@!$&'()*+,;=-._~%")
+    if not query:
+        return safe_path
+    safe_query = quote(query, safe="=&/:@!$'()*+,;?-._~%")
+    return f"{safe_path}?{safe_query}"
+
+
+# 将可能包含非 ASCII 字符的主机名转换为 IDNA ASCII 形式（ASCII 主机名原样返回）
+def _ascii_hostname(host: str) -> str:
+    return host if host.isascii() else host.encode("idna").decode("ascii")
+
+
+# 按剩余总截止时间刷新底层套接字超时，防止慢速滴水响应拖延超过上限
+def _refresh_socket_timeout(sock: Any, deadline: float, message: str) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(message)
+    if sock is not None and hasattr(sock, "settimeout"):
+        sock.settimeout(remaining)
+
+
+# 在总截止时间与最大字节数约束内分块读取响应体，并在每次阻塞读前刷新套接字剩余超时
+def _read_body_with_deadline(resp: object, max_bytes: int, deadline: float, *, sock: Any = None) -> bytes:
     chunks: list[bytes] = []
     total, target = 0, max_bytes + 1
     read1 = getattr(resp, "read1", None)
     reader = read1 if callable(read1) else getattr(resp, "read")
     while total < target:
-        if time.monotonic() > deadline:
-            raise TimeoutError("响应读取超过总时长限制。")
+        _refresh_socket_timeout(sock, deadline, "响应读取超过总时长限制。")
         chunk = reader(min(16384, target - total))
         if not chunk:
             break
@@ -236,16 +258,17 @@ def _read_body_with_deadline(resp: object, max_bytes: int, deadline: float) -> b
 def _connect_pinned(
     scheme: str, host: str, port: int, pinned_ip: str, timeout: float, ssl_context: Any = None
 ) -> http.client.HTTPConnection:
+    ascii_host = _ascii_hostname(host)
     sock = socket.create_connection((pinned_ip, port), timeout=timeout)
     try:
         if scheme == "https":
             ctx = ssl_context if ssl_context is not None else ssl.create_default_context()
-            sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock = ctx.wrap_socket(sock, server_hostname=ascii_host)
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                host, port, timeout=timeout, context=ctx if isinstance(ctx, ssl.SSLContext) else None
+                ascii_host, port, timeout=timeout, context=ctx if isinstance(ctx, ssl.SSLContext) else None
             )
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn = http.client.HTTPConnection(ascii_host, port, timeout=timeout)
         conn.sock = sock
         return conn
     except BaseException:
@@ -283,11 +306,13 @@ def _default_http_get(
             req_headers = {k: v for k, v in req_headers.items() if k.lower() not in SENSITIVE_REDIRECT_HEADERS}
         prev_origin = origin
 
-        target_path = f"{parts.path or '/'}?{parts.query}" if parts.query else (parts.path or "/")
+        target_path = _encode_request_target(parts.path, parts.query)
         conn = _connect_pinned(scheme, host, port, pinned_ip, step_timeout, ssl_context=ssl_context)
         resp: http.client.HTTPResponse | None = None
         try:
+            _refresh_socket_timeout(conn.sock, deadline, "网页请求超过总时长限制。")
             conn.request("GET", target_path, headers=req_headers)
+            _refresh_socket_timeout(conn.sock, deadline, "网页请求超过总时长限制。")
             resp = conn.getresponse()
             if resp.status in REDIRECT_STATUSES:
                 loc = (resp.getheader("Location") or "").strip()
@@ -299,7 +324,11 @@ def _default_http_get(
                 continue
             if resp.status >= 400:
                 raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
-            return clean_url, resp.getheader("Content-Type") or "text/plain", _read_body_with_deadline(resp, max_bytes, deadline)
+            return (
+                clean_url,
+                resp.getheader("Content-Type") or "text/plain",
+                _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock),
+            )
         finally:
             if resp is not None:
                 resp.close()
@@ -334,20 +363,22 @@ def _default_http_post_json(
         url, resolve_dns=resolve_dns, allow_fake_ip=allow_fake_ip
     )
     parts = urlsplit(clean_url)
-    target_path = f"{parts.path or '/'}?{parts.query}" if parts.query else (parts.path or "/")
+    target_path = _encode_request_target(parts.path, parts.query)
     conn = _connect_pinned(parts.scheme.lower(), host, port, pinned_ip, max(0.001, deadline - time.monotonic()))
     resp: http.client.HTTPResponse | None = None
     try:
+        _refresh_socket_timeout(conn.sock, deadline, "搜索请求超过总时长限制。")
         conn.request(
             "POST",
             target_path,
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"User-Agent": DEFAULT_USER_AGENT, "Content-Type": "application/json", **headers},
         )
+        _refresh_socket_timeout(conn.sock, deadline, "搜索请求超过总时长限制。")
         resp = conn.getresponse()
         if resp.status >= 400:
             raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
-        raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline)
+        raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock)
     finally:
         if resp is not None:
             resp.close()
@@ -420,12 +451,11 @@ def _unwrap_ddg_url(raw_href: str) -> str:
 
 # 解析 DuckDuckGo HTML 搜索页，提取真实链接、标题与摘要片段
 def parse_duckduckgo_html(html: str, limit: int = 5) -> list[dict[str, str]]:
-    anchors = re.findall(r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.S | re.I) or [
-        (href, title)
-        for title, href in re.findall(
-            r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', html, flags=re.S | re.I
-        )
-    ]
+    anchors = re.findall(
+        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.S | re.I
+    ) or re.findall(
+        r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', html, flags=re.S | re.I
+    )
     snippets = re.findall(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>', html, flags=re.S | re.I)
     results: list[dict[str, str]] = []
     for idx, (href, raw_title) in enumerate(anchors[:limit]):

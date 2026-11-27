@@ -216,6 +216,9 @@ class TelemetryObserver:
                 sess = _touch_bounded(self._sessions, session_key, _CumulativeStats, self.config.max_sessions)
                 sess.add_turn(rec)
             else:
+                if event.kind == "turn_aborted":
+                    self._in_flight.pop(session_key, None)
+                    return
                 dur = round(max(0.0, float(event.duration_ms)), 3)
                 usage = event.usage if isinstance(event.usage, TokenUsage) else None
                 self._task_seq += 1
