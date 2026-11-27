@@ -110,9 +110,15 @@ def _execute_tool_batch(
         MappingProxyType(dict(tool_context)) if tool_context is not None else None
     )
     workers = min(len(batch), max_parallel_tools)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = [pool.submit(_execute_single_tool, tools, call, readonly_ctx) for call in batch]
-        return [fut.result() for fut in futures]
+        results = [fut.result() for fut in futures]
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return results
 
 
 # 透传单轮模型流式事件，确定性关闭底层流并返回 (StreamDone, StreamError) 终止态
