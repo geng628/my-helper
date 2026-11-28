@@ -1,4 +1,4 @@
-"""持久化结构化 RAG 检索插件（零第三方依赖）：Markdown 结构分块、独立派生 SQLite 索引库、双语 FTS5 BM25 与 Small-to-Big 上下文扩展。"""
+"""持久化两层父子 RAG 检索插件（零第三方依赖）：父子表分离、整句 Overlap、Prompt-Caching 上下文摘要缓存与双语 FTS5 BM25。"""
 from __future__ import annotations
 
 import os
@@ -6,16 +6,25 @@ import sqlite3
 import threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from personal_assistant.agent.plugins import Plugin, PluginContext
-from personal_assistant.assistant.chunker import DEFAULT_CHUNK_MAX_CHARS, DocumentChunk, chunk_markdown
+from personal_assistant.ai import AbortSignal, ModelInvoker, StreamAbortedError
+from personal_assistant.assistant.chunker import (
+    DEFAULT_CHILD_MAX_CHARS,
+    DEFAULT_CHILD_OVERLAP_CHARS,
+    DEFAULT_PARENT_MAX_CHARS,
+    ParentChunk,
+    chunk_markdown_hierarchy,
+    format_context_header,
+)
 from personal_assistant.assistant.common import require_positive_int, today_shanghai
 from personal_assistant.assistant.memory import SearchHit
+from personal_assistant.assistant.rag_contextualizer import generate_document_contexts
 from personal_assistant.assistant.text_search import (
     parse_retrieval_thresholds,
     tokenize_text,
@@ -25,12 +34,23 @@ from personal_assistant.assistant.text_search import (
 if TYPE_CHECKING:
     from personal_assistant.assistant.memory import MemoryStore
 
+_T = TypeVar("_T")
+
 RETRIEVER_NAME = "rag"
-_SCHEMA_VERSION = "1"
-_CHUNKER_VERSION = "1"
+_SCHEMA_VERSION = "2"
+_CHUNKER_VERSION = "2"
 _MAX_SNIPPET_CHARS = 4000
-_DEFAULT_CONTEXT_MAX_CHARS = 1200
 _SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
+_REQUIRED_TABLES = frozenset(
+    {
+        "index_meta",
+        "indexed_files",
+        "parent_chunks",
+        "child_chunks",
+        "child_chunks_fts",
+        "chunk_contexts",
+    }
+)
 _CORRUPT_ERROR_CODES = frozenset(
     code
     for code in (
@@ -49,7 +69,6 @@ def _is_corruption_error(error: sqlite3.DatabaseError) -> bool:
         primary = code & 0xFF
         if code in _CORRUPT_ERROR_CODES or primary in _CORRUPT_ERROR_CODES:
             return True
-        # 具备明确非损坏 SQLite 错误码（如 BUSY/LOCKED/READONLY/IOERR/PERM/FULL）时直接排除
         return False
     msg = str(error).lower()
     if any(tok in msg for tok in ("locked", "busy", "readonly", "permission", "disk i/o")):
@@ -92,8 +111,7 @@ def _unlink_sqlite_files(db_path: Path, *, data_root: Path) -> None:
     _assert_safe_index_path(db_path, data_root=data_root)
     for suffix in _SQLITE_SIDECAR_SUFFIXES:
         candidate = db_path.parent / f"{db_path.name}{suffix}"
-        if candidate.exists():
-            candidate.unlink()
+        candidate.unlink(missing_ok=True)
 
 
 # 读取磁盘路径的 (st_dev, st_ino) 身份（不跟随符号链接），不存在时返回 None
@@ -105,22 +123,32 @@ def _file_identity(path: Path) -> tuple[int, int] | None:
     return (st.st_dev, st.st_ino)
 
 
-# 判断两块相邻分块是否同章节、均无过期标签且中间仅隔空行（确保扩展上下文绝不跨越标题或跳过时效行）
-def _is_contiguous_peer(lines: list[str], prev: DocumentChunk, cur: DocumentChunk) -> bool:
-    if prev.until_date or cur.until_date or prev.section != cur.section:
-        return False
-    if cur.start_line <= prev.end_line:
-        return False
-    return all(not lines[ln - 1].strip() for ln in range(prev.end_line + 1, cur.start_line))
+# 校验非负整数参数（严格拒绝布尔值与浮点数）
+def _require_non_negative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} 必须是非负整数。")
+    return value
 
 
-# 持久化/内存双用 SQLite 派生索引容器（与权威源文件及 assistant.db 物理隔离，可随时删除无损重建）
+# 持久化/内存双用两层父子 SQLite 派生索引容器（与权威源文件物理隔离，chunk_contexts 跨配置重建保留）
 class _DerivedRAGIndex:
-    # 打开指定磁盘路径（或 :memory:）并校验 Schema 与分块配置版本，确认物理损坏时安全自愈重建
-    def __init__(self, db_path: Path | None, *, data_root: Path | None, chunk_max_chars: int) -> None:
+    # 打开指定磁盘路径（或 :memory:）并校验 Schema 与父子分块配置版本，确认物理损坏时安全自愈重建
+    def __init__(
+        self,
+        db_path: Path | None,
+        *,
+        data_root: Path | None,
+        parent_max_chars: int,
+        child_max_chars: int,
+        child_overlap_chars: int,
+        context_model: str,
+    ) -> None:
         self.db_path = db_path
         self.data_root = data_root
-        self.chunk_max_chars = chunk_max_chars
+        self.parent_max_chars = parent_max_chars
+        self.child_max_chars = child_max_chars
+        self.child_overlap_chars = child_overlap_chars
+        self.context_model = context_model
         self.conn = self._open_and_initialize()
         self.file_identity = _file_identity(self.db_path) if self.db_path is not None else None
 
@@ -187,21 +215,24 @@ class _DerivedRAGIndex:
             conn.close()
             raise
 
-    # 检查并初始化表结构与 index_meta 版本指纹（已就绪库走只读快路径零写锁，变更或首建时持 BEGIN IMMEDIATE 原子提交）
+    # 检查并初始化两层父子表与 chunk_contexts 缓存表（已就绪库走只读快路径零写锁，配置变更重建时保留 chunk_contexts）
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         expected_meta = {
             "schema_version": _SCHEMA_VERSION,
             "chunker_version": _CHUNKER_VERSION,
-            "chunk_max_chars": str(self.chunk_max_chars),
+            "parent_max_chars": str(self.parent_max_chars),
+            "child_max_chars": str(self.child_max_chars),
+            "child_overlap_chars": str(self.child_overlap_chars),
         }
         # 只读快路径：若派生库表结构与元数据指纹均已匹配，无需申请写锁
         tables = {
             str(r[0])
             for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('index_meta', 'indexed_files', 'chunks', 'chunks_fts')"
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('index_meta', 'indexed_files', 'parent_chunks', 'child_chunks', 'child_chunks_fts', 'chunk_contexts')"
             ).fetchall()
         }
-        if tables == {"index_meta", "indexed_files", "chunks", "chunks_fts"}:
+        if tables == _REQUIRED_TABLES:
             existing_ro = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             if existing_ro == expected_meta:
                 return
@@ -218,6 +249,10 @@ class _DerivedRAGIndex:
             )
             existing_meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             if existing_meta and existing_meta != expected_meta:
+                # 配置或版本变更时仅重建派生分块与倒排表，绝不清空已付费生成的 chunk_contexts 缓存表
+                conn.execute("DROP TABLE IF EXISTS child_chunks_fts")
+                conn.execute("DROP TABLE IF EXISTS child_chunks")
+                conn.execute("DROP TABLE IF EXISTS parent_chunks")
                 conn.execute("DROP TABLE IF EXISTS chunks_fts")
                 conn.execute("DROP TABLE IF EXISTS chunks")
                 conn.execute("DROP TABLE IF EXISTS indexed_files")
@@ -239,32 +274,73 @@ class _DerivedRAGIndex:
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS chunks (
+                CREATE TABLE IF NOT EXISTS parent_chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     root_key TEXT NOT NULL,
                     path TEXT NOT NULL,
-                    chunk_index INTEGER NOT NULL,
+                    parent_index INTEGER NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    section TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    table_header TEXT NOT NULL,
+                    context_summary TEXT NOT NULL DEFAULT '',
+                    until_date TEXT NOT NULL,
+                    is_archive INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_parent_root_path_idx ON parent_chunks(root_key, path, parent_index)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_parent_content_hash ON parent_chunks(content_hash)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS child_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER NOT NULL,
+                    root_key TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    child_index INTEGER NOT NULL,
                     start_line INTEGER NOT NULL,
                     end_line INTEGER NOT NULL,
                     section TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     text TEXT NOT NULL,
                     until_date TEXT NOT NULL,
-                    is_archive INTEGER NOT NULL,
-                    join_prev INTEGER NOT NULL
+                    is_archive INTEGER NOT NULL
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_root_path_idx ON chunks(root_key, path, chunk_index)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_child_parent_id ON child_chunks(parent_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_child_root_path ON child_chunks(root_key, path)"
+            )
             conn.execute(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                CREATE VIRTUAL TABLE IF NOT EXISTS child_chunks_fts USING fts5(
                     path_tokens,
                     section_tokens,
-                    body_tokens,
                     context_tokens,
+                    body_tokens,
                     tokenize='unicode61 tokenchars ''_'''
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_contexts (
+                    content_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (content_hash, model)
                 )
                 """
             )
@@ -358,25 +434,43 @@ class _DerivedRAGIndex:
                 self.conn.execute("ROLLBACK")
             raise
 
-    # 删除指定根目录与文件路径对应的全部 chunks、FTS5 倒排条目及文件指纹记录（必须在活跃写事务内调用）
+    # 删除指定根目录与文件路径对应的全部父子分块、FTS5 倒排条目及文件指纹记录（必须在活跃写事务内调用）
     def _delete_path(self, root_key: str, display_path: str) -> None:
-        rows = self.conn.execute(
-            "SELECT id FROM chunks WHERE root_key = ? AND path = ?",
+        child_rows = self.conn.execute(
+            "SELECT id FROM child_chunks WHERE root_key = ? AND path = ?",
             (root_key, display_path),
         ).fetchall()
-        if rows:
-            ids = [(r[0],) for r in rows]
-            self.conn.executemany("DELETE FROM chunks_fts WHERE rowid = ?", ids)
+        if child_rows:
+            ids = [(r[0],) for r in child_rows]
+            self.conn.executemany("DELETE FROM child_chunks_fts WHERE rowid = ?", ids)
             self.conn.execute(
-                "DELETE FROM chunks WHERE root_key = ? AND path = ?",
+                "DELETE FROM child_chunks WHERE root_key = ? AND path = ?",
                 (root_key, display_path),
             )
+        self.conn.execute(
+            "DELETE FROM parent_chunks WHERE root_key = ? AND path = ?",
+            (root_key, display_path),
+        )
         self.conn.execute(
             "DELETE FROM indexed_files WHERE root_key = ? AND path = ?",
             (root_key, display_path),
         )
 
-    # 对单篇文档执行结构分块并写入 chunks 与双语 FTS5（低权 context_tokens 仅采同章节无过期相邻块边界行）
+    # 按父块内容哈希从 chunk_contexts 查找已缓存的离线背景摘要（优先匹配当前模型，否则取最新缓存）
+    def _lookup_cached_context(self, content_hash: str) -> str:
+        row = self.conn.execute(
+            """
+            SELECT summary
+            FROM chunk_contexts
+            WHERE content_hash = ?
+            ORDER BY CASE WHEN model = ? THEN 0 ELSE 1 END, created_at DESC
+            LIMIT 1
+            """,
+            (content_hash, self.context_model),
+        ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    # 对单篇文档执行两层父子分块并写入 parent_chunks、child_chunks 与 child_chunks_fts
     def _index_file(
         self,
         root_key: str,
@@ -386,164 +480,226 @@ class _DerivedRAGIndex:
         track_expiry: bool,
         is_archive: int,
     ) -> None:
-        chunks = chunk_markdown(
+        parents, children = chunk_markdown_hierarchy(
             display_path,
             text,
-            max_chars=self.chunk_max_chars,
+            parent_max_chars=self.parent_max_chars,
+            child_max_chars=self.child_max_chars,
+            child_overlap_chars=self.child_overlap_chars,
             track_expiry=track_expiry,
         )
-        if not chunks:
+        if not parents:
             return
-        lines = text.splitlines()
-        path_tok = " ".join(tokenize_text(display_path, for_query=False))
-        join_prev_flags = [
-            _is_contiguous_peer(lines, chunks[i - 1], chunks[i]) if i > 0 else False
-            for i in range(len(chunks))
-        ]
-        # 预取每个块首尾单行分词，供紧邻常驻同章节块填入低权 context_tokens（避免块边界割裂跨行多词查询）
-        first_line_toks = [
-            " ".join(tokenize_text(chunk.text.split("\n")[0], for_query=False))
-            if chunk.text
-            else ""
-            for chunk in chunks
-        ]
-        last_line_toks = [
-            " ".join(tokenize_text(chunk.text.split("\n")[-1], for_query=False))
-            if chunk.text
-            else ""
-            for chunk in chunks
-        ]
 
-        for idx, chunk in enumerate(chunks):
-            sec_tok = " ".join(tokenize_text(chunk.section, for_query=False))
-            body_tok = " ".join(tokenize_text(chunk.text, for_query=False))
-            ctx_parts: list[str] = []
-            if join_prev_flags[idx] and last_line_toks[idx - 1]:
-                ctx_parts.append(last_line_toks[idx - 1])
-            if idx + 1 < len(chunks) and join_prev_flags[idx + 1] and first_line_toks[idx + 1]:
-                ctx_parts.append(first_line_toks[idx + 1])
-            ctx_tok = " ".join(ctx_parts)
+        path_tok = " ".join(tokenize_text(display_path, for_query=False))
+        parent_id_by_idx: dict[int, int] = {}
+        parent_ctx_tok_by_idx: dict[int, str] = {}
+
+        for parent in parents:
+            summary = "" if parent.until_date else self._lookup_cached_context(parent.content_hash)
+            cur = self.conn.execute(
+                """
+                INSERT INTO parent_chunks (
+                    root_key, path, parent_index, start_line, end_line,
+                    section, kind, content_hash, text, table_header,
+                    context_summary, until_date, is_archive
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    root_key,
+                    parent.path,
+                    parent.parent_index,
+                    parent.start_line,
+                    parent.end_line,
+                    parent.section,
+                    parent.kind,
+                    parent.content_hash,
+                    parent.text,
+                    parent.table_header,
+                    summary,
+                    parent.until_date,
+                    is_archive,
+                ),
+            )
+            parent_id = cur.lastrowid
+            if parent_id is None:
+                raise RuntimeError("写入 parent_chunks 失败，未返回有效主键。")
+            parent_id_by_idx[parent.parent_index] = int(parent_id)
+            parent_ctx_tok_by_idx[parent.parent_index] = (
+                " ".join(tokenize_text(summary, for_query=False)) if summary else ""
+            )
+
+        for child in children:
+            parent_id = parent_id_by_idx[child.parent_index]
+            sec_tok = " ".join(tokenize_text(child.section, for_query=False))
+            ctx_tok = parent_ctx_tok_by_idx.get(child.parent_index, "")
+            body_tok = " ".join(tokenize_text(child.text, for_query=False))
 
             cur = self.conn.execute(
                 """
-                INSERT INTO chunks (
-                    root_key, path, chunk_index, start_line, end_line,
-                    section, content_hash, text, until_date, is_archive, join_prev
+                INSERT INTO child_chunks (
+                    parent_id, root_key, path, child_index, start_line, end_line,
+                    section, content_hash, text, until_date, is_archive
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    parent_id,
                     root_key,
-                    chunk.path,
-                    chunk.chunk_index,
-                    chunk.start_line,
-                    chunk.end_line,
-                    chunk.section,
-                    chunk.content_hash,
-                    chunk.text,
-                    chunk.until_date,
+                    child.path,
+                    child.child_index,
+                    child.start_line,
+                    child.end_line,
+                    child.section,
+                    child.content_hash,
+                    child.text,
+                    child.until_date,
                     is_archive,
-                    1 if join_prev_flags[idx] else 0,
                 ),
             )
-            rowid = cur.lastrowid
+            child_rowid = cur.lastrowid
             self.conn.execute(
                 """
-                INSERT INTO chunks_fts (rowid, path_tokens, section_tokens, body_tokens, context_tokens)
+                INSERT INTO child_chunks_fts (rowid, path_tokens, section_tokens, context_tokens, body_tokens)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (rowid, path_tok, sec_tok, body_tok, ctx_tok),
+                (child_rowid, path_tok, sec_tok, ctx_tok, body_tok),
             )
 
-    # Small-to-Big 上下文扩展：在严格同章节、无过期且仅隔空行的边界内向左右各扩展最多 1 块，绝不越界污染或重复已展示行
-    def expand_chunk_window(
+    # 原子落盘单条背景摘要至 chunk_contexts 并同步刷新对应父块及其全部子块的 FTS5 context_tokens
+    def upsert_context_summary(
+        self,
+        *,
+        content_hash: str,
+        model_name: str,
+        summary: str,
+        write_cache: bool = True,
+    ) -> None:
+        ctx_tok = " ".join(tokenize_text(summary, for_query=False)) if summary else ""
+        created_at = datetime.now(UTC).isoformat()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if write_cache:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chunk_contexts (content_hash, model, summary, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (content_hash, model_name, summary, created_at),
+                )
+            self.conn.execute(
+                "UPDATE parent_chunks SET context_summary = ? WHERE content_hash = ? AND until_date = ''",
+                (summary, content_hash),
+            )
+            child_ids = self.conn.execute(
+                """
+                SELECT c.id
+                FROM child_chunks AS c
+                JOIN parent_chunks AS p ON p.id = c.parent_id
+                WHERE p.content_hash = ? AND p.until_date = ''
+                """,
+                (content_hash,),
+            ).fetchall()
+            if child_ids:
+                self.conn.executemany(
+                    "UPDATE child_chunks_fts SET context_tokens = ? WHERE rowid = ?",
+                    [(ctx_tok, int(row[0])) for row in child_ids],
+                )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+    # 读取指定文档的全部常驻父块（排除过期条目）及其当前 context_summary，供离线摘要器增量补全
+    def load_enrichable_parents(
         self,
         root_key: str,
-        path: str,
-        chunk_index: int,
-        start_line: int,
-        end_line: int,
-        text: str,
-        until_date: str,
-        join_prev: int,
-        *,
-        max_context_chars: int,
-        blocked_spans: list[tuple[int, int]] | None = None,
-    ) -> tuple[int, int, str]:
-        if until_date or max_context_chars <= len(text):
-            return start_line, end_line, text
-
-        peers = {
-            int(c_idx): (int(s_ln), int(e_ln), str(c_txt), str(u_date), int(j_prev))
-            for c_idx, s_ln, e_ln, c_txt, u_date, j_prev in self.conn.execute(
-                """
-                SELECT chunk_index, start_line, end_line, text, until_date, join_prev
-                FROM chunks
-                WHERE root_key = ? AND path = ? AND chunk_index IN (?, ?)
-                """,
-                (root_key, path, chunk_index - 1, chunk_index + 1),
-            ).fetchall()
-        }
-
-        blocked = blocked_spans or []
-
-        # 判断候选邻居块行区间是否已与同文件更高分命中重叠，避免向模型重复展示同一段正文
-        def _overlaps_blocked(span_start: int, span_end: int) -> bool:
-            return any(span_start <= p_end and span_end >= p_start for p_start, p_end in blocked)
-
-        cur_start, cur_end, cur_text = start_line, end_line, text
-
-        # 优先尝试拼接左侧紧邻同章节块（必须由当前块 join_prev == 1 证明无标题/无过期行阻隔）
-        left = peers.get(chunk_index - 1)
-        if join_prev == 1 and left is not None and not left[3] and not _overlaps_blocked(left[0], left[1]):
-            gap = cur_start - left[1] - 1
-            if gap >= 0:
-                sep = "\n" * (gap + 1)
-                candidate = f"{left[2]}{sep}{cur_text}"
-                if len(candidate) <= max_context_chars:
-                    cur_start = left[0]
-                    cur_text = candidate
-
-        # 再尝试拼接右侧紧邻同章节块（必须由右块 join_prev == 1 证明无标题/无过期行阻隔）
-        right = peers.get(chunk_index + 1)
-        if right is not None and right[4] == 1 and not right[3] and not _overlaps_blocked(right[0], right[1]):
-            gap = right[0] - cur_end - 1
-            if gap >= 0:
-                sep = "\n" * (gap + 1)
-                candidate = f"{cur_text}{sep}{right[2]}"
-                if len(candidate) <= max_context_chars:
-                    cur_end = right[1]
-                    cur_text = candidate
-
-        return cur_start, cur_end, cur_text
+        display_path: str,
+    ) -> list[tuple[ParentChunk, str]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+                parent_index, start_line, end_line, section, kind,
+                content_hash, text, table_header, context_summary, until_date
+            FROM parent_chunks
+            WHERE root_key = ? AND path = ? AND until_date = '' AND kind != 'expiring'
+            ORDER BY parent_index
+            """,
+            (root_key, display_path),
+        ).fetchall()
+        result: list[tuple[ParentChunk, str]] = []
+        for (
+            parent_index,
+            start_line,
+            end_line,
+            section,
+            kind,
+            content_hash,
+            body_text,
+            table_header,
+            context_summary,
+            until_date,
+        ) in rows:
+            header = format_context_header(display_path, str(section))
+            tbl_hdr = str(table_header)
+            body = str(body_text)
+            contextual = f"{header}\n{tbl_hdr}\n{body}" if tbl_hdr else f"{header}\n{body}"
+            result.append(
+                (
+                    ParentChunk(
+                        path=display_path,
+                        parent_index=int(parent_index),
+                        start_line=int(start_line),
+                        end_line=int(end_line),
+                        section=str(section),
+                        kind=str(kind),
+                        text=body,
+                        contextual_text=contextual,
+                        content_hash=str(content_hash),
+                        until_date=str(until_date),
+                        table_header=tbl_hdr,
+                    ),
+                    str(context_summary),
+                )
+            )
+        return result
 
     # 关闭底层 SQLite 连接
     def close(self) -> None:
         self.conn.close()
 
 
-# 持久化结构化 RAG 检索插件配置项（从 config/tools.json 的 retrieval 段读取）
+# 持久化两层父子 RAG 检索插件配置项（从 config/tools.json 的 retrieval 段读取）
 @dataclass(frozen=True)
 class RAGConfig:
     min_term_coverage: float = 0.22
     min_bm25_score: float = 0.1
     max_hits_per_file: int = 2
-    chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS
-    context_max_chars: int = _DEFAULT_CONTEXT_MAX_CHARS
+    parent_max_chars: int = DEFAULT_PARENT_MAX_CHARS
+    child_max_chars: int = DEFAULT_CHILD_MAX_CHARS
+    child_overlap_chars: int = DEFAULT_CHILD_OVERLAP_CHARS
     index_path: str | None = None
+    context_model: str = "default"
 
-    # 校验覆盖率、BM25 下限、单文件命中上限、分块长度、扩展窗口及派生索引相对路径边界
+    # 校验覆盖率、BM25 下限、父子分块字数、Overlap 上界、模型标识及派生索引相对路径边界
     def __post_init__(self) -> None:
         validate_retrieval_thresholds(self.min_term_coverage, self.min_bm25_score)
         require_positive_int(self.max_hits_per_file, "retrieval.max_hits_per_file")
-        require_positive_int(self.chunk_max_chars, "retrieval.chunk_max_chars")
-        require_positive_int(self.context_max_chars, "retrieval.context_max_chars")
+        require_positive_int(self.parent_max_chars, "retrieval.parent_max_chars")
+        require_positive_int(self.child_max_chars, "retrieval.child_max_chars")
+        _require_non_negative_int(self.child_overlap_chars, "retrieval.child_overlap_chars")
+        if self.child_overlap_chars >= self.child_max_chars:
+            raise ValueError("retrieval.child_overlap_chars 必须严格小于 retrieval.child_max_chars。")
         if self.index_path is not None:
             if not isinstance(self.index_path, str) or not self.index_path.strip() or "\x00" in self.index_path:
                 raise ValueError("retrieval.index_path 必须是非空相对路径字符串或省略。")
             rel = Path(self.index_path.strip())
             if rel.is_absolute() or ".." in rel.parts:
                 raise ValueError("retrieval.index_path 必须是数据目录内的相对路径，不能为绝对路径或包含 ..。")
+        if not isinstance(self.context_model, str) or not self.context_model.strip() or "\x00" in self.context_model:
+            raise ValueError("retrieval.context_model 必须是非空字符串。")
 
     # 从配置字典构造 RAGConfig 并执行严格类型与数值校验（拒绝布尔值与非整型浮点数）
     @classmethod
@@ -551,42 +707,52 @@ class RAGConfig:
         cfg = raw or {}
         coverage, min_bm25 = parse_retrieval_thresholds(cfg)
 
-        # 解析并校验可选正整数配置项，显式拒绝布尔值与浮点数隐式截断
+        # 解析并校验可选整数配置项，显式拒绝布尔值与浮点数隐式截断
         def _parse_int(key: str, default: int) -> int:
             val = cfg.get(key, default)
             if val is None:
                 return default
             if isinstance(val, bool):
-                raise ValueError(f"retrieval.{key} 必须是正整数。")
+                raise ValueError(f"retrieval.{key} 必须是整数。")
             if isinstance(val, int):
                 return val
             if isinstance(val, str):
                 try:
                     return int(val.strip())
                 except ValueError as error:
-                    raise ValueError(f"retrieval.{key} 必须是正整数。") from error
-            raise ValueError(f"retrieval.{key} 必须是正整数，不支持浮点或非整型值。")
+                    raise ValueError(f"retrieval.{key} 必须是整数。") from error
+            raise ValueError(f"retrieval.{key} 必须是整数，不支持浮点或非整型值。")
 
         per_file = _parse_int("max_hits_per_file", 2)
-        chunk_chars = _parse_int("chunk_max_chars", DEFAULT_CHUNK_MAX_CHARS)
-        context_chars = _parse_int("context_max_chars", _DEFAULT_CONTEXT_MAX_CHARS)
+        parent_chars = _parse_int("parent_max_chars", DEFAULT_PARENT_MAX_CHARS)
+        child_chars = _parse_int("child_max_chars", DEFAULT_CHILD_MAX_CHARS)
+        overlap_chars = _parse_int("child_overlap_chars", DEFAULT_CHILD_OVERLAP_CHARS)
 
         raw_index_path = cfg.get("index_path")
         if raw_index_path is not None and not isinstance(raw_index_path, str):
             raise TypeError("retrieval.index_path 必须是字符串。")
         index_path = raw_index_path.strip() if isinstance(raw_index_path, str) and raw_index_path.strip() else None
 
+        raw_ctx_model = cfg.get("context_model")
+        if raw_ctx_model is not None and not isinstance(raw_ctx_model, str):
+            raise TypeError("retrieval.context_model 必须是字符串。")
+        context_model = (
+            raw_ctx_model.strip() if isinstance(raw_ctx_model, str) and raw_ctx_model.strip() else "default"
+        )
+
         return cls(
             min_term_coverage=coverage,
             min_bm25_score=min_bm25,
             max_hits_per_file=per_file,
-            chunk_max_chars=chunk_chars,
-            context_max_chars=context_chars,
+            parent_max_chars=parent_chars,
+            child_max_chars=child_chars,
+            child_overlap_chars=overlap_chars,
             index_path=index_path,
+            context_model=context_model,
         )
 
 
-# 持久化结构化 RAG 检索引擎（实现 RetrieverProtocol，线程安全，读写模式落盘到 data/state/rag_index.db，只读模式零写盘）
+# 持久化两层父子 RAG 检索引擎（实现 RetrieverProtocol，线程安全，读写落盘 data/state/rag_index.db，只读零写盘）
 class RAGRetriever:
     name = RETRIEVER_NAME
 
@@ -601,7 +767,7 @@ class RAGRetriever:
         if memory.read_only:
             return None
         base = memory.data_root
-        rel = Path(self.config.index_path) if self.config.index_path is not None else Path("state") / "rag_index.db"
+        rel = Path(self.config.index_path.strip()) if self.config.index_path is not None else Path("state") / "rag_index.db"
         db_path = base / rel
         return _assert_safe_index_path(db_path, data_root=base)
 
@@ -625,24 +791,67 @@ class RAGRetriever:
         created = _DerivedRAGIndex(
             db_path,
             data_root=memory.data_root if db_path is not None else None,
-            chunk_max_chars=self.config.chunk_max_chars,
+            parent_max_chars=self.config.parent_max_chars,
+            child_max_chars=self.config.child_max_chars,
+            child_overlap_chars=self.config.child_overlap_chars,
+            context_model=self.config.context_model,
         )
         self._indices[cache_key] = created
         return cache_key, created
 
-    # 将命中分块原文渲染为带精确行号前缀的片段（使用 split("\n") 保证与 start_line..end_line 精确对齐）
+    # 在持锁状态下执行依赖派生库的操作，遇到确认物理损坏的磁盘库时自动清理重建并安全重试一次
+    def _with_index_recovery(
+        self,
+        memory: "MemoryStore",
+        operation: Callable[[_DerivedRAGIndex], _T],
+    ) -> _T:
+        with self._lock:
+            for attempt in range(2):
+                cache_key, index = self._get_index(memory)
+                try:
+                    return operation(index)
+                except sqlite3.DatabaseError as error:
+                    if (
+                        attempt == 0
+                        and index.db_path is not None
+                        and index.data_root is not None
+                        and _is_corruption_error(error)
+                    ):
+                        try:
+                            index.close()
+                        finally:
+                            self._indices.pop(cache_key, None)
+                        _unlink_sqlite_files(index.db_path, data_root=index.data_root)
+                        continue
+                    raise
+        raise RuntimeError("派生索引操作异常终止。")
+
+    # 将命中的完整父块原文渲染为带可选背景摘要、续片表头与精确行号前缀的片段
     @staticmethod
-    def _format_chunk_snippet(text: str, start_line: int) -> str:
-        numbered = "\n".join(
+    def _format_parent_snippet(
+        text: str,
+        start_line: int,
+        *,
+        table_header: str = "",
+        context_summary: str = "",
+    ) -> str:
+        prefix_lines: list[str] = []
+        if context_summary:
+            prefix_lines.append(f"  [背景: {context_summary}]")
+        if table_header:
+            for hdr_line in table_header.split("\n"):
+                prefix_lines.append(f"  (表头) {hdr_line}")
+        body_lines = [
             f"  {n}: {line}"
             for n, line in enumerate(text.split("\n"), start=start_line)
-        )
-        if len(numbered) <= _MAX_SNIPPET_CHARS:
-            return numbered
-        cut = numbered[:_MAX_SNIPPET_CHARS].rsplit("\n", 1)[0]
-        return f"{cut}\n  …（分块内容较长，完整内容请调用 read_markdown 按行查看）"
+        ]
+        rendered = "\n".join(prefix_lines + body_lines)
+        if len(rendered) <= _MAX_SNIPPET_CHARS:
+            return rendered
+        cut = rendered[:_MAX_SNIPPET_CHARS].rsplit("\n", 1)[0]
+        return f"{cut}\n  …（父块内容较长，完整内容请调用 read_markdown 按行查看）"
 
-    # 在已打开的派生索引上执行增量同步、BM25 检索、覆盖率门控、Small-to-Big 扩展与多样性重排
+    # 在已打开的派生索引上执行增量同步、子块 BM25 检索、覆盖率门控、按 parent_id 聚合去重与多样性重排
     def _sync_and_query(
         self,
         index: _DerivedRAGIndex,
@@ -662,120 +871,112 @@ class RAGRetriever:
         fts_expr = " OR ".join(f'"{term}"' for term in query_terms)
         query_set = set(query_terms)
         min_matched = 2 if len(query_set) >= 4 else 1
-        candidate_limit = max(limit * 16, 80)
+        candidate_limit = max(limit * 20, 100)
 
         rows = index.conn.execute(
             """
             SELECT
-                c.path,
-                c.chunk_index,
-                c.start_line,
-                c.end_line,
-                c.section,
-                c.text,
-                c.until_date,
-                c.join_prev,
-                -bm25(chunks_fts, 0.4, 1.5, 3.0, 0.4) AS bm25_score,
+                p.id AS parent_id,
+                p.path,
+                p.start_line,
+                p.end_line,
+                p.section,
+                p.text AS parent_text,
+                p.table_header,
+                p.context_summary,
+                -bm25(child_chunks_fts, 0.4, 1.5, 1.8, 3.0) AS bm25_score,
                 f.path_tokens,
                 f.section_tokens,
-                f.body_tokens,
-                f.context_tokens
-            FROM chunks_fts AS f
-            JOIN chunks AS c ON c.id = f.rowid
-            WHERE chunks_fts MATCH ?
+                f.context_tokens,
+                f.body_tokens
+            FROM child_chunks_fts AS f
+            JOIN child_chunks AS c ON c.id = f.rowid
+            JOIN parent_chunks AS p ON p.id = c.parent_id
+            WHERE child_chunks_fts MATCH ?
               AND c.root_key = ?
               AND (? = 1 OR c.is_archive = 0)
               AND (c.until_date = '' OR c.until_date >= ?)
-            ORDER BY bm25(chunks_fts, 0.4, 1.5, 3.0, 0.4)
+            ORDER BY bm25(child_chunks_fts, 0.4, 1.5, 1.8, 3.0)
             LIMIT ?
             """,
             (fts_expr, root_key, 1 if searching_archive else 0, ref_day_iso, candidate_limit),
         ).fetchall()
 
-        total_chunks = int(
+        total_children = int(
             index.conn.execute(
-                "SELECT COUNT(*) FROM chunks WHERE root_key = ?",
+                "SELECT COUNT(*) FROM child_chunks WHERE root_key = ?",
                 (root_key,),
             ).fetchone()[0]
         )
-        scored: list[tuple[float, str, int, int, int, str, str, str, int]] = []
+
+        # 按 parent_id 聚合去重：同一父块下多个子块同时命中时取最高子块得分并只返回 1 条完整父块
+        best_by_parent: dict[int, tuple[float, str, int, int, str, str, str, str]] = {}
         for (
+            parent_id,
             path,
-            chunk_index,
             start_line,
             end_line,
             section,
-            body_text,
-            until_date,
-            join_prev,
+            parent_text,
+            table_header,
+            context_summary,
             bm25_score,
             p_tok,
             s_tok,
-            b_tok,
             c_tok,
+            b_tok,
         ) in rows:
             bm25_val = max(0.0, float(bm25_score))
-            core_terms = set(f"{p_tok} {s_tok} {b_tok}".split())
-            all_terms = core_terms | set(str(c_tok).split())
-            matched_core = query_set & core_terms
+            all_terms = set(f"{p_tok} {s_tok} {c_tok} {b_tok}".split())
             matched_all = query_set & all_terms
-            if not matched_core or len(matched_all) < min_matched:
+            if len(matched_all) < min_matched:
                 continue
             coverage = len(matched_all) / len(query_set)
             high_coverage = coverage >= 0.6
-            if total_chunks >= 10 and bm25_val < self.config.min_bm25_score and not high_coverage:
+            if total_children >= 10 and bm25_val < self.config.min_bm25_score and not high_coverage:
                 continue
             high_conf_bm25 = len(matched_all) >= 3 and bm25_val >= 10.0
             if coverage < self.config.min_term_coverage and not high_conf_bm25:
                 continue
-            body_terms = set(str(b_tok).split())
-            body_ratio = len(query_set & body_terms) / len(query_set)
+
+            body_and_ctx = set(f"{b_tok} {c_tok}".split())
+            body_ratio = len(query_set & body_and_ctx) / len(query_set)
             base_score = max(bm25_val, self.config.min_bm25_score, 0.1)
             final_score = round(base_score * (1.0 + 0.6 * coverage + 0.4 * body_ratio), 4)
-            scored.append(
-                (
+
+            pid = int(parent_id)
+            prev = best_by_parent.get(pid)
+            if prev is None or final_score > prev[0]:
+                best_by_parent[pid] = (
                     final_score,
                     str(path),
-                    int(chunk_index),
                     int(start_line),
                     int(end_line),
                     str(section),
-                    str(body_text),
-                    str(until_date),
-                    int(join_prev),
+                    str(parent_text),
+                    str(table_header),
+                    str(context_summary),
                 )
-            )
 
-        scored.sort(key=lambda item: (-item[0], item[1], item[3], item[4]))
+        ranked = sorted(best_by_parent.values(), key=lambda item: (-item[0], item[1], item[2], item[3]))
 
-        # 1. Small-to-Big 上下文扩展 + 同文件区间去重（防止同一上下文窗口被重复展示）
-        expanded: list[tuple[float, str, int, int, str, str]] = []
+        # 同文件行区间去重（防御性保障同一行区间不重复展示）
+        deduped: list[tuple[float, str, int, int, str, str, str, str]] = []
         used_spans_by_file: dict[str, list[tuple[int, int]]] = {}
-        for score, path, c_idx, s_ln, e_ln, section, body_text, until_date, join_prev in scored:
+        for item in ranked:
+            _, path, s_ln, e_ln, _, _, _, _ = item
             prev_spans = used_spans_by_file.setdefault(path, [])
             if any(s_ln <= p_end and e_ln >= p_start for p_start, p_end in prev_spans):
                 continue
-            exp_start, exp_end, exp_text = index.expand_chunk_window(
-                root_key,
-                path,
-                c_idx,
-                s_ln,
-                e_ln,
-                body_text,
-                until_date,
-                join_prev,
-                max_context_chars=self.config.context_max_chars,
-                blocked_spans=prev_spans,
-            )
-            prev_spans.append((exp_start, exp_end))
-            expanded.append((score, path, exp_start, exp_end, section, exp_text))
+            prev_spans.append((s_ln, e_ln))
+            deduped.append(item)
 
-        # 2. 按 max_hits_per_file 做多文件多样性优先挑选，剩余名额从溢出候选中补齐
-        primary_picks: list[tuple[float, str, int, int, str, str]] = []
-        overflow: list[tuple[float, str, int, int, str, str]] = []
+        # 按 max_hits_per_file 做多文件多样性优先挑选，剩余名额从溢出候选中补齐
+        primary_picks: list[tuple[float, str, int, int, str, str, str, str]] = []
+        overflow: list[tuple[float, str, int, int, str, str, str, str]] = []
         per_file_counts: dict[str, int] = {}
         cap = self.config.max_hits_per_file if limit >= 4 else limit
-        for item in expanded:
+        for item in deduped:
             path = item[1]
             count = per_file_counts.get(path, 0)
             if count < cap:
@@ -791,10 +992,15 @@ class RAGRetriever:
                 start_line=start_line,
                 end_line=end_line,
                 section=section,
-                snippet=self._format_chunk_snippet(body_text, start_line),
+                snippet=self._format_parent_snippet(
+                    parent_text,
+                    start_line,
+                    table_header=table_header,
+                    context_summary=context_summary,
+                ),
                 score=score,
             )
-            for score, path, start_line, end_line, section, body_text in chosen
+            for score, path, start_line, end_line, section, parent_text, table_header, context_summary in chosen
         ]
 
     # 对外检索入口：使用规范相对 root_key，遇到运行期确认物理损坏的磁盘派生库时自动清理重建并重试一次
@@ -813,37 +1019,186 @@ class RAGRetriever:
         ref_day_iso = (today or today_shanghai()).isoformat()
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
-        # 使用规范相对路径作为 root_key，避免数据目录拷贝迁移时残留失效的绝对路径脏行
         root_key = memory.display_path(target_dir)
 
-        with self._lock:
-            for attempt in range(2):
-                cache_key, index = self._get_index(memory)
-                try:
-                    return self._sync_and_query(
-                        index,
-                        root_key,
-                        searchable,
-                        searching_archive=searching_archive,
-                        query_terms=query_terms,
-                        ref_day_iso=ref_day_iso,
-                        limit=limit,
-                    )
-                except sqlite3.DatabaseError as error:
-                    if (
-                        attempt == 0
-                        and index.db_path is not None
-                        and index.data_root is not None
-                        and _is_corruption_error(error)
-                    ):
-                        try:
-                            index.close()
-                        finally:
-                            self._indices.pop(cache_key, None)
-                        _unlink_sqlite_files(index.db_path, data_root=index.data_root)
-                        continue
-                    raise
-        return []
+        return self._with_index_recovery(
+            memory,
+            lambda index: self._sync_and_query(
+                index,
+                root_key,
+                searchable,
+                searching_archive=searching_archive,
+                query_terms=query_terms,
+                ref_day_iso=ref_day_iso,
+                limit=limit,
+            ),
+        )
+
+    # 同步目标根目录并返回当前派生索引的详细只读状态（供 /rag status 展示）
+    def index_status(self, memory: "MemoryStore", root: str = "data/memory") -> dict[str, object]:
+        target_dir = memory.resolve_path(root, write=False)
+        searchable, searching_archive = memory.iter_searchable_files(root)
+        root_key = memory.display_path(target_dir)
+
+        # 同步后汇总目标根目录下的文件数、父子块数及上下文摘要覆盖情况
+        def _collect(index: _DerivedRAGIndex) -> dict[str, object]:
+            index.sync(root_key, searchable, is_archive_root=searching_archive)
+            indexed_files = int(
+                index.conn.execute(
+                    "SELECT COUNT(*) FROM indexed_files WHERE root_key = ?",
+                    (root_key,),
+                ).fetchone()[0]
+            )
+            parent_chunks = int(
+                index.conn.execute(
+                    "SELECT COUNT(*) FROM parent_chunks WHERE root_key = ?",
+                    (root_key,),
+                ).fetchone()[0]
+            )
+            child_chunks = int(
+                index.conn.execute(
+                    "SELECT COUNT(*) FROM child_chunks WHERE root_key = ?",
+                    (root_key,),
+                ).fetchone()[0]
+            )
+            enriched_parents = int(
+                index.conn.execute(
+                    "SELECT COUNT(*) FROM parent_chunks WHERE root_key = ? AND context_summary != ''",
+                    (root_key,),
+                ).fetchone()[0]
+            )
+            cached_contexts = int(
+                index.conn.execute("SELECT COUNT(*) FROM chunk_contexts").fetchone()[0]
+            )
+            if index.db_path is not None and index.data_root is not None:
+                rel_db = index.db_path.relative_to(index.data_root).as_posix()
+                db_label = f"data/{rel_db}"
+            else:
+                db_label = ":memory:"
+            return {
+                "retriever": RETRIEVER_NAME,
+                "root": root_key,
+                "db_path": db_label,
+                "schema_version": _SCHEMA_VERSION,
+                "parent_max_chars": self.config.parent_max_chars,
+                "child_max_chars": self.config.child_max_chars,
+                "child_overlap_chars": self.config.child_overlap_chars,
+                "indexed_files": indexed_files,
+                "parent_chunks": parent_chunks,
+                "child_chunks": child_chunks,
+                "enriched_parents": enriched_parents,
+                "cached_contexts": cached_contexts,
+            }
+
+        return self._with_index_recovery(memory, _collect)
+
+    # 离线为目标根目录的常驻父块生成 Prompt-Caching 背景摘要，逐条立即落盘并支持 AbortSignal 断点续跑
+    def enrich_contexts(
+        self,
+        memory: "MemoryStore",
+        llm: ModelInvoker,
+        *,
+        root: str = "data/memory",
+        model_name: str = "default",
+        min_doc_chars: int = 0,
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, int]:
+        if memory.read_only:
+            raise ValueError("只读模式下不支持写入离线上下文摘要。")
+        if not isinstance(model_name, str) or not model_name.strip() or "\x00" in model_name:
+            raise ValueError("model_name 必须是非空字符串。")
+        clean_model = model_name.strip()
+        min_chars = _require_non_negative_int(min_doc_chars, "min_doc_chars")
+
+        target_dir = memory.resolve_path(root, write=False)
+        searchable, searching_archive = memory.iter_searchable_files(root)
+        root_key = memory.display_path(target_dir)
+
+        self._with_index_recovery(
+            memory,
+            lambda index: index.sync(root_key, searchable, is_archive_root=searching_archive),
+        )
+
+        stats = {
+            "files": 0,
+            "parents_total": 0,
+            "enriched": 0,
+            "cached_hits": 0,
+            "skipped": 0,
+        }
+
+        for resolved, display_path, _ in searchable:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "离线上下文摘要已取消")
+            try:
+                raw_text = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            # 在持锁状态下读取本文件的常驻父块列表与已有缓存命中情况
+            def _prepare_file(index: _DerivedRAGIndex) -> tuple[list[ParentChunk], int, int]:
+                parent_rows = index.load_enrichable_parents(root_key, display_path)
+                if not parent_rows:
+                    return [], 0, 0
+                if len(raw_text) < min_chars:
+                    return [], 0, len(parent_rows)
+                missing: list[ParentChunk] = []
+                seen_missing_hashes: set[str] = set()
+                cached_cnt = 0
+                for parent, current_summary in parent_rows:
+                    row = index.conn.execute(
+                        "SELECT summary FROM chunk_contexts WHERE content_hash = ? AND model = ?",
+                        (parent.content_hash, clean_model),
+                    ).fetchone()
+                    if row is not None:
+                        cached_summary = str(row[0])
+                        cached_cnt += 1
+                        if current_summary != cached_summary:
+                            index.upsert_context_summary(
+                                content_hash=parent.content_hash,
+                                model_name=clean_model,
+                                summary=cached_summary,
+                                write_cache=False,
+                            )
+                    elif parent.content_hash not in seen_missing_hashes:
+                        seen_missing_hashes.add(parent.content_hash)
+                        missing.append(parent)
+                return missing, cached_cnt, 0
+
+            missing_parents, cached_cnt, skipped_cnt = self._with_index_recovery(memory, _prepare_file)
+            stats["files"] += 1
+            stats["parents_total"] += len(missing_parents) + cached_cnt + skipped_cnt
+            stats["cached_hits"] += cached_cnt
+            stats["skipped"] += skipped_cnt
+
+            if not missing_parents:
+                continue
+
+            # 在锁外流式调用模型生成背景摘要，每产出 1 条立即持锁原子提交至 chunk_contexts 与 FTS5
+            produced_hashes: set[str] = set()
+            for content_hash, summary in generate_document_contexts(
+                display_path,
+                raw_text,
+                missing_parents,
+                llm,
+                abort_signal=abort_signal,
+            ):
+                produced_hashes.add(content_hash)
+                self._with_index_recovery(
+                    memory,
+                    lambda index, h=content_hash, s=summary: index.upsert_context_summary(
+                        content_hash=h,
+                        model_name=clean_model,
+                        summary=s,
+                        write_cache=True,
+                    ),
+                )
+                stats["enriched"] += 1
+
+            # 统计模型返回空白摘要的父块数
+            stats["skipped"] += sum(1 for p in missing_parents if p.content_hash not in produced_hashes)
+
+        return stats
 
     # 安全关闭本实例持有的全部派生 SQLite 连接（单个关闭异常不阻断其余句柄回收）
     def close(self) -> None:
@@ -866,7 +1221,7 @@ def create_retriever(config: dict[str, object]) -> RAGRetriever:
     return RAGRetriever(RAGConfig.from_dict(config))
 
 
-# 持久化结构化 RAG 主板插件（外层继承 Plugin ABC，内层向 retrievers 插槽注册 rag 检索引擎并线程安全托管连接回收）
+# 持久化两层父子 RAG 主板插件（外层继承 Plugin ABC，内层向 retrievers 插槽注册 rag 检索引擎并线程安全托管连接回收）
 class RAGRetrieverPlugin(Plugin):
     plugin_id = RETRIEVER_NAME
 

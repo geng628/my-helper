@@ -32,7 +32,7 @@
 ### 1. 五大插件主板插槽与单次初始化生命周期
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供 Markdown 结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)）、独立持久化派生库 `data/state/rag_index.db`、双语 FTS5 BM25 与 Small-to-Big 同章节上下文扩展，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供两层父子结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)：中英文句界切分、超长表格续片保表头与可配整句 Overlap）、基于同文档 Prompt Caching 前缀的离线上下文摘要器（[personal_assistant/assistant/rag_contextualizer.py](personal_assistant/assistant/rag_contextualizer.py)，CLI `/rag status` 与 `/rag enrich` 触发）、独立持久化派生库 `data/state/rag_index.db`（`parent_chunks` + `child_chunks` + `child_chunks_fts` + 跨重建保留的 `chunk_contexts`）与按 `parent_id` 聚合去重的双语 FTS5 BM25 检索，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
   4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，支持外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动接入新厂商（`ToolsConfig.build_provider_registry()` 将插件翻译器与内建四大翻译器合并为应用级隔离副本，不污染进程全局注册表）。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（241 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（244 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -147,10 +147,10 @@ uv run python -m evals --mode memory \
 
 ### 1. 离线检索基准（确定性，零 API 调用）
 
-| 数据集 | 性质与规模 | `linear` 基线（`552863d`） | 旧 `fts5_bm25`（`8b19d97`） | `rag` 结构分块 + Small-to-Big（本版） | 说明 |
-| --- | --- | --- | --- | --- | --- |
-| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | `exact` 类 MRR 升至 `1.00`；剩余 2 题为纯同义零共享词改写与跨文档分散引用（待 Step 2 向量召回） |
-| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622`，Quote `60.2%` | 通过 `52.0%`（104/200），Recall `67.1%`，**MRR `0.651`**，Quote `60.1%` | `single-hop` 升至 `86.0%`（43/50）、`multi-hop` MRR `0.492 -> 0.552`；纯词面 `open-domain`（`40.8%`）与 `multi-hop`（`43.6%`）待 Step 2 稠密向量 + RRF 突破 |
+| 数据集 | 性质与规模 | `linear` 基线（`552863d`） | 旧 `fts5_bm25`（`8b19d97`） | `rag` Step 1（`d96e25c`） | `rag` Step 1.5 父子索引 + 整句 Overlap（本版） | 说明 |
+| --- | --- | --- | --- | --- | --- | --- |
+| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | `exact` 类 MRR 维持 `1.00`；剩余 2 题为纯同义零共享词改写与跨文档分散引用（待 Step 2 向量召回） |
+| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622`，Quote `60.2%` | 通过 `52.0%`（104/200），Recall `67.1%`，MRR `0.651`，Quote `60.1%` | **通过 `53.0%`（106/200）**，Recall `67.2%`，MRR `0.631`，**Quote `60.7%`** | 默认 `parent=1000 / child=320 / overlap=64`（20% 重叠，子块仅增 `+0.9%`），通过率与引文覆盖均超 Step 1 与旧 `fts5_bm25`；纯词面 `open-domain` 与 `multi-hop` 待 Step 2 稠密向量 + RRF 突破 |
 
 ### 2. 真实模型多轮记忆基准（中立 `v2-neutral` Judge 复测于 `1b421d2`）
 
@@ -177,7 +177,7 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与 DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 SQLite FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习卡片与间隔复习插件（save_study_card / list_due_reviews）
-│   ├── rag_retriever.py               # RetrieverProtocol：结构化分块 + 持久化派生库 + FTS5 BM25/Small-to-Big 检索
+│   ├── rag_retriever.py               # RetrieverProtocol：两层父子索引 + 持久化派生库 + FTS5 BM25 + 上下文摘要缓存
 │   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/reasoning/cache_retention）
 │   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
@@ -193,8 +193,9 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
-│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
-│                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
+│                                      #          rag_contextualizer.py / prompts.py / context.py / memory.py /
+│                                      #          builtin_tools.py / memory_lifecycle.py / db.py / consolidator.py /
+│                                      #          commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本
 │   ├── web_chat.py                    # 本地 HTTP/SSE 服务

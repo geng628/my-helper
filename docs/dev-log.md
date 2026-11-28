@@ -19,7 +19,7 @@
    - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫、`ai/` 内部三层解耦守卫、上层零 OpenAI 方言符号守卫及 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树零 `# type: ignore` 静态硬守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
-   - Slot 2 `RetrieverProtocol`（`plugins/rag_retriever.py` 持久化结构分块 + FTS5 BM25 + Small-to-Big，未挂载时由 `LinearRetriever` 兜底）；
+   - Slot 2 `RetrieverProtocol`（`plugins/rag_retriever.py` 持久化两层父子索引 + 整句 Overlap + FTS5 BM25 + 离线 Prompt-Caching 上下文摘要缓存，未挂载时由 `LinearRetriever` 兜底）；
    - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，支持 `api`/`reasoning`/`max_tokens`/`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设，`render` 采用显式强类型具名参数，核心参数对齐纯通用协议、扩展参数收敛于插件侧）；
    - Slot 4 `ApiProvider`（直接复用 Layer 1 宪法，供外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动扩展，由 `ToolsConfig.build_provider_registry()` 与内建四大翻译器合并为应用级隔离副本）；
    - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本，遇 `StreamError` 或 `turn_aborted` 自动清理在途态）；
@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `233 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `244 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -92,6 +92,8 @@
 | --- | --- | --- | --- |
 | `552863d` | `linear` | 通过 `32/40 (80.0%)`；Recall `96.6%`，MRR `0.908`，负例干净度 `63.6%` | 通过 `57/200 (28.5%)`；Recall `42.75%`，MRR `0.3587` |
 | `d2e20e3` ~ `1b421d2` | `fts5_bm25` | 通过 `38/40 (95.0%)`；Recall `94.83%`，MRR `0.9483`，Quote `94.83%`，负例干净度 `100%` | 通过 `105/200 (52.5%)`；Recall `68.51%`（`single-hop` `94.0%` / `temporal` `92.0%` / `open-domain` `44.2%` / `multi-hop` `43.9%`），MRR `0.6221`，Quote `60.17%` |
+| `d96e25c` | `rag`（Step 1） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | 通过 `104/200 (52.0%)`；Recall `67.12%`，**MRR `0.6508`**，Quote `60.14%`（`single-hop` `86.0%`） |
+| Issue `#103`（本次提交） | `rag`（Step 1.5 父子索引） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | **通过 `106/200 (53.0%)`**；Recall `67.16%`，MRR `0.6307`，**Quote `60.66%`**（默认 `parent=1000 / child=320 / overlap=64`） |
 
 ### 2. 真实模型多轮记忆评测（区分历史 `v1` Judge 与去泄漏 `v2-neutral` Judge）
 
@@ -282,7 +284,25 @@
   - 仓库内 40 题离线检索（`sample_cases.jsonl`）：`38/40 (95.0%)` 持平，Recall `0.9483`、Quote `0.9483`、负例干净度 `100%`，**MRR `0.9483 → 0.9655`**（`exact` 类 MRR `0.95 → 1.00`）；
   - 外部公开 `LoCoMo Search`（200 题 / 272 篇 `.md`）：`105/200 (52.5%) → 104/200 (52.0%)`（Recall `0.6851 → 0.6712`，Quote `0.6017 → 0.6014`，**MRR `0.6221 → 0.6508`**，`single-hop` `82% → 86%`）；1 题净差源自词面长块 BM25 长度归一化权衡，待 Step 2 稠密向量 + RRF 正面突破词面上限；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
-- **已知边界与下一步**：当前 Step 1 仅激活词面 BM25 通道，零词面重叠同义改写与隐式多跳仍受词面上限约束；下一步进入 **RAG Step 2**：接入单轨标准 `/v1/embeddings` 客户端、`rag_index.db` 的 `(content_hash, model_id)` 向量缓存表与 Python 3.12 `math.sumprod` 精确余弦 + RRF 混合检索。
+- **已知边界与下一步**：当前 Step 1 仅激活词面 BM25 通道，零词面重叠同义改写与隐式多跳仍受词面上限约束；下一步进入 **RAG Step 1.5**（索引期增强）与 **Step 2**（向量混合检索）。
+
+### [2026-11-28] RAG Step 1.5：索引期增强（句界切分/长表保表头、整句 Overlap、两层父子索引与 Prompt-Caching 离线上下文摘要）（Issue `#103`，本次提交）
+- **背景与目标**：在进入 Step 2 向量化之前，把 RAG 索引期最影响召回上限的四件事一次性打扎实：① 句子边界切分 + 超长表格续片保表头；② 可配整句/整行对齐 Overlap 并用客观消融实验实测“度”；③ 以规范化两层父子表（`parent_chunks` + `child_chunks`）单轨替代 Step 1 的 `join_prev` 邻居拼接；④ 落地 Anthropic Contextual Retrieval 风格的 Prompt-Caching 离线上下文摘要，消除“该公司”“本季度”“如上表所示”等代词指代盲区，同时保持零第三方运行依赖与零查询期 LLM 延迟。
+- **核心改动**：
+  - **父子结构化分块器单轨升级（[../personal_assistant/assistant/chunker.py](../personal_assistant/assistant/chunker.py)）**：单轨导出 `ParentChunk`、`ChildChunk`、`chunk_markdown_hierarchy`、`format_context_header`、`split_sentences`（默认 `parent_max_chars=1000`、`child_max_chars=320`、`child_overlap_chars=64`）；中英文句界切分保护小数 `3.14`、版本号 `v2.0`、文件名 `rag_index.db`、有序列表前缀 `1.`、常见缩写与闭合引号；超出 `2 * parent_max_chars` 的超长 GFM 表格拆分时续片记录 `table_header` 并在子块索引与片段渲染中复现表头且保持源码行号一一对齐；父块内子块按整句/短列表整行边界切分并向回吸纳 `<= child_overlap_chars` 的完整尾部单元（绝不截断半句、绝不跨标题或混入过期条目、代码块/表格/过期块保持 1:1 不拆碎）。
+  - **Prompt-Caching 离线上下文摘要器（新增 [../personal_assistant/assistant/rag_contextualizer.py](../personal_assistant/assistant/rag_contextualizer.py)）**：`generate_document_contexts()` 对同篇文档全部常驻父块构造逐字节完全一致的 `system_prompt`（固定指令 + 完整文档正文）并透传 `cache_retention="short"`、`session_id=f"rag-ctx:{path}"` 与 `abort_signal`，逐条产出 1–2 句单行背景说明，自动跳过带 `(until: ...)` 的过期条目防止敏感时效信息泄漏进长期缓存。
+  - **两层父子持久化索引与 CLI 接入（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../config/tools.json](../config/tools.json)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)）**：`rag_index.db` 升级至 `schema_version="2"`（`parent_chunks` + `child_chunks(parent_id)` + `child_chunks_fts(path_tokens, section_tokens, context_tokens, body_tokens)` + `chunk_contexts(content_hash, model, summary, created_at)`），移除旧 `expand_chunk_window` / `join_prev`；参数或版本变更触发分块重建时**保留 `chunk_contexts` 表**避免重复计费；检索命中子块后按 `parent_id` 取最高分聚合去重并回送完整父块（带 `[背景: ...]` 与续片 `(表头)` 前缀）；`RAGRetriever` 新增 `index_status()` 与支持逐条落盘断点续跑的 `enrich_contexts()`（持锁外调用 LLM、每产出 1 条立即 `BEGIN IMMEDIATE` 原子提交）；CLI REPL 新增 `/rag status [目录]` 与 `/rag enrich [目录]`（复用轻量 `consolidator` 模型并接入 `_sigint_to_abort`）。
+  - **测试覆盖**：重写 [../tests/test_chunker.py](../tests/test_chunker.py)、更新 [../tests/test_rag_plugin.py](../tests/test_rag_plugin.py)、新增 [../tests/test_rag_contextualizer.py](../tests/test_rag_contextualizer.py)，覆盖句界保护、超长表格保表头、整句 Overlap 校验、Prompt Caching 逐字节一致前缀、代词指代盲区召回、`AbortSignal` 断点续跑、参数重建保留 `chunk_contexts` 及全部安全/并发/损坏自愈回归。
+- **验证与同口径对比（`d96e25c` → 本次提交，坚持零外集调参，直接沿用预承诺默认 `1000 / 320 / 64`）**：
+  - 单元测试：`241 passed → 244 passed`（全绿，含 `tests/test_architecture.py`、`memory.py` `593 <= 600` 行预算）；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
+  - **Overlap 消融实验（固定 `parent_max_chars=1000, child_max_chars=320`，零 LLM 上下文补全）**：
+    | `child_overlap_chars`（占子块比例） | `sample_cases.jsonl`（40 题） | `LoCoMo Search`（200 题 / 272 `.md`） | `LoCoMo` 子块数（较 0 重叠） | 工程观察 |
+    | --- | --- | --- | --- | --- |
+    | `0`（0%） | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | `107/200 (53.5%)`, Recall `0.6741`, MRR `0.6266`, Quote `0.6116` | `3,644`（基准） | 零重复词频；长对话跨句问答偶发缝隙割裂 |
+    | **`64`（20%，默认）** | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | **`106/200 (53.0%)`**, Recall `0.6716`, **MRR `0.6307`**, Quote `0.6066` | `3,677`（`+0.9%`） | **最佳平衡点**：几乎零体积膨胀、MRR 最高，且通过率与 Quote 均超 Step 1（`104/200`）与旧 `fts5_bm25`（`105/200`） |
+    | `120`（37.5%） | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | `107/200 (53.5%)`, **Recall `0.6764`**, MRR `0.6211`, Quote `0.6089` | `3,909`（`+7.3%`） | `open-domain` Recall 升至 `0.475`，但子块膨胀 `+7.3%` 且 BM25 重复文档频次轻度稀释 IDF 导致 MRR 回落 |
+- **已知边界与下一步**：离线上下文摘要默认按需通过 `/rag enrich` 触发，不阻塞在线提问；纯词面通道对零共享词同义改写与跨文档多跳仍有上限，下一步进入 **RAG Step 2**：接入单轨标准 `/v1/embeddings` HTTP 客户端、`chunk_embeddings` 向量缓存表与 Python 3.12 `math.sumprod` 精确余弦 + RRF 混合检索。
 
 ---
 
