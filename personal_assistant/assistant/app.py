@@ -353,25 +353,31 @@ class AssistantApp:
         cfg_dir = self.config_path.parent if self.config_path is not None else None
         clean_cons_model = (consolidator_model or "").strip() or None
         clean_embed_model = (embedder_model or "").strip() or None
+        # 与 consolidator_llm 对称：显式注入 llm 且未指定 embedder_model 时保持离线隔离，不强读磁盘 models.dsl 或环境外网 embedder
         need_models_cfg = cfg_dir is not None and (
             llm is None
             or (consolidator_llm is None and clean_cons_model is not None)
-            or embedder is None
+            or (embedder is None and clean_embed_model is not None)
         )
         models_cfg = self.tools_config.load_models_config(cfg_dir) if need_models_cfg else None
 
         self._embedder_model = clean_embed_model
         self._custom_embedder = embedder is not None
-        self.embedder: EmbeddingInvoker | None = (
-            embedder
-            if embedder is not None
-            else self.tools_config.build_embedder(
+        existing_ret_emb = getattr(self.memory.retriever, "embedder", None) if memory is not None else None
+        if embedder is not None:
+            self.embedder: EmbeddingInvoker | None = embedder
+        elif llm is not None and clean_embed_model is None:
+            self.embedder = existing_ret_emb if isinstance(existing_ret_emb, EmbeddingInvoker) else None
+        else:
+            self.embedder = self.tools_config.build_embedder(
                 cfg_dir,
                 model_name=clean_embed_model,
                 models_cfg=models_cfg,
+                allow_load_config=need_models_cfg,
             )
-        )
-        if callable(set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)):
+        if (embedder is not None or memory is None or clean_embed_model is not None) and callable(
+            set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)
+        ):
             set_emb_fn(self.embedder)
 
         self.llm = (
@@ -451,12 +457,13 @@ class AssistantApp:
             "llm_configured": not isinstance(self.llm, NoopModelClient),
         }
 
-    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型与后台沉淀 ModelInvoker（单次编译，失败零污染）
+    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型、后台沉淀与向量嵌入客户端（单次编译，失败零污染）
     def reload_llm(
         self,
         model_name: str | None = None,
         *,
         consolidator_model: str | None = None,
+        embedder_model: str | None = None,
         models_cfg: ModelsConfig | None = None,
     ) -> None:
         with self._llm_lock:
@@ -464,6 +471,11 @@ class AssistantApp:
                 self._consolidator_model
                 if consolidator_model is None
                 else (consolidator_model.strip() or None)
+            )
+            next_embed_model = (
+                self._embedder_model
+                if embedder_model is None
+                else (embedder_model.strip() or None)
             )
             cfg_dir = self.config_path.parent if self.config_path is not None else None
             resolved_cfg = (
@@ -491,11 +503,12 @@ class AssistantApp:
                 if self._custom_embedder
                 else self.tools_config.build_embedder(
                     cfg_dir,
-                    model_name=self._embedder_model,
+                    model_name=next_embed_model,
                     models_cfg=resolved_cfg,
                 )
             )
             self._consolidator_model = next_cons_model
+            self._embedder_model = next_embed_model
             self.llm = new_llm
             if not self._custom_consolidator_llm:
                 self.consolidator.llm = new_cons_llm
@@ -530,6 +543,7 @@ class AssistantApp:
             self.reload_llm(
                 model_name=models_cfg.default,
                 consolidator_model="",
+                embedder_model="",
                 models_cfg=models_cfg,
             )
             return models_cfg.redacted_dict()
@@ -952,6 +966,7 @@ def build_app(
     project_root: Path | None = None,
     model_name: str | None = None,
     consolidator_model: str | None = None,
+    embedder_model: str | None = None,
     auto_consolidate: bool = True,
 ) -> AssistantApp:
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
@@ -969,5 +984,6 @@ def build_app(
         llm=llm,
         model_name=model_name,
         consolidator_model=consolidator_model,
+        embedder_model=embedder_model,
         auto_consolidate=auto_consolidate,
     )

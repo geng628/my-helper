@@ -139,7 +139,9 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
         embed_fn = getattr(retriever, "embed_chunks", None)
         if not callable(embed_fn):
             return f"当前检索引擎（{getattr(retriever, 'name', 'unknown')}）不支持向量化预计算。"
-        active_emb = app.embedder if app.embedder is not None else getattr(retriever, "embedder", None)
+        with app._llm_lock:
+            app_emb = app.embedder
+        active_emb = app_emb if app_emb is not None else getattr(retriever, "embedder", None)
         if active_emb is None:
             return "未配置向量嵌入模型（embedder）。请在 config/models.dsl 中添加 `embedder <模型名>` 或设置 EMBEDDING_MODEL 环境变量。"
         try:
@@ -156,8 +158,9 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
             return f"向量化未就绪：{error}"
         except Exception as error:  # noqa: BLE001
             return f"执行 /rag embed 失败：{error}"
+        dims_label = str(stats["dims"]) if stats["dims"] > 0 else "-"
         return (
-            f"向量化完成（目录：{root}，模型：{active_emb.model_id}，维度：{stats['dims']}）："
+            f"向量化完成（目录：{root}，模型：{active_emb.model_id}，维度：{dims_label}）："
             f"扫描 {stats['files']} 篇文档、{stats['children_total']} 个活跃子块；"
             f"新生成 {stats['embedded']} 条，复用缓存 {stats['cached_hits']} 条，跳过 {stats['skipped']} 条。"
         )
@@ -396,6 +399,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default=None, help="配置目录路径（默认读取 MY_HELPER_CONFIG 或 config）")
     parser.add_argument("--model", default=None, help="指定 models.dsl / models.json 中定义的模型档案名称")
     parser.add_argument("--consolidator-model", default=None, help="指定后台记忆沉淀专用模型档案名称")
+    parser.add_argument("--embedder-model", default=None, help="指定 RAG 向量嵌入模型档案名称")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
     subparsers.add_parser("setup", help="10 秒零代码交互式向导：选厂商 + 贴密钥，自动生成模型配置")
@@ -424,6 +428,7 @@ def main(argv: list[str] | None = None) -> None:
             config_root=cfg_dir,
             model_name=args.model,
             consolidator_model=args.consolidator_model,
+            embedder_model=args.embedder_model,
         )
         try:
             if isinstance(app.llm, NoopModelClient):

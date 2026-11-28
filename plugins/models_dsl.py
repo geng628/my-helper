@@ -590,7 +590,7 @@ class _DSLParser:
         return ModelDecl(name=name_tok.value, fields=fields, line=name_tok.line, col=name_tok.col)
 
 
-# 解析顶层模型引用（default / consolidator）：先按名称精确匹配，再按内置预设别名映射到 preset.id
+# 解析顶层模型引用（default / consolidator / embedder）：先按名称精确匹配，再按内置预设别名映射到 preset.id
 def _resolve_target_model(
     target: tuple[str, int, int],
     emitted_models: dict[str, dict[str, object]],

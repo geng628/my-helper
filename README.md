@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（255 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（256 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -149,8 +149,8 @@ uv run python -m evals --mode memory \
 
 | 数据集 | 性质与规模 | `linear` 基线（`552863d`） | 旧 `fts5_bm25`（`8b19d97`） | `rag` Step 1（`d96e25c`） | `rag` Step 1.5 父子索引 + 整句 Overlap（本版） | 说明 |
 | --- | --- | --- | --- | --- | --- | --- |
-| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | `exact` 类 MRR 维持 `1.00`；剩余 2 题为纯同义零共享词改写与跨文档分散引用（待 Step 2 向量召回） |
-| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622`，Quote `60.2%` | 通过 `52.0%`（104/200），Recall `67.1%`，MRR `0.651`，Quote `60.1%` | **通过 `53.0%`（106/200）**，Recall `67.2%`，MRR `0.631`，**Quote `60.7%`** | 默认 `parent=1000 / child=320 / overlap=64`（20% 重叠，子块仅增 `+0.9%`），通过率与引文覆盖均超 Step 1 与旧 `fts5_bm25`；纯词面 `open-domain` 与 `multi-hop` 待 Step 2 稠密向量 + RRF 突破 |
+| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | 纯词面离线基准零退步；配置 `embedder` 后自动激活 BM25+Dense RRF 混合检索 |
+| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622`，Quote `60.2%` | 通过 `52.0%`（104/200），Recall `67.1%`，MRR `0.651`，Quote `60.1%` | **通过 `53.0%`（106/200）**，Recall `67.2%`，MRR `0.631`，**Quote `60.7%`** | 默认 `parent=1000 / child=320 / overlap=64`（20% 重叠）；配 `embedder` 或传 `--embedder` 可开启向量混合检索 |
 
 ### 2. 真实模型多轮记忆基准（中立 `v2-neutral` Judge 复测于 `1b421d2`）
 
@@ -168,7 +168,7 @@ uv run python -m evals --mode memory \
 my_helper_v2/
 ├── config/
 │   ├── tools.json                     # 工具白名单、插件路径与各模块安全策略配置
-│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / api）
+│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / api）
 ├── plugins/
 │   ├── tools/                         # Tool(ToolSchema) 工具子包（由 ToolsPlugin 扫描加载）
 │   │   ├── plugin.py                  # ToolsPlugin(Plugin)

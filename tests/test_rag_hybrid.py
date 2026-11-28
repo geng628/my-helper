@@ -312,6 +312,109 @@ def test_rag_hybrid_expiry_readonly_error_fallback_and_config_validation(tmp_pat
         fb_mem.close()
 
 
+# 测试同一 model_id 切换维度（7 维 -> 3 维）自动重算缓存不归零、纯 Dense/纯 BM25 权重短路、损坏 BLOB 容错与 evals --embedder 校验
+def test_rag_hybrid_dimension_switch_weight_shortcircuit_corrupt_blob_and_eval_cli(tmp_path: Path) -> None:
+    from evals import main as eval_main
+    from plugins.rag_retriever import RAGConfig, RAGRetriever
+
+    # 支持切换输出维度的同 model_id 模拟向量器（先 7 维，后切 3 维）
+    class _DimSwitchEmbedder:
+        # 绑定模型标识（故意含首尾空白验证归一化）与目标维度
+        def __init__(self, dims: int, *, model_id: str = "  shared-bge-m3  ") -> None:
+            self.model_id = model_id
+            self.dimensions = dims
+            self.calls: list[list[str]] = []
+
+        # 按当前维度编码概念向量
+        def embed(self, texts: Sequence[str], *, abort_signal: AbortSignal | None = None) -> list[tuple[float, ...]]:
+            batch = list(texts)
+            self.calls.append(batch)
+            out: list[tuple[float, ...]] = []
+            for txt in batch:
+                low = txt.lower()
+                vec = [0.0] * self.dimensions
+                if any(k in low for k in ("linearretriever", "兜底查找", "fallback", "フォールバック")):
+                    vec[0] = 1.0
+                elif any(k in low for k in ("东京", "9092")):
+                    vec[1] = 1.0
+                else:
+                    vec[-1] = 1.0
+                out.append(normalize_vector(vec))
+            return out
+
+    data_dir = tmp_path / "data"
+    mem_dir = data_dir / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "a.md").write_text(
+        "# 架构\n\n## 回退\nLinearRetriever handles fallback scan.\n\n"
+        "- [2026-10-01] 过期项 EXPIRED_OLD (until: 2026-10-15)\n",
+        encoding="utf-8",
+    )
+
+    # 1. 先按 7 维落盘缓存，随后同一 model_id 切换为 3 维：验证 search_hits 与 index_status 精确识别新维度并重算命中
+    emb7 = _DimSwitchEmbedder(dims=7)
+    ret = RAGRetriever(RAGConfig(min_vector_score=0.5), embedder=emb7)
+    mem = MemoryStore(data_dir, create_dirs=True, retriever=ret)
+    try:
+        assert mem.search_hits("兜底查找", today=date(2026, 11, 20))
+        st7 = ret.index_status(mem, today=date(2026, 11, 20))
+        assert st7["embedder_model"] == "shared-bge-m3"
+        assert st7["embedded_children"] == 1  # 已过期子块绝不计入活跃已嵌入数
+
+        emb3 = _DimSwitchEmbedder(dims=3)
+        ret.set_embedder(emb3)
+        st3_before = ret.index_status(mem, today=date(2026, 11, 20))
+        assert st3_before["embedded_children"] == 0
+
+        hits3 = mem.search_hits("兜底查找", today=date(2026, 11, 20))
+        assert hits3 and "LinearRetriever" in hits3[0].snippet
+        st3_after = ret.index_status(mem, today=date(2026, 11, 20))
+        assert st3_after["embedded_children"] == 1
+        assert st3_after["cached_embeddings"] == 2  # 7 维与 3 维按 (content_hash, model, dims) 共存
+
+        # 2. 注入非法类型 vector_blob（整数 10**9）验证 get_cached_vector 安全返回 None 零 OOM，且 search_hits 自动重算自愈
+        db_path = data_dir / "state" / "rag_index.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE chunk_embeddings SET vector_blob = ? WHERE dims = 3", (10**9,))
+        ret_corrupt = RAGRetriever(RAGConfig(min_vector_score=0.5), embedder=_DimSwitchEmbedder(dims=3))
+        mem_corrupt = MemoryStore(data_dir, create_dirs=True, retriever=ret_corrupt)
+        try:
+            _, idx_obj = ret_corrupt._get_index(mem_corrupt)
+            assert idx_obj.get_cached_vector("bad_h", "shared-bge-m3", 3, 10**9) is None
+            assert idx_obj.get_cached_vector("bad_h", "shared-bge-m3", 3, "not-bytes") is None
+            # 损坏 BLOB 自动识别为无效缓存并重算自愈
+            healed_hits = mem_corrupt.search_hits("兜底查找", today=date(2026, 11, 20))
+            assert healed_hits and "LinearRetriever" in healed_hits[0].snippet
+        finally:
+            mem_corrupt.close()
+    finally:
+        mem.close()
+
+    # 3. vector_weight=0.0 时绝不调用 embedder；bm25_weight=0.0 时支持纯稠密与纯日文假名查询
+    spy_zero_vec = _DimSwitchEmbedder(dims=3)
+    ret_bm25_only = RAGRetriever(RAGConfig(bm25_weight=1.0, vector_weight=0.0), embedder=spy_zero_vec)
+    mem_bm25 = MemoryStore(data_dir, create_dirs=True, retriever=ret_bm25_only)
+    try:
+        assert mem_bm25.search_hits("LinearRetriever", today=date(2026, 11, 20))
+        assert len(spy_zero_vec.calls) == 0
+    finally:
+        mem_bm25.close()
+
+    spy_dense_only = _DimSwitchEmbedder(dims=3)
+    ret_dense_only = RAGRetriever(RAGConfig(bm25_weight=0.0, vector_weight=1.0, min_vector_score=0.5), embedder=spy_dense_only)
+    mem_dense = MemoryStore(data_dir, create_dirs=True, retriever=ret_dense_only)
+    try:
+        assert mem_dense.search_hits("兜底查找", today=date(2026, 11, 20))
+        kana_hits = mem_dense.search_hits("フォールバック", today=date(2026, 11, 20))
+        assert kana_hits and "LinearRetriever" in kana_hits[0].snippet
+    finally:
+        mem_dense.close()
+
+    # 4. evals/cli.py --embedder 与 --retriever linear 混用必须显式报错，绝不静默忽略
+    with pytest.raises(ValueError, match="linear"):
+        eval_main(["--mode", "search", "--retriever", "linear", "--embedder", "mock-emb", "--max-cases", "1"])
+
+
 # 测试 CLI /rag embed 与 /rag status（含未配 embedder、越界路径、多余参数、异常容错与 REPL 不崩）
 def test_cli_rag_embed_and_status_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

@@ -23,6 +23,7 @@ from personal_assistant.ai import (
     ModelInvoker,
     StreamAbortedError,
     cosine_similarity,
+    normalize_vector,
     pack_vector,
     unpack_vector,
 )
@@ -166,6 +167,24 @@ def _child_embed_payload(path: str, section: str, context_summary: str, child_te
     return embed_text, digest
 
 
+# 统一提取并去空白向量客户端的规范模型标识（未配置或为空时返回 None）
+def _clean_embedder_model(embedder: EmbeddingInvoker | None) -> str | None:
+    if embedder is None:
+        return None
+    clean = str(embedder.model_id).strip()
+    return clean or None
+
+
+# 读取向量客户端显式声明的目标维度（未声明或非正整数时返回 None）
+def _embedder_target_dims(embedder: EmbeddingInvoker | None) -> int | None:
+    if embedder is None:
+        return None
+    raw = getattr(embedder, "dimensions", None)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
 # 持久化/内存双用两层父子 SQLite 派生索引容器（与权威源文件物理隔离，chunk_contexts 与 chunk_embeddings 跨配置重建保留）
 class _DerivedRAGIndex:
     # 打开指定磁盘路径（或 :memory:）并校验 Schema 与父子分块配置版本，确认物理损坏时安全自愈重建
@@ -185,7 +204,7 @@ class _DerivedRAGIndex:
         self.child_max_chars = child_max_chars
         self.child_overlap_chars = child_overlap_chars
         self.context_model = context_model
-        self._vec_cache: dict[tuple[str, str], tuple[int, tuple[float, ...]]] = {}
+        self._vec_cache: dict[tuple[str, str, int], tuple[float, ...]] = {}
         self.conn = self._open_and_initialize()
         self.file_identity = _file_identity(self.db_path) if self.db_path is not None else None
 
@@ -396,7 +415,7 @@ class _DerivedRAGIndex:
                     dims INTEGER NOT NULL,
                     vector_blob BLOB NOT NULL,
                     created_at TEXT NOT NULL,
-                    PRIMARY KEY (content_hash, model)
+                    PRIMARY KEY (content_hash, model, dims)
                 )
                 """
             )
@@ -766,26 +785,26 @@ class _DerivedRAGIndex:
         for content_hash, vec in items:
             self._put_cached_vector(content_hash, model, vec)
 
-    # 将已解包向量写入有界内存缓存，超限时按 FIFO 驱逐最早条目控制常驻内存占用
+    # 将已解包向量写入有界内存缓存（按 (content_hash, model, dims) 三元组隔离不同维度），超限时按 FIFO 驱逐
     def _put_cached_vector(self, content_hash: str, model: str, vec: tuple[float, ...]) -> None:
-        key = (content_hash, model)
-        self._vec_cache[key] = (len(vec), vec)
+        key = (content_hash, model, len(vec))
+        self._vec_cache[key] = vec
         while len(self._vec_cache) > _MAX_VECTOR_CACHE_ITEMS:
             oldest = next(iter(self._vec_cache))
             self._vec_cache.pop(oldest, None)
 
-    # 读取指定 (embed_hash, model) 的解包浮点向量（优先命中内存缓存，未命中则校验维度解码 BLOB 并回填）
+    # 读取指定 (embed_hash, model, dims) 的解包浮点向量（优先命中内存缓存，未命中则校验类型与长度解码 BLOB 并回填）
     def get_cached_vector(
         self,
         embed_hash: str,
         model: str,
         dims: int,
-        blob: bytes | bytearray | memoryview,
+        blob: object,
     ) -> tuple[float, ...] | None:
-        key = (embed_hash, model)
+        key = (embed_hash, model, dims)
         cached = self._vec_cache.get(key)
-        if cached is not None and cached[0] == dims:
-            return cached[1]
+        if cached is not None:
+            return cached
         try:
             vec = unpack_vector(blob, dims)
         except ValueError:
@@ -1318,17 +1337,20 @@ class RAGRetriever:
         if not searchable:
             return []
 
-        bm25_by_parent = self._query_bm25_parents(
-            index,
-            root_key,
-            searching_archive=searching_archive,
-            query_terms=query_terms,
-            ref_day_iso=ref_day_iso,
-            limit=limit,
-        )
+        dense_active = query_vec is not None and bool(embedder_model) and self.config.vector_weight > 0.0
+        bm25_by_parent: dict[int, _ParentHitPayload] = {}
+        if query_terms and (not dense_active or self.config.bm25_weight > 0.0):
+            bm25_by_parent = self._query_bm25_parents(
+                index,
+                root_key,
+                searching_archive=searching_archive,
+                query_terms=query_terms,
+                ref_day_iso=ref_day_iso,
+                limit=limit,
+            )
 
         # 未激活稠密通道时直接走纯净 BM25 排序，零额外开销
-        if query_vec is None or not embedder_model:
+        if not dense_active or query_vec is None or not embedder_model:
             ranked = sorted(bm25_by_parent.values(), key=lambda item: (-item[0], item[1], item[2], item[3]))
             return self._finalize_hits(ranked, limit=limit)
 
@@ -1386,7 +1408,7 @@ class RAGRetriever:
         fused_entries.sort(key=lambda item: (-item[0], -item[1], item[2][1], item[2][2], item[2][3]))
         return self._finalize_hits([entry[2] for entry in fused_entries], limit=limit)
 
-    # 在锁外按批次为活跃子块增量补齐向量缓存（严守已过期条目绝不外发、每批原子落盘支持 AbortSignal 断点续跑）
+    # 在锁外按批次为活跃子块增量补齐目标维度向量缓存（严守已过期不外发、按 (hash, model, dims) 精确对齐并支持断点续跑）
     def _ensure_active_embeddings(
         self,
         memory: "MemoryStore",
@@ -1397,91 +1419,157 @@ class RAGRetriever:
         embedder: EmbeddingInvoker,
         ref_day_iso: str,
         batch_size: int,
+        expected_dims: int | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, int]:
-        model_id = str(embedder.model_id).strip()
+        model_id = _clean_embedder_model(embedder)
         if not model_id:
             raise ValueError("embedder.model_id 不能为空。")
 
-        # 持锁同步并一次性提取当前根目录全部活跃（未过期）子块与已有向量缓存键集合
-        def _collect_missing(index: _DerivedRAGIndex) -> tuple[int, int, int, list[tuple[str, str]], dict[str, int]]:
-            index.sync(root_key, searchable, is_archive_root=searching_archive)
-            rows = index.conn.execute(
-                """
-                SELECT c.embed_hash, c.path, c.section, p.context_summary, c.text
-                FROM child_chunks AS c
-                JOIN parent_chunks AS p ON p.id = c.parent_id
-                WHERE c.root_key = ?
-                  AND (? = 1 OR c.is_archive = 0)
-                  AND (c.until_date = '' OR c.until_date >= ?)
-                ORDER BY c.path, c.id
-                """,
-                (root_key, 1 if searching_archive else 0, ref_day_iso),
-            ).fetchall()
-            total_children = len(rows)
-            if not rows:
-                return 0, 0, 0, [], {}
-
-            cached_rows = index.conn.execute(
-                "SELECT content_hash, dims FROM chunk_embeddings WHERE model = ?",
-                (model_id,),
-            ).fetchall()
-            cached_map = {str(h): int(d) for h, d in cached_rows}
-
-            missing_unique: list[tuple[str, str]] = []
-            missing_counts: dict[str, int] = {}
-            cached_hits = 0
-            known_dims = 0
-            for embed_hash, c_path, c_sec, ctx_sum, c_text in rows:
-                h_str = str(embed_hash)
-                if h_str in cached_map:
-                    cached_hits += 1
-                    if known_dims == 0:
-                        known_dims = cached_map[h_str]
-                else:
-                    if h_str not in missing_counts:
-                        embed_text, _ = _child_embed_payload(str(c_path), str(c_sec), str(ctx_sum), str(c_text))
-                        missing_unique.append((h_str, embed_text))
-                    missing_counts[h_str] = missing_counts.get(h_str, 0) + 1
-            return total_children, cached_hits, known_dims, missing_unique, missing_counts
-
-        total_children, cached_hits, dims, missing_unique, missing_counts = self._with_index_recovery(
-            memory,
-            _collect_missing,
-        )
-
+        target_dims = expected_dims if expected_dims is not None else _embedder_target_dims(embedder)
         embedded = 0
-        # 锁外按 batch_size 分批请求 Embedding API，每批成功即持锁原子提交至 chunk_embeddings
-        for start in range(0, len(missing_unique), batch_size):
-            if abort_signal is not None and abort_signal.aborted:
-                raise StreamAbortedError(abort_signal.reason or "批量向量化已取消")
-            batch = missing_unique[start : start + batch_size]
-            vectors = embedder.embed([txt for _, txt in batch], abort_signal=abort_signal)
-            if len(vectors) != len(batch):
-                raise ValueError(f"向量化返回数量不匹配：期望 {len(batch)}，实际 {len(vectors)}。")
-            if vectors:
-                dims = len(vectors[0])
-            pairs = [(h, vec) for (h, _), vec in zip(batch, vectors)]
-            self._with_index_recovery(
+        final_total = 0
+        final_cached = 0
+        final_dims = target_dims or 0
+
+        # 最多两轮：若未显式声明维度且首轮新批返回的真实维度与历史推断维度不同，自动切至真实维度补齐其余子块
+        for _pass_idx in range(2):
+            # 持锁同步并一次性提取当前根目录全部活跃（未过期）子块及目标维度的已有向量缓存键集合
+            def _collect_missing(
+                index: _DerivedRAGIndex,
+                *,
+                req_dims: int | None = target_dims,
+            ) -> tuple[int, int, int | None, list[tuple[str, str]], dict[str, int]]:
+                index.sync(root_key, searchable, is_archive_root=searching_archive)
+                rows = index.conn.execute(
+                    """
+                    SELECT c.embed_hash, c.path, c.section, p.context_summary, c.text
+                    FROM child_chunks AS c
+                    JOIN parent_chunks AS p ON p.id = c.parent_id
+                    WHERE c.root_key = ?
+                      AND (? = 1 OR c.is_archive = 0)
+                      AND (c.until_date = '' OR c.until_date >= ?)
+                    ORDER BY c.path, c.id
+                    """,
+                    (root_key, 1 if searching_archive else 0, ref_day_iso),
+                ).fetchall()
+                total_children = len(rows)
+                if not rows:
+                    return 0, 0, req_dims, [], {}
+
+                effective_dims = req_dims
+                if effective_dims is None:
+                    latest = index.conn.execute(
+                        "SELECT dims FROM chunk_embeddings WHERE model = ? ORDER BY created_at DESC LIMIT 1",
+                        (model_id,),
+                    ).fetchone()
+                    if latest is not None:
+                        effective_dims = int(latest[0])
+
+                if effective_dims is not None:
+                    cached_hashes = {
+                        str(r[0])
+                        for r in index.conn.execute(
+                            """
+                            SELECT content_hash
+                            FROM chunk_embeddings
+                            WHERE model = ?
+                              AND dims = ?
+                              AND typeof(vector_blob) = 'blob'
+                              AND length(vector_blob) = dims * 4
+                            """,
+                            (model_id, effective_dims),
+                        ).fetchall()
+                    }
+                else:
+                    cached_hashes = set()
+
+                missing_unique: list[tuple[str, str]] = []
+                missing_counts: dict[str, int] = {}
+                cached_cnt = 0
+                for embed_hash, c_path, c_sec, ctx_sum, c_text in rows:
+                    h_str = str(embed_hash)
+                    if h_str in cached_hashes:
+                        cached_cnt += 1
+                    else:
+                        if h_str not in missing_counts:
+                            embed_text, _ = _child_embed_payload(str(c_path), str(c_sec), str(ctx_sum), str(c_text))
+                            missing_unique.append((h_str, embed_text))
+                        missing_counts[h_str] = missing_counts.get(h_str, 0) + 1
+                return total_children, cached_cnt, effective_dims, missing_unique, missing_counts
+
+            total_children, cached_cnt, inferred_dims, missing_unique, missing_counts = self._with_index_recovery(
                 memory,
-                lambda idx, items=pairs: idx.store_embeddings(model_id, items),
+                _collect_missing,
             )
-            for h, _ in pairs:
-                embedded += 1
-                occ = missing_counts.get(h, 1)
-                if occ > 1:
-                    cached_hits += occ - 1
+            final_total = total_children
+            final_cached = cached_cnt
+            if inferred_dims is not None and final_dims == 0:
+                final_dims = inferred_dims
+
+            if not missing_unique:
+                break
+
+            dims_changed = False
+            observed_dims: int | None = target_dims
+            # 锁外按 batch_size 分批请求 Embedding API，统一执行单位归一化与维度一致性校验并原子落盘
+            for start in range(0, len(missing_unique), batch_size):
+                if abort_signal is not None and abort_signal.aborted:
+                    raise StreamAbortedError(abort_signal.reason or "批量向量化已取消")
+                batch = missing_unique[start : start + batch_size]
+                raw_vectors = embedder.embed([txt for _, txt in batch], abort_signal=abort_signal)
+                if len(raw_vectors) != len(batch):
+                    raise ValueError(f"向量化返回数量不匹配：期望 {len(batch)}，实际 {len(raw_vectors)}。")
+                norm_vectors = [normalize_vector(vec) for vec in raw_vectors]
+                for vec in norm_vectors:
+                    if observed_dims is None:
+                        observed_dims = len(vec)
+                    elif len(vec) != observed_dims:
+                        raise ValueError(
+                            f"向量化返回维度不一致：期望 {observed_dims}，实际 {len(vec)}。"
+                        )
+                if observed_dims is not None:
+                    final_dims = observed_dims
+                pairs = [(h, vec) for (h, _), vec in zip(batch, norm_vectors)]
+
+                # 写回前确保若锁外期间磁盘派生库被外部重建，分块表与向量缓存可一并恢复同步
+                def _persist_batch(
+                    idx: _DerivedRAGIndex,
+                    *,
+                    items: list[tuple[str, tuple[float, ...]]] = pairs,
+                ) -> None:
+                    idx.sync(root_key, searchable, is_archive_root=searching_archive)
+                    idx.store_embeddings(model_id, items)
+
+                self._with_index_recovery(memory, _persist_batch)
+                for h, _ in pairs:
+                    embedded += 1
+                    occ = missing_counts.get(h, 1)
+                    if occ > 1:
+                        final_cached += occ - 1
+
+            if (
+                target_dims is None
+                and inferred_dims is not None
+                and observed_dims is not None
+                and observed_dims != inferred_dims
+                and final_cached > 0
+            ):
+                target_dims = observed_dims
+                dims_changed = True
+            if not dims_changed:
+                break
 
         return {
             "files": len(searchable),
-            "children_total": total_children,
+            "children_total": final_total,
             "embedded": embedded,
-            "cached_hits": cached_hits,
+            "cached_hits": final_cached,
             "skipped": 0,
-            "dims": dims,
+            "dims": final_dims,
         }
 
-    # 对外检索入口：未配 embedder 时直通纯 BM25；配置 embedder 时增量向量化并执行 BM25+Dense RRF（接口异常优雅降级 BM25）
+    # 对外检索入口：未配 embedder 或 vector_weight=0 时直通纯 BM25；否则先编码 query 获取真实维度再对齐向量缓存并执行 RRF
     def search_hits(
         self,
         memory: "MemoryStore",
@@ -1490,8 +1578,13 @@ class RAGRetriever:
         limit: int = 10,
         today: date | None = None,
     ) -> list[SearchHit]:
-        query_terms = list(dict.fromkeys(tokenize_text(query, for_query=True)))
-        if not query_terms:
+        clean_query = query.strip() if isinstance(query, str) else ""
+        query_terms = list(dict.fromkeys(tokenize_text(clean_query, for_query=True)))
+        active_embedder = self.embedder
+        active_model = _clean_embedder_model(active_embedder)
+        dense_enabled = active_embedder is not None and active_model is not None and self.config.vector_weight > 0.0
+
+        if not query_terms and (not clean_query or not dense_enabled):
             raise ValueError("搜索关键词不能为空。")
 
         ref_day_iso = (today or today_shanghai()).isoformat()
@@ -1499,11 +1592,16 @@ class RAGRetriever:
         searchable, searching_archive = memory.iter_searchable_files(root)
         root_key = memory.display_path(target_dir)
 
-        active_embedder = self.embedder
         query_vec: tuple[float, ...] | None = None
         embedder_model: str | None = None
-        if active_embedder is not None and searchable:
+        if dense_enabled and active_embedder is not None and active_model is not None and searchable:
             try:
+                # 先编码 query 获取真实 q_dims，确保维度变更时 _ensure_active_embeddings 精确按 (hash, model, q_dims) 补齐
+                q_vecs = active_embedder.embed([clean_query])
+                if len(q_vecs) != 1:
+                    raise ValueError(f"查询向量返回数量异常：期望 1，实际 {len(q_vecs)}。")
+                norm_q = normalize_vector(q_vecs[0])
+                q_dims = len(norm_q)
                 self._ensure_active_embeddings(
                     memory,
                     root_key,
@@ -1512,17 +1610,19 @@ class RAGRetriever:
                     embedder=active_embedder,
                     ref_day_iso=ref_day_iso,
                     batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+                    expected_dims=q_dims,
                 )
-                q_vecs = active_embedder.embed([query.strip()])
-                if len(q_vecs) == 1:
-                    query_vec = q_vecs[0]
-                    embedder_model = active_embedder.model_id
+                query_vec = norm_q
+                embedder_model = active_model
             except StreamAbortedError:
                 raise
-            except (OSError, RuntimeError, ValueError, LLMNotConfigured):
+            except (OSError, RuntimeError, ValueError, TypeError, LLMNotConfigured):
                 # 在线检索阶段遇 Embedding 接口异常自动优雅降级为纯 BM25，保障前台对话不中断
                 query_vec = None
                 embedder_model = None
+
+        if not query_terms and query_vec is None:
+            return []
 
         return self._with_index_recovery(
             memory,
@@ -1570,18 +1670,27 @@ class RAGRetriever:
             embedder=active,
             ref_day_iso=ref_day_iso,
             batch_size=batch_size,
+            expected_dims=_embedder_target_dims(active),
             abort_signal=abort_signal,
         )
 
-    # 同步目标根目录并返回当前派生索引的详细只读状态（含父子块、摘要与向量覆盖统计，供 /rag status 展示）
-    def index_status(self, memory: "MemoryStore", root: str = "data/memory") -> dict[str, object]:
+    # 同步目标根目录并返回当前派生索引的详细只读状态（含父子块、摘要与活跃子块目标维度向量覆盖统计，供 /rag status 展示）
+    def index_status(
+        self,
+        memory: "MemoryStore",
+        root: str = "data/memory",
+        *,
+        today: date | None = None,
+    ) -> dict[str, object]:
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
         root_key = memory.display_path(target_dir)
+        ref_day_iso = (today or today_shanghai()).isoformat()
         active_emb = self.embedder
-        active_model = active_emb.model_id if active_emb is not None else None
+        active_model = _clean_embedder_model(active_emb)
+        target_dims = _embedder_target_dims(active_emb)
 
-        # 同步后汇总目标根目录下的文件数、父子块数、上下文摘要及向量缓存覆盖情况
+        # 同步后汇总目标根目录下的文件数、父子块数、上下文摘要及活跃子块向量覆盖情况
         def _collect(index: _DerivedRAGIndex) -> dict[str, object]:
             index.sync(root_key, searchable, is_archive_root=searching_archive)
             indexed_files = int(
@@ -1615,18 +1724,36 @@ class RAGRetriever:
                 index.conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
             )
             if active_model is not None:
-                embedded_children = int(
-                    index.conn.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM child_chunks AS c
-                        JOIN chunk_embeddings AS e
-                          ON e.content_hash = c.embed_hash AND e.model = ?
-                        WHERE c.root_key = ?
-                        """,
-                        (active_model, root_key),
-                    ).fetchone()[0]
-                )
+                if target_dims is not None:
+                    embedded_children = int(
+                        index.conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT c.id)
+                            FROM child_chunks AS c
+                            JOIN chunk_embeddings AS e
+                              ON e.content_hash = c.embed_hash AND e.model = ? AND e.dims = ?
+                            WHERE c.root_key = ?
+                              AND (? = 1 OR c.is_archive = 0)
+                              AND (c.until_date = '' OR c.until_date >= ?)
+                            """,
+                            (active_model, target_dims, root_key, 1 if searching_archive else 0, ref_day_iso),
+                        ).fetchone()[0]
+                    )
+                else:
+                    embedded_children = int(
+                        index.conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT c.id)
+                            FROM child_chunks AS c
+                            JOIN chunk_embeddings AS e
+                              ON e.content_hash = c.embed_hash AND e.model = ?
+                            WHERE c.root_key = ?
+                              AND (? = 1 OR c.is_archive = 0)
+                              AND (c.until_date = '' OR c.until_date >= ?)
+                            """,
+                            (active_model, root_key, 1 if searching_archive else 0, ref_day_iso),
+                        ).fetchone()[0]
+                    )
             else:
                 embedded_children = 0
             if index.db_path is not None and index.data_root is not None:

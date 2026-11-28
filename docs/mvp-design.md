@@ -9,7 +9,7 @@
 1. **零第三方运行依赖**：
    - 生产代码仅使用 Python 3.12+ 标准库（`urllib`、`http.client`、`sqlite3`、`threading`、`http.server`、`shlex`、`ipaddress`、`unicodedata` 等）；`pytest` 仅作为开发测试依赖。
 2. **三层单向依赖漏斗（`ai ← agent ← assistant`）与 Layer 1 三层解耦**：
-   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`openai_reasoning`/`anthropic_messages`/`google_genai` 四大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）；
+   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`openai_reasoning`/`anthropic_messages`/`google_genai` 四大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）+ `embeddings.py`（标准 `/v1/embeddings` 客户端、小端 `float32` 编解码与 `math.sumprod` 精确余弦）；
    - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`）；包含中立 `Context` 驱动的通用 ReAct 循环、纯值对象工具递进扩展（`ToolSchema → Tool` + `bind_tool_context`）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 宪法）；
    - `personal_assistant/assistant/`（Layer 3）：个人与学习助手业务编排（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 会话存储、外层回合预算、后台压缩与 CLI/Web 接入）；
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级，产品包绝不反向导入 `evals/`，由 [../tests/test_architecture.py](../tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言扫描、子进程 `sys.modules` 断层隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 硬守卫强制保障。
@@ -51,14 +51,17 @@ flowchart TD
         Board["统一插件主板 Plugin + PluginContext (agent/plugins.py)"]
     end
 
-    subgraph L1["Layer 1: Pi ch04 三层模型调用翻译架构与缓存观测 (personal_assistant/ai/)"]
+    subgraph L1["Layer 1: Pi ch04 三层模型调用翻译架构、缓存观测与向量客户端 (personal_assistant/ai/)"]
         Facade["第一层·统一前台与通讯录 stream/stream_simple/complete & ApiProviderRegistry (ai/registry.py)"]
         Proto["第二层·中立事件协议 Context/Message/12 事件/ApiProvider/ModelInvoker (ai/protocol.py)"]
         Providers["第三层·原生翻译器 http + openai_completions / openai_reasoning / anthropic_messages / google_genai (ai/providers/)"]
         Cache["中立 Context 有界缓存观测 CacheMonitor / TrackingModelClient (ai/cache.py)"]
+        Embed["标准 /v1/embeddings 客户端与 float32 余弦底座 (ai/embeddings.py)"]
         Facade --> Proto
         Providers --> Proto
         Cache --> Proto
+        Embed --> Proto
+        Embed --> Providers
     end
 
     subgraph Plugins["外围可插拔生态 (plugins/)"]
@@ -92,7 +95,7 @@ flowchart TD
 my_helper_v2/
 ├── config/
 │   ├── tools.json                     # 工具白名单、插件入口与 retrieval/telemetry/web/shell/files/commands 段配置
-│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / api）
+│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / api）
 ├── plugins/
 │   ├── tools/
 │   │   ├── plugin.py                  # ToolsPlugin(Plugin)：统一扫描本命名空间目录 @tool 模块
@@ -235,8 +238,8 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - **即时落盘项**：回合中已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件操作，不参与跨文件事务回滚；覆盖写入依靠 `data/workspace/.backups/` 自动时间戳备份提供恢复手段。
 3. **外层装饰器预算与内核循环解耦**：
    - 步数、Token、墙钟与重复调用熔断放在 Layer 3 `_GuardedTurnLLM` 而非 Layer 2 `agent/react.py`，使 `react.py` 维持无业务策略的最小事件循环；若未来其他宿主直接复用 Layer 2 `run_react()`，需自行提供外层超时或预算包装。
-4. **纯词面检索（SQLite FTS5 + BM25）的召回天花板**：
-   - 双语词干/Bigram 分词配合 BM25 在精确术语、单跳事实与显式时间线检索上延迟低且可解释性强，但对零词面重叠的同义改写以及跨多会话隐式多跳推理（如 LoCoMo `multi-hop` 通过率仅 `14.0%`）存在固有词面瓶颈；此类场景需通过 `RetrieverProtocol` 扩展可选混合检索插件。
+4. **纯词面回退与混合检索的边界**：
+   - 未配置向量嵌入模型（`embedder`）时，`RAGRetriever` 自动以零网络开销走纯词面双语 FTS5 BM25（单跳精确事实与显式时间线延迟仅数毫秒），但面对零共享词同义改写与跨会话隐式多跳仍受词面上限约束；在 `config/models.dsl` 配置 `embedder`（或设置 `EMBEDDING_MODEL`）后自动启用持久化 `chunk_embeddings` + `math.sumprod` 精确余弦 + BM25 加权 RRF 混合检索。
 
 ---
 
@@ -263,7 +266,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `255 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `256 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

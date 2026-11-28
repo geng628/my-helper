@@ -566,10 +566,15 @@ class ToolsConfig:
         model_name: str | None = None,
         env: Mapping[str, str] | None = None,
         models_cfg: ModelsConfig | None = None,
+        allow_load_config: bool = True,
     ) -> EmbeddingInvoker | None:
         clean_name = (model_name or "").strip() or None
         source_env = os.environ if env is None else env
-        resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
+        resolved_cfg = (
+            models_cfg
+            if models_cfg is not None
+            else (self.load_models_config(config_dir) if allow_load_config else None)
+        )
         if clean_name is not None:
             if resolved_cfg is not None:
                 target = clean_name
@@ -579,16 +584,16 @@ class ToolsConfig:
                     if preset_id and preset_id in resolved_cfg.models:
                         target = preset_id
                 return from_embedding_profile(resolved_cfg.get_profile(target), env=source_env)
+            # 无 models.dsl 时绝不把对话厂商预设的 default_model（如 DeepSeek-V3/gpt-4o-mini）误当作向量模型 ID
+            matched_chat_preset = self._match_preset(clean_name)
+            if matched_chat_preset is not None:
+                raise ValueError(
+                    f"未找到 models.dsl；{clean_name!r} 是对话厂商预设名（默认对话模型为 "
+                    f"{matched_chat_preset.get('default_model')!r}），不能直接作为向量模型。"
+                    "请在 config/models.dsl 中定义向量模型并用 `embedder <名称>` 绑定，或直接传入具体向量模型 ID。"
+                )
             merged = dict(source_env)
-            preset = self._match_preset(clean_name)
-            if preset is not None:
-                merged["EMBEDDING_MODEL"] = str(preset.get("default_model") or clean_name)
-                if not merged.get("EMBEDDING_BASE_URL", "").strip() and preset.get("base_url"):
-                    merged["EMBEDDING_BASE_URL"] = str(preset["base_url"])
-                if preset.get("needs_key") is False and not merged.get("EMBEDDING_API_KEY", "").strip():
-                    merged["EMBEDDING_API_KEY"] = str(preset.get("id") or "local")
-            else:
-                merged["EMBEDDING_MODEL"] = clean_name
+            merged["EMBEDDING_MODEL"] = clean_name
             return from_env_embedder(merged)
         if resolved_cfg is not None:
             role_target = resolved_cfg.roles.get("embedder")

@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `255 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `256 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -313,7 +313,7 @@
   - **持久化向量缓存与 BM25+Dense RRF 混合检索（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../config/tools.json](../config/tools.json)）**：`rag_index.db` 升级至 `schema_version="3"`，新增跨调参重建保留的 `chunk_embeddings(content_hash, model, dims, vector_blob, created_at)` 表、有界内存解包缓存（上限 `20,000` 条）与随背景摘要自动联动的 `child_chunks.embed_hash`（旧版 v2 派生库原地平滑升级并保留 `chunk_contexts`）；`_ensure_active_embeddings` 在锁外按批次调用 `embedder` 并逐批 `BEGIN IMMEDIATE` 原子落盘（支持 `AbortSignal` 断点续跑且绝不外发 `until_date < today` 已过期条目）；混合检索经 `min_vector_score`（默认 `0.45`）抗噪门控后按父块粒度执行加权 RRF（`rrf_k=60`、`bm25_weight=1.0`、`vector_weight=1.0`），在线调用遇瞬时网络/接口故障优雅降级纯 BM25；新增 `embed_chunks()` 供离线预计算。
   - **CLI 与评测接入（[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../evals/cli.py](../evals/cli.py)、[../tests/conftest.py](../tests/conftest.py)）**：`/rag status` 新增 `embedder_model` / `embedded_children` / `cached_embeddings`；新增 `/rag embed [目录]` 接入 `_sigint_to_abort` 与全异常容错；`evals/cli.py` 支持可选 `--embedder` 参数；`tests/conftest.py` 隔离宿主机 `EMBEDDING_*` 环境变量；新增 [../tests/test_embeddings.py](../tests/test_embeddings.py) 与 [../tests/test_rag_hybrid.py](../tests/test_rag_hybrid.py)。
 - **验证与同口径对比（`9eda1ff` → 本次提交）**：
-  - 单元测试：`247 passed → 255 passed`（全绿，含零共享词同义改写救回、RRF 双路超越单路、抗噪负例 100% 拦截、v2→v3 原地升级、上下文摘要联动 `embed_hash` 刷新、过期隔离、只读零写盘、故障降级与 CLI 容错）；
+  - 单元测试：`247 passed → 256 passed`（全绿，含零共享词同义改写救回、RRF 双路超越单路、抗噪负例 100% 拦截、同 `model_id` 切换维度自动重算、v2→v3 原地升级、上下文摘要联动 `embed_hash` 刷新、损坏 BLOB 防 OOM 自愈、跨主机防密钥泄漏、过期隔离、只读零写盘、故障降级与 CLI 容错）；
   - 离线检索基准（零网络未配 `embedder` 回退口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（Recall `0.6716`、MRR `0.6307`、Quote `0.6066`），纯词面零退步；
   - 性能实测：纯 Python 3.12 标准库 `math.sumprod` 遍历 `4,000 × 1024` 维 `float32` 向量精确余弦仅需 `~41.6 ms`；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`，`memory.py` `593 <= 600` 行。

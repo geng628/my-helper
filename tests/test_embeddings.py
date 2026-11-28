@@ -39,9 +39,23 @@ def test_vector_normalize_pack_unpack_and_sumprod_cosine() -> None:
     assert math.isclose(restored[0], 0.6, rel_tol=1e-5)
     assert math.isclose(restored[1], 0.8, rel_tol=1e-5)
 
-    for bad in ([], [0.0, 0.0], [1.0, float("nan")], [1.0, float("inf")], [True, 1.0]):
+    for bad in ([], [0.0, 0.0], [1.0, float("nan")], [1.0, float("inf")], [True, 1.0], [10**400]):
         with pytest.raises(ValueError):
             normalize_vector(bad)  # type: ignore[arg-type]
+
+    # 极大/极小浮点经最大幅值缩放后零上溢、零下溢
+    huge = normalize_vector([1e200, 1e200])
+    tiny = normalize_vector([1e-200, 1e-200])
+    expected_diag = 1.0 / math.sqrt(2.0)
+    assert math.isclose(huge[0], expected_diag, rel_tol=1e-6)
+    assert math.isclose(tiny[0], expected_diag, rel_tol=1e-6)
+
+    # pack_vector 拦截超出 float32 范围的数值；unpack_vector 拒绝非字节类型（防止 bytes(int) 内存爆炸）
+    with pytest.raises(ValueError):
+        pack_vector([1e40])
+    for bad_blob in (None, "abcd", 10**9):
+        with pytest.raises(ValueError):
+            unpack_vector(bad_blob, 1)
 
     with pytest.raises(ValueError):
         unpack_vector(blob, 3)
@@ -102,12 +116,26 @@ def test_openai_embedding_client_batching_index_order_and_validation() -> None:
     with pytest.raises(LLMNotConfigured):
         OpenAIEmbeddingClient(remote_no_key, post_json=_fake_post).embed(["hello"])
 
-    # 本地 Ollama（127.0.0.1）免密钥允许调用
+    # 本地 Ollama（127.0.0.1）免密钥允许调用；同时验证 Azure 带 query 参数地址与裸字符串拦截、非 HTTP(S) 拦截
     local_ollama = ModelProfile(name="o", base_url="http://127.0.0.1:11434/v1/embeddings", model="bge-m3")
     local_vecs = OpenAIEmbeddingClient(local_ollama, post_json=_fake_post).embed(["hello"])
     assert len(local_vecs) == 1
     assert captured[-1][0] == "http://127.0.0.1:11434/v1/embeddings"
     assert "Authorization" not in captured[-1][2]
+
+    azure_prof = ModelProfile(
+        name="az",
+        base_url="https://demo.openai.azure.com/openai/deployments/emb?api-version=2024-02-01",
+        model="text-embedding-3-small",
+        api_key="sk-az",
+    )
+    OpenAIEmbeddingClient(azure_prof, post_json=_fake_post).embed(["hello"])
+    assert captured[-1][0] == "https://demo.openai.azure.com/openai/deployments/emb/embeddings?api-version=2024-02-01"
+
+    with pytest.raises(TypeError):
+        client.embed("single string not list")
+    with pytest.raises(ValueError):
+        OpenAIEmbeddingClient(ModelProfile(name="bad", base_url="file://localhost/etc/passwd", model="bge-m3"))
 
     # 服务端返回长度不匹配、跨批维度漂移或 HTTP 错误均安全校验与密钥脱敏
     # 模拟服务端漏返回向量导致数量不一致
@@ -158,6 +186,7 @@ def test_openai_embedding_client_abort_signal_and_env_factory() -> None:
         {
             "LLM_BASE_URL": "https://api.siliconflow.cn/v1",
             "LLM_API_KEY": "sk-env-key",
+            "EMBEDDING_BASE_URL": "   ",
             "EMBEDDING_MODEL": "BAAI/bge-m3",
             "EMBEDDING_DIMENSIONS": "1024",
         }
@@ -165,6 +194,22 @@ def test_openai_embedding_client_abort_signal_and_env_factory() -> None:
     assert isinstance(env_client, OpenAIEmbeddingClient)
     assert env_client.model_id == "BAAI/bge-m3"
     assert env_client.dimensions == 1024
+    assert env_client.profile.api_key == "sk-env-key"
+
+    # 安全边界：EMBEDDING_BASE_URL 指向不同主机（如本地 Ollama）时绝不向其泄漏主对话的 LLM_API_KEY
+    cross_host = from_env_embedder(
+        {
+            "LLM_BASE_URL": "https://api.deepseek.com/v1",
+            "LLM_API_KEY": "sk-deepseek-top-secret",
+            "EMBEDDING_BASE_URL": "http://127.0.0.1:11434/v1",
+            "EMBEDDING_MODEL": "bge-m3",
+        }
+    )
+    assert cross_host is not None
+    assert cross_host.profile.api_key == ""
+
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        from_env_embedder({"LLM_BASE_URL": "http://127.0.0.1:11434/v1", "EMBEDDING_MODEL": "bge", "EMBEDDING_DIMENSIONS": "0"})
 
 
 # 测试 models.dsl 的 embedder 顶层指令、ToolsConfig.build_embedder 优先级及 AssistantApp 自动装配与热重载
@@ -198,19 +243,46 @@ def test_models_dsl_embedder_role_and_tools_config_build_embedder(tmp_path: Path
         with pytest.raises(ValueError, match="未定义"):
             compiler.compile("use deepseek sk-1\nembedder ghost\n")
 
-        # AssistantApp 自动装配 embedder 并注入 RAGRetriever
+        # AssistantApp 自动装配 embedder、configure_model / reload_llm 原子刷新不崩，且离线显式注入 llm 时严守隔离
         tools_copy = cfg_dir / "tools.json"
         tools_copy.write_text((repo_root / "config" / "tools.json").read_text(encoding="utf-8"), encoding="utf-8")
         app = AssistantApp(
             data_root=tmp_path / "data",
             config_path=tools_copy,
             project_root=repo_root,
+            embedder_model="siliconflow",
             auto_consolidate=False,
         )
         try:
             assert app.embedder is not None and app.embedder.model_id == "BAAI/bge-m3"
             assert app.status()["embedder"] == "BAAI/bge-m3"
+            # configure_model 重写单模型配置后，reload_llm 自动清掉旧 embedder_model 而不抛缺失异常
+            app.configure_model(preset="deepseek", api_key="sk-new-chat")
+            assert app.embedder is None
+            assert app.status()["embedder"] is None
         finally:
             app.close()
+
+        # 离线显式注入 llm 且未指定 embedder_model 时，即使 cfg_dir 有损坏的 models.dsl 也不崩溃且不挂外网 embedder
+        from personal_assistant.ai import NoopModelClient
+
+        (cfg_dir / "models.dsl").write_text("broken { syntax error", encoding="utf-8")
+        iso_app = AssistantApp(
+            data_root=tmp_path / "iso_data",
+            config_path=tools_copy,
+            project_root=repo_root,
+            llm=NoopModelClient(),
+            auto_consolidate=False,
+        )
+        try:
+            assert iso_app.embedder is None
+        finally:
+            iso_app.close()
+
+        # 无 models.dsl 时传入对话预设名（如 siliconflow）必须显式拒绝，绝不把 DeepSeek-V3 当作向量模型
+        empty_cfg_dir = tmp_path / "empty_cfg"
+        empty_cfg_dir.mkdir()
+        with pytest.raises(ValueError, match="对话厂商预设名"):
+            tcfg.build_embedder(empty_cfg_dir, model_name="siliconflow")
     finally:
         tcfg.plugin_manager.terminate_all()
