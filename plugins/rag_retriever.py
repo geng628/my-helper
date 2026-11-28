@@ -21,6 +21,7 @@ from personal_assistant.assistant.chunker import (
     ParentChunk,
     chunk_markdown_hierarchy,
     format_context_header,
+    strip_expiring_lines,
 )
 from personal_assistant.assistant.common import require_positive_int, today_shanghai
 from personal_assistant.assistant.memory import SearchHit
@@ -434,6 +435,56 @@ class _DerivedRAGIndex:
                 self.conn.execute("ROLLBACK")
             raise
 
+    # 按指纹增量同步单个文件（供 enrich_contexts 在每文件准备期消除并发修改与损坏重建后的失步；指纹未变零写锁）
+    def sync_single_file(
+        self,
+        root_key: str,
+        display_path: str,
+        raw_text: str,
+        *,
+        fp: tuple[int, int, int, int],
+        track_expiry: bool,
+    ) -> None:
+        row = self.conn.execute(
+            "SELECT mtime_ns, size, ino, is_archive FROM indexed_files WHERE root_key = ? AND path = ?",
+            (root_key, display_path),
+        ).fetchone()
+        if row is not None and (int(row[0]), int(row[1]), int(row[2]), int(row[3])) == fp:
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            locked_row = self.conn.execute(
+                "SELECT mtime_ns, size, ino, is_archive FROM indexed_files WHERE root_key = ? AND path = ?",
+                (root_key, display_path),
+            ).fetchone()
+            if locked_row is None or (
+                int(locked_row[0]),
+                int(locked_row[1]),
+                int(locked_row[2]),
+                int(locked_row[3]),
+            ) != fp:
+                self._delete_path(root_key, display_path)
+                self._index_file(
+                    root_key,
+                    display_path,
+                    raw_text,
+                    track_expiry=track_expiry,
+                    is_archive=fp[3],
+                )
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO indexed_files
+                        (root_key, path, mtime_ns, size, ino, is_archive)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (root_key, display_path, fp[0], fp[1], fp[2], fp[3]),
+                )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
     # 删除指定根目录与文件路径对应的全部父子分块、FTS5 倒排条目及文件指纹记录（必须在活跃写事务内调用）
     def _delete_path(self, root_key: str, display_path: str) -> None:
         child_rows = self.conn.execute(
@@ -696,7 +747,7 @@ class RAGConfig:
             if not isinstance(self.index_path, str) or not self.index_path.strip() or "\x00" in self.index_path:
                 raise ValueError("retrieval.index_path 必须是非空相对路径字符串或省略。")
             rel = Path(self.index_path.strip())
-            if rel.is_absolute() or ".." in rel.parts:
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts:
                 raise ValueError("retrieval.index_path 必须是数据目录内的相对路径，不能为绝对路径或包含 ..。")
         if not isinstance(self.context_model, str) or not self.context_model.strip() or "\x00" in self.context_model:
             raise ValueError("retrieval.context_model 必须是非空字符串。")
@@ -1126,24 +1177,50 @@ class RAGRetriever:
             "cached_hits": 0,
             "skipped": 0,
         }
+        archive_flag = 1 if searching_archive else 0
 
-        for resolved, display_path, _ in searchable:
+        for resolved, display_path, is_memory in searchable:
             if abort_signal is not None and abort_signal.aborted:
                 raise StreamAbortedError(abort_signal.reason or "离线上下文摘要已取消")
             try:
+                st_before = resolved.stat()
                 raw_text = resolved.read_text(encoding="utf-8")
+                st_after = resolved.stat()
+                if (st_before.st_mtime_ns, st_before.st_size, st_before.st_ino) != (
+                    st_after.st_mtime_ns,
+                    st_after.st_size,
+                    st_after.st_ino,
+                ):
+                    raw_text = resolved.read_text(encoding="utf-8")
+                    st_after = resolved.stat()
             except (OSError, UnicodeDecodeError):
                 continue
+            fp = (st_after.st_mtime_ns, st_after.st_size, st_after.st_ino, archive_flag)
 
-            # 在持锁状态下读取本文件的常驻父块列表与已有缓存命中情况
-            def _prepare_file(index: _DerivedRAGIndex) -> tuple[list[ParentChunk], int, int]:
-                parent_rows = index.load_enrichable_parents(root_key, display_path)
+            # 在持锁状态下同步当前文件快照（抵御损坏重建与并发修改失步）并读取缺失父块与重复哈希计数
+            def _prepare_file(
+                index: _DerivedRAGIndex,
+                *,
+                d_path: str = display_path,
+                doc_text: str = raw_text,
+                file_fp: tuple[int, int, int, int] = fp,
+                mem_flag: bool = is_memory,
+            ) -> tuple[list[ParentChunk], dict[str, int], int, int, int]:
+                index.sync_single_file(
+                    root_key,
+                    d_path,
+                    doc_text,
+                    fp=file_fp,
+                    track_expiry=mem_flag,
+                )
+                parent_rows = index.load_enrichable_parents(root_key, d_path)
+                total_parents = len(parent_rows)
                 if not parent_rows:
-                    return [], 0, 0
-                if len(raw_text) < min_chars:
-                    return [], 0, len(parent_rows)
+                    return [], {}, 0, 0, 0
+                if len(doc_text) < min_chars:
+                    return [], {}, 0, total_parents, total_parents
                 missing: list[ParentChunk] = []
-                seen_missing_hashes: set[str] = set()
+                missing_counts: dict[str, int] = {}
                 cached_cnt = 0
                 for parent, current_summary in parent_rows:
                     row = index.conn.execute(
@@ -1160,25 +1237,32 @@ class RAGRetriever:
                                 summary=cached_summary,
                                 write_cache=False,
                             )
-                    elif parent.content_hash not in seen_missing_hashes:
-                        seen_missing_hashes.add(parent.content_hash)
-                        missing.append(parent)
-                return missing, cached_cnt, 0
+                    else:
+                        if parent.content_hash not in missing_counts:
+                            missing.append(parent)
+                        missing_counts[parent.content_hash] = missing_counts.get(parent.content_hash, 0) + 1
+                return missing, missing_counts, cached_cnt, 0, total_parents
 
-            missing_parents, cached_cnt, skipped_cnt = self._with_index_recovery(memory, _prepare_file)
+            missing_parents, missing_counts, cached_cnt, skipped_cnt, total_parents = self._with_index_recovery(
+                memory,
+                _prepare_file,
+            )
             stats["files"] += 1
-            stats["parents_total"] += len(missing_parents) + cached_cnt + skipped_cnt
+            stats["parents_total"] += total_parents
             stats["cached_hits"] += cached_cnt
             stats["skipped"] += skipped_cnt
 
             if not missing_parents:
                 continue
 
+            # 记忆文件送入 <document> 前剔除全部带 (until: ...) 的过期块，杜绝过期敏感内容外发或泄漏进常驻摘要缓存
+            safe_doc_text = strip_expiring_lines(raw_text) if is_memory else raw_text
+
             # 在锁外流式调用模型生成背景摘要，每产出 1 条立即持锁原子提交至 chunk_contexts 与 FTS5
             produced_hashes: set[str] = set()
             for content_hash, summary in generate_document_contexts(
                 display_path,
-                raw_text,
+                safe_doc_text,
                 missing_parents,
                 llm,
                 abort_signal=abort_signal,
@@ -1193,10 +1277,15 @@ class RAGRetriever:
                         write_cache=True,
                     ),
                 )
+                occ = missing_counts.get(content_hash, 1)
                 stats["enriched"] += 1
+                if occ > 1:
+                    stats["cached_hits"] += occ - 1
 
-            # 统计模型返回空白摘要的父块数
-            stats["skipped"] += sum(1 for p in missing_parents if p.content_hash not in produced_hashes)
+            # 统计模型返回空白摘要的父块数（保持 parents_total == enriched + cached_hits + skipped 恒等）
+            for h, occ in missing_counts.items():
+                if h not in produced_hashes:
+                    stats["skipped"] += occ
 
         return stats
 
@@ -1242,9 +1331,16 @@ class RAGRetrieverPlugin(Plugin):
 
         self.context.register_retriever(self.plugin_id, _tracked_factory)
 
-    # 统一停用清理生命周期：线程安全关闭本插件创建的所有 RAGRetriever SQLite 派生库连接（保留弱引用表供重复关闭兜底）
+    # 统一停用清理生命周期：线程安全关闭本插件创建的所有 RAGRetriever SQLite 派生库连接（单实例异常不阻断其余回收）
     def terminate(self) -> None:
         with self._lock:
             instances = list(self._instances)
+        first_error: Exception | None = None
         for instance in instances:
-            instance.close()
+            try:
+                instance.close()
+            except Exception as error:  # noqa: BLE001
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error

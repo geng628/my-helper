@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `244 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `247 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -294,7 +294,7 @@
   - **两层父子持久化索引与 CLI 接入（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../config/tools.json](../config/tools.json)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)）**：`rag_index.db` 升级至 `schema_version="2"`（`parent_chunks` + `child_chunks(parent_id)` + `child_chunks_fts(path_tokens, section_tokens, context_tokens, body_tokens)` + `chunk_contexts(content_hash, model, summary, created_at)`），移除旧 `expand_chunk_window` / `join_prev`；参数或版本变更触发分块重建时**保留 `chunk_contexts` 表**避免重复计费；检索命中子块后按 `parent_id` 取最高分聚合去重并回送完整父块（带 `[背景: ...]` 与续片 `(表头)` 前缀）；`RAGRetriever` 新增 `index_status()` 与支持逐条落盘断点续跑的 `enrich_contexts()`（持锁外调用 LLM、每产出 1 条立即 `BEGIN IMMEDIATE` 原子提交）；CLI REPL 新增 `/rag status [目录]` 与 `/rag enrich [目录]`（复用轻量 `consolidator` 模型并接入 `_sigint_to_abort`）。
   - **测试覆盖**：重写 [../tests/test_chunker.py](../tests/test_chunker.py)、更新 [../tests/test_rag_plugin.py](../tests/test_rag_plugin.py)、新增 [../tests/test_rag_contextualizer.py](../tests/test_rag_contextualizer.py)，覆盖句界保护、超长表格保表头、整句 Overlap 校验、Prompt Caching 逐字节一致前缀、代词指代盲区召回、`AbortSignal` 断点续跑、参数重建保留 `chunk_contexts` 及全部安全/并发/损坏自愈回归。
 - **验证与同口径对比（`d96e25c` → 本次提交，坚持零外集调参，直接沿用预承诺默认 `1000 / 320 / 64`）**：
-  - 单元测试：`241 passed → 244 passed`（全绿，含 `tests/test_architecture.py`、`memory.py` `593 <= 600` 行预算）；
+  - 单元测试：`241 passed → 247 passed`（全绿，含 `tests/test_architecture.py`、`memory.py` `593 <= 600` 行预算）；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - **Overlap 消融实验（固定 `parent_max_chars=1000, child_max_chars=320`，零 LLM 上下文补全）**：
     | `child_overlap_chars`（占子块比例） | `sample_cases.jsonl`（40 题） | `LoCoMo Search`（200 题 / 272 `.md`） | `LoCoMo` 子块数（较 0 重叠） | 工程观察 |

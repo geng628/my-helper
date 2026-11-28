@@ -75,6 +75,9 @@ def generate_document_contexts(
 
     system_prompt = _build_document_system_prompt(path, document_text, max_doc_chars=max_doc_chars)
     session_id = f"rag-ctx:{path}"
+    # 思考型推理协议（如 deepseek-reasoner）无法彻底关闭思考链，适当放宽输出预算防止空正文；其余协议显式关闭 reasoning
+    provider_api = str(getattr(getattr(llm, "profile", None), "api", "") or "").strip().lower()
+    token_budget = 1024 if provider_api == "openai-reasoning" else 160
 
     for parent in targets:
         if abort_signal is not None and abort_signal.aborted:
@@ -85,7 +88,8 @@ def generate_document_contexts(
         )
         opts = StreamOptions(
             temperature=0.0,
-            max_tokens=160,
+            max_tokens=token_budget,
+            reasoning="off",
             cache_retention="short",
             session_id=session_id,
             abort_signal=abort_signal,

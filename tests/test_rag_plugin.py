@@ -363,6 +363,10 @@ def test_rag_security_boundaries_concurrency_and_recovery_regressions(
         RAGConfig(index_path="/tmp/evil.db")
     with pytest.raises(ValueError):
         RAGConfig(index_path="../outside.db")
+    with pytest.raises(ValueError):
+        RAGConfig(index_path=".")
+    with pytest.raises(ValueError):
+        RAGConfig(index_path="./")
 
     # 1. read_only=True 即使配置 index_path 也严守零写盘
     ro_data = tmp_path / "ro_data"
@@ -506,8 +510,66 @@ def test_rag_security_boundaries_concurrency_and_recovery_regressions(
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(_worker, range(8)))
         assert all(r >= 1 for r in results)
+
+        # 验证 terminate_all 真正关闭所有底层 SQLite 连接
+        tracked_ret = manager.retrievers["rag"]({})
+        tracked_mem = MemoryStore(conc_data, create_dirs=True, retriever=tracked_ret)
+        assert tracked_mem.search_hits("CONCURRENT_SAFE_88")
+        opened_conns = [idx.conn for idx in tracked_ret._indices.values()]
+        assert opened_conns
     finally:
         manager.terminate_all()
+    for conn in opened_conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+# 测试旧版 v1 派生库原地平滑升级至 v2 与超长表格续片按表头列名端到端检索命中（展示 (表头) 前缀与精确行号）
+def test_rag_v1_inplace_upgrade_and_oversized_table_continuation_retrieval(tmp_path: Path) -> None:
+    from plugins.rag_retriever import RAGConfig, RAGRetriever
+
+    data_dir = tmp_path / "data"
+    mem_dir = data_dir / "memory"
+    state_dir = data_dir / "state"
+    mem_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True)
+
+    # 1. 构造旧版 PR #102 v1 schema（仅含 chunks / chunks_fts，schema_version="1"）
+    db_path = state_dir / "rag_index.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.executemany(
+            "INSERT INTO index_meta (key, value) VALUES (?, ?)",
+            [("schema_version", "1"), ("chunker_version", "1"), ("chunk_max_chars", "500")],
+        )
+        conn.execute("CREATE TABLE indexed_files (root_key TEXT, path TEXT)")
+        conn.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY, text TEXT)")
+        conn.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(body_tokens)")
+
+    # 2. 写入超出 2 * parent_max_chars 的大表格，验证原地升级后按表头列名 + 尾部行键精确命中续片并带 (表头)
+    rows = [f"| item_{i:02d} | 普通配置参数详细说明记录 {i:02d} |" for i in range(1, 14)]
+    rows.append("| item_tail_99 | 量子加速引擎延迟指标 1.2ms |")
+    (mem_dir / "metrics.md").write_text(
+        "# 压测报告\n\n| 压测项编码 | 核心指标明细 |\n| --- | --- |\n" + "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+
+    retriever = RAGRetriever(RAGConfig(parent_max_chars=160, child_max_chars=160, child_overlap_chars=32))
+    memory = MemoryStore(data_dir, create_dirs=True, retriever=retriever)
+    try:
+        hits = memory.search_hits("核心指标明细 item_tail_99 量子加速引擎")
+        assert hits
+        assert "(表头) | 压测项编码 | 核心指标明细 |" in hits[0].snippet
+        assert "item_tail_99" in hits[0].snippet
+        # 续片 start_line 为数据行真实行号，而非第 3 行表头行号
+        assert hits[0].start_line > 5
+
+        with sqlite3.connect(db_path) as conn:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+            assert "chunks" not in tables and "chunks_fts" not in tables
+            assert {"parent_chunks", "child_chunks", "child_chunks_fts", "chunk_contexts"}.issubset(tables)
+    finally:
+        memory.close()
 
 
 # 测试 AssistantApp 与 eval CLI 集成 rag 与 linear

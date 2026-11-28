@@ -18,7 +18,8 @@ _TABLE_SEP_RE = re.compile(
     r"^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$"
 )
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
-_CLOSING_WRAPPER_CHARS = frozenset("\"'”’」』）)]】》")
+_CLOSING_DIRECTIONAL_WRAPPERS = frozenset("”’」』）)]】》")
+_STRAIGHT_QUOTES = frozenset("\"'")
 _CJK_SENTENCE_ENDERS = frozenset("。！？")
 _ASCII_SENTENCE_ENDERS = frozenset(".!?")
 _EN_ABBREVS = frozenset(
@@ -131,10 +132,16 @@ def _split_sentences_with_seps(text: str) -> list[tuple[str, str]]:
         while punct_end < n and (text[punct_end] in _CJK_SENTENCE_ENDERS or text[punct_end] in _ASCII_SENTENCE_ENDERS):
             punct_end += 1
 
-        # 吞并紧跟在句末标点后的闭合引号与括号（如 "。”"、'!"'、"。）"）
+        # 吞并紧跟在句末标点后的闭合引号与括号；直引号仅在当前句内未成对闭合（奇数次出现）时才吞并
         wrap_end = punct_end
-        while wrap_end < n and text[wrap_end] in _CLOSING_WRAPPER_CHARS:
-            wrap_end += 1
+        while wrap_end < n:
+            wch = text[wrap_end]
+            if wch in _CLOSING_DIRECTIONAL_WRAPPERS:
+                wrap_end += 1
+            elif wch in _STRAIGHT_QUOTES and text[seg_start:wrap_end].count(wch) % 2 == 1:
+                wrap_end += 1
+            else:
+                break
 
         should_split = False
         if is_cjk_end:
@@ -182,18 +189,19 @@ def split_sentences(text: str) -> list[str]:
     return [sent for sent, _ in _split_sentences_with_seps(text)]
 
 
-# 当单个超长无句号从句超过 child_max_chars 时，优先在分号/逗号/空格处软切分，避免硬切破坏词语
+# 当单个超长无句号从句超过 child_max_chars 时，优先在分号/逗号/空格处软切分，按真实空白还原片段分隔符
 def _soft_split_long_sentence(sentence: str, max_chars: int) -> list[tuple[str, str]]:
     if len(sentence) <= max_chars:
         return [(sentence, "")]
     pieces: list[tuple[str, str]] = []
     start = 0
     total = len(sentence)
+    pending_sep = ""
     while start < total:
         if total - start <= max_chars:
             part = sentence[start:].strip()
             if part:
-                pieces.append((part, " " if pieces and part[0].isascii() and pieces[-1][0][-1].isascii() else ""))
+                pieces.append((part, pending_sep if pieces else ""))
             break
         limit_end = start + max_chars
         cut = -1
@@ -205,14 +213,15 @@ def _soft_split_long_sentence(sentence: str, max_chars: int) -> list[tuple[str, 
             cut = limit_end
         raw_part = sentence[start:cut]
         part = raw_part.strip()
+        next_start = cut
+        while next_start < total and sentence[next_start].isspace():
+            next_start += 1
+        # 仅在原文切缝处确实存在空白时保留单空格，既不向硬切长标识符注空格，也不丢失中英间的真实空格
+        had_ws = (raw_part[-1:].isspace()) or (next_start > cut)
         if part:
-            sep = ""
-            if pieces:
-                sep = " " if (raw_part[:1].isspace() or (part[0].isascii() and pieces[-1][0][-1].isascii())) else ""
-            pieces.append((part, sep))
-        start = cut
-        while start < total and sentence[start].isspace():
-            start += 1
+            pieces.append((part, pending_sep if pieces else ""))
+        pending_sep = " " if had_ws else ""
+        start = next_start
     return pieces
 
 
@@ -335,8 +344,6 @@ def _parse_atomic_blocks(
                             break
                         if _match_fenced_code(lines, idx, require_closed=True) is not None:
                             break
-                        if _LIST_ITEM_RE.match(nxt) is not None and _leading_indent(nxt) <= base_indent:
-                            break
                         if _leading_indent(nxt) <= base_indent:
                             break
                         idx += 1
@@ -421,8 +428,6 @@ def _parse_atomic_blocks(
                 if _parse_heading(nxt) is not None:
                     break
                 if _match_fenced_code(lines, idx, require_closed=track_expiry) is not None:
-                    break
-                if _LIST_ITEM_RE.match(nxt) is not None and _leading_indent(nxt) <= base_indent:
                     break
                 if _leading_indent(nxt) <= base_indent:
                     break
@@ -510,7 +515,7 @@ def _split_oversized_table(
             cur_chars = row_len
             has_data_row = True
         else:
-            cur_chars = row_len if (not first_slice and not has_data_row) else (cur_chars + 1 + row_len)
+            cur_chars = cur_chars + 1 + row_len
             has_data_row = True
 
     parts.append(
@@ -773,6 +778,22 @@ def _build_children_for_parent(
         pos = overlap_start
 
     return children
+
+
+# 剔除记忆文档中所有带合法 (until: YYYY-MM-DD) 时效标签的完整行区间（含多行缩进过期列表项、过期标题与表格过期行）
+def strip_expiring_lines(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    blocks, _ = _parse_atomic_blocks(lines, track_expiry=True)
+    drop_lines: set[int] = set()
+    for blk in blocks:
+        if blk.until_date or blk.kind == "expiring":
+            for ln in range(blk.start_line, blk.end_line + 1):
+                drop_lines.add(ln)
+    if not drop_lines:
+        return text
+    return "\n".join(line for idx, line in enumerate(lines, start=1) if idx not in drop_lines)
 
 
 # 将单篇 Markdown/纯文本切分为两层父子结构块 (ParentChunk 列表, ChildChunk 列表)

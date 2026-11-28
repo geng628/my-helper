@@ -38,7 +38,7 @@ flowchart TD
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
         App --> Ctx["上下文与 KV Cache 装配引擎 ContextAssembler (assistant/context.py)"]
         Ctx --> Prompts["提示词模板与 system-reminder 信源隔离 (assistant/prompts.py)"]
-        Ctx --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        Ctx --> Mem["Markdown 记忆、安全策略、分块与上下文摘要 (files_policy / text_search / chunker / rag_contextualizer / memory / builtin_tools / memory_lifecycle)"]
         App --> Mem
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与指数退避压缩 (assistant/consolidator.py)"]
@@ -262,7 +262,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `244 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `247 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：
