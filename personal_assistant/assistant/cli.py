@@ -28,6 +28,7 @@ from personal_assistant.ai import (
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
+from personal_assistant.assistant.rag_metadata import parse_filter_string
 
 
 # 打印单步工具执行日志与耗时
@@ -87,22 +88,35 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
-# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索前 Query 优化与检索）
+# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索优化与前置过滤）
 def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
-    usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query <问题>"
+    usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query [--filter 条件] <问题>"
     parts = text.split()
     sub = parts[1].lower() if len(parts) >= 2 else "status"
     retriever = app.memory.retriever
 
     if sub == "query":
-        query_text = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
+        rest = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
+        raw_filter = ""
+        query_text = rest
+        if rest.startswith("--filter"):
+            f_parts = rest.split(None, 2)
+            if f_parts[0] == "--filter":
+                if len(f_parts) < 3:
+                    return usage
+                raw_filter, query_text = f_parts[1].strip(), f_parts[2].strip()
         if not query_text:
             return usage
+        try:
+            meta_filter = parse_filter_string(raw_filter, allowed_access=app.allowed_access)
+        except ValueError as error:
+            return f"过滤条件不合法：{error}"
         try:
             with _sigint_to_abort(app, chat_id) as abort_sig:
                 res = app.smart_search(
                     query_text,
                     chat_id=chat_id,
+                    metadata_filter=meta_filter,
                     force_enable=True,
                     abort_signal=abort_sig,
                 )
@@ -134,6 +148,8 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
                 lines.append(
                     "【提示】当前未配置可用大模型（或已关闭全部优化开关），未执行 LLM 查询优化，已按原查询直通本地检索；运行 setup 可开启完整优化。"
                 )
+        if meta_filter.has_explicit_criteria or raw_filter:
+            lines.append(f"【过滤】{meta_filter.describe()}")
         lines.extend(
             [
                 f"【路由】{', '.join(str(r) for r in routes) or 'docs'}（needs_retrieval={needs_ret}"

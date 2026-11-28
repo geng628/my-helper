@@ -39,6 +39,7 @@ from personal_assistant.assistant.chunker import (
 from personal_assistant.assistant.common import require_positive_int, today_shanghai
 from personal_assistant.assistant.memory import SearchHit
 from personal_assistant.assistant.rag_contextualizer import generate_document_contexts
+from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_markdown_frontmatter
 from personal_assistant.assistant.text_search import (
     parse_retrieval_thresholds,
     tokenize_text,
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 RETRIEVER_NAME = "rag"
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 _CHUNKER_VERSION = "2"
 _MAX_SNIPPET_CHARS = 4000
 _MAX_VECTOR_CACHE_ITEMS = 20_000
@@ -327,6 +328,7 @@ class _DerivedRAGIndex:
                     size INTEGER NOT NULL,
                     ino INTEGER NOT NULL,
                     is_archive INTEGER NOT NULL,
+                    has_metadata INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (root_key, path)
                 )
                 """
@@ -347,7 +349,12 @@ class _DerivedRAGIndex:
                     table_header TEXT NOT NULL,
                     context_summary TEXT NOT NULL DEFAULT '',
                     until_date TEXT NOT NULL,
-                    is_archive INTEGER NOT NULL
+                    is_archive INTEGER NOT NULL,
+                    doc_date TEXT NOT NULL DEFAULT '',
+                    product TEXT NOT NULL DEFAULT '',
+                    department TEXT NOT NULL DEFAULT '',
+                    access_level TEXT NOT NULL DEFAULT 'public',
+                    tags_csv TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -372,7 +379,12 @@ class _DerivedRAGIndex:
                     embed_hash TEXT NOT NULL,
                     text TEXT NOT NULL,
                     until_date TEXT NOT NULL,
-                    is_archive INTEGER NOT NULL
+                    is_archive INTEGER NOT NULL,
+                    doc_date TEXT NOT NULL DEFAULT '',
+                    product TEXT NOT NULL DEFAULT '',
+                    department TEXT NOT NULL DEFAULT '',
+                    access_level TEXT NOT NULL DEFAULT 'public',
+                    tags_csv TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -384,6 +396,9 @@ class _DerivedRAGIndex:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_child_embed_hash ON child_chunks(embed_hash)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_child_metadata ON child_chunks(root_key, access_level, product, department, doc_date)"
             )
             conn.execute(
                 """
@@ -488,7 +503,7 @@ class _DerivedRAGIndex:
                     self._delete_path(root_key, display_path)
                     continue
                 self._delete_path(root_key, display_path)
-                self._index_file(
+                has_meta = self._index_file(
                     root_key,
                     display_path,
                     raw_text,
@@ -498,10 +513,10 @@ class _DerivedRAGIndex:
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO indexed_files
-                        (root_key, path, mtime_ns, size, ino, is_archive)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (root_key, path, mtime_ns, size, ino, is_archive, has_metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (root_key, display_path, fp[0], fp[1], fp[2], fp[3]),
+                    (root_key, display_path, fp[0], fp[1], fp[2], fp[3], 1 if has_meta else 0),
                 )
             self.conn.execute("COMMIT")
         except BaseException:
@@ -538,7 +553,7 @@ class _DerivedRAGIndex:
                 int(locked_row[3]),
             ) != fp:
                 self._delete_path(root_key, display_path)
-                self._index_file(
+                has_meta = self._index_file(
                     root_key,
                     display_path,
                     raw_text,
@@ -548,10 +563,10 @@ class _DerivedRAGIndex:
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO indexed_files
-                        (root_key, path, mtime_ns, size, ino, is_archive)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (root_key, path, mtime_ns, size, ino, is_archive, has_metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (root_key, display_path, fp[0], fp[1], fp[2], fp[3]),
+                    (root_key, display_path, fp[0], fp[1], fp[2], fp[3], 1 if has_meta else 0),
                 )
             self.conn.execute("COMMIT")
         except BaseException:
@@ -595,7 +610,7 @@ class _DerivedRAGIndex:
         ).fetchone()
         return str(row[0]) if row is not None else ""
 
-    # 对单篇文档执行两层父子分块并写入 parent_chunks、child_chunks（含 embed_hash）与 child_chunks_fts
+    # 对单篇文档提取顶部 Frontmatter 元数据并执行两层父子分块，写入 parent_chunks、child_chunks（含元数据列与 embed_hash）与 child_chunks_fts
     def _index_file(
         self,
         root_key: str,
@@ -604,22 +619,24 @@ class _DerivedRAGIndex:
         *,
         track_expiry: bool,
         is_archive: int,
-    ) -> None:
+    ) -> bool:
+        doc_meta, masked_text = parse_markdown_frontmatter(text)
         parents, children = chunk_markdown_hierarchy(
             display_path,
-            text,
+            masked_text,
             parent_max_chars=self.parent_max_chars,
             child_max_chars=self.child_max_chars,
             child_overlap_chars=self.child_overlap_chars,
             track_expiry=track_expiry,
         )
         if not parents:
-            return
+            return doc_meta.has_metadata
 
         path_tok = " ".join(tokenize_text(display_path, for_query=False))
         parent_id_by_idx: dict[int, int] = {}
         parent_summary_by_idx: dict[int, str] = {}
         parent_ctx_tok_by_idx: dict[int, str] = {}
+        tags_csv = doc_meta.tags_csv
 
         for parent in parents:
             summary = "" if parent.until_date else self._lookup_cached_context(parent.content_hash)
@@ -628,9 +645,10 @@ class _DerivedRAGIndex:
                 INSERT INTO parent_chunks (
                     root_key, path, parent_index, start_line, end_line,
                     section, kind, content_hash, text, table_header,
-                    context_summary, until_date, is_archive
+                    context_summary, until_date, is_archive,
+                    doc_date, product, department, access_level, tags_csv
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     root_key,
@@ -646,6 +664,11 @@ class _DerivedRAGIndex:
                     summary,
                     parent.until_date,
                     is_archive,
+                    doc_meta.doc_date,
+                    doc_meta.product,
+                    doc_meta.department,
+                    doc_meta.access,
+                    tags_csv,
                 ),
             )
             parent_id = cur.lastrowid
@@ -669,9 +692,10 @@ class _DerivedRAGIndex:
                 """
                 INSERT INTO child_chunks (
                     parent_id, root_key, path, child_index, start_line, end_line,
-                    section, content_hash, embed_hash, text, until_date, is_archive
+                    section, content_hash, embed_hash, text, until_date, is_archive,
+                    doc_date, product, department, access_level, tags_csv
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     parent_id,
@@ -686,6 +710,11 @@ class _DerivedRAGIndex:
                     child.text,
                     child.until_date,
                     is_archive,
+                    doc_meta.doc_date,
+                    doc_meta.product,
+                    doc_meta.department,
+                    doc_meta.access,
+                    tags_csv,
                 ),
             )
             child_rowid = cur.lastrowid
@@ -696,6 +725,7 @@ class _DerivedRAGIndex:
                 """,
                 (child_rowid, path_tok, sec_tok, ctx_tok, body_tok),
             )
+        return doc_meta.has_metadata
 
     # 原子落盘单条背景摘要至 chunk_contexts，并同步刷新对应父块及其全部子块的 FTS5 context_tokens 与 embed_hash
     def upsert_context_summary(
@@ -1103,7 +1133,7 @@ class RAGRetriever:
         cut = rendered[:_MAX_SNIPPET_CHARS].rsplit("\n", 1)[0]
         return f"{cut}\n  …（父块内容较长，完整内容请调用 read_markdown 按行查看）"
 
-    # 执行词面 BM25 子块检索并按 parent_id 聚合去重（取最高子块得分）
+    # 执行词面 BM25 子块检索（先在 SQLite WHERE 执行前置元数据与权限硬过滤，再按 parent_id 聚合去重取最高子块得分）
     def _query_bm25_parents(
         self,
         index: _DerivedRAGIndex,
@@ -1113,14 +1143,18 @@ class RAGRetriever:
         query_terms: list[str],
         ref_day_iso: str,
         limit: int,
+        metadata_filter: MetadataFilter,
     ) -> dict[int, _ParentHitPayload]:
+        if metadata_filter.is_unsatisfiable:
+            return {}
         fts_expr = " OR ".join(f'"{term}"' for term in query_terms)
         query_set = set(query_terms)
         min_matched = 2 if len(query_set) >= 4 else 1
         candidate_limit = max(limit * 20, 100)
+        meta_sql, meta_params = metadata_filter.to_sql_clause("c")
 
         rows = index.conn.execute(
-            """
+            f"""
             SELECT
                 p.id AS parent_id,
                 p.path,
@@ -1142,10 +1176,11 @@ class RAGRetriever:
               AND c.root_key = ?
               AND (? = 1 OR c.is_archive = 0)
               AND (c.until_date = '' OR c.until_date >= ?)
+              AND ({meta_sql})
             ORDER BY bm25(child_chunks_fts, 0.4, 1.5, 1.8, 3.0)
             LIMIT ?
             """,
-            (fts_expr, root_key, 1 if searching_archive else 0, ref_day_iso, candidate_limit),
+            (fts_expr, root_key, 1 if searching_archive else 0, ref_day_iso, *meta_params, candidate_limit),
         ).fetchall()
 
         total_children = int(
@@ -1204,7 +1239,7 @@ class RAGRetriever:
                 )
         return best_by_parent
 
-    # 执行稠密向量余弦相似度检索（math.sumprod），过 min_vector_score 抗噪门控并按 parent_id 聚合取最高相似度
+    # 执行稠密向量余弦相似度检索（先由 SQLite WHERE 前置硬过滤掉越权/超期/不匹配子块，再对合法候选执行 math.sumprod 精确余弦）
     def _query_dense_parents(
         self,
         index: _DerivedRAGIndex,
@@ -1214,10 +1249,14 @@ class RAGRetriever:
         query_vec: tuple[float, ...],
         embedder_model: str,
         ref_day_iso: str,
+        metadata_filter: MetadataFilter,
     ) -> dict[int, _ParentHitPayload]:
+        if metadata_filter.is_unsatisfiable:
+            return {}
         q_dims = len(query_vec)
+        meta_sql, meta_params = metadata_filter.to_sql_clause("c")
         rows = index.conn.execute(
-            """
+            f"""
             SELECT
                 p.id AS parent_id,
                 p.path,
@@ -1236,8 +1275,9 @@ class RAGRetriever:
             WHERE c.root_key = ?
               AND (? = 1 OR c.is_archive = 0)
               AND (c.until_date = '' OR c.until_date >= ?)
+              AND ({meta_sql})
             """,
-            (embedder_model, q_dims, root_key, 1 if searching_archive else 0, ref_day_iso),
+            (embedder_model, q_dims, root_key, 1 if searching_archive else 0, ref_day_iso, *meta_params),
         ).fetchall()
 
         min_sim = self.config.min_vector_score
@@ -1320,7 +1360,7 @@ class RAGRetriever:
             for score, path, start_line, end_line, section, parent_text, table_header, context_summary in chosen
         ]
 
-    # 在已完成同步的索引快照上执行单次 BM25（及可选 Dense + RRF 融合）、父级去重与多样性重排
+    # 在已完成同步的索引快照上执行单次前置过滤 + BM25（及可选 Dense + RRF 融合）、父级去重与多样性重排
     def _query_synced_index(
         self,
         index: _DerivedRAGIndex,
@@ -1330,10 +1370,11 @@ class RAGRetriever:
         query_terms: list[str],
         ref_day_iso: str,
         limit: int,
+        metadata_filter: MetadataFilter,
         query_vec: tuple[float, ...] | None = None,
         embedder_model: str | None = None,
     ) -> list[SearchHit]:
-        if limit <= 0:
+        if limit <= 0 or metadata_filter.is_unsatisfiable:
             return []
         dense_active = query_vec is not None and bool(embedder_model) and self.config.vector_weight > 0.0
         bm25_by_parent: dict[int, _ParentHitPayload] = {}
@@ -1345,6 +1386,7 @@ class RAGRetriever:
                 query_terms=query_terms,
                 ref_day_iso=ref_day_iso,
                 limit=limit,
+                metadata_filter=metadata_filter,
             )
 
         # 未激活稠密通道时直接走纯净 BM25 排序，零额外开销
@@ -1359,6 +1401,7 @@ class RAGRetriever:
             query_vec=query_vec,
             embedder_model=embedder_model,
             ref_day_iso=ref_day_iso,
+            metadata_filter=metadata_filter,
         )
         if not bm25_by_parent and not dense_by_parent:
             return []
@@ -1406,7 +1449,7 @@ class RAGRetriever:
         fused_entries.sort(key=lambda item: (-item[0], -item[1], item[2][1], item[2][2], item[2][3]))
         return self._finalize_hits([entry[2] for entry in fused_entries], limit=limit)
 
-    # 在已打开的派生索引上执行增量同步并委托 _query_synced_index 完成排序
+    # 在已打开的派生索引上执行增量同步并委托 _query_synced_index 完成前置过滤与排序
     def _sync_and_query(
         self,
         index: _DerivedRAGIndex,
@@ -1417,6 +1460,7 @@ class RAGRetriever:
         query_terms: list[str],
         ref_day_iso: str,
         limit: int,
+        metadata_filter: MetadataFilter,
         query_vec: tuple[float, ...] | None = None,
         embedder_model: str | None = None,
     ) -> list[SearchHit]:
@@ -1431,11 +1475,12 @@ class RAGRetriever:
             query_terms=query_terms,
             ref_day_iso=ref_day_iso,
             limit=limit,
+            metadata_filter=metadata_filter,
             query_vec=query_vec,
             embedder_model=embedder_model,
         )
 
-    # 在锁外按批次为活跃子块增量补齐目标维度向量缓存（严守已过期不外发、按 (hash, model, dims) 精确对齐并支持断点续跑）
+    # 在锁外按批次为活跃子块增量补齐目标维度向量缓存（支持在线检索前置过滤，严守越权与已过期片段绝不外发至外部 Embedding 接口）
     def _ensure_active_embeddings(
         self,
         memory: "MemoryStore",
@@ -1447,13 +1492,17 @@ class RAGRetriever:
         ref_day_iso: str,
         batch_size: int,
         expected_dims: int | None = None,
+        metadata_filter: MetadataFilter | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, int]:
         model_id = _clean_embedder_model(embedder)
         if not model_id:
             raise ValueError("embedder.model_id 不能为空。")
+        if metadata_filter is not None and metadata_filter.is_unsatisfiable:
+            return {"files": len(searchable), "children_total": 0, "embedded": 0, "cached_hits": 0, "skipped": 0, "dims": 0}
 
         target_dims = expected_dims if expected_dims is not None else _embedder_target_dims(embedder)
+        meta_sql, meta_params = metadata_filter.to_sql_clause("c") if metadata_filter is not None else ("1 = 1", [])
         embedded = 0
         final_total = 0
         final_cached = 0
@@ -1461,7 +1510,7 @@ class RAGRetriever:
 
         # 最多两轮：若未显式声明维度且首轮新批返回的真实维度与历史推断维度不同，自动切至真实维度补齐其余子块
         for _pass_idx in range(2):
-            # 持锁同步并一次性提取当前根目录全部活跃（未过期）子块及目标维度的已有向量缓存键集合
+            # 持锁同步并一次性提取当前根目录全部活跃（且通过可选前置权限/元数据过滤）子块及目标维度的已有向量缓存键集合
             def _collect_missing(
                 index: _DerivedRAGIndex,
                 *,
@@ -1469,16 +1518,17 @@ class RAGRetriever:
             ) -> tuple[int, int, int | None, list[tuple[str, str]], dict[str, int]]:
                 index.sync(root_key, searchable, is_archive_root=searching_archive)
                 rows = index.conn.execute(
-                    """
+                    f"""
                     SELECT c.embed_hash, c.path, c.section, p.context_summary, c.text
                     FROM child_chunks AS c
                     JOIN parent_chunks AS p ON p.id = c.parent_id
                     WHERE c.root_key = ?
                       AND (? = 1 OR c.is_archive = 0)
                       AND (c.until_date = '' OR c.until_date >= ?)
+                      AND ({meta_sql})
                     ORDER BY c.path, c.id
                     """,
-                    (root_key, 1 if searching_archive else 0, ref_day_iso),
+                    (root_key, 1 if searching_archive else 0, ref_day_iso, *meta_params),
                 ).fetchall()
                 total_children = len(rows)
                 if not rows:
@@ -1596,7 +1646,7 @@ class RAGRetriever:
             "dims": final_dims,
         }
 
-    # 对外检索入口：未配 embedder 或 vector_weight=0 时直通纯 BM25；支持可选 hyde_text（仅参与向量通道质心融合，绝不污染 BM25）与 AbortSignal
+    # 对外检索入口：前置元数据/权限硬过滤 + BM25/Dense RRF 混合检索；支持可选 hyde_text（仅向量通道质心融合）与 AbortSignal
     def search_hits(
         self,
         memory: "MemoryStore",
@@ -1606,12 +1656,14 @@ class RAGRetriever:
         today: date | None = None,
         *,
         hyde_text: str | None = None,
+        metadata_filter: MetadataFilter | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> list[SearchHit]:
         if abort_signal is not None and abort_signal.aborted:
             raise StreamAbortedError(abort_signal.reason or "检索已取消")
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("limit 必须是整数。")
+        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter()
         clean_query = query.strip() if isinstance(query, str) else ""
         # 词面分词严格仅基于真实原问题，绝不混入 HyDE 假设文本防止幻觉词污染 BM25
         query_terms = list(dict.fromkeys(tokenize_text(clean_query, for_query=True)))
@@ -1626,7 +1678,7 @@ class RAGRetriever:
         target_dir = memory.resolve_path(root, write=False)
         if not target_dir.is_dir():
             raise ValueError(f"目录不存在：{root}")
-        if limit <= 0:
+        if limit <= 0 or active_filter.is_unsatisfiable:
             return []
         searchable, searching_archive = memory.iter_searchable_files(root)
         root_key = memory.display_path(target_dir)
@@ -1662,6 +1714,7 @@ class RAGRetriever:
                     ref_day_iso=ref_day_iso,
                     batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
                     expected_dims=q_dims,
+                    metadata_filter=active_filter,
                     abort_signal=abort_signal,
                 )
                 query_vec = norm_q
@@ -1688,12 +1741,13 @@ class RAGRetriever:
                 query_terms=query_terms,
                 ref_day_iso=ref_day_iso,
                 limit=limit,
+                metadata_filter=active_filter,
                 query_vec=query_vec,
                 embedder_model=embedder_model,
             ),
         )
 
-    # 多子查询联合检索：单次扫盘、单次去重批量向量化与单快照同步后执行 Multi-Query RRF 与重叠区间去重融合
+    # 多子查询联合检索：单次扫盘、单次去重批量向量化与单快照前置过滤后执行 Multi-Query RRF 与重叠区间去重融合
     def search_multi_hits(
         self,
         memory: "MemoryStore",
@@ -1703,12 +1757,14 @@ class RAGRetriever:
         limit: int = 10,
         today: date | None = None,
         hyde_texts: Mapping[str, str] | None = None,
+        metadata_filter: MetadataFilter | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> list[SearchHit]:
         if abort_signal is not None and abort_signal.aborted:
             raise StreamAbortedError(abort_signal.reason or "检索已取消")
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("limit 必须是整数。")
+        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter()
         if isinstance(queries, (str, bytes, bytearray)):
             raise TypeError("queries 必须是字符串序列，不能是单个字符串或字节串。")
         clean_queries: list[str] = []
@@ -1727,7 +1783,7 @@ class RAGRetriever:
         target_dir = memory.resolve_path(root, write=False)
         if not target_dir.is_dir():
             raise ValueError(f"目录不存在：{root}")
-        if limit <= 0:
+        if limit <= 0 or active_filter.is_unsatisfiable:
             return []
 
         hyde_map = hyde_texts or {}
@@ -1740,6 +1796,7 @@ class RAGRetriever:
                 limit=limit,
                 today=today,
                 hyde_text=hyde_map.get(only_q),
+                metadata_filter=active_filter,
                 abort_signal=abort_signal,
             )
 
@@ -1802,6 +1859,7 @@ class RAGRetriever:
                     ref_day_iso=ref_day_iso,
                     batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
                     expected_dims=q_dims,
+                    metadata_filter=active_filter,
                     abort_signal=abort_signal,
                 )
                 embedder_model = active_model
@@ -1838,6 +1896,7 @@ class RAGRetriever:
                     query_terms=terms_by_query[sub_q],
                     ref_day_iso=ref_day_iso,
                     limit=per_query_limit,
+                    metadata_filter=active_filter,
                     query_vec=query_vecs.get(sub_q),
                     embedder_model=embedder_model,
                 )
@@ -1944,6 +2003,12 @@ class RAGRetriever:
                     (root_key,),
                 ).fetchone()[0]
             )
+            metadata_docs = int(
+                index.conn.execute(
+                    "SELECT COUNT(*) FROM indexed_files WHERE root_key = ? AND has_metadata = 1",
+                    (root_key,),
+                ).fetchone()[0]
+            )
             parent_chunks = int(
                 index.conn.execute(
                     "SELECT COUNT(*) FROM parent_chunks WHERE root_key = ?",
@@ -2015,6 +2080,7 @@ class RAGRetriever:
                 "child_max_chars": self.config.child_max_chars,
                 "child_overlap_chars": self.config.child_overlap_chars,
                 "indexed_files": indexed_files,
+                "metadata_docs": metadata_docs,
                 "parent_chunks": parent_chunks,
                 "child_chunks": child_chunks,
                 "enriched_parents": enriched_parents,
@@ -2138,8 +2204,9 @@ class RAGRetriever:
             if not missing_parents:
                 continue
 
-            # 记忆文件送入 <document> 前剔除全部带 (until: ...) 的过期块，杜绝过期敏感内容外发或泄漏进常驻摘要缓存
-            safe_doc_text = strip_expiring_lines(raw_text) if is_memory else raw_text
+            # 送入 <document> 前剥离顶部 Frontmatter 与全部带 (until: ...) 的过期块，杜绝元数据头或过期敏感内容外发
+            _, body_without_fm = parse_markdown_frontmatter(raw_text)
+            safe_doc_text = strip_expiring_lines(body_without_fm) if is_memory else body_without_fm
 
             # 在锁外流式调用模型生成背景摘要，每产出 1 条立即持锁原子提交至 chunk_contexts 与 FTS5
             produced_hashes: set[str] = set()

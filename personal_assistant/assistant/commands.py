@@ -43,6 +43,7 @@ from personal_assistant.assistant.query_optimizer import (
     QueryOptimizationConfig,
     QueryOptimizer,
 )
+from personal_assistant.assistant.rag_metadata import parse_allowed_access
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
@@ -337,6 +338,7 @@ class ToolsConfig:
         if not isinstance(retrieval_raw, dict):
             raise ValueError("retrieval 必须是 JSON 对象。")
         QueryOptimizationConfig.from_dict(retrieval_raw.get("query_optimization"))
+        parse_allowed_access(retrieval_raw.get("allowed_access"))
 
         telemetry_raw = raw.get("telemetry", {})
         if not isinstance(telemetry_raw, dict):
@@ -605,6 +607,11 @@ class ToolsConfig:
             if role_target:
                 return from_embedding_profile(resolved_cfg.get_profile(role_target), env=source_env)
         return from_env_embedder(source_env)
+
+    # 返回系统级文档访问权限白名单（对应 retrieval.allowed_access，默认 ("public",)）
+    @property
+    def allowed_access(self) -> tuple[str, ...]:
+        return parse_allowed_access(self.retrieval.get("allowed_access"))
 
     # 根据 retrieval.query_optimization 配置构造检索前 Query 优化器（默认关闭，保持零额外 LLM 调用）
     def build_query_optimizer(self) -> QueryOptimizer:

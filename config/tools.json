@@ -27,6 +27,7 @@
     "rrf_k": 60,
     "bm25_weight": 1.0,
     "vector_weight": 1.0,
+    "allowed_access": ["public"],
     "query_optimization": {
       "enabled": false,
       "routing": true,

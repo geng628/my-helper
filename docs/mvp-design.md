@@ -125,14 +125,15 @@ my_helper_v2/
 │   │   └── embeddings.py              #   标准 /v1/embeddings 客户端、float32 编解码与 math.sumprod 精确余弦
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
-│                                      #          rag_contextualizer.py / query_optimizer.py / prompts.py / context.py /
-│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py / db.py /
-│                                      #          consolidator.py / commands.py / app.py / cli.py
+│                                      #          rag_metadata.py / rag_contextualizer.py / query_optimizer.py /
+│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
+│                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
+│   ├── finetune_embedding.py          # 独立外部垂直领域 Embedding 微调脚本模板（按需 GPU 训练，零主包依赖）
 │   ├── web_chat.py                    # 零依赖本地 HTTP/SSE 服务（ThreadingHTTPServer）
 │   └── web_ui.html                    # 原生 HTML/JS 流式推导与交互页面
-├── evals/                             # 顶层统一评测包（search_eval / agent_eval / memory_eval / public_benchmarks）
+├── evals/                             # 顶层统一评测包（search_eval / agent_eval / memory_eval / public_benchmarks / embedding_finetune）
 ├── tests/                             # 确定性单测、宿主隔离 conftest.py、跨协议契约测试与架构/红队守卫
 ├── docs/
 │   ├── mvp-design.md                  # 本架构设计文档
@@ -267,7 +268,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `262 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `266 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：
