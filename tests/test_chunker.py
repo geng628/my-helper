@@ -129,3 +129,79 @@ def test_chunk_markdown_content_hash_and_long_text_line_splitting() -> None:
     heading_only = chunk_markdown("docs/empty_body.md", "# 仅有标题\n")
     assert len(heading_only) == 1 and heading_only[0].section == "仅有标题"
     assert chunk_markdown("docs/blank.md", "   \n\n") == []
+
+
+# 回归 B3 与 Nit 1：行内三反引号不误开围栏、未闭合围栏不吞过期条目、同名标题绝不合并、代码块/表格双向不与正文混块、多行过期列表与非法日期对齐生命周期
+def test_chunk_markdown_adversarial_edge_cases_and_expiry_isolation() -> None:
+    # 1. 行内 ```bash``` 不得误判为未闭合代码块围栏从而吞噬后续标题与过期条目
+    inline_fence_md = (
+        "# 记录\n\n"
+        "```bash``` 是常见的代码块围栏标记。\n\n"
+        "## 日程\n"
+        "- [2026-10-01] 过期敏感事项 EXPIRED_LEAK (until: 2026-10-15)\n"
+    )
+    inline_chunks = chunk_markdown("data/memory/inline.md", inline_fence_md, track_expiry=True)
+    exp_chunks = [c for c in inline_chunks if "EXPIRED_LEAK" in c.text]
+    assert len(exp_chunks) == 1
+    assert exp_chunks[0].until_date == "2026-10-15"
+    assert exp_chunks[0].section == "记录 > 日程"
+    assert all("EXPIRED_LEAK" not in c.text for c in inline_chunks if not c.until_date)
+
+    # 2. track_expiry=True 时真正未闭合的围栏同样不得吞噬后续过期条目
+    unclosed_exp_md = (
+        "# 记录\n"
+        "```python\n"
+        "x = 1\n"
+        "- [2026-10-01] 未闭合后过期项 UNCLOSED_EXP (until: 2026-10-15)\n"
+    )
+    unclosed_exp_chunks = chunk_markdown("data/memory/unclosed.md", unclosed_exp_md, track_expiry=True)
+    exp_after = [c for c in unclosed_exp_chunks if "UNCLOSED_EXP" in c.text]
+    assert len(exp_after) == 1 and exp_after[0].until_date == "2026-10-15"
+
+    # 3. 非过期追踪模式下未闭合代码块裁去尾部空行，保持 start_line..end_line 与 split("\n") 严格对齐
+    unclosed_code = "```python\nx = 1\n\n"
+    uc = chunk_markdown("docs/uc.md", unclosed_code, track_expiry=False)
+    assert len(uc) == 1
+    assert (uc[0].start_line, uc[0].end_line) == (1, 2)
+    assert len(uc[0].text.split("\n")) == uc[0].end_line - uc[0].start_line + 1
+
+    # 4. 同名二级标题在默认 max_chars=500 下绝不合并进同一分块，也不吞并标题行
+    dup_heading_md = "# 日记\n\n## 备忘\n第一段内容。\n\n## 备忘\n第二段内容。\n"
+    dup_chunks = chunk_markdown("docs/dup.md", dup_heading_md, max_chars=500)
+    assert len(dup_chunks) == 2
+    assert "## 备忘" not in dup_chunks[0].text and "## 备忘" not in dup_chunks[1].text
+    assert "第一段内容" in dup_chunks[0].text and "第二段内容" in dup_chunks[1].text
+
+    # 5. 代码块与表格在前后双向均保持独立块，不与紧跟其后的正文段落混拼
+    code_prose_md = "# 笔记\n\n```python\nx = 1\n```\n\n这是紧随代码块之后的正文段落。\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n表格后的正文。\n"
+    cp_chunks = chunk_markdown("docs/cp.md", code_prose_md, max_chars=500)
+    assert len(cp_chunks) == 4
+    assert cp_chunks[0].text.startswith("```python") and "紧随代码块之后" not in cp_chunks[0].text
+    assert cp_chunks[1].text == "这是紧随代码块之后的正文段落。"
+    assert cp_chunks[2].text.startswith("| A | B |") and "表格后的正文" not in cp_chunks[2].text
+    assert cp_chunks[3].text == "表格后的正文。"
+
+    # 6. 多行缩进过期列表项整体归入同一过期块；非法日期 (until: 2026-00-00) 按无截止日期处理；带过期标签的标题不泄漏进 section
+    expiry_edge_md = (
+        "# 常规\r\n"
+        "- [2026-10-01] 临时会议 (until: 2026-10-15)\r\n"
+        "  会议密码 TEMP_PASS_123\r\n"
+        "- [2026-10-01] 非法日期保留 (until: 2026-00-00)\r\n"
+        "## 过期标题 SECRET_HEADING (until: 2026-10-15)\r\n"
+        "普通正文行。\r\n"
+        "| 项 | 说明 |\r\n"
+        "| --- | --- |\r\n"
+        "| 常驻 | ok |\r\n"
+        "| 临时 | ROW_EXP (until: 2026-10-15) |\r\n"
+    )
+    ee_chunks = chunk_markdown("data/memory/edge.md", expiry_edge_md, track_expiry=True)
+    pass_chunks = [c for c in ee_chunks if "TEMP_PASS_123" in c.text]
+    assert len(pass_chunks) == 1 and pass_chunks[0].until_date == "2026-10-15"
+    invalid_date_chunks = [c for c in ee_chunks if "非法日期保留" in c.text]
+    assert len(invalid_date_chunks) == 1 and invalid_date_chunks[0].until_date == ""
+    heading_exp = [c for c in ee_chunks if "SECRET_HEADING" in c.text]
+    assert len(heading_exp) == 1 and heading_exp[0].until_date == "2026-10-15"
+    assert all("SECRET_HEADING" not in c.section for c in ee_chunks)
+    row_exp = [c for c in ee_chunks if "ROW_EXP" in c.text]
+    assert len(row_exp) == 1 and row_exp[0].until_date == "2026-10-15"
+

@@ -398,3 +398,187 @@ def test_rag_small_to_big_boundaries_dedup_and_plugin_terminate(tmp_path: Path) 
     manager.terminate_all()
     assert len(managed_ret._indices) == 0
 
+
+# 回归 B1 / B2 与 Nits 2-5：index_path 边界、祖先与 WAL 符号链接拦截、只读零写盘、锁竞争绝不删库、运行期损坏自愈、换 Inode 与删光清空、并发安全
+def test_rag_security_boundaries_concurrency_and_recovery_regressions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import concurrent.futures
+    from plugins.rag_retriever import RAGConfig, RAGRetriever
+
+    # 1. RAGConfig 拒绝绝对路径、.. 越界路径与浮点数截断
+    with pytest.raises(ValueError):
+        RAGConfig(index_path="/tmp/evil.db")
+    with pytest.raises(ValueError):
+        RAGConfig(index_path="../outside.db")
+    with pytest.raises(ValueError):
+        RAGConfig.from_dict({"chunk_max_chars": 1.9})
+    with pytest.raises(ValueError):
+        RAGConfig.from_dict({"max_hits_per_file": float("inf")})
+
+    # 2. read_only=True 即使配置了 index_path 也严守零写盘，绝不创建派生文件
+    ro_data = tmp_path / "ro_data"
+    (ro_data / "memory").mkdir(parents=True)
+    (ro_data / "memory" / "a.md").write_text("# 只读\n只读模式测试内容 ALPHA_RO。\n", encoding="utf-8")
+    ro_mem = MemoryStore(ro_data, create_dirs=False, retriever=RAGRetriever(RAGConfig(index_path="state/custom.db")))
+    try:
+        assert ro_mem.search_hits("ALPHA_RO")
+        assert not (ro_data / "state").exists()
+    finally:
+        ro_mem.close()
+
+    # 3. 祖先目录符号链接在 mkdir 之前即被拦截，绝不在 data_root 外创建任何目录
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    anc_data = tmp_path / "anc_data"
+    (anc_data / "memory").mkdir(parents=True)
+    (anc_data / "memory" / "a.md").write_text("# 祖先\n测试祖先符号链接拦截。\n", encoding="utf-8")
+    os.symlink(outside_dir, anc_data / "state")
+    anc_mem = MemoryStore(
+        anc_data,
+        create_dirs=True,
+        retriever=RAGRetriever(RAGConfig(index_path="state/nested/rag_index.db")),
+    )
+    try:
+        with pytest.raises(ValueError, match="符号链接"):
+            anc_mem.search_hits("祖先符号链接")
+        assert not (outside_dir / "nested").exists()
+    finally:
+        anc_mem.close()
+
+    # 4. WAL 附属文件符号链接在打开 SQLite 前即被拦截，保护外部目标文件不被覆写
+    victim = tmp_path / "victim.txt"
+    victim.write_text("KEEP_INTACT", encoding="utf-8")
+    wal_data = tmp_path / "wal_data"
+    (wal_data / "memory").mkdir(parents=True)
+    (wal_data / "state").mkdir(parents=True)
+    (wal_data / "memory" / "a.md").write_text("# WAL\n测试 WAL 符号链接拦截。\n", encoding="utf-8")
+    os.symlink(victim, wal_data / "state" / "rag_index.db-wal")
+    wal_mem = MemoryStore(wal_data, create_dirs=True, retriever=RAGRetriever())
+    try:
+        with pytest.raises(ValueError, match="符号链接"):
+            wal_mem.search_hits("WAL 符号链接")
+        assert victim.read_text(encoding="utf-8") == "KEEP_INTACT"
+    finally:
+        wal_mem.close()
+
+    # 5. 非损坏型数据库异常（如 SQLITE_BUSY / database is locked）绝不误删活派生库
+    busy_data = tmp_path / "busy_data"
+    (busy_data / "memory").mkdir(parents=True)
+    (busy_data / "memory" / "a.md").write_text("# 锁\n测试数据库锁竞争保护 BUSY_GUARD。\n", encoding="utf-8")
+    busy_mem = MemoryStore(busy_data, create_dirs=True, retriever=RAGRetriever())
+    try:
+        assert busy_mem.search_hits("BUSY_GUARD")
+    finally:
+        busy_mem.close()
+    busy_db = busy_data / "state" / "rag_index.db"
+    before_bytes = busy_db.read_bytes()
+    # 持有外部排他锁触发真实 OperationalError(database is locked)：分别覆盖 Schema 升级写锁与增量同步写锁
+    locker = sqlite3.connect(str(busy_db), isolation_level=None)
+    try:
+        locker.execute("BEGIN EXCLUSIVE")
+        from plugins.rag_retriever import _DerivedRAGIndex
+
+        orig_conn_disk = _DerivedRAGIndex._connect_disk
+
+        # 构造极短 busy_timeout 的磁盘连接模拟多进程高并发锁超时
+        def _short_disk_connect(db_p: Path, *, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+            return orig_conn_disk(db_p, busy_timeout_ms=20)
+
+        monkeypatch.setattr(_DerivedRAGIndex, "_connect_disk", staticmethod(_short_disk_connect))
+        # a) 变更 chunk_max_chars 迫使 _ensure_schema 走写事务并命中锁超时，绝不删除活派生库
+        busy_mem2 = MemoryStore(busy_data, create_dirs=True, retriever=RAGRetriever(RAGConfig(chunk_max_chars=300)))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                busy_mem2.search_hits("BUSY_GUARD")
+            assert busy_db.is_file() and busy_db.read_bytes() == before_bytes
+        finally:
+            busy_mem2.close()
+
+        # b) 修改文档迫使 sync() 走 BEGIN IMMEDIATE 写事务并命中锁超时，同样绝不删除活派生库
+        (busy_data / "memory" / "a.md").write_text("# 锁\n变更后的内容 BUSY_GUARD_V2。\n", encoding="utf-8")
+        busy_mem3 = MemoryStore(busy_data, create_dirs=True, retriever=RAGRetriever())
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                busy_mem3.search_hits("BUSY_GUARD_V2")
+            assert busy_db.is_file() and busy_db.read_bytes() == before_bytes
+        finally:
+            busy_mem3.close()
+            monkeypatch.undo()
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+
+    # 6. 外部重建换 Inode 检测、运行期损坏自愈、删光目录清空旧行与规范相对 root_key
+    rec_data = tmp_path / "rec_data"
+    (rec_data / "memory").mkdir(parents=True)
+    doc = rec_data / "memory" / "note.md"
+    doc.write_text("# 恢复\n初始关键内容 RECOVER_ALPHA。\n", encoding="utf-8")
+    rec_ret = RAGRetriever()
+    rec_mem = MemoryStore(rec_data, create_dirs=True, retriever=rec_ret)
+    try:
+        assert rec_mem.search_hits("RECOVER_ALPHA")
+        rec_db = rec_data / "state" / "rag_index.db"
+        with sqlite3.connect(rec_db) as conn:
+            root_keys = {r[0] for r in conn.execute("SELECT DISTINCT root_key FROM chunks").fetchall()}
+            assert root_keys == {"data/memory"}
+
+        # 外部原子替换 rag_index.db 为全新 Inode（模拟另一进程重建），当前实例应感知换 Inode 并正常查询
+        replacement = rec_data / "state" / "replacement.db"
+        tmp_ret = RAGRetriever(RAGConfig(index_path="state/replacement.db"))
+        tmp_mem = MemoryStore(rec_data, create_dirs=True, retriever=tmp_ret)
+        try:
+            assert tmp_mem.search_hits("RECOVER_ALPHA")
+        finally:
+            tmp_mem.close()
+        os.replace(replacement, rec_db)
+        assert rec_mem.search_hits("RECOVER_ALPHA")
+
+        # 模拟运行期中查询阶段触发物理损坏（SQLITE_CORRUPT），应自动关闭重建并重试成功
+        calls = {"n": 0}
+        orig_sync_query = rec_ret._sync_and_query
+
+        # 首次调用抛出 SQLITE_CORRUPT，验证 search_hits 清理损坏派生库并重试一次成功
+        def _flaky_corrupt(*args: object, **kwargs: object) -> list[SearchHit]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                err = sqlite3.DatabaseError("database disk image is malformed")
+                err.sqlite_errorcode = sqlite3.SQLITE_CORRUPT  # type: ignore[attr-defined]
+                raise err
+            return orig_sync_query(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(rec_ret, "_sync_and_query", _flaky_corrupt)
+        hits_after_corrupt = rec_mem.search_hits("RECOVER_ALPHA")
+        assert calls["n"] == 2 and hits_after_corrupt
+        monkeypatch.undo()
+
+        # 删除目录内最后一个文件后，派生库旧行必须被同步清空
+        doc.unlink()
+        assert rec_mem.search_hits("RECOVER_ALPHA") == []
+        with sqlite3.connect(rec_db) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM indexed_files").fetchone()[0] == 0
+    finally:
+        rec_mem.close()
+
+    # 7. 多线程并发 build_retriever 与并发 search_hits / terminate_all 零竞态
+    conc_data = tmp_path / "conc_data"
+    (conc_data / "memory").mkdir(parents=True)
+    (conc_data / "memory" / "c.md").write_text("# 并发\n多线程安全访问 CONCURRENT_SAFE_88。\n", encoding="utf-8")
+    repo_root = Path(__file__).resolve().parent.parent
+    manager = PluginManager.from_entries(["plugins"], repo_root)
+    try:
+        # 并发调用插件工厂与搜索验证锁保护正常
+        def _worker(_idx: int) -> int:
+            ret = manager.retrievers["rag"]({})
+            mem = MemoryStore(conc_data, create_dirs=True, retriever=ret)
+            hits = mem.search_hits("CONCURRENT_SAFE_88")
+            return len(hits)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(_worker, range(8)))
+        assert all(r >= 1 for r in results)
+    finally:
+        manager.terminate_all()
+
+

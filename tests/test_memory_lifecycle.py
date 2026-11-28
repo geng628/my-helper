@@ -426,6 +426,7 @@ def test_replace_and_remove_soft_retire_with_superseded_chain_and_rag_traceabili
         today=day2,
     )
     assert "(msg#42)" not in archive_file.read_text(encoding="utf-8")
+    memory.close()
 
 
 # 测试 op=merge 无损拼接互补维度：保留原时间与原事实正文，支持中英文标点与幂等去重，且不触发 superseded 软退休

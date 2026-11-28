@@ -5,6 +5,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from personal_assistant.assistant.common import parse_iso_date
 from personal_assistant.assistant.memory_lifecycle import UNTIL_PATTERN
 
 DEFAULT_CHUNK_MAX_CHARS = 500
@@ -12,7 +13,7 @@ DEFAULT_CHUNK_MAX_CHARS = 500
 _HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?:[ \t]+|$)(.*)$")
 _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _TABLE_SEP_RE = re.compile(
-    r"^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*$"
+    r"^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$"
 )
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
 
@@ -31,11 +32,12 @@ class DocumentChunk:
     until_date: str = ""
 
 
-# 内部原子结构块（围栏代码块、Markdown 表格、列表项、段落或独立过期条目）
+# 内部原子结构块（围栏代码块、Markdown 表格、列表项、段落或独立过期条目，携带单调递增 section_id）
 @dataclass(frozen=True)
 class _AtomicBlock:
     start_line: int
     end_line: int
+    section_id: int
     section: str
     kind: str
     until_date: str = ""
@@ -56,10 +58,47 @@ def _parse_heading(line: str) -> tuple[int, str] | None:
     return level, title
 
 
-# 提取单行文本中的 (until: YYYY-MM-DD) 截止日期，未命中时返回空字符串
+# 提取并校验单行文本中的有效 (until: YYYY-MM-DD) 截止日期，非法日期（如 2026-00-00）按无截止日期处理
 def _extract_until_date(line: str) -> str:
     match = UNTIL_PATTERN.search(line)
-    return match.group(1) if match else ""
+    if match is None:
+        return ""
+    parsed = parse_iso_date(match.group(1))
+    return parsed.isoformat() if parsed is not None else ""
+
+
+# 检测当前行是否为合法 CommonMark 围栏代码块起手（反引号围栏 info 串不得包含反引号），并返回闭合行下标
+def _match_fenced_code(
+    lines: list[str],
+    start_idx: int,
+    *,
+    require_closed: bool,
+) -> int | None:
+    line = lines[start_idx]
+    fence_match = _FENCE_OPEN_RE.match(line)
+    if fence_match is None:
+        return None
+    fence_token = fence_match.group(1)
+    fence_char = fence_token[0]
+    fence_len = len(fence_token)
+    # CommonMark §4.5：反引号围栏的 info string 不能包含反引号（避免把行内 ```code``` 误判为未闭合代码块）
+    if fence_char == "`" and "`" in line[fence_match.end() :]:
+        return None
+
+    close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$")
+    total = len(lines)
+    probe = start_idx + 1
+    while probe < total:
+        if close_re.match(lines[probe]) is not None:
+            return probe + 1
+        probe += 1
+    if require_closed:
+        return None
+    # 未闭合代码块收尾裁去尾部纯空行，保证 end_line 与可见正文行数严格对齐
+    end_idx = total
+    while end_idx > start_idx + 1 and not lines[end_idx - 1].strip():
+        end_idx -= 1
+    return end_idx
 
 
 # 判断当前行与下一行是否构成 GFM Markdown 表格起手（表头含 | 且次行为分隔行）
@@ -86,7 +125,7 @@ def _leading_indent(line: str) -> int:
     return width
 
 
-# 将整篇文本解析为带标题面包屑与行号范围的有序原子结构块列表（代码块内 # 注释绝不误判为标题）
+# 将整篇文本解析为带单调 section_id、标题面包屑与行号范围的有序原子结构块列表
 def _parse_atomic_blocks(
     lines: list[str],
     *,
@@ -95,6 +134,7 @@ def _parse_atomic_blocks(
     blocks: list[_AtomicBlock] = []
     heading_stack: list[tuple[int, str]] = []
     headings_seen: list[tuple[int, str]] = []
+    section_id = 0
     total = len(lines)
     idx = 0
 
@@ -104,60 +144,73 @@ def _parse_atomic_blocks(
             idx += 1
             continue
 
-        # 1. ATX 标题：更新多级标题栈面包屑（不直接作为正文块，若全文仅有标题则在末尾兜底）
-        heading = _parse_heading(line)
-        if heading is not None:
-            level, title = heading
-            while heading_stack and heading_stack[-1][0] >= level:
-                heading_stack.pop()
-            heading_stack.append((level, title))
-            section_now = " > ".join(t for _, t in heading_stack)
-            headings_seen.append((idx + 1, section_now))
-            idx += 1
-            continue
-
         section = " > ".join(t for _, t in heading_stack)
 
-        # 2. 围栏代码块（``` 或 ~~~）：保持整块原子性，内部空行与 # 注释绝不切开
-        fence_match = _FENCE_OPEN_RE.match(line)
-        if fence_match is not None:
-            fence_token = fence_match.group(1)
-            fence_char = fence_token[0]
-            fence_len = len(fence_token)
-            close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$")
-            start_idx = idx
-            idx += 1
-            while idx < total:
-                if close_re.match(lines[idx]) is not None:
-                    idx += 1
-                    break
-                idx += 1
-            blocks.append(
-                _AtomicBlock(
-                    start_line=start_idx + 1,
-                    end_line=idx,
-                    section=section,
-                    kind="code",
-                )
-            )
-            continue
-
-        # 3. 带截止日期的时效条目（仅在追踪过期时独立成块，防止与常驻邻居混块或过期泄漏）
+        # 1. 追踪过期模式优先检查合法 (until: YYYY-MM-DD)，防止带过期标签的标题或列表项泄漏进常驻索引
         if track_expiry:
             until_date = _extract_until_date(line)
             if until_date:
+                start_idx = idx
+                is_list = _LIST_ITEM_RE.match(line) is not None
+                base_indent = _leading_indent(line)
+                idx += 1
+                # 带过期标签的列表项同步吸收其缩进续行，避免子行密码/细节在过期后残留
+                if is_list:
+                    while idx < total:
+                        nxt = lines[idx]
+                        if not nxt.strip():
+                            break
+                        if _extract_until_date(nxt):
+                            break
+                        if _parse_heading(nxt) is not None:
+                            break
+                        if _match_fenced_code(lines, idx, require_closed=True) is not None:
+                            break
+                        if _LIST_ITEM_RE.match(nxt) is not None and _leading_indent(nxt) <= base_indent:
+                            break
+                        if _leading_indent(nxt) <= base_indent:
+                            break
+                        idx += 1
                 blocks.append(
                     _AtomicBlock(
-                        start_line=idx + 1,
-                        end_line=idx + 1,
+                        start_line=start_idx + 1,
+                        end_line=idx,
+                        section_id=section_id,
                         section=section,
                         kind="expiring",
                         until_date=until_date,
                         standalone=True,
                     )
                 )
-                idx += 1
                 continue
+
+        # 2. ATX 标题：更新多级标题栈面包屑并递增单调 section_id（确保同名标题绝不合并跨节）
+        heading = _parse_heading(line)
+        if heading is not None:
+            level, title = heading
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            section_id += 1
+            section_now = " > ".join(t for _, t in heading_stack)
+            headings_seen.append((idx + 1, section_now))
+            idx += 1
+            continue
+
+        # 3. 围栏代码块（``` 或 ~~~）：保持整块原子性；track_expiry=True 时未闭合围栏不吞噬后续过期条目
+        fence_end = _match_fenced_code(lines, idx, require_closed=track_expiry)
+        if fence_end is not None:
+            blocks.append(
+                _AtomicBlock(
+                    start_line=idx + 1,
+                    end_line=fence_end,
+                    section_id=section_id,
+                    section=section,
+                    kind="code",
+                )
+            )
+            idx = fence_end
+            continue
 
         # 4. GFM Markdown 表格：从表头 + 分隔行起连续吸收数据行，保证整表结构不被切碎
         if _is_table_start(lines, idx):
@@ -167,15 +220,18 @@ def _parse_atomic_blocks(
                 nxt = lines[idx]
                 if not nxt.strip() or "|" not in nxt:
                     break
-                if _parse_heading(nxt) is not None or _FENCE_OPEN_RE.match(nxt) is not None:
-                    break
                 if track_expiry and _extract_until_date(nxt):
+                    break
+                if _parse_heading(nxt) is not None:
+                    break
+                if _match_fenced_code(lines, idx, require_closed=track_expiry) is not None:
                     break
                 idx += 1
             blocks.append(
                 _AtomicBlock(
                     start_line=start_idx + 1,
                     end_line=idx,
+                    section_id=section_id,
                     section=section,
                     kind="table",
                 )
@@ -191,9 +247,11 @@ def _parse_atomic_blocks(
                 nxt = lines[idx]
                 if not nxt.strip():
                     break
-                if _parse_heading(nxt) is not None or _FENCE_OPEN_RE.match(nxt) is not None:
-                    break
                 if track_expiry and _extract_until_date(nxt):
+                    break
+                if _parse_heading(nxt) is not None:
+                    break
+                if _match_fenced_code(lines, idx, require_closed=track_expiry) is not None:
                     break
                 if _LIST_ITEM_RE.match(nxt) is not None and _leading_indent(nxt) <= base_indent:
                     break
@@ -204,6 +262,7 @@ def _parse_atomic_blocks(
                 _AtomicBlock(
                     start_line=start_idx + 1,
                     end_line=idx,
+                    section_id=section_id,
                     section=section,
                     kind="list",
                 )
@@ -217,20 +276,21 @@ def _parse_atomic_blocks(
             nxt = lines[idx]
             if not nxt.strip():
                 break
+            if track_expiry and _extract_until_date(nxt):
+                break
             if (
                 _parse_heading(nxt) is not None
-                or _FENCE_OPEN_RE.match(nxt) is not None
+                or _match_fenced_code(lines, idx, require_closed=track_expiry) is not None
                 or _is_table_start(lines, idx)
                 or _LIST_ITEM_RE.match(nxt) is not None
             ):
-                break
-            if track_expiry and _extract_until_date(nxt):
                 break
             idx += 1
         blocks.append(
             _AtomicBlock(
                 start_line=start_idx + 1,
                 end_line=idx,
+                section_id=section_id,
                 section=section,
                 kind="prose",
             )
@@ -264,6 +324,7 @@ def _split_oversized_block(
                 _AtomicBlock(
                     start_line=cur_start,
                     end_line=line_no - 1,
+                    section_id=block.section_id,
                     section=block.section,
                     kind=block.kind,
                     until_date=block.until_date,
@@ -278,6 +339,7 @@ def _split_oversized_block(
         _AtomicBlock(
             start_line=cur_start,
             end_line=block.end_line,
+            section_id=block.section_id,
             section=block.section,
             kind=block.kind,
             until_date=block.until_date,
@@ -352,11 +414,12 @@ def chunk_markdown(
     chunks: list[DocumentChunk] = []
     buf_start: int | None = None
     buf_end: int | None = None
+    buf_section_id: int | None = None
     buf_section = ""
 
     # 将当前同章节缓冲区落成一条连续行范围的 DocumentChunk
     def _flush() -> None:
-        nonlocal buf_start, buf_end, buf_section
+        nonlocal buf_start, buf_end, buf_section_id, buf_section
         if buf_start is None or buf_end is None:
             return
         chunks.append(
@@ -371,11 +434,12 @@ def chunk_markdown(
         )
         buf_start = None
         buf_end = None
+        buf_section_id = None
         buf_section = ""
 
     for blk in normalized_blocks:
-        # 独立时效块或大型结构块（代码块/表格）不跨边界混拼，保障结构与过期边界纯净
-        if blk.standalone:
+        # 独立时效块及代码块/表格在前后双向均保持独立边界，不与相邻段落混拼
+        if blk.standalone or blk.kind in {"code", "table"}:
             _flush()
             chunks.append(
                 _build_chunk(
@@ -393,24 +457,27 @@ def chunk_markdown(
         if buf_start is None or buf_end is None:
             buf_start = blk.start_line
             buf_end = blk.end_line
+            buf_section_id = blk.section_id
             buf_section = blk.section
             continue
 
-        # 跨标题章节绝不合并；同章节下按精确原文跨度判断是否仍在 max_chars 预算内
-        if blk.section != buf_section:
+        # 跨标题章节（含同名新标题，按单调 section_id 判定）绝不合并
+        if blk.section_id != buf_section_id:
             _flush()
             buf_start = blk.start_line
             buf_end = blk.end_line
+            buf_section_id = blk.section_id
             buf_section = blk.section
             continue
 
         merged_len = len("\n".join(lines[buf_start - 1 : blk.end_line]))
-        if merged_len <= max_chars and blk.kind not in {"code", "table"}:
+        if merged_len <= max_chars:
             buf_end = blk.end_line
         else:
             _flush()
             buf_start = blk.start_line
             buf_end = blk.end_line
+            buf_section_id = blk.section_id
             buf_section = blk.section
 
     _flush()

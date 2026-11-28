@@ -278,7 +278,7 @@
   - **单轨升级 `SearchHit` 与全仓调用点**：[../personal_assistant/assistant/memory.py](../personal_assistant/assistant/memory.py) 直接将 `SearchHit` 升级为 `(path, start_line, end_line, section, snippet, score)`（`search_markdown` 输出 `path:start-end`），新增 `MemoryStore.read_only` 与 `MemoryStore.close()`（并在 `AssistantApp.close()` 调用）；同步更新 [../config/tools.json](../config/tools.json)、[../.github/workflows/test.yml](../.github/workflows/test.yml)、[../evals/cli.py](../evals/cli.py) 与全仓测试，新增 [../tests/test_chunker.py](../tests/test_chunker.py) 与 [../tests/test_rag_plugin.py](../tests/test_rag_plugin.py)（替换 `tests/test_fts5_plugin.py`）。
 - **踩坑根因与修复**：初版纯结构分块无相邻上下文时，40 题 MRR 虽升至 `0.9655`，但 LoCoMo 200 题因对话问答跨块边界被切裂导致 `quote_coverage` 由 `0.6017` 跌至 `0.5018`（通过率 `43.0%`）；引入零冗余分块的 `join_prev` 精确校验 + Small-to-Big 同章节相邻块扩展与防重行去重后，LoCoMo 恢复至 `104/200 (52.0%)` 且 MRR 进一步提升至 `0.6508`（`single-hop` 升至 `86.0%`，`multi-hop` MRR 由 `0.4923` 升至 `0.5523`）。
 - **验证与同口径对比（`8b19d97` → 本次提交）**：
-  - 单元测试：`233 passed → 239 passed`（全绿，含 `tests/test_architecture.py`、`memory.py <= 600` 行预算与插件隔离守卫）；
+  - 单元测试：`233 passed → 241 passed`（全绿，含 `tests/test_architecture.py`、`memory.py <= 600` 行预算、插件隔离守卫以及针对符号链接/WAL 附属文件/锁竞争保护/运行期损坏自愈/换 Inode/行内围栏/同名标题与多行过期列表项的对抗回归测试）；
   - 仓库内 40 题离线检索（`sample_cases.jsonl`）：`38/40 (95.0%)` 持平，Recall `0.9483`、Quote `0.9483`、负例干净度 `100%`，**MRR `0.9483 → 0.9655`**（`exact` 类 MRR `0.95 → 1.00`）；
   - 外部公开 `LoCoMo Search`（200 题 / 272 篇 `.md`）：`105/200 (52.5%) → 104/200 (52.0%)`（Recall `0.6851 → 0.6712`，Quote `0.6017 → 0.6014`，**MRR `0.6221 → 0.6508`**，`single-hop` `82% → 86%`）；1 题净差源自词面长块 BM25 长度归一化权衡，待 Step 2 稠密向量 + RRF 正面突破词面上限；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
