@@ -87,14 +87,73 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
-# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文摘要；embed 离线批量计算向量缓存并支持 Ctrl+C 断点续跑）
+# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索前 Query 优化与检索）
 def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
+    usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query <问题>"
     parts = text.split()
-    if len(parts) > 3:
-        return "用法：/rag status [目录]、/rag enrich [目录] 或 /rag embed [目录]"
     sub = parts[1].lower() if len(parts) >= 2 else "status"
-    root = parts[2] if len(parts) >= 3 else "data/memory"
     retriever = app.memory.retriever
+
+    if sub == "query":
+        query_text = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
+        if not query_text:
+            return usage
+        try:
+            with _sigint_to_abort(app, chat_id) as abort_sig:
+                res = app.smart_search(
+                    query_text,
+                    chat_id=chat_id,
+                    force_enable=True,
+                    abort_signal=abort_sig,
+                )
+        except (KeyboardInterrupt, StreamAbortedError):
+            return "已中止 /rag query 检索优化。"
+        except LLMNotConfigured as error:
+            return f"查询优化未就绪：{error}"
+        except Exception as error:  # noqa: BLE001
+            return f"执行 /rag query 失败：{error}"
+
+        plan = res.get("plan") if isinstance(res.get("plan"), dict) else {}
+        route = plan.get("route") if isinstance(plan.get("route"), dict) else {}
+        expansion = plan.get("expansion") if isinstance(plan.get("expansion"), dict) else {}
+        routes = route.get("routes") if isinstance(route.get("routes"), list) else []
+        sub_queries = expansion.get("sub_queries") if isinstance(expansion.get("sub_queries"), list) else []
+        applied = bool(plan.get("applied", True))
+        needs_ret = bool(route.get("needs_retrieval", True))
+        reason = str(route.get("reason") or "")
+        rewritten = str(plan.get("rewritten_query") or query_text)
+        strategy = str(expansion.get("strategy") or "single")
+        hyde_doc = str(plan.get("hyde_document") or "")
+        rendered = str(res.get("rendered") or "")
+
+        lines: list[str] = []
+        if not applied:
+            if reason == "fallback":
+                lines.append("【提示】优化模型调用异常或未返回有效 JSON，已自动降级为原查询直通本地检索。")
+            else:
+                lines.append(
+                    "【提示】当前未配置可用大模型（或已关闭全部优化开关），未执行 LLM 查询优化，已按原查询直通本地检索；运行 setup 可开启完整优化。"
+                )
+        lines.extend(
+            [
+                f"【路由】{', '.join(str(r) for r in routes) or 'docs'}（needs_retrieval={needs_ret}"
+                + (f"，原因：{reason}" if reason else "")
+                + "）",
+                f"【改写】{rewritten}",
+                f"【扩展】strategy={strategy} | 子查询：{' ； '.join(str(q) for q in sub_queries)}",
+            ]
+        )
+        if hyde_doc:
+            lines.append(f"【HyDE】{hyde_doc}")
+        if needs_ret and "docs" in routes:
+            lines.append("\n【命中文档】\n" + (rendered or "（无命中结果）"))
+        else:
+            lines.append("\n【命中文档】本次路由未指向本地文档库（docs），已跳过本地文档检索。")
+        return "\n".join(lines)
+
+    if len(parts) > 3:
+        return usage
+    root = parts[2] if len(parts) >= 3 else "data/memory"
 
     if sub == "status":
         status_fn = getattr(retriever, "index_status", None)
@@ -109,7 +168,8 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
         enrich_fn = getattr(retriever, "enrich_contexts", None)
         if not callable(enrich_fn):
             return f"当前检索引擎（{getattr(retriever, 'name', 'unknown')}）不支持离线上下文摘要补全。"
-        enrich_llm = app.consolidator.llm
+        with app._llm_lock:
+            enrich_llm = app.consolidator.llm
         if isinstance(enrich_llm, NoopModelClient):
             return "未配置可用大模型，无法执行离线上下文摘要补全。请先运行 setup 配置模型。"
         raw_model = getattr(enrich_llm, "model", None) or getattr(app, "_consolidator_model", None) or "default"
@@ -165,10 +225,10 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
             f"新生成 {stats['embedded']} 条，复用缓存 {stats['cached_hits']} 条，跳过 {stats['skipped']} 条。"
         )
 
-    return "用法：/rag status [目录]、/rag enrich [目录] 或 /rag embed [目录]"
+    return usage
 
 
-# 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh），不消耗模型 Token（/rag enrich 除外）
+# 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh）；仅 /rag enrich|embed|query 会按需调用模型或向量接口
 def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> str | None:
     head = text.split(None, 1)[0] if text.strip() else ""
     if text == "/status":

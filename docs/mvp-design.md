@@ -125,9 +125,9 @@ my_helper_v2/
 │   │   └── embeddings.py              #   标准 /v1/embeddings 客户端、float32 编解码与 math.sumprod 精确余弦
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
-│                                      #          rag_contextualizer.py / prompts.py / context.py / memory.py /
-│                                      #          builtin_tools.py / memory_lifecycle.py / db.py / consolidator.py /
-│                                      #          commands.py / app.py / cli.py
+│                                      #          rag_contextualizer.py / query_optimizer.py / prompts.py / context.py /
+│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py / db.py /
+│                                      #          consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
 │   ├── web_chat.py                    # 零依赖本地 HTTP/SSE 服务（ThreadingHTTPServer）
@@ -209,7 +209,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 
 1. **零内部依赖底座（`common.py`、`text_search.py`、`files_policy.py`）**：
    - `common.py` 沉淀全仓共享的基础工具：`now_shanghai` / `today_shanghai` / `parse_iso_date`、`require_positive_int`、`atomic_write_text`、`format_date_with_weekday`、`load_dotenv` 与 `truncate_or_offload()`（超长工具输出按 1 MB 上限落盘至 `data/workspace/tool_outputs/` 并返回带行号的 `head` / `head_tail` 预览），供 `assistant/` 与 `plugins/tools/study_tools.py` 等外围插件统一复用；
-   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `rag_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；`chunker.py` 提供两层父子结构化分块（多级标题面包屑、中英文句界切分、超长表格续片保表头、可配整句 Overlap、`(until: ...)` 时效条目隔离与 SHA-256 `content_hash`）；`rag_contextualizer.py` 提供基于同文档逐字节一致 Prompt Caching 前缀的离线父块上下文摘要生成（支持 `AbortSignal` 断点续跑并经 `/rag enrich` 复用后台沉淀模型）；
+   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `rag_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；`chunker.py` 提供两层父子结构化分块（多级标题面包屑、中英文句界切分、超长表格续片保表头、可配整句 Overlap、`(until: ...)` 时效条目隔离与 SHA-256 `content_hash`）；`rag_contextualizer.py` 提供基于同文档逐字节一致 Prompt Caching 前缀的离线父块上下文摘要生成（支持 `AbortSignal` 断点续跑并经 `/rag enrich` 复用后台沉淀模型）；`query_optimizer.py` 提供检索前 Query 侧优化（单次合并快路径完成多源路由 Routing、多轮指代改写、多查询扩展/拆解，仅在 `docs + embedder` 就绪时按需生成 HyDE 假设文档并严格隔离于向量质心通道与执行期隐藏 `turn_ctx`，绝不污染 BM25 或泄漏进主对话 Prompt，经 `search_markdown(sub_queries=...)`、`AssistantApp.smart_search()` 与 CLI `/rag query <问题>` 全链路打通）；
    - `files_policy.py` 保持零内部依赖，提供 `normalize_segment`（剥离 Unicode `Cf` 格式控制符 + `NFKC` + `casefold()`）、`is_sensitive_segment`、`FilesPolicy.protected_inodes(data_root)` 轻量受保护文件 `(st_dev, st_ino)` Inode 采集与 `FilesPolicy` 读写路径白名单，供 `MemoryStore`（含 `list_files` 与检索遍历）与 `shell_tools.py` 共享同一套路径防线。
 2. **Markdown 记忆生命周期、内置兜底检索与内置工具（`memory.py`、`builtin_tools.py`、`memory_lifecycle.py`）**：
    - `MemoryStore` 内置零索引 `LinearRetriever`（实现 `RetrieverProtocol`）作为未挂载外部检索插件时的默认兜底；使用可重入写锁 `_write_lock` 保护磁盘写入与 `audit.jsonl`；`remember_user_statement` 在流式轮内先写入 `(turn#<tag>)` 暂存标记，回合落库成功后经 `finalize_turn_fact` 升级为 `(msg#<id>)`，中断或 `StreamError` 时回滚清理；
@@ -238,8 +238,9 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - **即时落盘项**：回合中已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件操作，不参与跨文件事务回滚；覆盖写入依靠 `data/workspace/.backups/` 自动时间戳备份提供恢复手段。
 3. **外层装饰器预算与内核循环解耦**：
    - 步数、Token、墙钟与重复调用熔断放在 Layer 3 `_GuardedTurnLLM` 而非 Layer 2 `agent/react.py`，使 `react.py` 维持无业务策略的最小事件循环；若未来其他宿主直接复用 Layer 2 `run_react()`，需自行提供外层超时或预算包装。
-4. **纯词面回退与混合检索的边界**：
-   - 未配置向量嵌入模型（`embedder`）时，`RAGRetriever` 自动以零网络开销走纯词面双语 FTS5 BM25（单跳精确事实与显式时间线延迟仅数毫秒），但面对零共享词同义改写与跨会话隐式多跳仍受词面上限约束；在 `config/models.dsl` 配置 `embedder`（或设置 `EMBEDDING_MODEL`）后自动启用持久化 `chunk_embeddings` + `math.sumprod` 精确余弦 + BM25 加权 RRF 混合检索。
+4. **纯词面回退、混合检索与 Query 侧优化的边界**：
+   - 未配置向量嵌入模型（`embedder`）时，`RAGRetriever` 自动以零网络开销走纯词面双语 FTS5 BM25（单跳精确事实与显式时间线延迟仅数毫秒），但面对零共享词同义改写与跨会话隐式多跳仍受词面上限约束；在 `config/models.dsl` 配置 `embedder`（或设置 `EMBEDDING_MODEL`）后自动启用持久化 `chunk_embeddings` + `math.sumprod` 精确余弦 + BM25 加权 RRF 混合检索；
+   - `retrieval.query_optimization.enabled` 默认关闭（`false`），保障离线基准零额外调用与最大跨轮历史缓存复用；显式开启后，规划建议仅通过 `<system-reminder>` 注入当前轮用户消息而落库保存纯净原话——`system_prompt` 与更早历史前缀保持逐字节冻结，但紧邻上一轮的 `UserMessage` 在下一轮不再包含已消费的规划提示（`CacheMonitor` 会据此记录 `message[k]:user`），且 HyDE 仅作用于首次 `data/memory` 检索批次（单次消费后自动回收）以杜绝跨步或跨目录污染。
 
 ---
 
@@ -266,7 +267,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `256 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `262 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

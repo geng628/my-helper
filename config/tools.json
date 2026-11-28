@@ -26,7 +26,15 @@
     "min_vector_score": 0.45,
     "rrf_k": 60,
     "bm25_weight": 1.0,
-    "vector_weight": 1.0
+    "vector_weight": 1.0,
+    "query_optimization": {
+      "enabled": false,
+      "routing": true,
+      "rewrite": true,
+      "multi_query": true,
+      "hyde": true,
+      "max_sub_queries": 3
+    }
   },
   "telemetry": {
     "enabled": true,

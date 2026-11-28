@@ -63,7 +63,14 @@ from personal_assistant.assistant.context import (
 )
 from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.files_policy import FilesPolicy
-from personal_assistant.assistant.memory import MemoryStore
+from personal_assistant.assistant.memory import MemoryStore, SearchHit
+from personal_assistant.assistant.query_optimizer import (
+    MAX_HISTORY_TURNS_FOR_REWRITE,
+    QueryOptimizer,
+    QueryPlan,
+    format_search_hits,
+    fuse_multi_query_hits,
+)
 
 MAX_SESSION_LOCKS = 256
 
@@ -284,6 +291,7 @@ class AssistantApp:
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: ModelInvoker | None = None,
         embedder: EmbeddingInvoker | None = None,
+        query_optimizer: QueryOptimizer | None = None,
         auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
@@ -423,6 +431,9 @@ class AssistantApp:
         self.background_consolidator = BackgroundConsolidator(
             self.consolidator,
             on_event=self._emit_event,
+        )
+        self.query_optimizer = (
+            query_optimizer if query_optimizer is not None else self.tools_config.build_query_optimizer()
         )
         self._tool_registry = self._build_base_registry()
 
@@ -750,134 +761,177 @@ class AssistantApp:
                         }
                         system_prompt = self.get_session_system_prompt(chat_id, registry)
                         summary_text = str(compaction.get("summary") or "").strip()
-                        context = self.context_assembler.assemble(
-                            system_prompt=system_prompt,
-                            summary_text=summary_text,
-                            history=history,
-                            user_text=clean_text,
-                            registry=registry,
-                            today=turn_day,
-                        )
-
-                        traces: list[dict[str, object]] = []
-                        thinking_parts: list[str] = []
-                        reply = ""
-                        aborted_reason: str | None = None
-                        start_idx = self.cache_monitor.snapshot_index()
-                        with self._llm_lock:
-                            active_llm = self.llm
-                        tracked_llm = self.cache_monitor.wrap(active_llm, session_key=chat_id)
-                        guarded_llm = _GuardedTurnLLM(
-                            tracked_llm,
-                            max_steps=self.max_turn_steps,
-                            max_tokens=self.max_turn_tokens,
-                            max_seconds=self.max_turn_seconds,
-                            max_repeated_tool_calls=self.max_repeated_tool_calls,
-                            clock=self._clock,
-                        )
-                        projector = self.context_assembler.create_turn_projector()
-                        with closing(
-                            iter_react(
-                                guarded_llm,
-                                context,
-                                registry,
-                                convert_to_llm=projector,
-                                tool_context=turn_ctx,
-                                options=StreamOptions(
-                                    session_id=chat_id,
-                                    abort_signal=turn_controller.signal,
-                                ),
-                            )
-                        ) as react_events:
-                            for event in react_events:
-                                if isinstance(event, ToolStart):
-                                    meta = registry.metadata(event.tool)
-                                    if meta is not None and meta.risk == "network":
-                                        turn_ctx["untrusted_tool_seen"] = True
-                                    if event.tool == "remember_fact":
-                                        fact_used = True
-                                    guarded_llm.observe_tool_call(event.tool, event.arguments)
-                                self._emit_event(chat_id, event)
-                                if on_event is not None:
-                                    on_event(event)
-                                if isinstance(event, StreamError):
-                                    if event.reason == "aborted":
-                                        aborted_reason = (
-                                            event.error_message
-                                            or turn_controller.signal.reason
-                                            or "请求已取消"
+                        query_hint = ""
+                        opt_aborted_reason: str | None = None
+                        if self.query_optimizer.config.enabled:
+                            with self._llm_lock:
+                                opt_llm = self.consolidator.llm
+                            if not isinstance(opt_llm, NoopModelClient):
+                                try:
+                                    plan = self.query_optimizer.plan(
+                                        clean_text,
+                                        opt_llm,
+                                        history=history,
+                                        available_tools=registry.names,
+                                        has_embedder=self._has_dense_retriever(),
+                                        abort_signal=turn_controller.signal,
+                                    )
+                                    query_hint = plan.format_agent_hint()
+                                    if plan.hyde_document:
+                                        turn_ctx["hyde_text"] = plan.hyde_document
+                                        turn_ctx["hyde_anchor_queries"] = tuple(
+                                            dict.fromkeys(
+                                                [plan.original_query, plan.rewritten_query, *plan.expansion.sub_queries]
+                                            )
                                         )
-                                        break
-                                    raise RuntimeError(event.error_message)
-                                if isinstance(event, ThinkingDelta) and event.text:
-                                    thinking_parts.append(event.text)
-                                    yield {"type": "thinking_delta", "text": event.text}
-                                elif isinstance(event, ToolStart):
-                                    yield {
-                                        "type": "tool_start",
-                                        "tool": event.tool,
-                                        "arguments": event.arguments,
-                                        "call_id": event.call_id,
-                                    }
-                                elif isinstance(event, TextDelta) and event.text:
-                                    yield {"type": "text_delta", "text": event.text}
-                                elif isinstance(event, ToolStep):
-                                    step_dict: dict[str, object] = {
-                                        "tool": event.tool,
-                                        "arguments": event.arguments,
-                                        "observation": event.observation,
-                                        "call_id": event.call_id,
-                                        "duration_ms": event.duration_ms,
-                                    }
-                                    traces.append(step_dict)
-                                    yield {"type": "tool_step", **step_dict}
-                                elif isinstance(event, TurnEnd):
-                                    turn_ended = True
-                                    reply = event.reply
+                                except StreamAbortedError as error:
+                                    opt_aborted_reason = (
+                                        str(error) or turn_controller.signal.reason or "请求已取消"
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    query_hint = ""
+                        turn_ctx["abort_signal"] = turn_controller.signal
 
-                        if aborted_reason is not None or turn_controller.signal.aborted:
+                        if opt_aborted_reason is not None or turn_controller.signal.aborted:
                             aborted_payload = {
                                 "type": "aborted",
-                                "reason": aborted_reason or turn_controller.signal.reason or "请求已取消",
+                                "reason": opt_aborted_reason or turn_controller.signal.reason or "请求已取消",
                                 "chat_id": chat_id,
                             }
                         else:
-                            user_msg_id, assistant_msg_id = self.state.append_turn(
-                                chat_id,
-                                clean_text,
-                                reply,
-                                created_at=turn_created_at,
+                            context = self.context_assembler.assemble(
+                                system_prompt=system_prompt,
+                                summary_text=summary_text,
+                                history=history,
+                                user_text=clean_text,
+                                registry=registry,
+                                today=turn_day,
+                                query_hint=query_hint,
                             )
-                            turn_persisted = True
-                            if fact_used:
-                                self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
-                            scheduled = (
-                                self.background_consolidator.maybe_schedule(
-                                    chat_id,
-                                    on_complete=lambda res: (
-                                        self.reset_session_prompt(res.chat_id)
-                                        if res.saved_files
-                                        else self.context_assembler.clear_history_floor(res.chat_id)
+
+                            traces: list[dict[str, object]] = []
+                            thinking_parts: list[str] = []
+                            reply = ""
+                            aborted_reason: str | None = None
+                            start_idx = self.cache_monitor.snapshot_index()
+                            with self._llm_lock:
+                                active_llm = self.llm
+                            tracked_llm = self.cache_monitor.wrap(active_llm, session_key=chat_id)
+                            guarded_llm = _GuardedTurnLLM(
+                                tracked_llm,
+                                max_steps=self.max_turn_steps,
+                                max_tokens=self.max_turn_tokens,
+                                max_seconds=self.max_turn_seconds,
+                                max_repeated_tool_calls=self.max_repeated_tool_calls,
+                                clock=self._clock,
+                            )
+                            projector = self.context_assembler.create_turn_projector()
+                            with closing(
+                                iter_react(
+                                    guarded_llm,
+                                    context,
+                                    registry,
+                                    convert_to_llm=projector,
+                                    tool_context=turn_ctx,
+                                    options=StreamOptions(
+                                        session_id=chat_id,
+                                        abort_signal=turn_controller.signal,
                                     ),
                                 )
-                                if self.auto_consolidate
-                                else False
-                            )
-                            done_payload = {
-                                "type": "done",
-                                "reply": reply,
-                                "thinking": "".join(thinking_parts),
-                                "chat_id": chat_id,
-                                "message_id": assistant_msg_id,
-                                "tool_calls": traces,
-                                "cache": self.cache_monitor.summary(since=start_idx, session_key=chat_id),
-                                "consolidation_scheduled": scheduled,
-                            }
-                            if guarded_llm.breach is not None:
-                                done_payload["budget_exceeded"] = guarded_llm.breach.reason
-                            telemetry = self._collect_telemetry(session_key=chat_id)
-                            if telemetry:
-                                done_payload["telemetry"] = telemetry
+                            ) as react_events:
+                                for event in react_events:
+                                    if isinstance(event, ToolStart):
+                                        meta = registry.metadata(event.tool)
+                                        if meta is not None and meta.risk == "network":
+                                            turn_ctx["untrusted_tool_seen"] = True
+                                        if event.tool == "remember_fact":
+                                            fact_used = True
+                                        guarded_llm.observe_tool_call(event.tool, event.arguments)
+                                    self._emit_event(chat_id, event)
+                                    if on_event is not None:
+                                        on_event(event)
+                                    if isinstance(event, StreamError):
+                                        if event.reason == "aborted":
+                                            aborted_reason = (
+                                                event.error_message
+                                                or turn_controller.signal.reason
+                                                or "请求已取消"
+                                            )
+                                            break
+                                        raise RuntimeError(event.error_message)
+                                    if isinstance(event, ThinkingDelta) and event.text:
+                                        thinking_parts.append(event.text)
+                                        yield {"type": "thinking_delta", "text": event.text}
+                                    elif isinstance(event, ToolStart):
+                                        yield {
+                                            "type": "tool_start",
+                                            "tool": event.tool,
+                                            "arguments": event.arguments,
+                                            "call_id": event.call_id,
+                                        }
+                                    elif isinstance(event, TextDelta) and event.text:
+                                        yield {"type": "text_delta", "text": event.text}
+                                    elif isinstance(event, ToolStep):
+                                        if event.tool == "search_markdown":
+                                            # 首个检索批次完成后立即消费并回收 HyDE，防止同轮后续步跨主题追查被初始 HyDE 污染
+                                            turn_ctx.pop("hyde_text", None)
+                                            turn_ctx.pop("hyde_anchor_queries", None)
+                                        step_dict: dict[str, object] = {
+                                            "tool": event.tool,
+                                            "arguments": event.arguments,
+                                            "observation": event.observation,
+                                            "call_id": event.call_id,
+                                            "duration_ms": event.duration_ms,
+                                        }
+                                        traces.append(step_dict)
+                                        yield {"type": "tool_step", **step_dict}
+                                    elif isinstance(event, TurnEnd):
+                                        turn_ended = True
+                                        reply = event.reply
+
+                            if aborted_reason is not None or turn_controller.signal.aborted:
+                                aborted_payload = {
+                                    "type": "aborted",
+                                    "reason": aborted_reason or turn_controller.signal.reason or "请求已取消",
+                                    "chat_id": chat_id,
+                                }
+                            else:
+                                user_msg_id, assistant_msg_id = self.state.append_turn(
+                                    chat_id,
+                                    clean_text,
+                                    reply,
+                                    created_at=turn_created_at,
+                                )
+                                turn_persisted = True
+                                if fact_used:
+                                    self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
+                                scheduled = (
+                                    self.background_consolidator.maybe_schedule(
+                                        chat_id,
+                                        on_complete=lambda res: (
+                                            self.reset_session_prompt(res.chat_id)
+                                            if res.saved_files
+                                            else self.context_assembler.clear_history_floor(res.chat_id)
+                                        ),
+                                    )
+                                    if self.auto_consolidate
+                                    else False
+                                )
+                                done_payload = {
+                                    "type": "done",
+                                    "reply": reply,
+                                    "thinking": "".join(thinking_parts),
+                                    "chat_id": chat_id,
+                                    "message_id": assistant_msg_id,
+                                    "tool_calls": traces,
+                                    "cache": self.cache_monitor.summary(since=start_idx, session_key=chat_id),
+                                    "consolidation_scheduled": scheduled,
+                                }
+                                if guarded_llm.breach is not None:
+                                    done_payload["budget_exceeded"] = guarded_llm.breach.reason
+                                telemetry = self._collect_telemetry(session_key=chat_id)
+                                if telemetry:
+                                    done_payload["telemetry"] = telemetry
                 finally:
                     if not turn_ended:
                         turn_controller.abort("连接已断开")
@@ -924,6 +978,129 @@ class AssistantApp:
                     result = {k: v for k, v in frame.items() if k != "type"}
         return result
 
+    # 判断当前检索引擎是否已真实激活稠密向量通道（以当前检索器绑定的非空 model_id embedder 与正向量权重为准）
+    def _has_dense_retriever(self) -> bool:
+        retriever = self.memory.retriever
+        if not hasattr(retriever, "embedder"):
+            return False
+        ret_emb = getattr(retriever, "embedder", None)
+        if ret_emb is None:
+            return False
+        model_id = str(getattr(ret_emb, "model_id", "") or "").strip()
+        if not model_id:
+            return False
+        raw_weight = getattr(getattr(retriever, "config", None), "vector_weight", 0.0)
+        return isinstance(raw_weight, (int, float)) and not isinstance(raw_weight, bool) and float(raw_weight) > 0.0
+
+    # 对单条用户查询执行检索前优化规划（路由 + 多轮指代改写 + 多查询扩展/拆解 + 条件 HyDE）
+    def optimize_query(
+        self,
+        query: str,
+        *,
+        chat_id: str | None = None,
+        force_enable: bool = False,
+        abort_signal: AbortSignal | None = None,
+    ) -> QueryPlan:
+        history: list[dict[str, object]] | None = None
+        if chat_id is not None:
+            history = self.state.active_messages(chat_id, limit=MAX_HISTORY_TURNS_FOR_REWRITE)
+        with self._llm_lock:
+            opt_llm = self.consolidator.llm
+        return self.query_optimizer.plan(
+            query,
+            opt_llm,
+            history=history,
+            available_tools=self._tool_registry.names,
+            has_embedder=self._has_dense_retriever(),
+            force_enable=force_enable,
+            abort_signal=abort_signal,
+        )
+
+    # 执行完整的检索前 Query 优化 + 本地知识库多查询 RRF / HyDE 检索（供 CLI /rag query 与接口调用）
+    def smart_search(
+        self,
+        query: str,
+        *,
+        chat_id: str | None = None,
+        root: str = "data/memory",
+        limit: int = 10,
+        today: date | None = None,
+        force_enable: bool = True,
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, object]:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("limit 必须是整数。")
+        plan = self.optimize_query(
+            query,
+            chat_id=chat_id,
+            force_enable=force_enable,
+            abort_signal=abort_signal,
+        )
+        ref_day = today or self._today()
+        hits: list[SearchHit] = []
+        rendered = ""
+        if plan.route.needs_retrieval and "docs" in plan.route.routes:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "检索已取消")
+            queries = list(plan.expansion.sub_queries) or [plan.rewritten_query]
+            hyde_map = (
+                {q: plan.hyde_document for q in queries}
+                if (plan.hyde_document and plan.expansion.strategy != "decompose")
+                else None
+            )
+            multi_fn = getattr(self.memory.retriever, "search_multi_hits", None)
+            if callable(multi_fn):
+                hits = list(
+                    multi_fn(
+                        self.memory,
+                        queries,
+                        root=root,
+                        limit=limit,
+                        today=ref_day,
+                        hyde_texts=hyde_map,
+                        abort_signal=abort_signal,
+                    )
+                )
+            else:
+                target_dir = self.memory.resolve_path(root, write=False)
+                if not target_dir.is_dir():
+                    raise ValueError(f"目录不存在：{root}")
+                if limit > 0:
+                    if len(queries) > 1:
+                        per_q_limit = max(limit * 2, 10)
+                        hit_lists: list[list[SearchHit]] = []
+                        last_val_err: ValueError | None = None
+                        for sub_q in queries:
+                            if abort_signal is not None and abort_signal.aborted:
+                                raise StreamAbortedError(abort_signal.reason or "检索已取消")
+                            try:
+                                hit_lists.append(
+                                    self.memory.search_hits(sub_q, root=root, limit=per_q_limit, today=ref_day)
+                                )
+                            except ValueError as error:
+                                last_val_err = error
+                        if not hit_lists and last_val_err is not None:
+                            raise last_val_err
+                        hits = fuse_multi_query_hits(hit_lists, limit=limit)
+                    else:
+                        hits = self.memory.search_hits(queries[0], root=root, limit=limit, today=ref_day)
+            rendered = format_search_hits(hits, query="；".join(queries), root=root)
+        return {
+            "plan": plan.to_dict(),
+            "hits": [
+                {
+                    "path": h.path,
+                    "start_line": h.start_line,
+                    "end_line": h.end_line,
+                    "section": h.section,
+                    "snippet": h.snippet,
+                    "score": h.score,
+                }
+                for h in hits
+            ],
+            "rendered": rendered,
+        }
+
     # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
     def search(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
         return self.memory.search_markdown(query, root=root, limit=limit)
@@ -950,6 +1127,7 @@ class AssistantApp:
             "plugins": list(self.tools_config.plugins),
             "retriever": self.memory.retriever.name,
             "embedder": self.embedder.model_id if self.embedder is not None else None,
+            "query_optimization": self.query_optimizer.config.enabled,
             "observers": [obs.name for obs in self.observers],
             "telemetry": self._collect_telemetry(),
             "cache": self.cache_monitor.summary(),

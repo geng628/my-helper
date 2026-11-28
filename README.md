@@ -32,7 +32,7 @@
 ### 1. 五大插件主板插槽与单次初始化生命周期
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供两层父子结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)：中英文句界切分、超长表格续片保表头与可配整句 Overlap）、基于同文档 Prompt Caching 前缀的离线上下文摘要器（[personal_assistant/assistant/rag_contextualizer.py](personal_assistant/assistant/rag_contextualizer.py)）、独立持久化派生库 `data/state/rag_index.db`（`parent_chunks` + `child_chunks` + `child_chunks_fts` + 跨重建保留的 `chunk_contexts` 与 `chunk_embeddings`）、基于 Python 3.12 `math.sumprod` 的精确余弦向量召回与 **BM25 + Dense 加权 RRF 混合检索**（CLI `/rag status`、`/rag enrich`、`/rag embed`；未配置 `embedder` 时自动零开销退回纯词面 BM25），未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供两层父子结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)：中英文句界切分、超长表格续片保表头与可配整句 Overlap）、基于同文档 Prompt Caching 前缀的离线上下文摘要器（[personal_assistant/assistant/rag_contextualizer.py](personal_assistant/assistant/rag_contextualizer.py)）、检索前 Query 侧优化引擎（[personal_assistant/assistant/query_optimizer.py](personal_assistant/assistant/query_optimizer.py)：单次合并快路径完成多源路由 Routing、多轮指代改写、多查询扩展/拆解与按需 HyDE 假设文档生成，不击穿系统前缀 KV Cache 且严格隔离 HyDE 与 BM25）、独立持久化派生库 `data/state/rag_index.db`（`parent_chunks` + `child_chunks` + `child_chunks_fts` + 跨重建保留的 `chunk_contexts` 与 `chunk_embeddings`）、基于 Python 3.12 `math.sumprod` 的精确余弦向量召回与 **BM25 + Dense 加权 RRF / Multi-Query RRF + HyDE 质心融合**（CLI `/rag status`、`/rag enrich`、`/rag embed`、`/rag query <问题>`；未配置 `embedder` 时自动零开销退回纯词面 BM25），未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
   4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，支持外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动接入新厂商（`ToolsConfig.build_provider_registry()` 将插件翻译器与内建四大翻译器合并为应用级隔离副本，不污染进程全局注册表）。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（256 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（262 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -194,9 +194,9 @@ my_helper_v2/
 │   │   └── embeddings.py              #   标准 /v1/embeddings 纯标准库客户端、float32 编解码与 math.sumprod 余弦
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
-│                                      #          rag_contextualizer.py / prompts.py / context.py / memory.py /
-│                                      #          builtin_tools.py / memory_lifecycle.py / db.py / consolidator.py /
-│                                      #          commands.py / app.py / cli.py
+│                                      #          rag_contextualizer.py / query_optimizer.py / prompts.py / context.py /
+│                                      #          memory.py / builtin_tools.py / memory_lifecycle.py / db.py /
+│                                      #          consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本
 │   ├── web_chat.py                    # 本地 HTTP/SSE 服务

@@ -44,6 +44,9 @@ class Tool(ToolSchema):
     accepted_context_keys: frozenset[str] | None = field(
         default=frozenset(), kw_only=True, repr=False, compare=False
     )
+    allow_empty_params: frozenset[str] = field(
+        default=frozenset(), kw_only=True, repr=False, compare=False
+    )
 
     # 携带执行期上下文运行工具：合并预绑定上下文、执行期动态上下文与模型入参后调用 handler
     def run_with_context(
@@ -120,6 +123,18 @@ def build_tool(
             if param_name not in schema_params and param.kind in ctx_kinds
         )
 
+    if sig is None:
+        allow_empty: frozenset[str] = frozenset()
+    else:
+        required_set_final = set(resolved_required)
+        allow_empty = frozenset(
+            k
+            for k in schema_params
+            if k not in required_set_final
+            and (param := sig.parameters.get(k)) is not None
+            and param.default == ""
+        )
+
     bound_context = _filter_context_kwargs(schema_params, accepted_keys, context)
     return Tool(
         name=tool_name,
@@ -131,6 +146,7 @@ def build_tool(
         metadata=ToolMetadata(risk=risk, always_on=always_on, parallel=bool(parallel)),
         bound_kwargs=bound_context,
         accepted_context_keys=accepted_keys,
+        allow_empty_params=allow_empty,
     )
 
 
@@ -337,6 +353,8 @@ class ToolRegistry:
             # 兼容模型直接传入数字参数（如 start_line: 1），同时严格拒绝布尔值与空串
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 val = str(val)
+            if isinstance(val, str) and not val.strip() and key in item.allow_empty_params:
+                continue
             if not isinstance(val, str) or not val.strip():
                 return {}, f"{item.name} 的参数 {key} 必须是非空字符串。"
             if item.param_enums and key in item.param_enums and val not in item.param_enums[key]:
