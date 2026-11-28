@@ -89,14 +89,15 @@ def _extract_access_level(scalars: dict[str, str], lists: dict[str, list[str]]) 
     return _RESTRICTED_FALLBACK_ACCESS if declared_any else "public"
 
 
-# 将单行或跨行方括号列表片段拆分为条目列表（返回 (条目列表, 是否已闭合)）
+# 将单行或跨行方括号列表片段拆分为条目列表（遇 ']' 即闭合，自动忽略闭合符后的 YAML 行内注释如 `] # comment`）
 def _parse_bracket_list_segment(segment: str) -> tuple[list[str], bool]:
-    text = segment.strip()
-    closed = text.endswith("]")
-    if closed:
-        text = text[:-1].strip()
-    items = [item.strip() for item in text.split(",") if item.strip()]
-    return items, closed
+    close_idx = segment.find("]")
+    if close_idx != -1:
+        body = segment[:close_idx].strip()
+        items = [item.strip() for item in body.split(",") if item.strip()]
+        return items, True
+    items = [item.strip() for item in segment.strip().split(",") if item.strip()]
+    return items, False
 
 
 # 单篇 Markdown 文档顶部提取出的结构化元数据（默认 access='public'，确保无头部旧文档零破坏）
@@ -186,11 +187,15 @@ def parse_markdown_frontmatter(text: str) -> tuple[DocumentMetadata, str]:
         if not stripped or stripped.startswith("#"):
             continue
         if multiline_bracket_key is not None:
-            items, closed = _parse_bracket_list_segment(stripped)
-            lists.setdefault(multiline_bracket_key, []).extend(items)
-            if closed:
+            # 纵深防御：若遇到顶格新键值对且非 `]` 闭合行（如未闭合的 `title: [Draft Q4`），立即结束列表态以防吞噬后续 `access` 声明
+            if raw_line[0] not in {" ", "\t"} and not stripped.startswith("]") and _KEY_VAL_RE.match(raw_line) is not None:
                 multiline_bracket_key = None
-            continue
+            else:
+                items, closed = _parse_bracket_list_segment(stripped)
+                lists.setdefault(multiline_bracket_key, []).extend(items)
+                if closed:
+                    multiline_bracket_key = None
+                continue
         if raw_line[0] in {" ", "\t"}:
             if not saw_key:
                 return DocumentMetadata(), text
@@ -228,9 +233,18 @@ def parse_markdown_frontmatter(text: str) -> tuple[DocumentMetadata, str]:
         elif not val:
             lists.setdefault(key, [])
         elif val.startswith("["):
-            items, closed = _parse_bracket_list_segment(val[1:])
-            lists.setdefault(key, []).extend(items)
-            if not closed:
+            close_idx = val.find("]", 1)
+            if close_idx != -1:
+                tail = val[close_idx + 1 :].strip()
+                if not tail or tail.startswith("#"):
+                    items, _ = _parse_bracket_list_segment(val[1 : close_idx + 1])
+                    lists.setdefault(key, []).extend(items)
+                else:
+                    # 如 `title: [Internal] Q4 Salary` 属于带方括号前缀的普通标量文本，绝不进入多行列表态
+                    scalars[key] = val
+            else:
+                items, _ = _parse_bracket_list_segment(val[1:])
+                lists.setdefault(key, []).extend(items)
                 multiline_bracket_key = key
         else:
             scalars[key] = val

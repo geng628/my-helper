@@ -174,7 +174,9 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
 
         lines: list[str] = []
         if not applied:
-            if reason == "fallback":
+            if reason == "access_denied":
+                lines.append("【提示】请求过滤条件超出当前会话允许访问的权限边界，已拦截本次检索。")
+            elif reason == "fallback":
                 lines.append("【提示】优化模型调用异常或未返回有效 JSON，已自动降级为原查询直通本地检索。")
             else:
                 lines.append(

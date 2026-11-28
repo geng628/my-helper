@@ -405,7 +405,8 @@ def test_embedding_finetune_triplet_export_hard_negatives_and_security(tmp_path:
     assert "7 天内支持无理由原路退回" in rows[0]["positive"]
     assert "纸质图书" in rows[0]["negative"]
     # 校验 BM25 难负样本与正样本严格同分布（绝不带 `"  <行号>: "` 渲染前缀防对比学习捷径污染）
-    assert not rows[0]["negative"].lstrip().startswith(("1:", "2:", "3:", "4:", "5:", "6:", "7:", "8:", "9:"))
+    import re
+    assert not re.match(r"^\s*\d+:\s", rows[0]["negative"])
     assert not rows[0]["negative"].startswith("  ")
     assert "高管" not in rows[0]["negative"] and "双十一" not in rows[0]["positive"]
 
@@ -461,12 +462,11 @@ def test_embedding_finetune_triplet_export_hard_negatives_and_security(tmp_path:
     assert "--triplets" in help_proc.stdout and "--base-model" in help_proc.stdout
 
 
-# 对抗审查回归测试（B1-B4 与 Nit 1-7）：Frontmatter Fail-Closed、预绑定权限、离线 enrich/embed 零泄露、CLI 引号过滤与钳制
+# 对抗审查回归测试（B1-B4、R2-B1 与 Nit 1-7）：Frontmatter Fail-Closed、预绑定权限、离线 enrich/embed 零泄露、CLI 引号过滤与钳制
 def test_review_regressions_frontmatter_fail_closed_prebound_access_and_offline_isolation(tmp_path: Path) -> None:
-    import re
     from plugins.rag_retriever import RAGConfig, RAGRetriever
 
-    # 1. B1: 列表权限、嵌套 YAML、块标量、多行列表、带点键名、引号空串遮蔽与超长未闭合 Frontmatter 均严格 Fail-Closed
+    # 1. B1 + R2-B1: 列表权限、嵌套 YAML、块标量、多行列表、带点键名、引号空串遮蔽、方括号标题/行内注释/未闭合 `[` 与超长未闭合均严格 Fail-Closed
     for bad_md, expected_access in (
         ("---\naccess: [confidential]\n---\n正文\n", "confidential"),
         ("---\naccess:\n  - hr\n---\n正文\n", "hr"),
@@ -478,9 +478,16 @@ def test_review_regressions_frontmatter_fail_closed_prebound_access_and_offline_
         ("---\naccess: \"\"\n---\n正文\n", "__restricted__"),
         ("---\naccess: [hr, finance]\n---\n正文\n", "__restricted__"),
         ("---\naccess: confidential\n" + ("tag_pad: x\n" * 270) + "---\n正文\n", "confidential"),
+        ("---\ntitle: [Internal] Q4 Salary\naccess: confidential\n---\n正文\n", "confidential"),
+        ("---\ntags: [a, b] # ok\naccess: confidential\n---\n正文\n", "confidential"),
+        ("---\ntags: [\n  a,\n  b\n] # end\naccess: confidential\n---\n正文\n", "confidential"),
+        ("---\ntitle: [Draft Q4\naccess: confidential\n---\n正文\n", "confidential"),
     ):
         m, _ = parse_markdown_frontmatter(bad_md)
         assert m.access == expected_access and m.access != "public"
+
+    m_comment, _ = parse_markdown_frontmatter("---\ntags: [a, b] # ok\naccess: confidential\n---\n正文\n")
+    assert m_comment.tags == ("a", "b") and m_comment.access == "confidential"
 
     # Nit 5: parse_filter_string 引号权限、空值/重复单值键校验
     assert parse_filter_string('access="public"', allowed_access=("public",)).allowed_access == ("public",)
@@ -562,11 +569,13 @@ def test_review_regressions_frontmatter_fail_closed_prebound_access_and_offline_
         assert "1折特批" not in app_pub.search("高管内部定价底线", metadata_filter=MetadataFilter(allowed_access=("confidential",)))
         assert app_pub.smart_search("高管内部定价底线", metadata_filter=MetadataFilter(allowed_access=("confidential",)))["hits"] == []
 
-        # Nit 1: --filter= 与引号含空格过滤
+        # Nit 1 + R2 Nit 2: --filter= 与引号含空格过滤；越权过滤明确提示权限拦截而非误报未配模型
         out_eq = _handle_repl_command(app_pub, "/rag query --filter=product=billing 7天无理由")
         assert out_eq is not None and "公开退款说明" in out_eq and "【过滤】" in out_eq
         out_q = _handle_repl_command(app_pub, '/rag query --filter "product=billing; date_from=2026-06-01" 7天无理由')
         assert out_q is not None and "公开退款说明" in out_q and "【过滤】" in out_q
+        out_denied = _handle_repl_command(app_pub, "/rag query --filter access=confidential 机密")
+        assert out_denied is not None and "权限边界" in out_denied and "未配置可用大模型" not in out_denied
     finally:
         app_pub.close()
 
@@ -609,9 +618,9 @@ def test_review_regressions_frontmatter_fail_closed_prebound_access_and_offline_
     )
     skew_mem = MemoryStore(skew_dir, create_dirs=True, retriever=RAGRetriever(RAGConfig()))
     try:
-        hits = skew_mem.search_hits("平台通用配置说明", metadata_filter=MetadataFilter(product="billing"))
+        # 查询含未出现词以使 coverage < 0.6 且触发 bm25_val < 0.1，真正检验 filtered total_children < 10 放行
+        hits = skew_mem.search_hits("平台 通用 缺失甲 缺失乙 缺失丙", metadata_filter=MetadataFilter(product="billing"))
         assert len(hits) == 1 and hits[0].path == "data/memory/target.md"
-        assert not re.match(r"^\s*\d+:\s", "")
     finally:
         skew_mem.close()
 
