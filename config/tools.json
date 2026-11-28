@@ -22,7 +22,11 @@
     "max_hits_per_file": 2,
     "parent_max_chars": 1000,
     "child_max_chars": 320,
-    "child_overlap_chars": 64
+    "child_overlap_chars": 64,
+    "min_vector_score": 0.45,
+    "rrf_k": 60,
+    "bm25_weight": 1.0,
+    "vector_weight": 1.0
   },
   "telemetry": {
     "enabled": true,

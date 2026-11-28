@@ -19,7 +19,7 @@
    - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫、`ai/` 内部三层解耦守卫、上层零 OpenAI 方言符号守卫及 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树零 `# type: ignore` 静态硬守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
-   - Slot 2 `RetrieverProtocol`（`plugins/rag_retriever.py` 持久化两层父子索引 + 整句 Overlap + FTS5 BM25 + 离线 Prompt-Caching 上下文摘要缓存，未挂载时由 `LinearRetriever` 兜底）；
+   - Slot 2 `RetrieverProtocol`（`plugins/rag_retriever.py` 持久化两层父子混合索引 + 整句 Overlap + FTS5 BM25 + `chunk_contexts` 摘要缓存 + `chunk_embeddings` float32 向量缓存 + BM25/Dense RRF 融合，未挂载时由 `LinearRetriever` 兜底）；
    - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，支持 `api`/`reasoning`/`max_tokens`/`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设，`render` 采用显式强类型具名参数，核心参数对齐纯通用协议、扩展参数收敛于插件侧）；
    - Slot 4 `ApiProvider`（直接复用 Layer 1 宪法，供外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动扩展，由 `ToolsConfig.build_provider_registry()` 与内建四大翻译器合并为应用级隔离副本）；
    - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本，遇 `StreamError` 或 `turn_aborted` 自动清理在途态）；
@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `247 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `256 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -93,7 +93,8 @@
 | `552863d` | `linear` | 通过 `32/40 (80.0%)`；Recall `96.6%`，MRR `0.908`，负例干净度 `63.6%` | 通过 `57/200 (28.5%)`；Recall `42.75%`，MRR `0.3587` |
 | `d2e20e3` ~ `1b421d2` | `fts5_bm25` | 通过 `38/40 (95.0%)`；Recall `94.83%`，MRR `0.9483`，Quote `94.83%`，负例干净度 `100%` | 通过 `105/200 (52.5%)`；Recall `68.51%`（`single-hop` `94.0%` / `temporal` `92.0%` / `open-domain` `44.2%` / `multi-hop` `43.9%`），MRR `0.6221`，Quote `60.17%` |
 | `d96e25c` | `rag`（Step 1） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | 通过 `104/200 (52.0%)`；Recall `67.12%`，**MRR `0.6508`**，Quote `60.14%`（`single-hop` `86.0%`） |
-| Issue `#103`（本次提交） | `rag`（Step 1.5 父子索引） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | **通过 `106/200 (53.0%)`**；Recall `67.16%`，MRR `0.6307`，**Quote `60.66%`**（默认 `parent=1000 / child=320 / overlap=64`） |
+| `9eda1ff` | `rag`（Step 1.5 父子索引） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | **通过 `106/200 (53.0%)`**；Recall `67.16%`，MRR `0.6307`，**Quote `60.66%`**（默认 `parent=1000 / child=320 / overlap=64`） |
+| Issue `#105`（本次提交） | `rag`（Step 2 混合检索底座，离线无 embedder 回退口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（零退步；接入向量后可救回零共享词同义改写） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（未配 `embedder` 零退步；支持 `--embedder` 激活 BM25+Dense RRF） |
 
 ### 2. 真实模型多轮记忆评测（区分历史 `v1` Judge 与去泄漏 `v2-neutral` Judge）
 
@@ -303,6 +304,20 @@
     | **`64`（20%，默认）** | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | **`106/200 (53.0%)`**, Recall `0.6716`, **MRR `0.6307`**, Quote `0.6066` | `3,677`（`+0.9%`） | **最佳平衡点**：几乎零体积膨胀、MRR 最高，且通过率与 Quote 均超 Step 1（`104/200`）与旧 `fts5_bm25`（`105/200`） |
     | `120`（37.5%） | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | `107/200 (53.5%)`, **Recall `0.6764`**, MRR `0.6211`, Quote `0.6089` | `3,909`（`+7.3%`） | `open-domain` Recall 升至 `0.475`，但子块膨胀 `+7.3%` 且 BM25 重复文档频次轻度稀释 IDF 导致 MRR 回落 |
 - **已知边界与下一步**：离线上下文摘要默认按需通过 `/rag enrich` 触发，不阻塞在线提问；纯词面通道对零共享词同义改写与跨文档多跳仍有上限，下一步进入 **RAG Step 2**：接入单轨标准 `/v1/embeddings` HTTP 客户端、`chunk_embeddings` 向量缓存表与 Python 3.12 `math.sumprod` 精确余弦 + RRF 混合检索。
+
+### [2026-11-28] RAG Step 2：标准 `/v1/embeddings` 客户端、持久化向量缓存与 BM25+Dense RRF 混合检索（Issue `#105`，本次提交）
+- **背景与目标**：在零第三方运行依赖的前提下补齐 RAG 语义向量化与混合检索闭环，突破纯词面 BM25 在零共享词同义改写与跨语种检索上的召回上限，同时保证未配置向量模型时零开销平滑退回纯 BM25、已过期记忆绝不外发至外部 Embedding 接口、在线接口瞬时异常不影响前台对话。
+- **核心改动**：
+  - **Layer 1 标准向量客户端（新增 [../personal_assistant/ai/embeddings.py](../personal_assistant/ai/embeddings.py)）**：定义 `EmbeddingInvoker` 协议与 `OpenAIEmbeddingClient`（复用 `providers/http.py` 可中断连接/重试/密钥脱敏，兼容 OpenAI / 硅基流动 SiliconFlow / 通义千问 DashScope / 本地免密钥 Ollama `/v1/embeddings`），支持分批发送、乱序 `index` 对齐、有限实数与 L2 单位归一化、小端 `float32` BLOB 编解码（`pack_vector`/`unpack_vector`）、Python 3.12 `math.sumprod` 精确余弦相似度（`cosine_similarity`）、`AbortSignal` 批次取消与环境变量工厂 `from_env_embedder()`；[../tests/test_architecture.py](../tests/test_architecture.py) 锁定其仅依赖 `ai.protocol` 与 `ai.providers.http`。
+  - **配置角色与编排装配（[../plugins/models_dsl.py](../plugins/models_dsl.py)、[../personal_assistant/assistant/commands.py](../personal_assistant/assistant/commands.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../config/models.example.dsl](../config/models.example.dsl)）**：`models.dsl` 新增顶层 `embedder <模型名>` 指令编译至通用 `ModelsConfig.roles["embedder"]`；`ToolsConfig.build_embedder()` 按「显式参数 > `roles['embedder']` > `EMBEDDING_MODEL` > `None`」构造；`AssistantApp` 自动装配 `self.embedder` 并热同步至 `RAGRetriever.set_embedder()`。
+  - **持久化向量缓存与 BM25+Dense RRF 混合检索（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../config/tools.json](../config/tools.json)）**：`rag_index.db` 升级至 `schema_version="3"`，新增跨调参重建保留的 `chunk_embeddings(content_hash, model, dims, vector_blob, created_at)` 表、有界内存解包缓存（上限 `20,000` 条）与随背景摘要自动联动的 `child_chunks.embed_hash`（旧版 v2 派生库原地平滑升级并保留 `chunk_contexts`）；`_ensure_active_embeddings` 在锁外按批次调用 `embedder` 并逐批 `BEGIN IMMEDIATE` 原子落盘（支持 `AbortSignal` 断点续跑且绝不外发 `until_date < today` 已过期条目）；混合检索经 `min_vector_score`（默认 `0.45`）抗噪门控后按父块粒度执行加权 RRF（`rrf_k=60`、`bm25_weight=1.0`、`vector_weight=1.0`），在线调用遇瞬时网络/接口故障优雅降级纯 BM25；新增 `embed_chunks()` 供离线预计算。
+  - **CLI 与评测接入（[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../evals/cli.py](../evals/cli.py)、[../tests/conftest.py](../tests/conftest.py)）**：`/rag status` 新增 `embedder_model` / `embedded_children` / `cached_embeddings`；新增 `/rag embed [目录]` 接入 `_sigint_to_abort` 与全异常容错；`evals/cli.py` 支持可选 `--embedder` 参数；`tests/conftest.py` 隔离宿主机 `EMBEDDING_*` 环境变量；新增 [../tests/test_embeddings.py](../tests/test_embeddings.py) 与 [../tests/test_rag_hybrid.py](../tests/test_rag_hybrid.py)。
+- **验证与同口径对比（`9eda1ff` → 本次提交）**：
+  - 单元测试：`247 passed → 256 passed`（全绿，含零共享词同义改写救回、RRF 双路超越单路、抗噪负例 100% 拦截、同 `model_id` 切换维度自动重算、v2→v3 原地升级、上下文摘要联动 `embed_hash` 刷新、损坏 BLOB 防 OOM 自愈、跨主机防密钥泄漏、过期隔离、只读零写盘、故障降级与 CLI 容错）；
+  - 离线检索基准（零网络未配 `embedder` 回退口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（Recall `0.6716`、MRR `0.6307`、Quote `0.6066`），纯词面零退步；
+  - 性能实测：纯 Python 3.12 标准库 `math.sumprod` 遍历 `4,000 × 1024` 维 `float32` 向量精确余弦仅需 `~41.6 ms`；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`，`memory.py` `593 <= 600` 行。
+- **已知边界与下一步**：离线默认不连网，需用户在 `config/models.dsl` 配 `embedder` 或设置 `EMBEDDING_MODEL` 方可启用混合检索；下一步进入 **RAG Step 3**：接入可选 `/v1/rerank` Cross-Encoder 精排与相关性门控，以及 **Step 4** 专用知识库 `data/knowledge/` 与端到端 RAG 实模评测。
 
 ---
 

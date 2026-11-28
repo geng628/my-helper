@@ -12,3 +12,10 @@ use deepseek sk-替换为你的真实密钥
 # use reasoner sk-替换为你的真实密钥
 # add deepseek sk-替换为你的真实密钥
 # consolidator deepseek
+#
+# 可选：接入标准 /v1/embeddings 向量模型开启 RAG 语义+词面混合检索（支持硅基流动 / 通义 / OpenAI / 本地 Ollama）：
+# add siliconflow BAAI/bge-m3 sk-你的硅基流动密钥
+# embedder siliconflow
+# 或使用本地免密钥 Ollama：
+# add ollama bge-m3
+# embedder ollama

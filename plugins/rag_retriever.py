@@ -1,19 +1,32 @@
-"""持久化两层父子 RAG 检索插件（零第三方依赖）：父子表分离、整句 Overlap、Prompt-Caching 上下文摘要缓存与双语 FTS5 BM25。"""
+"""持久化两层父子混合 RAG 检索插件（零第三方依赖）：父子表分离、整句 Overlap、上下文摘要缓存、float32 向量缓存与 BM25+Dense RRF 融合。"""
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import sqlite3
 import threading
 import time
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 from personal_assistant.agent.plugins import Plugin, PluginContext
-from personal_assistant.ai import AbortSignal, ModelInvoker, StreamAbortedError
+from personal_assistant.ai import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    AbortSignal,
+    EmbeddingInvoker,
+    LLMNotConfigured,
+    ModelInvoker,
+    StreamAbortedError,
+    cosine_similarity,
+    normalize_vector,
+    pack_vector,
+    unpack_vector,
+)
 from personal_assistant.assistant.chunker import (
     DEFAULT_CHILD_MAX_CHARS,
     DEFAULT_CHILD_OVERLAP_CHARS,
@@ -38,9 +51,10 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 RETRIEVER_NAME = "rag"
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 _CHUNKER_VERSION = "2"
 _MAX_SNIPPET_CHARS = 4000
+_MAX_VECTOR_CACHE_ITEMS = 20_000
 _SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _REQUIRED_TABLES = frozenset(
     {
@@ -50,6 +64,7 @@ _REQUIRED_TABLES = frozenset(
         "child_chunks",
         "child_chunks_fts",
         "chunk_contexts",
+        "chunk_embeddings",
     }
 )
 _CORRUPT_ERROR_CODES = frozenset(
@@ -61,6 +76,8 @@ _CORRUPT_ERROR_CODES = frozenset(
     )
     if isinstance(code, int)
 )
+
+_ParentHitPayload = tuple[float, str, int, int, str, str, str, str]
 
 
 # 精确判断异常是否属于 SQLite 文件物理损坏（严禁把锁竞争 SQLITE_BUSY/LOCKED/READONLY/IOERR 误判为损坏而删库）
@@ -131,7 +148,44 @@ def _require_non_negative_int(value: object, name: str) -> int:
     return value
 
 
-# 持久化/内存双用两层父子 SQLite 派生索引容器（与权威源文件物理隔离，chunk_contexts 跨配置重建保留）
+# 校验有限浮点参数位于指定闭区间内（严格拒绝布尔值、NaN 与 Inf）
+def _require_bounded_float(value: object, name: str, *, low: float, high: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是有限数字。")
+    val = float(value)
+    if not math.isfinite(val) or val < low or (high is not None and val > high):
+        bounds = f"[{low:g}, {high:g}]" if high is not None else f">= {low:g}"
+        raise ValueError(f"{name} 必须是有限数字且满足 {bounds}。")
+    return val
+
+
+# 构造单个子块的统一向量化文本（含来源/章节/背景摘要头）及其 SHA-256 缓存键 embed_hash
+def _child_embed_payload(path: str, section: str, context_summary: str, child_text: str) -> tuple[str, str]:
+    header = format_context_header(path, section, context_summary)
+    embed_text = f"{header}\n{child_text}"
+    digest = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
+    return embed_text, digest
+
+
+# 统一提取并去空白向量客户端的规范模型标识（未配置或为空时返回 None）
+def _clean_embedder_model(embedder: EmbeddingInvoker | None) -> str | None:
+    if embedder is None:
+        return None
+    clean = str(embedder.model_id).strip()
+    return clean or None
+
+
+# 读取向量客户端显式声明的目标维度（未声明或非正整数时返回 None）
+def _embedder_target_dims(embedder: EmbeddingInvoker | None) -> int | None:
+    if embedder is None:
+        return None
+    raw = getattr(embedder, "dimensions", None)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
+# 持久化/内存双用两层父子 SQLite 派生索引容器（与权威源文件物理隔离，chunk_contexts 与 chunk_embeddings 跨配置重建保留）
 class _DerivedRAGIndex:
     # 打开指定磁盘路径（或 :memory:）并校验 Schema 与父子分块配置版本，确认物理损坏时安全自愈重建
     def __init__(
@@ -150,6 +204,7 @@ class _DerivedRAGIndex:
         self.child_max_chars = child_max_chars
         self.child_overlap_chars = child_overlap_chars
         self.context_model = context_model
+        self._vec_cache: dict[tuple[str, str, int], tuple[float, ...]] = {}
         self.conn = self._open_and_initialize()
         self.file_identity = _file_identity(self.db_path) if self.db_path is not None else None
 
@@ -216,7 +271,7 @@ class _DerivedRAGIndex:
             conn.close()
             raise
 
-    # 检查并初始化两层父子表与 chunk_contexts 缓存表（已就绪库走只读快路径零写锁，配置变更重建时保留 chunk_contexts）
+    # 检查并初始化两层父子表、chunk_contexts 与 chunk_embeddings 缓存表（配置变更重建时双缓存表均保留不丢失）
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         expected_meta = {
             "schema_version": _SCHEMA_VERSION,
@@ -230,7 +285,9 @@ class _DerivedRAGIndex:
             str(r[0])
             for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('index_meta', 'indexed_files', 'parent_chunks', 'child_chunks', 'child_chunks_fts', 'chunk_contexts')"
+                "AND name IN ("
+                "'index_meta', 'indexed_files', 'parent_chunks', 'child_chunks', "
+                "'child_chunks_fts', 'chunk_contexts', 'chunk_embeddings')"
             ).fetchall()
         }
         if tables == _REQUIRED_TABLES:
@@ -250,7 +307,7 @@ class _DerivedRAGIndex:
             )
             existing_meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             if existing_meta and existing_meta != expected_meta:
-                # 配置或版本变更时仅重建派生分块与倒排表，绝不清空已付费生成的 chunk_contexts 缓存表
+                # 配置或版本变更时仅重建派生分块与倒排表，绝不清空已付费生成的 chunk_contexts 与 chunk_embeddings
                 conn.execute("DROP TABLE IF EXISTS child_chunks_fts")
                 conn.execute("DROP TABLE IF EXISTS child_chunks")
                 conn.execute("DROP TABLE IF EXISTS parent_chunks")
@@ -258,6 +315,7 @@ class _DerivedRAGIndex:
                 conn.execute("DROP TABLE IF EXISTS chunks")
                 conn.execute("DROP TABLE IF EXISTS indexed_files")
                 conn.execute("DELETE FROM index_meta")
+                self._vec_cache.clear()
                 existing_meta = {}
 
             conn.execute(
@@ -311,6 +369,7 @@ class _DerivedRAGIndex:
                     end_line INTEGER NOT NULL,
                     section TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    embed_hash TEXT NOT NULL,
                     text TEXT NOT NULL,
                     until_date TEXT NOT NULL,
                     is_archive INTEGER NOT NULL
@@ -322,6 +381,9 @@ class _DerivedRAGIndex:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_child_root_path ON child_chunks(root_key, path)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_child_embed_hash ON child_chunks(embed_hash)"
             )
             conn.execute(
                 """
@@ -342,6 +404,18 @@ class _DerivedRAGIndex:
                     summary TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (content_hash, model)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                    content_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dims INTEGER NOT NULL,
+                    vector_blob BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (content_hash, model, dims)
                 )
                 """
             )
@@ -521,7 +595,7 @@ class _DerivedRAGIndex:
         ).fetchone()
         return str(row[0]) if row is not None else ""
 
-    # 对单篇文档执行两层父子分块并写入 parent_chunks、child_chunks 与 child_chunks_fts
+    # 对单篇文档执行两层父子分块并写入 parent_chunks、child_chunks（含 embed_hash）与 child_chunks_fts
     def _index_file(
         self,
         root_key: str,
@@ -544,6 +618,7 @@ class _DerivedRAGIndex:
 
         path_tok = " ".join(tokenize_text(display_path, for_query=False))
         parent_id_by_idx: dict[int, int] = {}
+        parent_summary_by_idx: dict[int, str] = {}
         parent_ctx_tok_by_idx: dict[int, str] = {}
 
         for parent in parents:
@@ -577,12 +652,15 @@ class _DerivedRAGIndex:
             if parent_id is None:
                 raise RuntimeError("写入 parent_chunks 失败，未返回有效主键。")
             parent_id_by_idx[parent.parent_index] = int(parent_id)
+            parent_summary_by_idx[parent.parent_index] = summary
             parent_ctx_tok_by_idx[parent.parent_index] = (
                 " ".join(tokenize_text(summary, for_query=False)) if summary else ""
             )
 
         for child in children:
             parent_id = parent_id_by_idx[child.parent_index]
+            summary = parent_summary_by_idx.get(child.parent_index, "")
+            _, embed_hash = _child_embed_payload(child.path, child.section, summary, child.text)
             sec_tok = " ".join(tokenize_text(child.section, for_query=False))
             ctx_tok = parent_ctx_tok_by_idx.get(child.parent_index, "")
             body_tok = " ".join(tokenize_text(child.text, for_query=False))
@@ -591,9 +669,9 @@ class _DerivedRAGIndex:
                 """
                 INSERT INTO child_chunks (
                     parent_id, root_key, path, child_index, start_line, end_line,
-                    section, content_hash, text, until_date, is_archive
+                    section, content_hash, embed_hash, text, until_date, is_archive
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     parent_id,
@@ -604,6 +682,7 @@ class _DerivedRAGIndex:
                     child.end_line,
                     child.section,
                     child.content_hash,
+                    embed_hash,
                     child.text,
                     child.until_date,
                     is_archive,
@@ -618,7 +697,7 @@ class _DerivedRAGIndex:
                 (child_rowid, path_tok, sec_tok, ctx_tok, body_tok),
             )
 
-    # 原子落盘单条背景摘要至 chunk_contexts 并同步刷新对应父块及其全部子块的 FTS5 context_tokens
+    # 原子落盘单条背景摘要至 chunk_contexts，并同步刷新对应父块及其全部子块的 FTS5 context_tokens 与 embed_hash
     def upsert_context_summary(
         self,
         *,
@@ -643,25 +722,95 @@ class _DerivedRAGIndex:
                 "UPDATE parent_chunks SET context_summary = ? WHERE content_hash = ? AND until_date = ''",
                 (summary, content_hash),
             )
-            child_ids = self.conn.execute(
+            child_rows = self.conn.execute(
                 """
-                SELECT c.id
+                SELECT c.id, c.path, c.section, c.text
                 FROM child_chunks AS c
                 JOIN parent_chunks AS p ON p.id = c.parent_id
                 WHERE p.content_hash = ? AND p.until_date = ''
                 """,
                 (content_hash,),
             ).fetchall()
-            if child_ids:
+            if child_rows:
+                fts_updates: list[tuple[str, int]] = []
+                hash_updates: list[tuple[str, int]] = []
+                for cid, c_path, c_sec, c_text in child_rows:
+                    cid_int = int(cid)
+                    _, new_embed_hash = _child_embed_payload(str(c_path), str(c_sec), summary, str(c_text))
+                    fts_updates.append((ctx_tok, cid_int))
+                    hash_updates.append((new_embed_hash, cid_int))
                 self.conn.executemany(
                     "UPDATE child_chunks_fts SET context_tokens = ? WHERE rowid = ?",
-                    [(ctx_tok, int(row[0])) for row in child_ids],
+                    fts_updates,
+                )
+                self.conn.executemany(
+                    "UPDATE child_chunks SET embed_hash = ? WHERE id = ?",
+                    hash_updates,
                 )
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
             raise
+
+    # 将一批 L2 单位向量原子写入 chunk_embeddings（小端 float32 BLOB）并预热有界内存向量缓存
+    def store_embeddings(
+        self,
+        model: str,
+        items: Sequence[tuple[str, tuple[float, ...]]],
+    ) -> None:
+        if not items:
+            return
+        created_at = datetime.now(UTC).isoformat()
+        packed_rows = [
+            (content_hash, model, len(vec), pack_vector(vec), created_at)
+            for content_hash, vec in items
+        ]
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO chunk_embeddings
+                    (content_hash, model, dims, vector_blob, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                packed_rows,
+            )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+        for content_hash, vec in items:
+            self._put_cached_vector(content_hash, model, vec)
+
+    # 将已解包向量写入有界内存缓存（按 (content_hash, model, dims) 三元组隔离不同维度），超限时按 FIFO 驱逐
+    def _put_cached_vector(self, content_hash: str, model: str, vec: tuple[float, ...]) -> None:
+        key = (content_hash, model, len(vec))
+        self._vec_cache[key] = vec
+        while len(self._vec_cache) > _MAX_VECTOR_CACHE_ITEMS:
+            oldest = next(iter(self._vec_cache))
+            self._vec_cache.pop(oldest, None)
+
+    # 读取指定 (embed_hash, model, dims) 的解包浮点向量（优先命中内存缓存，未命中则校验类型与长度解码 BLOB 并回填）
+    def get_cached_vector(
+        self,
+        embed_hash: str,
+        model: str,
+        dims: int,
+        blob: object,
+    ) -> tuple[float, ...] | None:
+        key = (embed_hash, model, dims)
+        cached = self._vec_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            vec = unpack_vector(blob, dims)
+        except ValueError:
+            return None
+        self._put_cached_vector(embed_hash, model, vec)
+        return vec
 
     # 读取指定文档的全部常驻父块（排除过期条目）及其当前 context_summary，供离线摘要器增量补全
     def load_enrichable_parents(
@@ -717,12 +866,13 @@ class _DerivedRAGIndex:
             )
         return result
 
-    # 关闭底层 SQLite 连接
+    # 关闭底层 SQLite 连接并清空内存向量缓存
     def close(self) -> None:
+        self._vec_cache.clear()
         self.conn.close()
 
 
-# 持久化两层父子 RAG 检索插件配置项（从 config/tools.json 的 retrieval 段读取）
+# 持久化两层父子混合 RAG 检索插件配置项（从 config/tools.json 的 retrieval 段读取）
 @dataclass(frozen=True)
 class RAGConfig:
     min_term_coverage: float = 0.22
@@ -733,8 +883,12 @@ class RAGConfig:
     child_overlap_chars: int = DEFAULT_CHILD_OVERLAP_CHARS
     index_path: str | None = None
     context_model: str = "default"
+    min_vector_score: float = 0.45
+    rrf_k: int = 60
+    bm25_weight: float = 1.0
+    vector_weight: float = 1.0
 
-    # 校验覆盖率、BM25 下限、父子分块字数、Overlap 上界、模型标识及派生索引相对路径边界
+    # 校验覆盖率、BM25 下限、父子分块、Overlap、混合 RRF 权重、抗噪余弦阈值及派生索引相对路径边界
     def __post_init__(self) -> None:
         validate_retrieval_thresholds(self.min_term_coverage, self.min_bm25_score)
         require_positive_int(self.max_hits_per_file, "retrieval.max_hits_per_file")
@@ -743,6 +897,12 @@ class RAGConfig:
         _require_non_negative_int(self.child_overlap_chars, "retrieval.child_overlap_chars")
         if self.child_overlap_chars >= self.child_max_chars:
             raise ValueError("retrieval.child_overlap_chars 必须严格小于 retrieval.child_max_chars。")
+        _require_bounded_float(self.min_vector_score, "retrieval.min_vector_score", low=0.0, high=1.0)
+        require_positive_int(self.rrf_k, "retrieval.rrf_k")
+        w_bm25 = _require_bounded_float(self.bm25_weight, "retrieval.bm25_weight", low=0.0)
+        w_vec = _require_bounded_float(self.vector_weight, "retrieval.vector_weight", low=0.0)
+        if w_bm25 <= 0.0 and w_vec <= 0.0:
+            raise ValueError("retrieval.bm25_weight 与 retrieval.vector_weight 不能同时为 0。")
         if self.index_path is not None:
             if not isinstance(self.index_path, str) or not self.index_path.strip() or "\x00" in self.index_path:
                 raise ValueError("retrieval.index_path 必须是非空相对路径字符串或省略。")
@@ -774,10 +934,30 @@ class RAGConfig:
                     raise ValueError(f"retrieval.{key} 必须是整数。") from error
             raise ValueError(f"retrieval.{key} 必须是整数，不支持浮点或非整型值。")
 
+        # 解析并校验可选有限浮点配置项，显式拒绝布尔值与非数值
+        def _parse_float(key: str, default: float) -> float:
+            val = cfg.get(key, default)
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                raise ValueError(f"retrieval.{key} 必须是有限数字。")
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str):
+                try:
+                    return float(val.strip())
+                except ValueError as error:
+                    raise ValueError(f"retrieval.{key} 必须是有限数字。") from error
+            raise ValueError(f"retrieval.{key} 必须是有限数字。")
+
         per_file = _parse_int("max_hits_per_file", 2)
         parent_chars = _parse_int("parent_max_chars", DEFAULT_PARENT_MAX_CHARS)
         child_chars = _parse_int("child_max_chars", DEFAULT_CHILD_MAX_CHARS)
         overlap_chars = _parse_int("child_overlap_chars", DEFAULT_CHILD_OVERLAP_CHARS)
+        min_vec_score = _parse_float("min_vector_score", 0.45)
+        rrf_k = _parse_int("rrf_k", 60)
+        bm25_w = _parse_float("bm25_weight", 1.0)
+        vec_w = _parse_float("vector_weight", 1.0)
 
         raw_index_path = cfg.get("index_path")
         if raw_index_path is not None and not isinstance(raw_index_path, str):
@@ -800,18 +980,39 @@ class RAGConfig:
             child_overlap_chars=overlap_chars,
             index_path=index_path,
             context_model=context_model,
+            min_vector_score=min_vec_score,
+            rrf_k=rrf_k,
+            bm25_weight=bm25_w,
+            vector_weight=vec_w,
         )
 
 
-# 持久化两层父子 RAG 检索引擎（实现 RetrieverProtocol，线程安全，读写落盘 data/state/rag_index.db，只读零写盘）
+# 持久化两层父子混合 RAG 检索引擎（实现 RetrieverProtocol，线程安全，未配 embedder 时零开销走纯 BM25，配置后自动激活 BM25+Dense RRF）
 class RAGRetriever:
     name = RETRIEVER_NAME
 
-    # 初始化检索配置、线程锁与按数据根目录隔离的派生 SQLite 索引句柄缓存
-    def __init__(self, config: RAGConfig | None = None) -> None:
+    # 初始化检索配置、可选向量客户端、线程锁与按数据根目录隔离的派生 SQLite 索引句柄缓存
+    def __init__(
+        self,
+        config: RAGConfig | None = None,
+        *,
+        embedder: EmbeddingInvoker | None = None,
+    ) -> None:
         self.config = config or RAGConfig()
+        self._embedder: EmbeddingInvoker | None = embedder
         self._lock = threading.RLock()
         self._indices: dict[Path, _DerivedRAGIndex] = {}
+
+    # 线程安全读取当前绑定的可选向量嵌入客户端
+    @property
+    def embedder(self) -> EmbeddingInvoker | None:
+        with self._lock:
+            return self._embedder
+
+    # 线程安全热切换可选向量嵌入客户端（传入 None 即平滑退回纯词面 BM25 模式）
+    def set_embedder(self, embedder: EmbeddingInvoker | None) -> None:
+        with self._lock:
+            self._embedder = embedder
 
     # 解析当前 MemoryStore 对应的派生索引路径：只读模式恒返回 None 零写盘，读写模式严格收口于 data_root 内
     def _resolve_db_path(self, memory: "MemoryStore") -> Path | None:
@@ -902,23 +1103,17 @@ class RAGRetriever:
         cut = rendered[:_MAX_SNIPPET_CHARS].rsplit("\n", 1)[0]
         return f"{cut}\n  …（父块内容较长，完整内容请调用 read_markdown 按行查看）"
 
-    # 在已打开的派生索引上执行增量同步、子块 BM25 检索、覆盖率门控、按 parent_id 聚合去重与多样性重排
-    def _sync_and_query(
+    # 执行词面 BM25 子块检索并按 parent_id 聚合去重（取最高子块得分）
+    def _query_bm25_parents(
         self,
         index: _DerivedRAGIndex,
         root_key: str,
-        searchable: list[tuple[Path, str, bool]],
         *,
         searching_archive: bool,
         query_terms: list[str],
         ref_day_iso: str,
         limit: int,
-    ) -> list[SearchHit]:
-        # 无论 searchable 是否为空均先 sync，确保目录内所有文件被删后派生库旧行也被彻底清除
-        index.sync(root_key, searchable, is_archive_root=searching_archive)
-        if not searchable:
-            return []
-
+    ) -> dict[int, _ParentHitPayload]:
         fts_expr = " OR ".join(f'"{term}"' for term in query_terms)
         query_set = set(query_terms)
         min_matched = 2 if len(query_set) >= 4 else 1
@@ -960,8 +1155,7 @@ class RAGRetriever:
             ).fetchone()[0]
         )
 
-        # 按 parent_id 聚合去重：同一父块下多个子块同时命中时取最高子块得分并只返回 1 条完整父块
-        best_by_parent: dict[int, tuple[float, str, int, int, str, str, str, str]] = {}
+        best_by_parent: dict[int, _ParentHitPayload] = {}
         for (
             parent_id,
             path,
@@ -1008,11 +1202,82 @@ class RAGRetriever:
                     str(table_header),
                     str(context_summary),
                 )
+        return best_by_parent
 
-        ranked = sorted(best_by_parent.values(), key=lambda item: (-item[0], item[1], item[2], item[3]))
+    # 执行稠密向量余弦相似度检索（math.sumprod），过 min_vector_score 抗噪门控并按 parent_id 聚合取最高相似度
+    def _query_dense_parents(
+        self,
+        index: _DerivedRAGIndex,
+        root_key: str,
+        *,
+        searching_archive: bool,
+        query_vec: tuple[float, ...],
+        embedder_model: str,
+        ref_day_iso: str,
+    ) -> dict[int, _ParentHitPayload]:
+        q_dims = len(query_vec)
+        rows = index.conn.execute(
+            """
+            SELECT
+                p.id AS parent_id,
+                p.path,
+                p.start_line,
+                p.end_line,
+                p.section,
+                p.text AS parent_text,
+                p.table_header,
+                p.context_summary,
+                c.embed_hash,
+                e.vector_blob
+            FROM child_chunks AS c
+            JOIN parent_chunks AS p ON p.id = c.parent_id
+            JOIN chunk_embeddings AS e
+              ON e.content_hash = c.embed_hash AND e.model = ? AND e.dims = ?
+            WHERE c.root_key = ?
+              AND (? = 1 OR c.is_archive = 0)
+              AND (c.until_date = '' OR c.until_date >= ?)
+            """,
+            (embedder_model, q_dims, root_key, 1 if searching_archive else 0, ref_day_iso),
+        ).fetchall()
 
-        # 同文件行区间去重（防御性保障同一行区间不重复展示）
-        deduped: list[tuple[float, str, int, int, str, str, str, str]] = []
+        min_sim = self.config.min_vector_score
+        best_by_parent: dict[int, _ParentHitPayload] = {}
+        for (
+            parent_id,
+            path,
+            start_line,
+            end_line,
+            section,
+            parent_text,
+            table_header,
+            context_summary,
+            embed_hash,
+            vector_blob,
+        ) in rows:
+            vec = index.get_cached_vector(str(embed_hash), embedder_model, q_dims, vector_blob)
+            if vec is None:
+                continue
+            sim = cosine_similarity(query_vec, vec)
+            if sim < min_sim:
+                continue
+            pid = int(parent_id)
+            prev = best_by_parent.get(pid)
+            if prev is None or sim > prev[0]:
+                best_by_parent[pid] = (
+                    round(sim, 6),
+                    str(path),
+                    int(start_line),
+                    int(end_line),
+                    str(section),
+                    str(parent_text),
+                    str(table_header),
+                    str(context_summary),
+                )
+        return best_by_parent
+
+    # 将父级候选按行区间去重与 max_hits_per_file 多样性重排后渲染为 SearchHit 列表
+    def _finalize_hits(self, ranked: list[_ParentHitPayload], *, limit: int) -> list[SearchHit]:
+        deduped: list[_ParentHitPayload] = []
         used_spans_by_file: dict[str, list[tuple[int, int]]] = {}
         for item in ranked:
             _, path, s_ln, e_ln, _, _, _, _ = item
@@ -1022,9 +1287,8 @@ class RAGRetriever:
             prev_spans.append((s_ln, e_ln))
             deduped.append(item)
 
-        # 按 max_hits_per_file 做多文件多样性优先挑选，剩余名额从溢出候选中补齐
-        primary_picks: list[tuple[float, str, int, int, str, str, str, str]] = []
-        overflow: list[tuple[float, str, int, int, str, str, str, str]] = []
+        primary_picks: list[_ParentHitPayload] = []
+        overflow: list[_ParentHitPayload] = []
         per_file_counts: dict[str, int] = {}
         cap = self.config.max_hits_per_file if limit >= 4 else limit
         for item in deduped:
@@ -1054,7 +1318,258 @@ class RAGRetriever:
             for score, path, start_line, end_line, section, parent_text, table_header, context_summary in chosen
         ]
 
-    # 对外检索入口：使用规范相对 root_key，遇到运行期确认物理损坏的磁盘派生库时自动清理重建并重试一次
+    # 在已打开的派生索引上执行增量同步、BM25（及可选 Dense + RRF 融合）、父级去重与多样性重排
+    def _sync_and_query(
+        self,
+        index: _DerivedRAGIndex,
+        root_key: str,
+        searchable: list[tuple[Path, str, bool]],
+        *,
+        searching_archive: bool,
+        query_terms: list[str],
+        ref_day_iso: str,
+        limit: int,
+        query_vec: tuple[float, ...] | None = None,
+        embedder_model: str | None = None,
+    ) -> list[SearchHit]:
+        # 无论 searchable 是否为空均先 sync，确保目录内所有文件被删后派生库旧行也被彻底清除
+        index.sync(root_key, searchable, is_archive_root=searching_archive)
+        if not searchable:
+            return []
+
+        dense_active = query_vec is not None and bool(embedder_model) and self.config.vector_weight > 0.0
+        bm25_by_parent: dict[int, _ParentHitPayload] = {}
+        if query_terms and (not dense_active or self.config.bm25_weight > 0.0):
+            bm25_by_parent = self._query_bm25_parents(
+                index,
+                root_key,
+                searching_archive=searching_archive,
+                query_terms=query_terms,
+                ref_day_iso=ref_day_iso,
+                limit=limit,
+            )
+
+        # 未激活稠密通道时直接走纯净 BM25 排序，零额外开销
+        if not dense_active or query_vec is None or not embedder_model:
+            ranked = sorted(bm25_by_parent.values(), key=lambda item: (-item[0], item[1], item[2], item[3]))
+            return self._finalize_hits(ranked, limit=limit)
+
+        dense_by_parent = self._query_dense_parents(
+            index,
+            root_key,
+            searching_archive=searching_archive,
+            query_vec=query_vec,
+            embedder_model=embedder_model,
+            ref_day_iso=ref_day_iso,
+        )
+        if not bm25_by_parent and not dense_by_parent:
+            return []
+
+        # 加权 Reciprocal Rank Fusion (RRF)：双路同时命中的父块自然排在单路命中之前
+        bm25_order = sorted(
+            bm25_by_parent.items(),
+            key=lambda kv: (-kv[1][0], kv[1][1], kv[1][2], kv[1][3]),
+        )
+        dense_order = sorted(
+            dense_by_parent.items(),
+            key=lambda kv: (-kv[1][0], kv[1][1], kv[1][2], kv[1][3]),
+        )
+        bm25_rank = {pid: rank for rank, (pid, _) in enumerate(bm25_order, start=1)}
+        dense_rank = {pid: rank for rank, (pid, _) in enumerate(dense_order, start=1)}
+
+        k = self.config.rrf_k
+        w_bm25 = self.config.bm25_weight
+        w_vec = self.config.vector_weight
+        fused_entries: list[tuple[float, float, _ParentHitPayload]] = []
+        for pid in set(bm25_by_parent) | set(dense_by_parent):
+            rrf_score = 0.0
+            tie_signal = 0.0
+            if pid in bm25_rank and w_bm25 > 0.0:
+                rrf_score += w_bm25 / (k + bm25_rank[pid])
+                tie_signal = max(tie_signal, bm25_by_parent[pid][0])
+            if pid in dense_rank and w_vec > 0.0:
+                rrf_score += w_vec / (k + dense_rank[pid])
+                tie_signal = max(tie_signal, dense_by_parent[pid][0])
+            if rrf_score <= 0.0:
+                continue
+            meta = bm25_by_parent.get(pid) or dense_by_parent[pid]
+            fused_payload: _ParentHitPayload = (
+                round(rrf_score, 6),
+                meta[1],
+                meta[2],
+                meta[3],
+                meta[4],
+                meta[5],
+                meta[6],
+                meta[7],
+            )
+            fused_entries.append((fused_payload[0], tie_signal, fused_payload))
+
+        fused_entries.sort(key=lambda item: (-item[0], -item[1], item[2][1], item[2][2], item[2][3]))
+        return self._finalize_hits([entry[2] for entry in fused_entries], limit=limit)
+
+    # 在锁外按批次为活跃子块增量补齐目标维度向量缓存（严守已过期不外发、按 (hash, model, dims) 精确对齐并支持断点续跑）
+    def _ensure_active_embeddings(
+        self,
+        memory: "MemoryStore",
+        root_key: str,
+        searchable: list[tuple[Path, str, bool]],
+        *,
+        searching_archive: bool,
+        embedder: EmbeddingInvoker,
+        ref_day_iso: str,
+        batch_size: int,
+        expected_dims: int | None = None,
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, int]:
+        model_id = _clean_embedder_model(embedder)
+        if not model_id:
+            raise ValueError("embedder.model_id 不能为空。")
+
+        target_dims = expected_dims if expected_dims is not None else _embedder_target_dims(embedder)
+        embedded = 0
+        final_total = 0
+        final_cached = 0
+        final_dims = target_dims or 0
+
+        # 最多两轮：若未显式声明维度且首轮新批返回的真实维度与历史推断维度不同，自动切至真实维度补齐其余子块
+        for _pass_idx in range(2):
+            # 持锁同步并一次性提取当前根目录全部活跃（未过期）子块及目标维度的已有向量缓存键集合
+            def _collect_missing(
+                index: _DerivedRAGIndex,
+                *,
+                req_dims: int | None = target_dims,
+            ) -> tuple[int, int, int | None, list[tuple[str, str]], dict[str, int]]:
+                index.sync(root_key, searchable, is_archive_root=searching_archive)
+                rows = index.conn.execute(
+                    """
+                    SELECT c.embed_hash, c.path, c.section, p.context_summary, c.text
+                    FROM child_chunks AS c
+                    JOIN parent_chunks AS p ON p.id = c.parent_id
+                    WHERE c.root_key = ?
+                      AND (? = 1 OR c.is_archive = 0)
+                      AND (c.until_date = '' OR c.until_date >= ?)
+                    ORDER BY c.path, c.id
+                    """,
+                    (root_key, 1 if searching_archive else 0, ref_day_iso),
+                ).fetchall()
+                total_children = len(rows)
+                if not rows:
+                    return 0, 0, req_dims, [], {}
+
+                effective_dims = req_dims
+                if effective_dims is None:
+                    latest = index.conn.execute(
+                        "SELECT dims FROM chunk_embeddings WHERE model = ? ORDER BY created_at DESC LIMIT 1",
+                        (model_id,),
+                    ).fetchone()
+                    if latest is not None:
+                        effective_dims = int(latest[0])
+
+                if effective_dims is not None:
+                    cached_hashes = {
+                        str(r[0])
+                        for r in index.conn.execute(
+                            """
+                            SELECT content_hash
+                            FROM chunk_embeddings
+                            WHERE model = ?
+                              AND dims = ?
+                              AND typeof(vector_blob) = 'blob'
+                              AND length(vector_blob) = dims * 4
+                            """,
+                            (model_id, effective_dims),
+                        ).fetchall()
+                    }
+                else:
+                    cached_hashes = set()
+
+                missing_unique: list[tuple[str, str]] = []
+                missing_counts: dict[str, int] = {}
+                cached_cnt = 0
+                for embed_hash, c_path, c_sec, ctx_sum, c_text in rows:
+                    h_str = str(embed_hash)
+                    if h_str in cached_hashes:
+                        cached_cnt += 1
+                    else:
+                        if h_str not in missing_counts:
+                            embed_text, _ = _child_embed_payload(str(c_path), str(c_sec), str(ctx_sum), str(c_text))
+                            missing_unique.append((h_str, embed_text))
+                        missing_counts[h_str] = missing_counts.get(h_str, 0) + 1
+                return total_children, cached_cnt, effective_dims, missing_unique, missing_counts
+
+            total_children, cached_cnt, inferred_dims, missing_unique, missing_counts = self._with_index_recovery(
+                memory,
+                _collect_missing,
+            )
+            final_total = total_children
+            final_cached = cached_cnt
+            if inferred_dims is not None and final_dims == 0:
+                final_dims = inferred_dims
+
+            if not missing_unique:
+                break
+
+            dims_changed = False
+            observed_dims: int | None = target_dims
+            # 锁外按 batch_size 分批请求 Embedding API，统一执行单位归一化与维度一致性校验并原子落盘
+            for start in range(0, len(missing_unique), batch_size):
+                if abort_signal is not None and abort_signal.aborted:
+                    raise StreamAbortedError(abort_signal.reason or "批量向量化已取消")
+                batch = missing_unique[start : start + batch_size]
+                raw_vectors = embedder.embed([txt for _, txt in batch], abort_signal=abort_signal)
+                if len(raw_vectors) != len(batch):
+                    raise ValueError(f"向量化返回数量不匹配：期望 {len(batch)}，实际 {len(raw_vectors)}。")
+                norm_vectors = [normalize_vector(vec) for vec in raw_vectors]
+                for vec in norm_vectors:
+                    if observed_dims is None:
+                        observed_dims = len(vec)
+                    elif len(vec) != observed_dims:
+                        raise ValueError(
+                            f"向量化返回维度不一致：期望 {observed_dims}，实际 {len(vec)}。"
+                        )
+                if observed_dims is not None:
+                    final_dims = observed_dims
+                pairs = [(h, vec) for (h, _), vec in zip(batch, norm_vectors)]
+
+                # 写回前确保若锁外期间磁盘派生库被外部重建，分块表与向量缓存可一并恢复同步
+                def _persist_batch(
+                    idx: _DerivedRAGIndex,
+                    *,
+                    items: list[tuple[str, tuple[float, ...]]] = pairs,
+                ) -> None:
+                    idx.sync(root_key, searchable, is_archive_root=searching_archive)
+                    idx.store_embeddings(model_id, items)
+
+                self._with_index_recovery(memory, _persist_batch)
+                for h, _ in pairs:
+                    embedded += 1
+                    occ = missing_counts.get(h, 1)
+                    if occ > 1:
+                        final_cached += occ - 1
+
+            if (
+                target_dims is None
+                and inferred_dims is not None
+                and observed_dims is not None
+                and observed_dims != inferred_dims
+                and final_cached > 0
+            ):
+                target_dims = observed_dims
+                dims_changed = True
+            if not dims_changed:
+                break
+
+        return {
+            "files": len(searchable),
+            "children_total": final_total,
+            "embedded": embedded,
+            "cached_hits": final_cached,
+            "skipped": 0,
+            "dims": final_dims,
+        }
+
+    # 对外检索入口：未配 embedder 或 vector_weight=0 时直通纯 BM25；否则先编码 query 获取真实维度再对齐向量缓存并执行 RRF
     def search_hits(
         self,
         memory: "MemoryStore",
@@ -1063,14 +1578,51 @@ class RAGRetriever:
         limit: int = 10,
         today: date | None = None,
     ) -> list[SearchHit]:
-        query_terms = list(dict.fromkeys(tokenize_text(query, for_query=True)))
-        if not query_terms:
+        clean_query = query.strip() if isinstance(query, str) else ""
+        query_terms = list(dict.fromkeys(tokenize_text(clean_query, for_query=True)))
+        active_embedder = self.embedder
+        active_model = _clean_embedder_model(active_embedder)
+        dense_enabled = active_embedder is not None and active_model is not None and self.config.vector_weight > 0.0
+
+        if not query_terms and (not clean_query or not dense_enabled):
             raise ValueError("搜索关键词不能为空。")
 
         ref_day_iso = (today or today_shanghai()).isoformat()
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
         root_key = memory.display_path(target_dir)
+
+        query_vec: tuple[float, ...] | None = None
+        embedder_model: str | None = None
+        if dense_enabled and active_embedder is not None and active_model is not None and searchable:
+            try:
+                # 先编码 query 获取真实 q_dims，确保维度变更时 _ensure_active_embeddings 精确按 (hash, model, q_dims) 补齐
+                q_vecs = active_embedder.embed([clean_query])
+                if len(q_vecs) != 1:
+                    raise ValueError(f"查询向量返回数量异常：期望 1，实际 {len(q_vecs)}。")
+                norm_q = normalize_vector(q_vecs[0])
+                q_dims = len(norm_q)
+                self._ensure_active_embeddings(
+                    memory,
+                    root_key,
+                    searchable,
+                    searching_archive=searching_archive,
+                    embedder=active_embedder,
+                    ref_day_iso=ref_day_iso,
+                    batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+                    expected_dims=q_dims,
+                )
+                query_vec = norm_q
+                embedder_model = active_model
+            except StreamAbortedError:
+                raise
+            except (OSError, RuntimeError, ValueError, TypeError, LLMNotConfigured):
+                # 在线检索阶段遇 Embedding 接口异常自动优雅降级为纯 BM25，保障前台对话不中断
+                query_vec = None
+                embedder_model = None
+
+        if not query_terms and query_vec is None:
+            return []
 
         return self._with_index_recovery(
             memory,
@@ -1082,16 +1634,63 @@ class RAGRetriever:
                 query_terms=query_terms,
                 ref_day_iso=ref_day_iso,
                 limit=limit,
+                query_vec=query_vec,
+                embedder_model=embedder_model,
             ),
         )
 
-    # 同步目标根目录并返回当前派生索引的详细只读状态（供 /rag status 展示）
-    def index_status(self, memory: "MemoryStore", root: str = "data/memory") -> dict[str, object]:
+    # 离线批量为目标根目录的活跃子块计算并持久化向量缓存（供 /rag embed 调用，支持 AbortSignal 断点续跑且暴露真实错误）
+    def embed_chunks(
+        self,
+        memory: "MemoryStore",
+        *,
+        root: str = "data/memory",
+        embedder: EmbeddingInvoker | None = None,
+        batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE,
+        today: date | None = None,
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, int]:
+        if memory.read_only:
+            raise ValueError("只读模式下不支持持久化写入向量缓存。")
+        require_positive_int(batch_size, "batch_size")
+        active = embedder if embedder is not None else self.embedder
+        if active is None:
+            raise ValueError("未配置向量嵌入模型（embedder），请先在 config/models.dsl 中添加 embedder 或设置 EMBEDDING_MODEL。")
+
+        ref_day_iso = (today or today_shanghai()).isoformat()
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
         root_key = memory.display_path(target_dir)
 
-        # 同步后汇总目标根目录下的文件数、父子块数及上下文摘要覆盖情况
+        return self._ensure_active_embeddings(
+            memory,
+            root_key,
+            searchable,
+            searching_archive=searching_archive,
+            embedder=active,
+            ref_day_iso=ref_day_iso,
+            batch_size=batch_size,
+            expected_dims=_embedder_target_dims(active),
+            abort_signal=abort_signal,
+        )
+
+    # 同步目标根目录并返回当前派生索引的详细只读状态（含父子块、摘要与活跃子块目标维度向量覆盖统计，供 /rag status 展示）
+    def index_status(
+        self,
+        memory: "MemoryStore",
+        root: str = "data/memory",
+        *,
+        today: date | None = None,
+    ) -> dict[str, object]:
+        target_dir = memory.resolve_path(root, write=False)
+        searchable, searching_archive = memory.iter_searchable_files(root)
+        root_key = memory.display_path(target_dir)
+        ref_day_iso = (today or today_shanghai()).isoformat()
+        active_emb = self.embedder
+        active_model = _clean_embedder_model(active_emb)
+        target_dims = _embedder_target_dims(active_emb)
+
+        # 同步后汇总目标根目录下的文件数、父子块数、上下文摘要及活跃子块向量覆盖情况
         def _collect(index: _DerivedRAGIndex) -> dict[str, object]:
             index.sync(root_key, searchable, is_archive_root=searching_archive)
             indexed_files = int(
@@ -1121,6 +1720,42 @@ class RAGRetriever:
             cached_contexts = int(
                 index.conn.execute("SELECT COUNT(*) FROM chunk_contexts").fetchone()[0]
             )
+            cached_embeddings = int(
+                index.conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
+            )
+            if active_model is not None:
+                if target_dims is not None:
+                    embedded_children = int(
+                        index.conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT c.id)
+                            FROM child_chunks AS c
+                            JOIN chunk_embeddings AS e
+                              ON e.content_hash = c.embed_hash AND e.model = ? AND e.dims = ?
+                            WHERE c.root_key = ?
+                              AND (? = 1 OR c.is_archive = 0)
+                              AND (c.until_date = '' OR c.until_date >= ?)
+                            """,
+                            (active_model, target_dims, root_key, 1 if searching_archive else 0, ref_day_iso),
+                        ).fetchone()[0]
+                    )
+                else:
+                    embedded_children = int(
+                        index.conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT c.id)
+                            FROM child_chunks AS c
+                            JOIN chunk_embeddings AS e
+                              ON e.content_hash = c.embed_hash AND e.model = ?
+                            WHERE c.root_key = ?
+                              AND (? = 1 OR c.is_archive = 0)
+                              AND (c.until_date = '' OR c.until_date >= ?)
+                            """,
+                            (active_model, root_key, 1 if searching_archive else 0, ref_day_iso),
+                        ).fetchone()[0]
+                    )
+            else:
+                embedded_children = 0
             if index.db_path is not None and index.data_root is not None:
                 rel_db = index.db_path.relative_to(index.data_root).as_posix()
                 db_label = f"data/{rel_db}"
@@ -1139,6 +1774,9 @@ class RAGRetriever:
                 "child_chunks": child_chunks,
                 "enriched_parents": enriched_parents,
                 "cached_contexts": cached_contexts,
+                "embedder_model": active_model,
+                "embedded_children": embedded_children,
+                "cached_embeddings": cached_embeddings,
             }
 
         return self._with_index_recovery(memory, _collect)
@@ -1310,7 +1948,7 @@ def create_retriever(config: dict[str, object]) -> RAGRetriever:
     return RAGRetriever(RAGConfig.from_dict(config))
 
 
-# 持久化两层父子 RAG 主板插件（外层继承 Plugin ABC，内层向 retrievers 插槽注册 rag 检索引擎并线程安全托管连接回收）
+# 持久化两层父子混合 RAG 主板插件（外层继承 Plugin ABC，内层向 retrievers 插槽注册 rag 检索引擎并线程安全托管连接回收）
 class RAGRetrieverPlugin(Plugin):
     plugin_id = RETRIEVER_NAME
 

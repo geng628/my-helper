@@ -274,12 +274,13 @@ class ModelDecl:
     col: int
 
 
-# 顶层 DSL 程序 AST 节点（可选 default / consolidator 声明 + 全部 model 块）
+# 顶层 DSL 程序 AST 节点（可选 default / consolidator / embedder 声明 + 全部 model 块）
 @dataclass(frozen=True)
 class ModelsDSLProgram:
     default_model: tuple[str, int, int] | None
     models: tuple[ModelDecl, ...]
     consolidator_model: tuple[str, int, int] | None = None
+    embedder_model: tuple[str, int, int] | None = None
 
 
 # 词法分析器：支持 # 注释、单双引号字符串、免引号裸值（URL/密钥/数字）与花括号块
@@ -418,6 +419,7 @@ class _DSLParser:
     def parse(self) -> ModelsDSLProgram:
         default_decl: tuple[str, int, int] | None = None
         consolidator_decl: tuple[str, int, int] | None = None
+        embedder_decl: tuple[str, int, int] | None = None
         models: list[ModelDecl] = []
 
         self._skip_newlines()
@@ -425,7 +427,7 @@ class _DSLParser:
             tok = self._peek()
             if tok.kind != "WORD":
                 raise DSLCompileError(
-                    f"顶层期望 use、add、default、consolidator 或 model 声明，实际遇到 {tok.value!r}。",
+                    f"顶层期望 use、add、default、consolidator、embedder 或 model 声明，实际遇到 {tok.value!r}。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -444,6 +446,13 @@ class _DSLParser:
                     raise DSLCompileError("不允许重复声明 consolidator。", source=self._source, line=tok.line, col=tok.col)
                 consolidator_decl = (target.value, target.line, target.col)
                 self._expect_line_end()
+            elif tok.value == "embedder":
+                self._advance()
+                target = self._expect("WORD", "embedder 后必须指定向量嵌入模型名称。")
+                if embedder_decl is not None:
+                    raise DSLCompileError("不允许重复声明 embedder。", source=self._source, line=tok.line, col=tok.col)
+                embedder_decl = (target.value, target.line, target.col)
+                self._expect_line_end()
             elif tok.value in {"use", "add"}:
                 decl, is_default = self._parse_preset_line()
                 models.append(decl)
@@ -460,7 +469,7 @@ class _DSLParser:
                 models.append(self._parse_model_block())
             else:
                 raise DSLCompileError(
-                    f"未知顶层指令 {tok.value!r}（支持 use、add、default、consolidator 与 model）。",
+                    f"未知顶层指令 {tok.value!r}（支持 use、add、default、consolidator、embedder 与 model）。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -471,6 +480,7 @@ class _DSLParser:
             default_model=default_decl,
             models=tuple(models),
             consolidator_model=consolidator_decl,
+            embedder_model=embedder_decl,
         )
 
     # 解析极简一行预设语句：`use/add <厂商> [模型名] [api_key]`，自动展开为完整 ModelDecl AST
@@ -580,7 +590,7 @@ class _DSLParser:
         return ModelDecl(name=name_tok.value, fields=fields, line=name_tok.line, col=name_tok.col)
 
 
-# 解析顶层模型引用（default / consolidator）：先按名称精确匹配，再按内置预设别名映射到 preset.id
+# 解析顶层模型引用（default / consolidator / embedder）：先按名称精确匹配，再按内置预设别名映射到 preset.id
 def _resolve_target_model(
     target: tuple[str, int, int],
     emitted_models: dict[str, dict[str, object]],
@@ -746,15 +756,23 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
         "default": default_name,
         "models": emitted_models,
     }
+    roles: dict[str, str] = {}
     if program.consolidator_model is not None:
-        compiled["roles"] = {
-            "consolidator": _resolve_target_model(
-                program.consolidator_model,
-                emitted_models,
-                directive="consolidator",
-                source=source,
-            )
-        }
+        roles["consolidator"] = _resolve_target_model(
+            program.consolidator_model,
+            emitted_models,
+            directive="consolidator",
+            source=source,
+        )
+    if program.embedder_model is not None:
+        roles["embedder"] = _resolve_target_model(
+            program.embedder_model,
+            emitted_models,
+            directive="embedder",
+            source=source,
+        )
+    if roles:
+        compiled["roles"] = roles
     return compiled
 
 

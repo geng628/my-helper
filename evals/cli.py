@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default="data/memory", help="search 模式检索根目录")
     parser.add_argument("--limit", type=int, default=5, help="search 模式 Top-K 数量")
     parser.add_argument("--retriever", default="auto", help="search 模式检索后端：auto（按 tools.json）/ linear / 插件名如 rag")
+    parser.add_argument("--embedder", default=None, help="search 模式可选向量嵌入模型（models.dsl 档案名或环境变量；省略时默认零网络纯词面评测）")
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
@@ -132,16 +133,33 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "search":
             cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
+            clean_embedder = (args.embedder or "").strip() or None
             retriever = None
             if args.retriever != "linear":
                 tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
                 if loaded_cfg is not None:
                     override = None if args.retriever == "auto" else args.retriever
                     retriever = loaded_cfg.build_retriever(override_name=override)
-                elif args.retriever != "auto":
+                    if clean_embedder is not None:
+                        set_emb = getattr(retriever, "set_embedder", None)
+                        if retriever is None or not callable(set_emb):
+                            raise ValueError(
+                                "--embedder 仅支持具备向量检索能力的检索插件（如 --retriever rag），"
+                                "当前检索后端不支持向量融合。"
+                            )
+                        embedder = loaded_cfg.build_embedder(tools_cfg_path.parent, model_name=clean_embedder)
+                        if embedder is None:
+                            raise ValueError(f"无法加载向量嵌入模型：{clean_embedder!r}")
+                        set_emb(embedder)
+                elif args.retriever != "auto" or clean_embedder is not None:
                     raise ValueError(f"无法加载检索插件 {args.retriever!r}：未找到配置文件 {tools_cfg_path}")
+            elif clean_embedder is not None:
+                raise ValueError("--embedder 不能与 --retriever linear 同时使用，请改用 --retriever rag。")
             memory = MemoryStore(data_dir, create_dirs=False, retriever=retriever)
-            report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
+            try:
+                report = evaluate_search(memory, cases, root=args.root, limit=args.limit)
+            finally:
+                memory.close()
         elif args.mode == "agent":
             cases = _filter_items(load_cases(cases_path), category=args.category, max_cases=args.max_cases)
             tools_cfg_path, loaded_cfg = _load_tools_config(cfg_path)
