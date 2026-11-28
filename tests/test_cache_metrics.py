@@ -103,7 +103,8 @@ def test_extract_openai_usage_supports_deepseek_openai_and_anthropic_formats() -
 # 测试 ModelClient 在请求后自动记录响应中的 last_usage
 def test_model_client_records_last_usage() -> None:
     # 模拟接口返回带 DeepSeek 缓存命中信息的 SSE 响应流
-    def fake_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del url, payload, headers, abort_signal
         yield 'data: {"choices":[{"delta":{"role":"assistant","content":"ok"}}]}\n'
         yield 'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30,"prompt_cache_hit_tokens":1024}}\n'
         yield "data: [DONE]\n"
@@ -211,7 +212,10 @@ def test_model_client_last_usage_and_cache_monitor_thread_safe() -> None:
         url: str,
         payload: dict[str, object],
         headers: dict[str, str],
+        *,
+        abort_signal=None,
     ) -> Iterator[str]:
+        del url, headers, abort_signal
         if getattr(should_fail, "flag", False):
             raise RuntimeError("boom")
         msgs = payload["messages"]

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from urllib.error import HTTPError
 
 from personal_assistant.ai.protocol import (
+    AbortSignal,
     AssistantBlock,
     AssistantMessage,
     AssistantMessageEvent,
@@ -16,7 +17,6 @@ from personal_assistant.ai.protocol import (
     DoneReason,
     ModelProfile,
     StreamDone,
-    StreamError,
     StreamOptions,
     StreamStart,
     TextBlock,
@@ -39,11 +39,12 @@ from personal_assistant.ai.protocol import (
 )
 from personal_assistant.ai.providers.http import (
     PostStream,
+    build_stream_error,
     default_post_stream,
     format_http_error,
     iter_sse_events,
     non_negative_int,
-    redact_error_tokens,
+    raise_if_aborted,
 )
 
 _STREAM_OPTIONS_MARKERS = ("stream_options", "include_usage")
@@ -243,20 +244,24 @@ class OpenAICompletionsProvider:
         headers = {"Authorization": f"Bearer {model.api_key}"}
         return url, payload, headers
 
-    # 打开 OpenAI SSE 行流；首包前若明确因 stream_options/include_usage 返回 400 则降级重试一次
+    # 打开 OpenAI SSE 行流；首包前若明确因 stream_options/include_usage 返回 400 且未取消则降级重试一次
     def _open_stream(
         self,
         url: str,
         model_id: str,
         payload: dict[str, object],
         headers: dict[str, str],
+        *,
+        abort_signal: AbortSignal | None = None,
     ) -> Iterator[str]:
+        raise_if_aborted(abort_signal)
         yielded_any = False
         first_iter: Iterator[str] | None = None
         try:
             try:
-                first_iter = self.post_stream(url, payload, headers)
+                first_iter = self.post_stream(url, payload, headers, abort_signal=abort_signal)
                 for line in first_iter:
+                    raise_if_aborted(abort_signal)
                     yielded_any = True
                     yield line
                 return
@@ -266,7 +271,14 @@ class OpenAICompletionsProvider:
                     if callable(close_fn):
                         close_fn()
         except HTTPError as error:
+            if abort_signal is not None and abort_signal.aborted:
+                try:
+                    error.close()
+                except (OSError, ValueError, AttributeError):
+                    pass
+                raise_if_aborted(abort_signal)
             formatted_error, error_text = format_http_error(error)
+            raise_if_aborted(abort_signal)
             if (
                 error.code != 400
                 or yielded_any
@@ -281,14 +293,22 @@ class OpenAICompletionsProvider:
             second_iter: Iterator[str] | None = None
             try:
                 try:
-                    second_iter = self.post_stream(url, fallback_payload, headers)
-                    yield from second_iter
+                    second_iter = self.post_stream(url, fallback_payload, headers, abort_signal=abort_signal)
+                    for line in second_iter:
+                        raise_if_aborted(abort_signal)
+                        yield line
                 finally:
                     if second_iter is not None:
                         close_fn2 = getattr(second_iter, "close", None)
                         if callable(close_fn2):
                             close_fn2()
             except HTTPError as retry_error:
+                if abort_signal is not None and abort_signal.aborted:
+                    try:
+                        retry_error.close()
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                    raise_if_aborted(abort_signal)
                 formatted_retry, _ = format_http_error(retry_error)
                 if formatted_retry is retry_error:
                     raise
@@ -340,13 +360,16 @@ class OpenAICompletionsProvider:
                 text_open = False
                 yield TextEnd(content_index=text_idx, text=full, partial=snapshot())
 
+        abort_signal = options.abort_signal if options is not None else None
         yield StreamStart(partial=snapshot())
 
         line_iter: Iterator[str] | None = None
         try:
+            raise_if_aborted(abort_signal)
             url, payload, headers = self._build_request(model, context, options)
-            line_iter = self._open_stream(url, model.model, payload, headers)
+            line_iter = self._open_stream(url, model.model, payload, headers, abort_signal=abort_signal)
             for _, data_str in iter_sse_events(line_iter):
+                raise_if_aborted(abort_signal)
                 if data_str == "[DONE]":
                     break
                 chunk = json.loads(data_str)
@@ -465,6 +488,7 @@ class OpenAICompletionsProvider:
                                 arguments="".join(acc.args),
                             )
 
+            raise_if_aborted(abort_signal)
             yield from close_thinking()
             yield from close_text()
             for slot_idx, (block_idx, acc) in sorted(tool_slots.items(), key=lambda item: item[1][0]):
@@ -486,22 +510,12 @@ class OpenAICompletionsProvider:
                 latency_ms=round((time.perf_counter() - t0) * 1000, 3),
             )
         except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, HTTPError):
-                _, diag = format_http_error(exc)
-                err_msg = f"HTTP {exc.code}: {diag}" if diag else f"HTTP {exc.code}"
-            else:
-                err_msg = redact_error_tokens(f"{type(exc).__name__}: {exc}")
-            err_msg_obj = AssistantMessage(
-                blocks=tuple(blocks),
-                stop_reason="error",
+            yield build_stream_error(
+                exc,
+                blocks=blocks,
                 usage=usage,
-                error_message=err_msg,
-            )
-            yield StreamError(
-                reason="error",
-                message=err_msg_obj,
-                error_message=err_msg,
-                latency_ms=round((time.perf_counter() - t0) * 1000, 3),
+                started_at=t0,
+                abort_signal=abort_signal,
             )
         finally:
             if line_iter is not None:

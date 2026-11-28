@@ -1,19 +1,22 @@
-"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：中立 Context 驱动、只读工具分批并发与写路障原序提交。"""
+"""Layer 2 通用 ReAct 核心循环（对标 pi-agent-core）：中立 Context 驱动、只读并发、写路障与协同取消。"""
 from __future__ import annotations
 
+from collections import ChainMap
 from collections.abc import Callable, Generator, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
 from types import MappingProxyType
 
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai.protocol import (
+    AbortSignal,
     AssistantMessage,
     AssistantMessageEvent,
     Context,
     Message,
     ModelInvoker,
+    StreamAbortedError,
     StreamDone,
     StreamError,
     StreamOptions,
@@ -61,6 +64,29 @@ def _validate_max_parallel_tools(value: int) -> int:
     return value
 
 
+# 构造规范的协同取消终结事件 StreamError(reason="aborted")
+def _make_aborted_event(abort_signal: AbortSignal | None, started_at: float) -> StreamError:
+    reason = (abort_signal.reason if abort_signal is not None and abort_signal.reason else "") or "请求已取消"
+    return StreamError(
+        reason="aborted",
+        message=AssistantMessage(stop_reason="aborted", error_message=reason),
+        error_message=reason,
+        latency_ms=round((perf_counter() - started_at) * 1000, 3),
+    )
+
+
+# 将单一真相源 abort_signal 以零拷贝 ChainMap 视图注入工具执行上下文，绝不原地修改调用方字典
+def _with_abort_context(
+    tool_context: Mapping[str, object] | None,
+    abort_signal: AbortSignal | None,
+) -> Mapping[str, object] | None:
+    if abort_signal is None:
+        return tool_context
+    if tool_context is None:
+        return MappingProxyType({"abort_signal": abort_signal})
+    return ChainMap({"abort_signal": abort_signal}, tool_context)
+
+
 # 将同轮工具调用按并发安全性切分为有序批次：连续 parallel=True 合并为并发批，其余作为单条串行路障
 def _split_tool_batches(
     tool_calls: tuple[ToolCall, ...],
@@ -94,7 +120,7 @@ def _execute_single_tool(
     return observation, duration_ms
 
 
-# 执行单个工具批次：单条/串行/上限为 1 时主线程内联执行，多条并发批经有界线程池执行并按发射原序返回结果
+# 执行单个工具批次：支持协同取消与排队任务跳过，并发批经有界线程池执行并按发射原序返回结果（取消时返回 None）
 def _execute_tool_batch(
     tools: ToolRegistry,
     batch: tuple[ToolCall, ...],
@@ -102,51 +128,108 @@ def _execute_tool_batch(
     is_parallel: bool,
     tool_context: Mapping[str, object] | None,
     max_parallel_tools: int,
-) -> list[tuple[str, float]]:
+    abort_signal: AbortSignal | None = None,
+) -> list[tuple[str, float]] | None:
+    if abort_signal is not None and abort_signal.aborted:
+        return None
     if not is_parallel or len(batch) <= 1 or max_parallel_tools <= 1:
-        return [_execute_single_tool(tools, call, tool_context) for call in batch]
+        serial_results: list[tuple[str, float]] = []
+        for call in batch:
+            if abort_signal is not None and abort_signal.aborted:
+                return None
+            serial_results.append(_execute_single_tool(tools, call, tool_context))
+        if abort_signal is not None and abort_signal.aborted:
+            return None
+        return serial_results
+
     # 并发工作线程仅接收只读快照，隔离主线程可变上下文防止竞态与误改写
     readonly_ctx: Mapping[str, object] | None = (
         MappingProxyType(dict(tool_context)) if tool_context is not None else None
     )
     workers = min(len(batch), max_parallel_tools)
     pool = ThreadPoolExecutor(max_workers=workers)
+    futures: list[Future[tuple[str, float]]] = []
+    unsub: Callable[[], None] | None = None
+
+    # 工作线程入口：在真正调用工具前再次核查取消信号，避免排队任务在取消瞬间抢跑
+    def _run_item(call: ToolCall) -> tuple[str, float]:
+        if abort_signal is not None and abort_signal.aborted:
+            return "错误：工具调用已取消。", 0.0
+        return _execute_single_tool(tools, call, readonly_ctx)
+
+    # 取消所有尚未启动的排队 Future
+    def _cancel_queued() -> None:
+        for fut in futures:
+            fut.cancel()
+
+    aborted = False
     try:
-        futures = [pool.submit(_execute_single_tool, tools, call, readonly_ctx) for call in batch]
-        results = [fut.result() for fut in futures]
+        futures = [pool.submit(_run_item, call) for call in batch]
+        if abort_signal is not None:
+            unsub = abort_signal.subscribe(_cancel_queued)
+        results: list[tuple[str, float]] = []
+        for fut in futures:
+            try:
+                results.append(fut.result())
+            except CancelledError:
+                aborted = True
+                break
+        if abort_signal is not None and abort_signal.aborted:
+            aborted = True
     except BaseException:
+        if unsub is not None:
+            unsub()
         pool.shutdown(wait=True, cancel_futures=True)
         raise
-    pool.shutdown(wait=True)
-    return results
+    finally:
+        if unsub is not None:
+            unsub()
+    pool.shutdown(wait=True, cancel_futures=aborted)
+    return None if aborted else results
 
 
-# 透传单轮模型流式事件，确定性关闭底层流并返回 (StreamDone, StreamError) 终止态
+# 透传单轮模型流式事件，确定性关闭底层流并响应协同取消，返回 (StreamDone, StreamError) 终止态
 def _stream_llm_round(
     llm: ModelInvoker,
     context: Context,
     options: StreamOptions | None = None,
 ) -> Generator[AgentEvent, None, tuple[StreamDone | None, StreamError | None]]:
+    t_round = perf_counter()
+    abort_signal = options.abort_signal if options is not None else None
+    if abort_signal is not None and abort_signal.aborted:
+        aborted_err = _make_aborted_event(abort_signal, t_round)
+        yield aborted_err
+        return None, aborted_err
+
     done: StreamDone | None = None
     err: StreamError | None = None
     event_iter = llm.stream(context, options) if options is not None else llm.stream(context)
     try:
         for event in event_iter:
+            if isinstance(event, StreamError):
+                yield event
+                err = event
+                break
+            if abort_signal is not None and abort_signal.aborted:
+                err = _make_aborted_event(abort_signal, t_round)
+                yield err
+                break
             yield event
             if isinstance(event, StreamDone):
                 done = event
-                break
-            if isinstance(event, StreamError):
-                err = event
                 break
     finally:
         close_fn = getattr(event_iter, "close", None)
         if callable(close_fn):
             close_fn()
+    if err is None and abort_signal is not None and abort_signal.aborted:
+        err = _make_aborted_event(abort_signal, t_round)
+        yield err
+        return None, err
     return done, err
 
 
-# 内部流式 ReAct 循环生成器：在完成入参校验后执行多轮 Reason -> Act & Observe，并发批按原序提交结果
+# 内部流式 ReAct 循环生成器：在完成入参校验后执行多轮 Reason -> Act & Observe，支持并发批与全节点协同取消
 def _iter_react_loop(
     llm: ModelInvoker,
     context: Context,
@@ -158,10 +241,16 @@ def _iter_react_loop(
     max_parallel_tools: int,
 ) -> Iterator[AgentEvent]:
     t_turn = perf_counter()
+    abort_signal = options.abort_signal if options is not None else None
+    effective_tool_ctx = _with_abort_context(tool_context, abort_signal)
     history: list[Message] = list(context.messages)
     active_tools = tuple(context.tools) if context.tools else tools.schemas()
 
     while True:
+        if abort_signal is not None and abort_signal.aborted:
+            yield _make_aborted_event(abort_signal, t_turn)
+            return
+
         # 1. Reason：组装当轮不可变中立 Context，按需经 convert_to_llm 变换后流式调用模型
         round_ctx = Context(
             system_prompt=context.system_prompt,
@@ -171,6 +260,9 @@ def _iter_react_loop(
         llm_ctx = convert_to_llm(round_ctx) if convert_to_llm is not None else round_ctx
         done, err = yield from _stream_llm_round(llm, llm_ctx, options)
         if err is not None:
+            return
+        if abort_signal is not None and abort_signal.aborted:
+            yield _make_aborted_event(abort_signal, t_turn)
             return
         if done is None:
             empty_msg = AssistantMessage()
@@ -196,15 +288,22 @@ def _iter_react_loop(
         # 2. Act & Observe：按只读并发批与写路障分批执行，主线程按原序发出 ToolStart -> 批量执行 -> 按原序提交 ToolStep 与轨迹
         history.append(assistant_msg)
         for is_parallel, batch in _split_tool_batches(tool_calls, tools):
+            if abort_signal is not None and abort_signal.aborted:
+                yield _make_aborted_event(abort_signal, t_turn)
+                return
             for call in batch:
                 yield ToolStart(tool=call.name, arguments=call.arguments, call_id=call.id)
             results = _execute_tool_batch(
                 tools,
                 batch,
                 is_parallel=is_parallel,
-                tool_context=tool_context,
+                tool_context=effective_tool_ctx,
                 max_parallel_tools=max_parallel_tools,
+                abort_signal=abort_signal,
             )
+            if results is None or (abort_signal is not None and abort_signal.aborted):
+                yield _make_aborted_event(abort_signal, t_turn)
+                return
             for call, (observation, duration_ms) in zip(batch, results, strict=True):
                 yield ToolStep(
                     tool=call.name,
@@ -223,7 +322,7 @@ def _iter_react_loop(
                 )
 
 
-# 执行流式通用 ReAct 主循环：入参即时校验，纯中立 Context 驱动，支持并发只读批与写路障原序提交
+# 执行流式通用 ReAct 主循环：入参即时校验，纯中立 Context 驱动，支持并发只读批、写路障与协同取消
 def iter_react(
     llm: ModelInvoker,
     context: Context,
@@ -246,7 +345,7 @@ def iter_react(
     )
 
 
-# 执行通用 ReAct 主循环：可选订阅强类型 AgentEvent、上下文转换、StreamOptions 与并发上限；遇 StreamError 抛 RuntimeError
+# 执行通用 ReAct 主循环：支持订阅强类型 AgentEvent、上下文转换、StreamOptions 与并发上限；遇取消抛 StreamAbortedError
 def run_react(
     llm: ModelInvoker,
     context: Context,
@@ -273,6 +372,8 @@ def run_react(
             if on_event is not None:
                 on_event(event)
             if isinstance(event, StreamError):
+                if event.reason == "aborted":
+                    raise StreamAbortedError(event.error_message or "请求已取消")
                 raise RuntimeError(event.error_message)
             if isinstance(event, TurnEnd):
                 reply = event.reply

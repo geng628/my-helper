@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `225 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `233 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -243,17 +243,30 @@
   - 实模评测（`9a9d000`，即抽离 `context.py` 与追加 `<system-reminder>` 围栏前同机制提交，`evals/memory_scenarios.jsonl` 16 场景，`deepseek-chat`，`v2-neutral` Judge，`--workers 4`）：通过率 **`16/16 (100.0%)`**（较 `1b421d2` `15/16 = 93.8%` 提升，6/6 类别全过），`kv-cache-efficiency` 服务端 KV 命中 **`90.63%`**（终轮 **`93.39%`**，`prefix_breaks=0`，`last_break_section="append"`）、`rolling-multi-compaction` 两次压缩后终轮服务端 KV 命中 **`87.44%`**（本地前缀复用 `87.91%`，`last_break_section="append"`），16 场景并发总口径服务端命中 `72.85%`（4 并发冷启动摊薄）、本地前缀复用 `90.12%`；表四 `1b421d2` 历史实模基线保持原样不篡改。
 - **已知边界与下一步**：紧接着推进 PR 2——在 `tools.py` 与 `react.py` 实现「并行只读工具 + 写工具串行路障 + 按模型原序提交」（见下方 Issue `#97`）。
 
-### [2026-11-27] 并行只读工具执行、写工具串行路障与按模型原序提交（Issue `#97`，本次提交）
+### [2026-11-27] 并行只读工具执行、写工具串行路障与按模型原序提交（Issue `#97`，Commit `760b54c`）
 - **背景与目标**：消除单轮模型并发发出多个只读/无状态网络工具调用时的串行耗时叠加，同时守住写操作一致性、同轮网络污染阻断 `save_rule` 安全不变量与确定性 KV Cache 前缀顺序。
 - **核心改动**：
   - **Layer 2（[../personal_assistant/agent/tools.py](../personal_assistant/agent/tools.py)、[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)、[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)、[../personal_assistant/agent/__init__.py](../personal_assistant/agent/__init__.py)）**：`ToolMetadata`、`build_tool()` 与 `@tool()` 新增 `parallel: bool = False`（默认安全串行，不泄漏至 `ToolSchema`），`ToolRegistry` 新增 `is_parallel(name)`；`iter_react()` / `run_react()` 新增 `max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS`（默认 `4`，即时正整数校验），通过 `_split_tool_batches()` 与 `_execute_tool_batch()` 对连续并发只读调用经标准库有界 `ThreadPoolExecutor`（异常中止时 `cancel_futures=True` 且等待在途线程退出）与只读 `MappingProxyType` 上下文快照并发执行（单条/串行/`max_parallel_tools=1` 主线程内联零线程开销），写/执行/未知工具作为串行路障，完成后严格按模型发射原序产出 `ToolStep` 与 `ToolResultMessage`；
   - **全量工具线程安全审计、TOAST 并发锁加固与标注（[../personal_assistant/assistant/common.py](../personal_assistant/assistant/common.py) 等）**：为 `common._write_offload_file()` 增加 `_OFFLOAD_LOCK` 互斥锁保护并发落盘与懒清理（防止多路并发 `fetch_webpage` 互删临时文件）；为经审计确认线程安全的 9 个只读/锁保护工具标记 `parallel=True`（`list_files`、`search_markdown`、`read_markdown`、`get_current_time`、`add_numbers`、`search_chat_history`、`web_search`、`fetch_webpage`、`list_due_reviews`），写/执行工具（`write_file`、`remember_fact`、`save_rule`、`save_study_card`、`run_command`、`cmd_*`）保持 `parallel=False`；
   - **测试与文档**：新增 [../tests/test_parallel_tools.py](../tests/test_parallel_tools.py)（`threading.Barrier` 真实并发重叠、`Event` 确定性验证快调用不抢跑原序提交、`[r1, r2, w1, r3, r4]` 写路障、`[save_rule, network, save_rule]` 写前放行与写后安全拦截、并发上限 `max_parallel_tools` 峰值校验、只读 `MappingProxyType` 隔离、并发 TOAST 落盘互斥、异常隔离、即时参数校验与五只读工具并发烟测），更新相关旧测试与三份主文档。
-- **验证与同口径对比（`93a12ce` → 本次提交）**：
+- **验证与同口径对比（`93a12ce` → `760b54c`）**：
   - 单元测试：`219 passed → 225 passed`（100% 通过）；
   - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`；演示脚本通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测口径：本次仅优化单轮多只读工具并发调度并严格保持与串行一致的 `ToolResultMessage` 发射顺序，未改动任何提示词、检索或记忆语义，沿用 `9a9d000` / `1b421d2` 实模基线。
 - **已知边界与下一步**：默认单批并发上限 `max_parallel_tools=4`（可通过 `iter_react`/`run_react` 覆盖或设 `1` 退回单线程）；两项高杠杆借鉴改造（KV Cache 架构 + 只读并发调度）至此均已闭环。
+
+### [2026-11-28] 全链路协同取消（`AbortController`/`AbortSignal` 贯通 L1→L2→L3→CLI/Web）（Issue `#99`，本次提交）
+- **背景与目标**：补齐 `protocol.py` 中已声明的 `ErrorReason = Literal["error", "aborted"]` 与前端 `AbortController` 对应的全栈后端取消能力，解决长思考 TTFB 等待、SSE 流读取、`429/5xx` 重试退避与慢工具阻塞期间后端线程死占 `_chat_turn_lock(chat_id)` 和子进程无法瞬时终止的问题；全程采用纯单轨契约（零双轨兼容壳、零 `inspect.signature` 反射补丁）。
+- **核心改动**：
+  - **Layer 1（[../personal_assistant/ai/protocol.py](../personal_assistant/ai/protocol.py)、[../personal_assistant/ai/registry.py](../personal_assistant/ai/registry.py)、[../personal_assistant/ai/providers/http.py](../personal_assistant/ai/providers/http.py) 及四大翻译器）**：新增只读观察端 `AbortSignal`、触发端 `AbortController` 与 `StreamAbortedError(RuntimeError)`，`StreamOptions` 新增 `abort_signal`；`providers/http.py` 按 Pi ch04 `providers/ → protocol.py` 单轨依赖 `protocol.py`，统一收口 `open_http_request()`（自定义 `_AbortableHTTPHandler`/`_AbortableHTTPSHandler` 保留代理并建连后跟踪 socket，取消时 `shutdown(SHUT_RDWR)` 毫秒级打断阻塞）、可中断退避 `abort_signal.wait(delay)`、单轨 `PostStream(url, payload, headers, *, abort_signal=None)` 协议与统一 `build_stream_error()` 收口；四大原生翻译器在请求前、每帧 SSE 与发 `StreamDone` 前校验取消态，统一产出 `StreamError(reason="aborted")` 且不污染 `CacheMonitor`。
+  - **Layer 2（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：轮间、流中与工具批次前后校验 `options.abort_signal`，通过 `collections.ChainMap` 将只读 `abort_signal` 零拷贝零变异透传给工具层（`tools.py` 0 行改动），并行批取消时跳过未启动排队 Future 并安全等待在途线程收口，绝不产出 `TurnEnd`；`run_react()` 遇取消抛 `StreamAbortedError`。
+  - **慢 I/O 插件与 Layer 3 / CLI / Web（[../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)、[../plugins/tools/web_tools.py](../plugins/tools/web_tools.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../scripts/web_chat.py](../scripts/web_chat.py)、[../scripts/web_ui.html](../scripts/web_ui.html)）**：`run_command` 取消即唤醒并 `SIGKILL` 整个子进程组；`web_search` / `fetch_webpage` 取消即断 socket（DDG 取消绝不回退 Bing RSS）；`_GuardedTurnLLM` 取消优先于预算兜底；`AssistantApp` 提供 `abort_turn(chat_id)`（零写 SQLite、回滚 `(turn#)` 暂存事实、发 `turn_aborted` 清遥测、释放会话锁并在 `close()` 中止在途回合）；CLI `run_repl()` 临时将首次 `SIGINT` 转接为 `abort_turn`；Web 新增受同源/Bearer 保护的 `POST /api/chat/abort` 与前端「停止」按钮（切「新会话」同步通知后端停算）。
+  - **测试与守卫**：新增 [../tests/test_cancellation.py](../tests/test_cancellation.py)（8 大端到端测试，涵盖真 TCP Socket 跨线程毫秒级打断、`BaseException` 穿透保护、真实 `SIGINT` 异步信号安全管道无自死锁与二次按键回退、`GeneratorExit` 断连回滚、`close()` 中止在途与 Web `/api/chat/abort` 安全边界），全仓同步迁移 9 个既有测试文件至单轨 `PostStream`/`open_http_request` 契约与 `test_architecture.py` 依赖规则。
+- **验证与同口径对比（`760b54c` → 本次提交）**：
+  - 单元测试：`225 passed → 233 passed`（100% 通过）；
+  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`，负例干净度 `100%`；`scripts/demo.py` 通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
+  - 实模评测口径：本次为运行时协同取消架构改造，未改动正常完成路径的提示词、检索或记忆语义，沿用 `9a9d000` / `1b421d2` 实模基线。
+- **已知边界与下一步**：客户端若仅物理断开 SSE TCP 连接且上游未吐新帧，需配合 `/api/chat/abort`（前端「停止」与「新会话」已自动触发）方可在静默思考期毫秒级唤醒；后续如继续演进，可考虑 Pi 风格 Append-only 树状会话（`/undo`/`/fork`）或多模态 `ImageBlock`。
 
 ---
 

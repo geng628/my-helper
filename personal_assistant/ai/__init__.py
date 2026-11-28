@@ -14,6 +14,8 @@ from personal_assistant.ai.protocol import (
     CACHE_RETENTIONS,
     THINKING_BUDGETS,
     THINKING_LEVELS,
+    AbortController,
+    AbortSignal,
     ApiProvider,
     AssistantBlock,
     AssistantMessage,
@@ -28,6 +30,7 @@ from personal_assistant.ai.protocol import (
     ModelProfile,
     ModelsConfig,
     StopReason,
+    StreamAbortedError,
     StreamDone,
     StreamError,
     StreamOptions,
@@ -82,6 +85,8 @@ from personal_assistant.ai.registry import (
 register_builtin_providers(default_registry())
 
 __all__ = [
+    "AbortController",
+    "AbortSignal",
     "AnthropicMessagesProvider",
     "ApiProvider",
     "ApiProviderRegistry",
@@ -108,6 +113,7 @@ __all__ = [
     "PostJson",
     "PostStream",
     "StopReason",
+    "StreamAbortedError",
     "StreamDone",
     "StreamError",
     "StreamOptions",

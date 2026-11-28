@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlsplit
 
 from personal_assistant.agent.tools import tool
+from personal_assistant.ai.protocol import AbortSignal, StreamAbortedError
 from personal_assistant.assistant.common import DEFAULT_SOFT_WRAP_CHARS, truncate_or_offload, truncate_utf8
 
 DEFAULT_USER_AGENT = (
@@ -238,19 +239,49 @@ def _refresh_socket_timeout(sock: Any, deadline: float, message: str) -> None:
             sock.settimeout(remaining)
 
 
-# 在总截止时间与最大字节数约束内分块读取响应体，并在每次阻塞读前刷新套接字剩余超时
-def _read_body_with_deadline(resp: object, max_bytes: int, deadline: float, *, sock: Any = None) -> bytes:
+# 若协同取消信号已触发，立即抛出 StreamAbortedError 终止网页/搜索请求
+def _raise_if_web_aborted(abort_signal: AbortSignal | None) -> None:
+    if abort_signal is not None and abort_signal.aborted:
+        raise StreamAbortedError(abort_signal.reason or "请求已取消")
+
+
+# 取消回调：仅关停阻塞中的底层套接字以唤醒读线程（fd 关闭留给持有线程 finally，无 socket 时回退关连接）
+def _abort_http_connection(sock: Any, conn: Any) -> None:
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        return
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
+# 在总截止时间与最大字节数约束内分块读取响应体，并在每次阻塞读前刷新套接字剩余超时与响应协同取消
+def _read_body_with_deadline(
+    resp: object,
+    max_bytes: int,
+    deadline: float,
+    *,
+    sock: Any = None,
+    abort_signal: AbortSignal | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     total, target = 0, max_bytes + 1
     read1 = getattr(resp, "read1", None)
     reader = read1 if callable(read1) else getattr(resp, "read")
     while total < target:
+        _raise_if_web_aborted(abort_signal)
         _refresh_socket_timeout(sock, deadline, "响应读取超过总时长限制。")
         chunk = reader(min(16384, target - total))
+        _raise_if_web_aborted(abort_signal)
         if not chunk:
             break
         chunks.append(chunk)
         total += len(chunk)
+    _raise_if_web_aborted(abort_signal)
     if time.monotonic() > deadline:
         raise TimeoutError("响应读取超过总时长限制。")
     return b"".join(chunks)
@@ -278,7 +309,7 @@ def _connect_pinned(
         raise
 
 
-# 基于 http.client 直连钉住 IP 发起安全 GET 请求（逐跳校验重定向且跨源自动剥离敏感头）
+# 基于 http.client 直连钉住 IP 发起安全 GET 请求（逐跳校验重定向、跨源剥离敏感头并支持即时协同取消）
 def _default_http_get(
     url: str,
     headers: dict[str, str],
@@ -288,6 +319,7 @@ def _default_http_get(
     resolve_dns: DnsResolver = socket.getaddrinfo,
     allow_fake_ip: bool = False,
     ssl_context: Any = None,
+    abort_signal: AbortSignal | None = None,
 ) -> tuple[str, str, bytes]:
     deadline = time.monotonic() + timeout
     req_headers = {"User-Agent": DEFAULT_USER_AGENT, **headers}
@@ -295,12 +327,14 @@ def _default_http_get(
     prev_origin: tuple[str, str, int] | None = None
 
     for hop in range(MAX_REDIRECTS + 1):
+        _raise_if_web_aborted(abort_signal)
         step_timeout = deadline - time.monotonic()
         if step_timeout <= 0:
             raise TimeoutError("网页请求超过总时长限制。")
         clean_url, host, port, pinned_ip = resolve_and_validate_public_url(
             current_url, resolve_dns=resolve_dns, allow_fake_ip=allow_fake_ip
         )
+        _raise_if_web_aborted(abort_signal)
         parts = urlsplit(clean_url)
         scheme = parts.scheme.lower()
         origin = (scheme, host, port)
@@ -311,12 +345,20 @@ def _default_http_get(
         target_path = _encode_request_target(parts.path, parts.query)
         conn = _connect_pinned(scheme, host, port, pinned_ip, step_timeout, ssl_context=ssl_context)
         raw_sock = conn.sock
+        unsub = (
+            abort_signal.subscribe(lambda s=raw_sock, c=conn: _abort_http_connection(s, c))
+            if abort_signal is not None
+            else None
+        )
         resp: http.client.HTTPResponse | None = None
         try:
+            _raise_if_web_aborted(abort_signal)
             _refresh_socket_timeout(raw_sock, deadline, "网页请求超过总时长限制。")
             conn.request("GET", target_path, headers=req_headers)
+            _raise_if_web_aborted(abort_signal)
             _refresh_socket_timeout(raw_sock, deadline, "网页请求超过总时长限制。")
             resp = conn.getresponse()
+            _raise_if_web_aborted(abort_signal)
             if resp.status in REDIRECT_STATUSES:
                 loc = (resp.getheader("Location") or "").strip()
                 if not loc:
@@ -330,9 +372,23 @@ def _default_http_get(
             return (
                 clean_url,
                 resp.getheader("Content-Type") or "text/plain",
-                _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock or raw_sock),
+                _read_body_with_deadline(
+                    resp,
+                    max_bytes,
+                    deadline,
+                    sock=conn.sock or raw_sock,
+                    abort_signal=abort_signal,
+                ),
             )
+        except StreamAbortedError:
+            raise
+        except Exception:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "请求已取消") from None
+            raise
         finally:
+            if unsub is not None:
+                unsub()
             if resp is not None:
                 resp.close()
             conn.close()
@@ -350,7 +406,7 @@ def _format_json_text(text: str) -> str:
         return stripped
 
 
-# 基于 http.client 直连钉住 IP 发送 JSON POST 请求（供 Tavily 搜索接口使用）
+# 基于 http.client 直连钉住 IP 发送 JSON POST 请求（供 Tavily 搜索接口使用，支持即时协同取消）
 def _default_http_post_json(
     url: str,
     payload: dict[str, object],
@@ -360,17 +416,26 @@ def _default_http_post_json(
     resolve_dns: DnsResolver = socket.getaddrinfo,
     allow_fake_ip: bool = False,
     max_bytes: int = 2 * 1024 * 1024,
+    abort_signal: AbortSignal | None = None,
 ) -> dict[str, object]:
+    _raise_if_web_aborted(abort_signal)
     deadline = time.monotonic() + timeout
     clean_url, host, port, pinned_ip = resolve_and_validate_public_url(
         url, resolve_dns=resolve_dns, allow_fake_ip=allow_fake_ip
     )
+    _raise_if_web_aborted(abort_signal)
     parts = urlsplit(clean_url)
     target_path = _encode_request_target(parts.path, parts.query)
     conn = _connect_pinned(parts.scheme.lower(), host, port, pinned_ip, max(0.001, deadline - time.monotonic()))
     raw_sock = conn.sock
+    unsub = (
+        abort_signal.subscribe(lambda s=raw_sock, c=conn: _abort_http_connection(s, c))
+        if abort_signal is not None
+        else None
+    )
     resp: http.client.HTTPResponse | None = None
     try:
+        _raise_if_web_aborted(abort_signal)
         _refresh_socket_timeout(raw_sock, deadline, "搜索请求超过总时长限制。")
         conn.request(
             "POST",
@@ -378,22 +443,45 @@ def _default_http_post_json(
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"User-Agent": DEFAULT_USER_AGENT, "Content-Type": "application/json", **headers},
         )
+        _raise_if_web_aborted(abort_signal)
         _refresh_socket_timeout(raw_sock, deadline, "搜索请求超过总时长限制。")
         resp = conn.getresponse()
+        _raise_if_web_aborted(abort_signal)
         if resp.status >= 400:
             raise HTTPError(clean_url, resp.status, resp.reason, resp.headers, None)
-        raw_bytes = _read_body_with_deadline(resp, max_bytes, deadline, sock=conn.sock or raw_sock)
+        raw_bytes = _read_body_with_deadline(
+            resp,
+            max_bytes,
+            deadline,
+            sock=conn.sock or raw_sock,
+            abort_signal=abort_signal,
+        )
+    except StreamAbortedError:
+        raise
+    except Exception:
+        if abort_signal is not None and abort_signal.aborted:
+            raise StreamAbortedError(abort_signal.reason or "请求已取消") from None
+        raise
     finally:
+        if unsub is not None:
+            unsub()
         if resp is not None:
             resp.close()
         conn.close()
     return json.loads(raw_bytes[:max_bytes].decode("utf-8", errors="replace"))
 
 
-# 抓取公开网页并提取标题与纯文本正文（含 SSRF 校验、DNS Pinning、类型过滤与 TOAST 卸载）
+# 抓取公开网页并提取标题与纯文本正文（含 SSRF 校验、DNS Pinning、协同取消、类型过滤与 TOAST 卸载）
 def execute_fetch_webpage(
-    url: str, policy: WebPolicy, *, resolve_dns: DnsResolver = socket.getaddrinfo, http_get: HttpGetFn | None = None
+    url: str,
+    policy: WebPolicy,
+    *,
+    resolve_dns: DnsResolver = socket.getaddrinfo,
+    http_get: HttpGetFn | None = None,
+    abort_signal: AbortSignal | None = None,
 ) -> str:
+    if abort_signal is not None and abort_signal.aborted:
+        return "错误：网页抓取已取消。"
     if http_get is not None:
         try:
             safe_url = validate_public_url(url, resolve_dns=resolve_dns, allow_fake_ip=policy.allow_fake_ip)
@@ -403,7 +491,13 @@ def execute_fetch_webpage(
     else:
         safe_url = (url or "").strip()
         getter = lambda u, h, t, m: _default_http_get(
-            u, h, t, m, resolve_dns=resolve_dns, allow_fake_ip=policy.allow_fake_ip
+            u,
+            h,
+            t,
+            m,
+            resolve_dns=resolve_dns,
+            allow_fake_ip=policy.allow_fake_ip,
+            abort_signal=abort_signal,
         )
     try:
         final_url, content_type, raw_bytes = getter(
@@ -412,10 +506,18 @@ def execute_fetch_webpage(
             policy.timeout,
             policy.max_download_bytes,
         )
+    except StreamAbortedError:
+        return "错误：网页抓取已取消。"
     except HTTPError as error:
+        if abort_signal is not None and abort_signal.aborted:
+            return "错误：网页抓取已取消。"
         return f"错误：网页请求失败（HTTP {error.code} {error.reason}）。"
     except (URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as error:
+        if abort_signal is not None and abort_signal.aborted:
+            return "错误：网页抓取已取消。"
         return f"错误：网页抓取失败（{error}）。"
+    if abort_signal is not None and abort_signal.aborted:
+        return "错误：网页抓取已取消。"
 
     mime = content_type.split(";", 1)[0].strip().lower()
     if mime and not mime.startswith(ALLOWED_CONTENT_PREFIXES):
@@ -513,18 +615,35 @@ def _extract_json_items(records: object, snippet_key: str, limit: int) -> list[d
     ]
 
 
-# 执行联网搜索：优先 Tavily，次选 Brave，默认免 Key 走 DuckDuckGo 与 Bing RSS
+# 执行联网搜索：优先 Tavily，次选 Brave，默认免 Key 走 DuckDuckGo 与 Bing RSS（支持即时协同取消）
 def execute_web_search(
-    query: str, policy: WebPolicy, *, http_get: HttpGetFn | None = None, http_post_json: HttpPostJsonFn | None = None
+    query: str,
+    policy: WebPolicy,
+    *,
+    http_get: HttpGetFn | None = None,
+    http_post_json: HttpPostJsonFn | None = None,
+    abort_signal: AbortSignal | None = None,
 ) -> str:
+    if abort_signal is not None and abort_signal.aborted:
+        return "错误：联网搜索已取消。"
     clean_query = " ".join((query or "").split())
     if not clean_query:
         return "错误：搜索关键词不能为空。"
 
-    getter = http_get or (lambda u, h, t, m: _default_http_get(u, h, t, m, allow_fake_ip=policy.allow_fake_ip))
+    getter = http_get or (
+        lambda u, h, t, m: _default_http_get(
+            u, h, t, m, allow_fake_ip=policy.allow_fake_ip, abort_signal=abort_signal
+        )
+    )
     poster = http_post_json or (
         lambda u, p, h, t: _default_http_post_json(
-            u, p, h, t, allow_fake_ip=policy.allow_fake_ip, max_bytes=policy.max_download_bytes
+            u,
+            p,
+            h,
+            t,
+            allow_fake_ip=policy.allow_fake_ip,
+            max_bytes=policy.max_download_bytes,
+            abort_signal=abort_signal,
         )
     )
     tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
@@ -538,6 +657,7 @@ def execute_web_search(
                 {},
                 policy.timeout,
             )
+            _raise_if_web_aborted(abort_signal)
             items = _extract_json_items(data.get("results"), "content", policy.max_results)
             return _format_search_results(clean_query, "tavily", items, policy.max_output_bytes)
 
@@ -546,6 +666,7 @@ def execute_web_search(
             _, _, raw = getter(
                 url, {"Accept": "application/json", "X-Subscription-Token": brave_key}, policy.timeout, policy.max_download_bytes
             )
+            _raise_if_web_aborted(abort_signal)
             data = json.loads(raw.decode("utf-8", errors="replace"))
             items = _extract_json_items((data.get("web") or {}).get("results"), "description", policy.max_results)
             return _format_search_results(clean_query, "brave", items, policy.max_output_bytes)
@@ -553,19 +674,30 @@ def execute_web_search(
         try:
             ddg_url = f"https://html.duckduckgo.com/html/?q={quote(clean_query)}"
             _, _, ddg_raw = getter(ddg_url, {}, policy.timeout, policy.max_download_bytes)
+            _raise_if_web_aborted(abort_signal)
             ddg_items = parse_duckduckgo_html(ddg_raw.decode("utf-8", errors="replace"), limit=policy.max_results)
             if ddg_items:
                 return _format_search_results(clean_query, "duckduckgo", ddg_items, policy.max_output_bytes)
+        except StreamAbortedError:
+            raise
         except (HTTPError, URLError, http.client.HTTPException, TimeoutError, OSError, ValueError):
-            pass
+            _raise_if_web_aborted(abort_signal)
 
+        _raise_if_web_aborted(abort_signal)
         rss_url = f"https://www.bing.com/search?format=rss&q={quote(clean_query)}"
         _, _, raw = getter(rss_url, {}, policy.timeout, policy.max_download_bytes)
+        _raise_if_web_aborted(abort_signal)
         items = parse_bing_rss(raw.decode("utf-8", errors="replace"), limit=policy.max_results)
         return _format_search_results(clean_query, "bing_rss", items, policy.max_output_bytes)
+    except StreamAbortedError:
+        return "错误：联网搜索已取消。"
     except HTTPError as error:
+        if abort_signal is not None and abort_signal.aborted:
+            return "错误：联网搜索已取消。"
         return f"错误：联网搜索请求失败（HTTP {error.code} {error.reason}）。"
     except (URLError, http.client.HTTPException, TimeoutError, OSError, ET.ParseError, json.JSONDecodeError, ValueError) as error:
+        if abort_signal is not None and abort_signal.aborted:
+            return "错误：联网搜索已取消。"
         return f"错误：联网搜索失败（{error}）。"
 
 
@@ -577,8 +709,13 @@ def execute_web_search(
     risk="network",
     parallel=True,
 )
-def web_search(query: str, *, web_config: Mapping[str, object] | None = None) -> str:
-    return execute_web_search(query, WebPolicy.from_dict(web_config))
+def web_search(
+    query: str,
+    *,
+    web_config: Mapping[str, object] | None = None,
+    abort_signal: AbortSignal | None = None,
+) -> str:
+    return execute_web_search(query, WebPolicy.from_dict(web_config), abort_signal=abort_signal)
 
 
 # 插件工具入口：抓取指定公开网页并提取标题与纯文本正文（超长自动落盘分页）
@@ -593,6 +730,14 @@ def web_search(query: str, *, web_config: Mapping[str, object] | None = None) ->
     parallel=True,
 )
 def fetch_webpage(
-    url: str, *, offload_dir: Path | None = None, web_config: Mapping[str, object] | None = None
+    url: str,
+    *,
+    offload_dir: Path | None = None,
+    web_config: Mapping[str, object] | None = None,
+    abort_signal: AbortSignal | None = None,
 ) -> str:
-    return execute_fetch_webpage(url, WebPolicy.from_dict(web_config, offload_dir=offload_dir))
+    return execute_fetch_webpage(
+        url,
+        WebPolicy.from_dict(web_config, offload_dir=offload_dir),
+        abort_signal=abort_signal,
+    )

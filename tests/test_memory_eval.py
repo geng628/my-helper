@@ -729,7 +729,11 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         return _mock_choice_resp(f"ok-{idx}", 200 + idx, 50 + idx, 10 + idx)
 
     reg1 = ApiProviderRegistry()
-    reg1.register(OpenAICompletionsProvider(post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(concurrent_post(u, p, h)))))
+    reg1.register(
+        OpenAICompletionsProvider(
+            post_stream=lambda u, p, h, **_kw: iter(_mock_sse_from_choice_resp(concurrent_post(u, p, h)))
+        )
+    )
     shared_llm = ModelClient(
         profile=ModelProfile(
             name="demo",
@@ -811,7 +815,11 @@ def test_evaluate_memory_concurrent_workers_preserves_order_isolation_and_cli_ar
         return _mock_choice_resp("Alice's dog is named Max.", 310, 120, 12)
 
     reg2 = ApiProviderRegistry()
-    reg2.register(OpenAICompletionsProvider(post_stream=lambda u, p, h: iter(_mock_sse_from_choice_resp(shared_post(u, p, h)))))
+    reg2.register(
+        OpenAICompletionsProvider(
+            post_stream=lambda u, p, h, **_kw: iter(_mock_sse_from_choice_resp(shared_post(u, p, h)))
+        )
+    )
     shared_report = evaluate_memory(
         ModelClient(
             profile=ModelProfile(

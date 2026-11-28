@@ -214,7 +214,8 @@ def test_openai_completions_provider_bidirectional_and_stream_error() -> None:
     captured: dict[str, object] = {}
 
     # 模拟 OpenAI SSE 流式输出文本与工具调用
-    def fake_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         captured["url"] = url
         captured["payload"] = payload
         captured["headers"] = headers
@@ -290,7 +291,8 @@ def test_openai_completions_provider_bidirectional_and_stream_error() -> None:
     assert done.usage == TokenUsage(prompt_tokens=150, cached_tokens=96, completion_tokens=20)
 
     # HTTP/传输异常必须收敛为 StreamError 且脱敏凭据
-    def fail_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fail_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         raise HTTPError(
             url,
             401,
@@ -315,7 +317,8 @@ def test_anthropic_messages_provider_request_sse_caching_thinking_and_errors() -
     captured: dict[str, object] = {}
 
     # 模拟 Anthropic 原生 SSE 完整流（message_start -> thinking+signature -> text -> tool_use -> message_delta -> message_stop）
-    def fake_anthropic_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_anthropic_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         captured["url"] = url
         captured["payload"] = payload
         captured["headers"] = headers
@@ -463,7 +466,8 @@ def test_anthropic_messages_provider_request_sse_caching_thinking_and_errors() -
     none_captured: dict[str, object] = {}
 
     # 模拟关闭缓存并在流内返回原生 error 帧
-    def err_anthropic_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def err_anthropic_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         none_captured["payload"] = payload
         return iter(
             [
@@ -493,7 +497,8 @@ def test_google_genai_provider_request_sse_and_errors() -> None:
     captured: dict[str, object] = {}
 
     # 模拟 Gemini 原生 SSE 流（思考 -> 文本 -> functionCall + usageMetadata）
-    def fake_gemini_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_gemini_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         captured["url"] = url
         captured["payload"] = payload
         captured["headers"] = headers
@@ -586,7 +591,8 @@ def test_google_genai_provider_request_sse_and_errors() -> None:
     assert done.usage == TokenUsage(prompt_tokens=300, cached_tokens=120, completion_tokens=40)
 
     # 3. 验证网络异常转为 StreamError 且脱敏 Google API Key
-    def fail_net(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fail_net(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         raise URLError("x-goog-api-key: AIzaSyLeakedToken9999999")
 
     err_evs = list(GoogleGenAIProvider(post_stream=fail_net).stream(model, ctx))
@@ -644,7 +650,8 @@ def test_provider_wire_protocol_edge_cases_and_stream_options_override() -> None
     gem_url_calls: list[tuple[str, dict[str, object]]] = []
 
     # 捕获 Gemini 请求地址与载荷并返回最小终止流
-    def _cap_gem(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _cap_gem(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         gem_url_calls.append((url, payload))
         return iter(['data: {"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n'])
 
@@ -677,7 +684,8 @@ def test_provider_wire_protocol_edge_cases_and_stream_options_override() -> None
     anth_captured: dict[str, object] = {}
 
     # 模拟真实 Anthropic SSE（message_delta.usage 含 null 输入字段）
-    def _cap_anth(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _cap_anth(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         anth_captured["payload"] = payload
         return iter(
             [
@@ -851,7 +859,8 @@ def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> 
     ]
 
     # 捕获 Anthropic 上游请求载荷并返回预设原生 SSE 帧
-    def _fake_anth_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _fake_anth_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         del url, headers
         anth_payloads.append(payload)
         return iter(anth_streams.pop(0))
@@ -876,7 +885,8 @@ def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> 
     ]
 
     # 捕获 OpenAI Completions 上游请求载荷并返回预设 SSE 帧
-    def _fake_oa_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _fake_oa_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         del url, headers
         oa_payloads.append(payload)
         return iter(oa_streams.pop(0))
@@ -894,7 +904,8 @@ def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> 
     ]
 
     # 捕获 Gemini 上游请求载荷并返回预设原生 SSE 帧
-    def _fake_gem_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _fake_gem_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         del url, headers
         gem_payloads.append(payload)
         return iter(gem_streams.pop(0))
@@ -920,7 +931,8 @@ def test_mid_conversation_cross_protocol_hot_swap_end_to_end(tmp_path: Path) -> 
     ]
 
     # 捕获 OpenAI Reasoning 上游请求载荷并返回预设 SSE 帧
-    def _fake_r1_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def _fake_r1_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         del url, headers
         r1_payloads.append(payload)
         return iter(r1_streams.pop(0))
@@ -1364,13 +1376,14 @@ class AcmeProviderPlugin(Plugin):
         assert t3_msgs[1] == AssistantMessage.from_text("ACME 已记住项目代号北极星。")
         assert isinstance(t3_msgs[2], UserMessage) and t3_msgs[2].content.endswith("\n现在恢复正常了吗？")
         assert t3_msgs[0] == recorded_contexts[0].messages[0]
-        assert recorded_options[-1] == StreamOptions(
-            temperature=0.2,
-            max_tokens=4096,
-            reasoning="medium",
-            cache_retention="long",
-            session_id="acme-chat",
-        )
+        last_opt = recorded_options[-1]
+        assert last_opt.temperature == 0.2
+        assert last_opt.max_tokens == 4096
+        assert last_opt.reasoning == "medium"
+        assert last_opt.cache_retention == "long"
+        assert last_opt.session_id == "acme-chat"
+        assert last_opt.abort_signal is not None
+        assert last_opt.abort_signal.aborted is False
 
         # 验证 Turn 3 遥测未被失败 Turn 2 污染，且 CacheMonitor 记录完整 4 次成功调用
         assert app.cache_monitor.summary(session_key="acme-chat")["llm_calls"] == 4

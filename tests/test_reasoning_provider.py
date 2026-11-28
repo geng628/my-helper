@@ -111,7 +111,8 @@ def test_openai_reasoning_provider_wire_protocol_and_sse_parsing() -> None:
     stream_attempts = 0
 
     # 模拟首包因 stream_options 返回 HTTP 400、去参数重试后流式吐出 reasoning_content + content + usage
-    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         nonlocal stream_attempts
         stream_attempts += 1
         assert url == "https://api.deepseek.com/v1/chat/completions"
@@ -240,8 +241,8 @@ def test_assistant_app_two_turn_reasoning_tool_loop_and_telemetry(tmp_path: Path
     ]
 
     # 按序记录发往上游的消息切片并返回预设 SSE 帧
-    def scripted_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
-        del url, headers
+    def scripted_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del url, headers, abort_signal
         assert "temperature" not in payload
         wire_history.append([dict(m) for m in payload["messages"]])  # type: ignore[arg-type]
         return iter(turn_streams.pop(0))
@@ -324,7 +325,7 @@ def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
     # 2. 轮内无思维链但带 tool_calls 时，序列化仍补齐 reasoning_content="" 以满足 DeepSeek Reasoner 协议要求
     wire_captured: list[dict[str, object]] = []
     provider = OpenAIReasoningProvider(
-        post_stream=lambda _u, p, _h: (
+        post_stream=lambda _u, p, _h, **_kw: (
             wire_captured.append(p)
             or iter(['data: {"choices":[{"delta":{"content":"done"}}]}\n', "data: [DONE]\n"])
         )
@@ -347,7 +348,7 @@ def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
 
     # 3. 多分片 tool_calls 拼接
     frag_provider = OpenAIReasoningProvider(
-        post_stream=lambda _u, _p, _h: iter(
+        post_stream=lambda _u, _p, _h, **_kw: iter(
             [
                 'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_frag","type":"function","function":{"name":"read_","arguments":"{\\"pa"}}]}}]}\n',
                 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\\":\\"a\\"}"}}]}}]}\n',
@@ -365,7 +366,7 @@ def test_reasoning_provider_edge_cases_and_stream_errors() -> None:
     err_reg = ApiProviderRegistry()
     err_reg.register(
         OpenAIReasoningProvider(
-            post_stream=lambda _u, _p, _h: iter(['data: {"error":{"message":"bad upstream"}}\n'])
+            post_stream=lambda _u, _p, _h, **_kw: iter(['data: {"error":{"message":"bad upstream"}}\n'])
         )
     )
     err_client = ModelClient(profile=profile, registry=err_reg)

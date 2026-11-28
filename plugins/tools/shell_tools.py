@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import IO
 
 from personal_assistant.agent.tools import tool
+from personal_assistant.ai.protocol import AbortSignal
 from personal_assistant.assistant.common import truncate_or_offload
 from personal_assistant.assistant.files_policy import (
     DEFAULT_REJECT_SEGMENTS,
@@ -676,10 +677,18 @@ def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
-# 以独立进程组、限长流式管道读取和超时强杀机制执行单个子进程命令
+# 以独立进程组、限长流式管道读取、超时强杀与协同取消机制执行单个子进程命令
 def _run_subprocess_limited(
-    cmd_argv: tuple[str, ...], *, cwd: Path, timeout: float, env: Mapping[str, str], max_capture_bytes: int
+    cmd_argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
+    max_capture_bytes: int,
+    abort_signal: AbortSignal | None = None,
 ) -> tuple[int, str, str, str | None]:
+    if abort_signal is not None and abort_signal.aborted:
+        return -1, "", "", "错误：命令执行已取消。"
     proc = subprocess.Popen(
         cmd_argv, shell=False, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(env), start_new_session=True,
@@ -687,6 +696,8 @@ def _run_subprocess_limited(
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
     overflow, wake = threading.Event(), threading.Event()
+    unsub: object = None
+    threads: tuple[threading.Thread, ...] = ()
 
     # 等待子进程退出并唤醒主线程
     def _wait_proc() -> None:
@@ -695,38 +706,66 @@ def _run_subprocess_limited(
         finally:
             wake.set()
 
-    threads = (
-        threading.Thread(target=_read_pipe_limited, args=(proc.stdout, max_capture_bytes, out_chunks, overflow, wake), daemon=True),
-        threading.Thread(target=_read_pipe_limited, args=(proc.stderr, max_capture_bytes, err_chunks, overflow, wake), daemon=True),
-        threading.Thread(target=_wait_proc, daemon=True),
-    )
-    for th in threads:
-        th.start()
+    try:
+        unsub = abort_signal.subscribe(wake.set) if abort_signal is not None else None
+        threads = (
+            threading.Thread(target=_read_pipe_limited, args=(proc.stdout, max_capture_bytes, out_chunks, overflow, wake), daemon=True),
+            threading.Thread(target=_read_pipe_limited, args=(proc.stderr, max_capture_bytes, err_chunks, overflow, wake), daemon=True),
+            threading.Thread(target=_wait_proc, daemon=True),
+        )
+        for th in threads:
+            th.start()
 
-    if not wake.wait(timeout=timeout):
+        waited = wake.wait(timeout=timeout)
+        if abort_signal is not None and abort_signal.aborted:
+            _kill_process_group(proc)
+            for th in threads:
+                th.join(timeout=1.0)
+            return -1, "", "", "错误：命令执行已取消。"
+        if not waited:
+            _kill_process_group(proc)
+            for th in threads:
+                th.join(timeout=1.0)
+            return -1, "", "", f"错误：命令执行超时（>{timeout:g}s）。"
+
+        for th in threads:
+            th.join(timeout=0.5)
+        if any(th.is_alive() for th in threads[:2]) or proc.poll() is None:
+            _kill_process_group(proc)
+            for th in threads:
+                th.join(timeout=1.0)
+        if abort_signal is not None and abort_signal.aborted:
+            return -1, "", "", "错误：命令执行已取消。"
+        if overflow.is_set():
+            return -1, "", "", f"错误：命令输出超过单流硬上限（>{max_capture_bytes} 字节），已强制终止。"
+        return (
+            proc.returncode if proc.returncode is not None else 0,
+            b"".join(out_chunks).decode("utf-8", errors="replace"),
+            b"".join(err_chunks).decode("utf-8", errors="replace"),
+            None,
+        )
+    except BaseException:
         _kill_process_group(proc)
         for th in threads:
-            th.join(timeout=1.0)
-        return -1, "", "", f"错误：命令执行超时（>{timeout:g}s）。"
-
-    for th in threads:
-        th.join(timeout=0.5)
-    if any(th.is_alive() for th in threads[:2]) or proc.poll() is None:
-        _kill_process_group(proc)
-        for th in threads:
-            th.join(timeout=1.0)
-    if overflow.is_set():
-        return -1, "", "", f"错误：命令输出超过单流硬上限（>{max_capture_bytes} 字节），已强制终止。"
-    return (
-        proc.returncode if proc.returncode is not None else 0,
-        b"".join(out_chunks).decode("utf-8", errors="replace"),
-        b"".join(err_chunks).decode("utf-8", errors="replace"),
-        None,
-    )
+            if th.is_alive():
+                th.join(timeout=1.0)
+        raise
+    finally:
+        if callable(unsub):
+            unsub()
+        if proc.poll() is None:
+            _kill_process_group(proc)
 
 
-# 在安全策略护栏内执行单条受控命令（shell=False、隔离 HOME、进程组限长与输出卸载）
-def execute_safe_command(command: str, policy: ShellPolicy) -> str:
+# 在安全策略护栏内执行单条受控命令（shell=False、隔离 HOME、进程组限长、协同取消与输出卸载）
+def execute_safe_command(
+    command: str,
+    policy: ShellPolicy,
+    *,
+    abort_signal: AbortSignal | None = None,
+) -> str:
+    if abort_signal is not None and abort_signal.aborted:
+        return "错误：命令执行已取消。"
     try:
         argv = _parse_single_command(command)
         if "/" in argv[0] or "\\" in argv[0]:
@@ -750,6 +789,7 @@ def execute_safe_command(command: str, policy: ShellPolicy) -> str:
                 timeout=policy.timeout,
                 env=_build_isolated_env(safe_path, isolated_home),
                 max_capture_bytes=_MAX_CAPTURE_BYTES,
+                abort_signal=abort_signal,
             )
         except OSError as error:
             return f"错误：命令启动失败（{error}）。"
@@ -779,10 +819,11 @@ def run_command(
     project_root: Path | None = None,
     offload_dir: Path | None = None,
     shell_config: Mapping[str, object] | None = None,
+    abort_signal: AbortSignal | None = None,
 ) -> str:
     policy = ShellPolicy.from_dict(
         shell_config,
         project_root=project_root or REPO_ROOT,
         offload_dir=offload_dir,
     )
-    return execute_safe_command(command, policy)
+    return execute_safe_command(command, policy, abort_signal=abort_signal)

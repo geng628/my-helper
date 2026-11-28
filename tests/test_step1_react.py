@@ -324,7 +324,8 @@ def test_model_invoker_from_env_payload_and_stream_error_handling(monkeypatch: p
     captured: dict[str, object] = {}
 
     # 模拟捕获请求参数的流式发送桩
-    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         captured["url"] = url
         captured["payload"] = payload
         captured["headers"] = headers
@@ -391,7 +392,8 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
     attempts = {"count": 0}
 
     # 模拟前 2 次遇到 TLS EOF，第 3 次成功返回 JSON
-    def flaky_urlopen(request, timeout=60):
+    def flaky_urlopen(request, timeout=60, abort_signal=None):
+        del request, timeout, abort_signal
         attempts["count"] += 1
         if attempts["count"] < 3:
             raise URLError(ssl.SSLEOFError("EOF occurred in violation of protocol"))
@@ -412,18 +414,19 @@ def test_default_post_json_retries_transient_error_but_not_http_400(monkeypatch)
 
         return _Resp()
 
-    monkeypatch.setattr(http_mod, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", flaky_urlopen)
     assert http_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
     assert attempts["count"] == 3
 
     bad_attempts = {"count": 0}
 
     # 模拟 400 Bad Request：必须立刻抛出，不重试
-    def bad_request_urlopen(request, timeout=60):
+    def bad_request_urlopen(request, timeout=60, abort_signal=None):
+        del request, timeout, abort_signal
         bad_attempts["count"] += 1
         raise HTTPError("https://example.com/v1", 400, "Bad Request", {}, io.BytesIO(b"bad"))
 
-    monkeypatch.setattr(http_mod, "urlopen", bad_request_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", bad_request_urlopen)
     with pytest.raises(HTTPError):
         http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert bad_attempts["count"] == 1
@@ -543,7 +546,8 @@ def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.Monk
     read_attempts = {"count": 0, "closed": 0}
 
     # 模拟连接建立成功但 response.read() 前两次分别抛 IncompleteRead 与 SSLError，第三次完整返回 JSON
-    def flaky_body_urlopen(request, timeout=60):
+    def flaky_body_urlopen(request, timeout=60, abort_signal=None):
+        del request, timeout, abort_signal
         read_attempts["count"] += 1
         attempt = read_attempts["count"]
 
@@ -557,7 +561,7 @@ def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.Monk
 
         return _make_resp(_read, on_exit=lambda: read_attempts.__setitem__("closed", read_attempts["closed"] + 1))
 
-    monkeypatch.setattr(http_mod, "urlopen", flaky_body_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", flaky_body_urlopen)
     assert http_mod.default_post_json("https://example.com/v1", {"a": 1}, {}) == {"ok": True}
     assert read_attempts["count"] == 3
     assert read_attempts["closed"] == 3
@@ -566,7 +570,8 @@ def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.Monk
     seq_attempts = {"count": 0}
 
     # 依次抛出不同类型的读取阶段瞬时异常直至重试耗尽
-    def exhausted_body_urlopen(request, timeout=60):
+    def exhausted_body_urlopen(request, timeout=60, abort_signal=None):
+        del request, timeout, abort_signal
         idx = seq_attempts["count"]
         seq_attempts["count"] += 1
 
@@ -576,7 +581,7 @@ def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.Monk
 
         return _make_resp(_read_fail)
 
-    monkeypatch.setattr(http_mod, "urlopen", exhausted_body_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", exhausted_body_urlopen)
     with pytest.raises(URLError):
         http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert seq_attempts["count"] == 3
@@ -584,11 +589,12 @@ def test_sync_post_json_body_read_retry_and_broken_json(monkeypatch: pytest.Monk
     bad_json_attempts = {"count": 0}
 
     # 返回语法错误 JSON 字节流：不得盲目重试
-    def bad_json_urlopen(request, timeout=60):
+    def bad_json_urlopen(request, timeout=60, abort_signal=None):
+        del request, timeout, abort_signal
         bad_json_attempts["count"] += 1
         return _make_resp(lambda: b"{broken-json")
 
-    monkeypatch.setattr(http_mod, "urlopen", bad_json_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", bad_json_urlopen)
     with pytest.raises(json.JSONDecodeError):
         http_mod.default_post_json("https://example.com/v1", {"a": 1}, {})
     assert bad_json_attempts["count"] == 1

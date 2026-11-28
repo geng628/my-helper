@@ -21,6 +21,8 @@ from personal_assistant.agent.react import (
 )
 from personal_assistant.agent.tools import ToolRegistry
 from personal_assistant.ai import (
+    AbortController,
+    AbortSignal,
     AssistantMessage,
     AssistantMessageEvent,
     CacheMonitor,
@@ -29,6 +31,7 @@ from personal_assistant.ai import (
     ModelInvoker,
     ModelsConfig,
     NoopModelClient,
+    StreamAbortedError,
     StreamDone,
     StreamError,
     StreamOptions,
@@ -162,12 +165,24 @@ class _GuardedTurnLLM:
         else:
             self.last_usage = None
 
-    # 流式调用前执行预算核查；检测到 length 截断且含破损工具 JSON 时立即就地熔断收束
+    # 流式调用前优先响应协同取消再执行预算核查；检测到 length 截断且含破损工具 JSON 时立即就地熔断收束
     def stream(
         self,
         context: Context,
         options: StreamOptions | None = None,
     ) -> Iterator[AssistantMessageEvent]:
+        abort_signal = options.abort_signal if options is not None else None
+        if abort_signal is not None and abort_signal.aborted:
+            self.last_usage = None
+            reason = abort_signal.reason or "请求已取消"
+            yield StreamError(
+                reason="aborted",
+                message=AssistantMessage(stop_reason="aborted", error_message=reason),
+                error_message=reason,
+                latency_ms=0.0,
+            )
+            return
+
         breach = self._check_budget()
         if breach is not None:
             self.breach = breach
@@ -189,6 +204,16 @@ class _GuardedTurnLLM:
                 if isinstance(event, StreamError):
                     self.last_usage = None
                     yield event
+                    return
+                if abort_signal is not None and abort_signal.aborted:
+                    self.last_usage = None
+                    reason = abort_signal.reason or "请求已取消"
+                    yield StreamError(
+                        reason="aborted",
+                        message=AssistantMessage(stop_reason="aborted", error_message=reason),
+                        error_message=reason,
+                        latency_ms=0.0,
+                    )
                     return
                 if isinstance(event, StreamDone):
                     usage = event.usage if isinstance(event.usage, TokenUsage) else self._inner.last_usage
@@ -230,6 +255,8 @@ class _GuardedTurnLLM:
         try:
             for event in event_iter:
                 if isinstance(event, StreamError):
+                    if event.reason == "aborted":
+                        raise StreamAbortedError(event.error_message or "请求已取消")
                     raise RuntimeError(event.error_message)
                 if isinstance(event, StreamDone):
                     return event.message
@@ -341,6 +368,8 @@ class AssistantApp:
         )
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: dict[str, tuple[threading.Lock, int]] = {}
+        self._abort_lock = threading.Lock()
+        self._active_aborts: dict[str, AbortController] = {}
         self.cache_monitor = CacheMonitor()
         self.observers: tuple[ObserverProtocol, ...] = (
             tuple(observers) if observers is not None else tuple(self.tools_config.build_observers())
@@ -476,8 +505,20 @@ class AssistantApp:
     def wait_for_consolidation(self, timeout: float = 15.0) -> None:
         self.background_consolidator.wait(timeout=timeout)
 
-    # 先等待后台沉淀收尾，再按所有权关闭已加载插件生命周期，最后关闭底层状态存储资源
+    # 主动向指定会话正在执行的前台回合发送协同取消信号；存在在途回合并首次触发取消时返回 True
+    def abort_turn(self, chat_id: str, *, reason: str = "用户已取消当前请求") -> bool:
+        with self._abort_lock:
+            controller = self._active_aborts.get(chat_id)
+        if controller is None:
+            return False
+        return controller.abort(reason)
+
+    # 先中止所有在途前台回合、等待后台沉淀收尾，再按所有权关闭已加载插件生命周期，最后关闭底层状态存储资源
     def close(self) -> None:
+        with self._abort_lock:
+            controllers = list(self._active_aborts.values())
+        for controller in controllers:
+            controller.abort("服务正在关闭")
         try:
             self.background_consolidator.wait(timeout=15.0)
             if self._owns_tools_config:
@@ -576,13 +617,14 @@ class AssistantApp:
                     else:
                         self._chat_locks[chat_id] = (lock, new_refs)
 
-    # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回事件帧生成器
+    # 处理一轮流式对话（单一主流程）：先同步校验输入与模型就绪状态，再返回支持协同取消的事件帧生成器
     def stream_chat(
         self,
         text: str,
         chat_id: str = "default",
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
+        abort_signal: AbortSignal | None = None,
     ) -> Generator[dict[str, object], None, None]:
         clean_text = text.strip()
         if not clean_text:
@@ -597,167 +639,226 @@ class AssistantApp:
             clean_text,
             chat_id,
             on_event=on_event,
+            abort_signal=abort_signal,
         )
 
-    # 内部生成器：同会话加锁串行执行，成功后再原子成对落库 user+assistant 与绑定事实标记，异常/中断零脏写
+    # 内部生成器：同会话加锁串行执行，支持 abort_turn 与外部信号协同取消；成功后原子成对落库，取消/中断零脏写
     def _run_stream_turn(
         self,
         clean_text: str,
         chat_id: str,
         *,
         on_event: Callable[[AgentEvent], None] | None,
+        abort_signal: AbortSignal | None = None,
     ) -> Generator[dict[str, object], None, None]:
-        with self._chat_turn_lock(chat_id):
-            turn_day, turn_created_at = self._turn_clock_stamp()
-            self.context_assembler.maybe_archive_expired(turn_day)
-            compaction, active_all = self.state.get_context_snapshot(chat_id)
-            history = self.context_assembler.select_history(chat_id, active_all)
-            before_msg_id = self.state.max_message_id() + 1
-            turn_tag = uuid.uuid4().hex[:12]
-            fact_used = False
-
-            turn_persisted = False
-            turn_ended = False
-            try:
-                registry = self._tool_registry
-                turn_ctx: dict[str, object] = {
-                    "user_text": clean_text,
-                    "before_msg_id": before_msg_id,
-                    "turn_tag": turn_tag,
-                    "untrusted_tool_seen": False,
-                    "today": turn_day,
-                    "history_db_path": self.state.db_path,
-                }
-                system_prompt = self.get_session_system_prompt(chat_id, registry)
-                summary_text = str(compaction.get("summary") or "").strip()
-                context = self.context_assembler.assemble(
-                    system_prompt=system_prompt,
-                    summary_text=summary_text,
-                    history=history,
-                    user_text=clean_text,
-                    registry=registry,
-                    today=turn_day,
-                )
-
-                traces: list[dict[str, object]] = []
-                thinking_parts: list[str] = []
-                reply = ""
-                start_idx = self.cache_monitor.snapshot_index()
-                with self._llm_lock:
-                    active_llm = self.llm
-                tracked_llm = self.cache_monitor.wrap(active_llm, session_key=chat_id)
-                guarded_llm = _GuardedTurnLLM(
-                    tracked_llm,
-                    max_steps=self.max_turn_steps,
-                    max_tokens=self.max_turn_tokens,
-                    max_seconds=self.max_turn_seconds,
-                    max_repeated_tool_calls=self.max_repeated_tool_calls,
-                    clock=self._clock,
-                )
-                projector = self.context_assembler.create_turn_projector()
-                with closing(
-                    iter_react(
-                        guarded_llm,
-                        context,
-                        registry,
-                        convert_to_llm=projector,
-                        tool_context=turn_ctx,
-                        options=StreamOptions(session_id=chat_id),
-                    )
-                ) as react_events:
-                    for event in react_events:
-                        if isinstance(event, ToolStart):
-                            meta = registry.metadata(event.tool)
-                            if meta is not None and meta.risk == "network":
-                                turn_ctx["untrusted_tool_seen"] = True
-                            if event.tool == "remember_fact":
-                                fact_used = True
-                            guarded_llm.observe_tool_call(event.tool, event.arguments)
-                        self._emit_event(chat_id, event)
-                        if on_event is not None:
-                            on_event(event)
-                        if isinstance(event, StreamError):
-                            raise RuntimeError(event.error_message)
-                        if isinstance(event, ThinkingDelta) and event.text:
-                            thinking_parts.append(event.text)
-                            yield {"type": "thinking_delta", "text": event.text}
-                        elif isinstance(event, ToolStart):
-                            yield {
-                                "type": "tool_start",
-                                "tool": event.tool,
-                                "arguments": event.arguments,
-                                "call_id": event.call_id,
-                            }
-                        elif isinstance(event, TextDelta) and event.text:
-                            yield {"type": "text_delta", "text": event.text}
-                        elif isinstance(event, ToolStep):
-                            step_dict: dict[str, object] = {
-                                "tool": event.tool,
-                                "arguments": event.arguments,
-                                "observation": event.observation,
-                                "call_id": event.call_id,
-                                "duration_ms": event.duration_ms,
-                            }
-                            traces.append(step_dict)
-                            yield {"type": "tool_step", **step_dict}
-                        elif isinstance(event, TurnEnd):
-                            turn_ended = True
-                            reply = event.reply
-
-                user_msg_id, assistant_msg_id = self.state.append_turn(
-                    chat_id,
-                    clean_text,
-                    reply,
-                    created_at=turn_created_at,
-                )
-                turn_persisted = True
-                if fact_used:
-                    self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
-            finally:
-                if not turn_ended:
-                    self._emit_event(
-                        chat_id,
-                        TaskEvent(kind="turn_aborted", duration_ms=0.0, error="turn_interrupted"),
-                    )
-                if not turn_persisted and fact_used:
-                    self.memory.finalize_turn_fact(turn_tag, message_id=None)
-
-            scheduled = (
-                self.background_consolidator.maybe_schedule(
-                    chat_id,
-                    on_complete=lambda res: (
-                        self.reset_session_prompt(res.chat_id)
-                        if res.saved_files
-                        else self.context_assembler.clear_history_floor(res.chat_id)
-                    ),
-                )
-                if self.auto_consolidate
-                else False
+        turn_controller = AbortController()
+        unsub_external = (
+            abort_signal.subscribe(
+                lambda: turn_controller.abort(abort_signal.reason or "外部已取消当前请求")
             )
-            done_payload: dict[str, object] = {
-                "type": "done",
-                "reply": reply,
-                "thinking": "".join(thinking_parts),
-                "chat_id": chat_id,
-                "message_id": assistant_msg_id,
-                "tool_calls": traces,
-                "cache": self.cache_monitor.summary(since=start_idx, session_key=chat_id),
-                "consolidation_scheduled": scheduled,
-            }
-            if guarded_llm.breach is not None:
-                done_payload["budget_exceeded"] = guarded_llm.breach.reason
-            telemetry = self._collect_telemetry(session_key=chat_id)
-            if telemetry:
-                done_payload["telemetry"] = telemetry
-        yield done_payload
+            if abort_signal is not None
+            else None
+        )
+        try:
+            if turn_controller.signal.aborted:
+                yield {
+                    "type": "aborted",
+                    "reason": turn_controller.signal.reason or "请求已取消",
+                    "chat_id": chat_id,
+                }
+                return
 
-    # 处理一轮完整同步对话：直接消费 stream_chat 单一实现并确保异常时确定性关闭生成器
+            done_payload: dict[str, object] | None = None
+            aborted_payload: dict[str, object] | None = None
+            with self._chat_turn_lock(chat_id):
+                with self._abort_lock:
+                    self._active_aborts[chat_id] = turn_controller
+                turn_persisted = False
+                turn_ended = False
+                fact_used = False
+                turn_tag = uuid.uuid4().hex[:12]
+                try:
+                    if turn_controller.signal.aborted:
+                        aborted_payload = {
+                            "type": "aborted",
+                            "reason": turn_controller.signal.reason or "请求已取消",
+                            "chat_id": chat_id,
+                        }
+                    else:
+                        turn_day, turn_created_at = self._turn_clock_stamp()
+                        self.context_assembler.maybe_archive_expired(turn_day)
+                        compaction, active_all = self.state.get_context_snapshot(chat_id)
+                        history = self.context_assembler.select_history(chat_id, active_all)
+                        before_msg_id = self.state.max_message_id() + 1
+
+                        registry = self._tool_registry
+                        turn_ctx: dict[str, object] = {
+                            "user_text": clean_text,
+                            "before_msg_id": before_msg_id,
+                            "turn_tag": turn_tag,
+                            "untrusted_tool_seen": False,
+                            "today": turn_day,
+                            "history_db_path": self.state.db_path,
+                        }
+                        system_prompt = self.get_session_system_prompt(chat_id, registry)
+                        summary_text = str(compaction.get("summary") or "").strip()
+                        context = self.context_assembler.assemble(
+                            system_prompt=system_prompt,
+                            summary_text=summary_text,
+                            history=history,
+                            user_text=clean_text,
+                            registry=registry,
+                            today=turn_day,
+                        )
+
+                        traces: list[dict[str, object]] = []
+                        thinking_parts: list[str] = []
+                        reply = ""
+                        aborted_reason: str | None = None
+                        start_idx = self.cache_monitor.snapshot_index()
+                        with self._llm_lock:
+                            active_llm = self.llm
+                        tracked_llm = self.cache_monitor.wrap(active_llm, session_key=chat_id)
+                        guarded_llm = _GuardedTurnLLM(
+                            tracked_llm,
+                            max_steps=self.max_turn_steps,
+                            max_tokens=self.max_turn_tokens,
+                            max_seconds=self.max_turn_seconds,
+                            max_repeated_tool_calls=self.max_repeated_tool_calls,
+                            clock=self._clock,
+                        )
+                        projector = self.context_assembler.create_turn_projector()
+                        with closing(
+                            iter_react(
+                                guarded_llm,
+                                context,
+                                registry,
+                                convert_to_llm=projector,
+                                tool_context=turn_ctx,
+                                options=StreamOptions(
+                                    session_id=chat_id,
+                                    abort_signal=turn_controller.signal,
+                                ),
+                            )
+                        ) as react_events:
+                            for event in react_events:
+                                if isinstance(event, ToolStart):
+                                    meta = registry.metadata(event.tool)
+                                    if meta is not None and meta.risk == "network":
+                                        turn_ctx["untrusted_tool_seen"] = True
+                                    if event.tool == "remember_fact":
+                                        fact_used = True
+                                    guarded_llm.observe_tool_call(event.tool, event.arguments)
+                                self._emit_event(chat_id, event)
+                                if on_event is not None:
+                                    on_event(event)
+                                if isinstance(event, StreamError):
+                                    if event.reason == "aborted":
+                                        aborted_reason = (
+                                            event.error_message
+                                            or turn_controller.signal.reason
+                                            or "请求已取消"
+                                        )
+                                        break
+                                    raise RuntimeError(event.error_message)
+                                if isinstance(event, ThinkingDelta) and event.text:
+                                    thinking_parts.append(event.text)
+                                    yield {"type": "thinking_delta", "text": event.text}
+                                elif isinstance(event, ToolStart):
+                                    yield {
+                                        "type": "tool_start",
+                                        "tool": event.tool,
+                                        "arguments": event.arguments,
+                                        "call_id": event.call_id,
+                                    }
+                                elif isinstance(event, TextDelta) and event.text:
+                                    yield {"type": "text_delta", "text": event.text}
+                                elif isinstance(event, ToolStep):
+                                    step_dict: dict[str, object] = {
+                                        "tool": event.tool,
+                                        "arguments": event.arguments,
+                                        "observation": event.observation,
+                                        "call_id": event.call_id,
+                                        "duration_ms": event.duration_ms,
+                                    }
+                                    traces.append(step_dict)
+                                    yield {"type": "tool_step", **step_dict}
+                                elif isinstance(event, TurnEnd):
+                                    turn_ended = True
+                                    reply = event.reply
+
+                        if aborted_reason is not None or turn_controller.signal.aborted:
+                            aborted_payload = {
+                                "type": "aborted",
+                                "reason": aborted_reason or turn_controller.signal.reason or "请求已取消",
+                                "chat_id": chat_id,
+                            }
+                        else:
+                            user_msg_id, assistant_msg_id = self.state.append_turn(
+                                chat_id,
+                                clean_text,
+                                reply,
+                                created_at=turn_created_at,
+                            )
+                            turn_persisted = True
+                            if fact_used:
+                                self.memory.finalize_turn_fact(turn_tag, message_id=user_msg_id)
+                            scheduled = (
+                                self.background_consolidator.maybe_schedule(
+                                    chat_id,
+                                    on_complete=lambda res: (
+                                        self.reset_session_prompt(res.chat_id)
+                                        if res.saved_files
+                                        else self.context_assembler.clear_history_floor(res.chat_id)
+                                    ),
+                                )
+                                if self.auto_consolidate
+                                else False
+                            )
+                            done_payload = {
+                                "type": "done",
+                                "reply": reply,
+                                "thinking": "".join(thinking_parts),
+                                "chat_id": chat_id,
+                                "message_id": assistant_msg_id,
+                                "tool_calls": traces,
+                                "cache": self.cache_monitor.summary(since=start_idx, session_key=chat_id),
+                                "consolidation_scheduled": scheduled,
+                            }
+                            if guarded_llm.breach is not None:
+                                done_payload["budget_exceeded"] = guarded_llm.breach.reason
+                            telemetry = self._collect_telemetry(session_key=chat_id)
+                            if telemetry:
+                                done_payload["telemetry"] = telemetry
+                finally:
+                    if not turn_ended:
+                        turn_controller.abort("连接已断开")
+                        self._emit_event(
+                            chat_id,
+                            TaskEvent(kind="turn_aborted", duration_ms=0.0, error="turn_interrupted"),
+                        )
+                    if not turn_persisted and fact_used:
+                        self.memory.finalize_turn_fact(turn_tag, message_id=None)
+                    with self._abort_lock:
+                        if self._active_aborts.get(chat_id) is turn_controller:
+                            self._active_aborts.pop(chat_id, None)
+
+            if aborted_payload is not None:
+                yield aborted_payload
+            elif done_payload is not None:
+                yield done_payload
+        finally:
+            if unsub_external is not None:
+                unsub_external()
+
+    # 处理一轮完整同步对话：直接消费 stream_chat 单一实现，被取消时抛 StreamAbortedError
     def chat(
         self,
         text: str,
         chat_id: str = "default",
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
+        abort_signal: AbortSignal | None = None,
     ) -> dict[str, object]:
         result: dict[str, object] = {}
         with closing(
@@ -765,9 +866,12 @@ class AssistantApp:
                 text,
                 chat_id=chat_id,
                 on_event=on_event,
+                abort_signal=abort_signal,
             )
         ) as frames:
             for frame in frames:
+                if frame.get("type") == "aborted":
+                    raise StreamAbortedError(str(frame.get("reason") or "请求已取消"))
                 if frame.get("type") == "done":
                     result = {k: v for k, v in frame.items() if k != "type"}
         return result

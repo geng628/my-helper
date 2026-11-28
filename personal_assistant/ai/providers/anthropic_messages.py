@@ -5,7 +5,6 @@ import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from urllib.error import HTTPError
 
 from personal_assistant.ai.protocol import (
     THINKING_BUDGETS,
@@ -17,7 +16,6 @@ from personal_assistant.ai.protocol import (
     DoneReason,
     ModelProfile,
     StreamDone,
-    StreamError,
     StreamOptions,
     StreamStart,
     TextBlock,
@@ -40,11 +38,11 @@ from personal_assistant.ai.protocol import (
 )
 from personal_assistant.ai.providers.http import (
     PostStream,
+    build_stream_error,
     default_post_stream,
-    format_http_error,
     iter_sse_events,
     non_negative_int,
-    redact_error_tokens,
+    raise_if_aborted,
 )
 
 ANTHROPIC_API_VERSION = "2023-06-01"
@@ -319,13 +317,16 @@ class AnthropicMessagesProvider:
                 blocks[cidx] = final_call
                 yield ToolCallEnd(content_index=cidx, tool_call=final_call, partial=snapshot())
 
+        abort_signal = options.abort_signal if options is not None else None
         yield StreamStart(partial=snapshot())
 
         line_iter: Iterator[str] | None = None
         try:
+            raise_if_aborted(abort_signal)
             url, payload, headers = self._build_request(model, context, options)
-            line_iter = self.post_stream(url, payload, headers)
+            line_iter = self.post_stream(url, payload, headers, abort_signal=abort_signal)
             for sse_event, data_str in iter_sse_events(line_iter):
+                raise_if_aborted(abort_signal)
                 data = json.loads(data_str)
                 if not isinstance(data, dict):
                     continue
@@ -476,6 +477,7 @@ class AnthropicMessagesProvider:
                 if ev_type == "message_stop":
                     break
 
+            raise_if_aborted(abort_signal)
             for anth_idx in sorted(list(open_indices)):
                 yield from close_block(anth_idx)
 
@@ -491,22 +493,12 @@ class AnthropicMessagesProvider:
                 latency_ms=round((time.perf_counter() - t0) * 1000, 3),
             )
         except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, HTTPError):
-                _, diag = format_http_error(exc)
-                err_msg = f"HTTP {exc.code}: {diag}" if diag else f"HTTP {exc.code}"
-            else:
-                err_msg = redact_error_tokens(f"{type(exc).__name__}: {exc}")
-            err_msg_obj = AssistantMessage(
-                blocks=tuple(blocks),
-                stop_reason="error",
+            yield build_stream_error(
+                exc,
+                blocks=blocks,
                 usage=build_usage(),
-                error_message=err_msg,
-            )
-            yield StreamError(
-                reason="error",
-                message=err_msg_obj,
-                error_message=err_msg,
-                latency_ms=round((time.perf_counter() - t0) * 1000, 3),
+                started_at=t0,
+                abort_signal=abort_signal,
             )
         finally:
             if line_iter is not None:
