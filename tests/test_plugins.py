@@ -259,13 +259,13 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols(tmp_path: Path) -> 
     plugin_ids = {p.plugin_id for p in manager.plugins}
     assert plugin_ids == {
         "tools",
-        "fts5_bm25",
+        "rag",
         "models_dsl",
         "telemetry",
     }
     assert {type(p).__name__ for p in manager.plugins} == {
         "ToolsPlugin",
-        "FTS5RetrieverPlugin",
+        "RAGRetrieverPlugin",
         "ModelsDSLPlugin",
         "TelemetryPlugin",
     }
@@ -279,9 +279,9 @@ def test_plugin_motherboard_abc_and_all_five_inner_protocols(tmp_path: Path) -> 
     )
 
     # 3. 内层子协议 2：RetrieverProtocol（MemoryStore 只认 search_hits）
-    fts_instance = manager.retrievers["fts5_bm25"]({})
-    assert isinstance(fts_instance, RetrieverProtocol)
-    assert fts_instance.name == "fts5_bm25"
+    rag_instance = manager.retrievers["rag"]({})
+    assert isinstance(rag_instance, RetrieverProtocol)
+    assert rag_instance.name == "rag"
 
     # 4. 内层子协议 3：ConfigCompilerProtocol（ToolsConfig 只认 compile / presets / render）
     dsl_compiler = ModelsDSLCompiler()

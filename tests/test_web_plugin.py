@@ -9,7 +9,7 @@ import pytest
 
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.memory import MemoryStore
-from plugins.fts5_retriever import FTS5Retriever
+from plugins.rag_retriever import RAGRetriever
 from plugins.tools.web_tools import (
     WebPolicy,
     execute_fetch_webpage,
@@ -229,11 +229,14 @@ def test_fetch_webpage_toast_offload_download_cap_notice_and_json_pretty(tmp_pat
     next_match = re.search(r"start_line=(\d+)", out)
     assert path_match is not None and next_match is not None
 
-    memory = MemoryStore(tmp_path, retriever=FTS5Retriever())
-    rest = memory.read_markdown(path_match.group(1), start_line=int(next_match.group(1)), end_line=100)
-    assert "TOAST_ARTICLE_MARKER_881" in rest
-    hits = memory.search_markdown("TOAST_ARTICLE_MARKER_881", root="data/workspace/tool_outputs")
-    assert path_match.group(1) in hits
+    memory = MemoryStore(tmp_path, retriever=RAGRetriever())
+    try:
+        rest = memory.read_markdown(path_match.group(1), start_line=int(next_match.group(1)), end_line=100)
+        assert "TOAST_ARTICLE_MARKER_881" in rest
+        hits = memory.search_markdown("TOAST_ARTICLE_MARKER_881", root="data/workspace/tool_outputs")
+        assert path_match.group(1) in hits
+    finally:
+        memory.close()
 
     # 2. 原始响应超过 max_download_bytes 时必须显式提示源码已截断（不再静默截半）
     small_cap_policy = WebPolicy(timeout=5.0, max_download_bytes=120, max_output_bytes=4096, offload_dir=offload_dir)

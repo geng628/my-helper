@@ -521,6 +521,7 @@ class AssistantApp:
             controller.abort("服务正在关闭")
         try:
             self.background_consolidator.wait(timeout=15.0)
+            self.memory.close()
             if self._owns_tools_config:
                 self.tools_config.plugin_manager.terminate_all()
         finally:

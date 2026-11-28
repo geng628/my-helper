@@ -32,7 +32,7 @@
 ### 1. 五大插件主板插槽与单次初始化生命周期
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/fts5_retriever.py](plugins/fts5_retriever.py)（`fts5_bm25`）外挂双语 BM25 索引，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供 Markdown 结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)）、独立持久化派生库 `data/state/rag_index.db`、双语 FTS5 BM25 与 Small-to-Big 同章节上下文扩展，未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever` 自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
   4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，支持外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动接入新厂商（`ToolsConfig.build_provider_registry()` 将插件翻译器与内建四大翻译器合并为应用级隔离副本，不污染进程全局注册表）。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
@@ -45,7 +45,7 @@
 - **已知工程取舍**：跨轮对话历史仅持久化 `user` 与 `assistant` 文本，剥离轮内 `tool_calls` 与原始 `tool` 观察以控制 Token 与保护缓存前缀（若上轮工具细节未写入回复正文，追问时需重新调工具读取）；回合中断仅回滚未提交问答对与 `turn_tag` 暂存事实，已落盘的 `write_file` / `save_study_card` 依赖 `data/workspace/.backups/` 备份恢复。
 
 ### 3. 纵深安全边界
-- **APFS Unicode 折叠与 Inode 文件隔离**：零内部依赖的 [personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验（统一覆盖文件读写、`list_files` 列举与 `LinearRetriever`/`FTS5Retriever` 搜索遍历），阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
+- **APFS Unicode 折叠与 Inode 文件隔离**：零内部依赖的 [personal_assistant/assistant/files_policy.py](personal_assistant/assistant/files_policy.py) 剥离零宽格式符并执行 `NFKC + casefold()`，配合受保护路径 `(st_dev, st_ino)` 硬链接/软链接校验（统一覆盖文件读写、`list_files` 列举与 `LinearRetriever`/`RAGRetriever` 搜索遍历），阻断 macOS APFS 字符折叠绕过（如 `ſ -> s`），严格限制只读根目录与唯一写目录 `data/workspace/`。
 - **语法级只读 Shell 沙箱**：[plugins/tools/shell_tools.py](plugins/tools/shell_tools.py) 以 `shell=False`、隔离空 `HOME`（禁用系统/全局 `.gitconfig`）与独立进程组运行白名单命令：`find` 使用独立只读表达式白名单（绝不因 `--` 放过 `-exec`/`-delete` 并禁 `-L`/`-H`）；`ls`/`wc`/`rg` 封堵解引用与大小写绕过；`pytest` 强制限定 `tests/` 并忽略 `data/`；`git` 执行语法级逐子命令只读白名单（拦截 `branch -D/-m/--edit-description`、`log -p` 及冒号引用/解引用/裸对象哈希，无显式文件时自动补 `--stat`，并为 `git diff` 注入敏感路径负向排除）；超时或超 1 MB 管道输出时经 `os.killpg` 整组回收子孙进程。
 - **直连 `http.client` + TLS/DNS Pinning 防 SSRF 与间接注入防护**：[plugins/tools/web_tools.py](plugins/tools/web_tools.py) 基于标准库 `http.client` + `socket.create_connection` + TLS SNI/证书校验直接连接已校验公网 IP（天然不走系统环境代理、消除二次 DNS 解析 Rebinding 窗口，自动处理非 ASCII URL 百分号与 IDNA 编码，每次阻塞读前刷新 socket 剩余截止超时），默认关闭 Fake-IP 放行（`allow_fake_ip=False`），拦截私网及 NAT64/6to4/Teredo 隧道内嵌私网地址；同轮一旦调用网络类工具，执行期上下文立即锁死 `save_rule` 写入，防范网页内容持久化篡改全局系统提示词。
 - **本地 Web 服务防护**：[scripts/web_chat.py](scripts/web_chat.py) 校验 `Host`、`Origin`、`Sec-Fetch-Site` 与单一 `Content-Type: application/json`，下发 CSP / `nosniff` / `DENY` 响应头，支持非回环绑定下静态首页壳与 `/api/*` 常量时间 Bearer Token 鉴权；密钥配置文件纳入 `.gitignore` 并以 `0600` 权限原子写入。
@@ -60,11 +60,11 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（233 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（241 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
-uv run python -m evals --mode search --retriever fts5_bm25 --fail-under 0.90
+uv run python -m evals --mode search --retriever rag --fail-under 0.90
 
 # 4. 下载并转换公开评测集（存入 gitignore 的 evals/public/）
 uv run python -m evals --mode download --dataset all --longmemeval-limit 70 --locomo-memory-limit 100 --locomo-max-convs 1
@@ -145,12 +145,12 @@ uv run python -m evals --mode memory \
 3. **LoCoMo Memory 口径说明**：默认下载配置（`--locomo-max-convs 1 --locomo-memory-limit 100`）导出的 100 道题**全部来自同一段包含 19 个时间会话的长对话 `conv-26`**（通过 `shared_setup` 对该对话沉淀一次后逐题隔离提问），而非 19 段独立对话；跨多段对话的纯词面检索能力由 `LoCoMo Search`（200 题，覆盖多段对话共 272 篇会话 `.md`）单独评估。
 4. **Judge 去泄漏版本化**：自 `c761c81` / `1b421d2` 起，`evals/memory_eval.py` 移除早期评分提示词中针对公开集失败题补充的具名示例，统一采用零测试集实体的中立提示词（`JUDGE_PROMPT_VERSION = "v2-neutral"`，`prompt_sha256 = "08e7c0adcb56"`），并在输出报告中记录 `self_judged` 标记。
 
-### 1. 离线检索基准（确定性，零 API 调用，验证于 `1b421d2`）
+### 1. 离线检索基准（确定性，零 API 调用）
 
-| 数据集 | 性质与规模 | `linear` 基线（`552863d`） | `fts5_bm25`（`1b421d2`） | 说明 |
-| --- | --- | --- | --- | --- |
-| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 剩余 2 题失败为纯同义零共享词改写与跨文档分散引用 |
-| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622` | `single-hop` Recall `94.0%`、`temporal` `92.0%`；但 `multi-hop`（`43.9%`）与 `open-domain`（`44.2%`）受限于纯词面匹配 |
+| 数据集 | 性质与规模 | `linear` 基线（`552863d`） | 旧 `fts5_bm25`（`8b19d97`） | `rag` 结构分块 + Small-to-Big（本版） | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| [evals/sample_cases.jsonl](evals/sample_cases.jsonl) | 仓库内回归集（5 类，40 题） | 通过 `80.0%`（32/40），MRR `0.908`，负例干净度 `63.6%` | 通过 `95.0%`（38/40），Recall `94.8%`，MRR `0.948`，负例干净度 `100%` | 通过 `95.0%`（38/40），Recall `94.8%`，**MRR `0.966`**，负例干净度 `100%` | `exact` 类 MRR 升至 `1.00`；剩余 2 题为纯同义零共享词改写与跨文档分散引用（待 Step 2 向量召回） |
+| LoCoMo Search（ACL 2024） | 外部公开多对话检索（200 题，272 篇 `.md`） | 通过 `28.5%`（57/200），Recall `42.8%`，MRR `0.359` | 通过 `52.5%`（105/200），Recall `68.5%`，MRR `0.622`，Quote `60.2%` | 通过 `52.0%`（104/200），Recall `67.1%`，**MRR `0.651`**，Quote `60.1%` | `single-hop` 升至 `86.0%`（43/50）、`multi-hop` MRR `0.492 -> 0.552`；纯词面 `open-domain`（`40.8%`）与 `multi-hop`（`43.6%`）待 Step 2 稠密向量 + RRF 突破 |
 
 ### 2. 真实模型多轮记忆基准（中立 `v2-neutral` Judge 复测于 `1b421d2`）
 
@@ -177,7 +177,7 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与 DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 SQLite FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习卡片与间隔复习插件（save_study_card / list_due_reviews）
-│   ├── fts5_retriever.py              # RetrieverProtocol：SQLite FTS5 + BM25 双语检索
+│   ├── rag_retriever.py               # RetrieverProtocol：结构化分块 + 持久化派生库 + FTS5 BM25/Small-to-Big 检索
 │   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/reasoning/cache_retention）
 │   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
@@ -192,9 +192,9 @@ my_helper_v2/
 │   │   │   └── google_genai.py        #     google-generative-ai 原生翻译器（思考/函数调用）
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
-│   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
-│                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
+│   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
+│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
+│                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本
 │   ├── web_chat.py                    # 本地 HTTP/SSE 服务

@@ -378,14 +378,14 @@ print(json.dumps({"has_main": callable(evals.main), "leaked": leaked}))
     assert out_evals["leaked"] == []
 
     res_cli = subprocess.run(
-        [sys.executable, "-m", "evals", "--mode", "search", "--retriever", "fts5_bm25", "--max-cases", "1"],
+        [sys.executable, "-m", "evals", "--mode", "search", "--retriever", "rag", "--max-cases", "1"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
         timeout=15,
     )
-    assert "Eval mode=search  retriever=fts5_bm25" in res_cli.stdout
+    assert "Eval mode=search  retriever=rag" in res_cli.stdout
 
 
 # 测试 Slot-4 ApiProvider 翻译器插件加载、局部隔离注册表与全局注册表分发

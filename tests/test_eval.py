@@ -251,7 +251,7 @@ def test_search_eval_supports_categories_and_temporal_today(tmp_path: Path) -> N
     assert report["cases"][0]["category"] == "temporal"
 
 
-# 测试 agent_eval 直接复用 AssistantApp 挂载 fts5_bm25、接入 case["today"] 防到期失效并隔离 TOAST 落盘
+# 测试 agent_eval 直接复用 AssistantApp 挂载 rag、接入 case["today"] 防到期失效并隔离 TOAST 落盘
 def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,7 +271,7 @@ def test_agent_eval_mounts_configured_retriever_and_isolates_toast_offload(
     seen_prompts: list[str] = []
     seen_observations: list[str] = []
 
-    # 录制系统提示词并触发 search_markdown 核实逻辑日期 today 与 fts5_bm25 检索插件同时生效
+    # 录制系统提示词并触发 search_markdown 核实逻辑日期 today 与 rag 检索插件同时生效
     class TemporalSpyLLM:
         last_usage: TokenUsage | None = None
 

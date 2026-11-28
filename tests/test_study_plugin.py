@@ -219,13 +219,19 @@ def test_multiline_summary_roundtrip_and_fts5_search_integration(tmp_path: Path)
     assert cards[1].concept == "奇异值分解 SVD"
     assert cards[1].summary == "任何实矩阵都可以分解为 A = U Sigma V^T。"
 
-    # 挂载真实 FTS5 检索插件，验证落盘学习卡片可直接被 MemoryStore.search_markdown(..., root="data/workspace") 检索命中
+    # 挂载真实 RAG 检索插件，验证落盘学习卡片可直接被 MemoryStore.search_markdown(..., root="data/workspace") 检索命中
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
-    retriever = cfg.build_retriever()
-    memory = MemoryStore(data_root, retriever=retriever)
-    search_out = memory.search_markdown("列随机矩阵转置方向", root="data/workspace")
-    assert "data/workspace/study/linear-algebra.md" in search_out
-    assert "行随机矩阵与列随机矩阵转置方向切勿混淆" in search_out
+    try:
+        retriever = cfg.build_retriever()
+        memory = MemoryStore(data_root, retriever=retriever)
+        try:
+            search_out = memory.search_markdown("列随机矩阵转置方向", root="data/workspace")
+            assert "data/workspace/study/linear-algebra.md" in search_out
+            assert "行随机矩阵与列随机矩阵转置方向切勿混淆" in search_out
+        finally:
+            memory.close()
+    finally:
+        cfg.plugin_manager.terminate_all()
 
     # 验证 \u2028 / \u2029 / \x85 / \f 等非常规换行符与尾随纯空格行无法注入伪造卡片且重读 100% 一致
     unicode_break_summary = (

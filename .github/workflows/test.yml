@@ -18,7 +18,7 @@ jobs:
       - name: Run unit & architecture tests
         run: uv run pytest -v
       - name: Run offline retrieval benchmark smoke check
-        run: uv run python -m evals --mode search --retriever fts5_bm25 --fail-under 0.90
+        run: uv run python -m evals --mode search --retriever rag --fail-under 0.90
       - name: Verify Chinese comments above functions and classes
         run: |
           uv run python - <<'EOF'

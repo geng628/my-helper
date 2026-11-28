@@ -10,7 +10,7 @@ import pytest
 
 from personal_assistant.assistant.common import truncate_or_offload
 from personal_assistant.assistant.memory import MemoryStore
-from plugins.fts5_retriever import FTS5Retriever
+from plugins.rag_retriever import RAGRetriever
 
 
 # 测试未超字节上限时直接透传原文且零落盘，以及非法参数校验
@@ -58,15 +58,18 @@ def test_truncate_or_offload_head_mode_integrates_with_memory_store(tmp_path: Pa
     assert f"第 {next_line - 1:02d} 行" in out
     assert f"第 {next_line:02d} 行" not in out
 
-    memory = MemoryStore(tmp_path, retriever=FTS5Retriever())
-    rest = memory.read_markdown(rel_path, start_line=next_line, end_line=40)
-    assert f"{next_line}: 第 {next_line:02d} 行" in rest
-    assert "QUORUM_CHECKPOINT_9942" in rest
-    assert "40: 第 40 行" in rest
+    memory = MemoryStore(tmp_path, retriever=RAGRetriever())
+    try:
+        rest = memory.read_markdown(rel_path, start_line=next_line, end_line=40)
+        assert f"{next_line}: 第 {next_line:02d} 行" in rest
+        assert "QUORUM_CHECKPOINT_9942" in rest
+        assert "40: 第 40 行" in rest
 
-    search_out = memory.search_markdown("QUORUM_CHECKPOINT_9942", root="data/workspace/tool_outputs")
-    assert rel_path in search_out
-    assert "35: 第 35 行" in search_out
+        search_out = memory.search_markdown("QUORUM_CHECKPOINT_9942", root="data/workspace/tool_outputs")
+        assert rel_path in search_out
+        assert "35: 第 35 行" in search_out
+    finally:
+        memory.close()
 
 
 # 测试 head_tail 模式保留首尾预览（如 pytest 失败汇总），中间标出精确省略行号且可按行回查
