@@ -38,7 +38,7 @@ flowchart TD
     subgraph L3["Layer 3: 个人与学习助手业务层 (personal_assistant/assistant/)"]
         App --> Ctx["上下文与 KV Cache 装配引擎 ContextAssembler (assistant/context.py)"]
         Ctx --> Prompts["提示词模板与 system-reminder 信源隔离 (assistant/prompts.py)"]
-        Ctx --> Mem["Markdown 记忆、安全策略与内置工具 (files_policy / text_search / memory / builtin_tools / memory_lifecycle)"]
+        Ctx --> Mem["Markdown 记忆、安全策略、分块与上下文摘要 (files_policy / text_search / chunker / rag_contextualizer / memory / builtin_tools / memory_lifecycle)"]
         App --> Mem
         App --> State["SQLite 成对状态存储 StateStore (assistant/db.py)"]
         App --> Cons["后台沉淀与指数退避压缩 (assistant/consolidator.py)"]
@@ -101,7 +101,7 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与直连 http.client+TLS/DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
-│   ├── rag_retriever.py               # 持久化结构化 RAG 检索插件（RetrieverProtocol：分块 + 派生库 + BM25/Small-to-Big）
+│   ├── rag_retriever.py               # 持久化两层父子 RAG 检索插件（RetrieverProtocol：父子表 + 整句 Overlap + FTS5 + 上下文缓存）
 │   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/reasoning/cache_retention）
 │   └── telemetry.py                   # 有界 MRU 会话耗时拆解与后台任务观测插件（ObserverProtocol）
 ├── personal_assistant/                # 纯净三层产品包（绝不反向依赖 evals/）
@@ -121,8 +121,9 @@ my_helper_v2/
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
-│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
-│                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
+│                                      #          rag_contextualizer.py / prompts.py / context.py / memory.py /
+│                                      #          builtin_tools.py / memory_lifecycle.py / db.py / consolidator.py /
+│                                      #          commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
 │   ├── web_chat.py                    # 零依赖本地 HTTP/SSE 服务（ThreadingHTTPServer）
@@ -153,7 +154,7 @@ data/
 │   └── study/                         # 结构化 Markdown 学习知识卡片（<slug>.md）
 └── state/
     ├── chat_history.sqlite3           # 对话历史（messages）与滚动压缩游标（session_compactions）
-    └── rag_index.db                   # 独立持久化派生 RAG 索引（分块/指纹/FTS5，与权威源解耦，删库可无损重建）
+    └── rag_index.db                   # 独立持久化派生 RAG 索引（父子表/指纹/FTS5 与跨重建保留的 chunk_contexts，删库可无损重建）
 ```
 
 ---
@@ -204,7 +205,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 
 1. **零内部依赖底座（`common.py`、`text_search.py`、`files_policy.py`）**：
    - `common.py` 沉淀全仓共享的基础工具：`now_shanghai` / `today_shanghai` / `parse_iso_date`、`require_positive_int`、`atomic_write_text`、`format_date_with_weekday`、`load_dotenv` 与 `truncate_or_offload()`（超长工具输出按 1 MB 上限落盘至 `data/workspace/tool_outputs/` 并返回带行号的 `head` / `head_tail` 预览），供 `assistant/` 与 `plugins/tools/study_tools.py` 等外围插件统一复用；
-   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `rag_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；`chunker.py` 提供 Markdown 结构化分块（多级标题面包屑、围栏代码块/表格保护、`(until: ...)` 时效条目独立隔离与 SHA-256 `content_hash`）；
+   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `rag_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；`chunker.py` 提供两层父子结构化分块（多级标题面包屑、中英文句界切分、超长表格续片保表头、可配整句 Overlap、`(until: ...)` 时效条目隔离与 SHA-256 `content_hash`）；`rag_contextualizer.py` 提供基于同文档逐字节一致 Prompt Caching 前缀的离线父块上下文摘要生成（支持 `AbortSignal` 断点续跑并经 `/rag enrich` 复用后台沉淀模型）；
    - `files_policy.py` 保持零内部依赖，提供 `normalize_segment`（剥离 Unicode `Cf` 格式控制符 + `NFKC` + `casefold()`）、`is_sensitive_segment`、`FilesPolicy.protected_inodes(data_root)` 轻量受保护文件 `(st_dev, st_ino)` Inode 采集与 `FilesPolicy` 读写路径白名单，供 `MemoryStore`（含 `list_files` 与检索遍历）与 `shell_tools.py` 共享同一套路径防线。
 2. **Markdown 记忆生命周期、内置兜底检索与内置工具（`memory.py`、`builtin_tools.py`、`memory_lifecycle.py`）**：
    - `MemoryStore` 内置零索引 `LinearRetriever`（实现 `RetrieverProtocol`）作为未挂载外部检索插件时的默认兜底；使用可重入写锁 `_write_lock` 保护磁盘写入与 `audit.jsonl`；`remember_user_statement` 在流式轮内先写入 `(turn#<tag>)` 暂存标记，回合落库成功后经 `finalize_turn_fact` 升级为 `(msg#<id>)`，中断或 `StreamError` 时回滚清理；
@@ -261,7 +262,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `233 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `247 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

@@ -87,8 +87,60 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
-# 处理终端本地快捷命令（/status、/memory、/search、/refresh），不消耗模型 Token
+# 处理 /rag 快捷子命令（status 查看父子索引状态；enrich 复用轻量模型离线补全父块上下文摘要并支持 Ctrl+C 断点续跑）
+def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
+    parts = text.split()
+    if len(parts) > 3:
+        return "用法：/rag status [目录] 或 /rag enrich [目录]"
+    sub = parts[1].lower() if len(parts) >= 2 else "status"
+    root = parts[2] if len(parts) >= 3 else "data/memory"
+    retriever = app.memory.retriever
+
+    if sub == "status":
+        status_fn = getattr(retriever, "index_status", None)
+        if not callable(status_fn):
+            return f"当前检索引擎（{getattr(retriever, 'name', 'unknown')}）未启用持久化 RAG 索引。"
+        try:
+            return json.dumps(status_fn(app.memory, root=root), ensure_ascii=False, indent=2)
+        except Exception as error:  # noqa: BLE001
+            return f"查询 /rag status 失败：{error}"
+
+    if sub == "enrich":
+        enrich_fn = getattr(retriever, "enrich_contexts", None)
+        if not callable(enrich_fn):
+            return f"当前检索引擎（{getattr(retriever, 'name', 'unknown')}）不支持离线上下文摘要补全。"
+        enrich_llm = app.consolidator.llm
+        if isinstance(enrich_llm, NoopModelClient):
+            return "未配置可用大模型，无法执行离线上下文摘要补全。请先运行 setup 配置模型。"
+        raw_model = getattr(enrich_llm, "model", None) or getattr(app, "_consolidator_model", None) or "default"
+        model_name = str(raw_model).strip() or "default"
+        try:
+            with _sigint_to_abort(app, chat_id) as abort_sig:
+                stats = enrich_fn(
+                    app.memory,
+                    enrich_llm,
+                    root=root,
+                    model_name=model_name,
+                    abort_signal=abort_sig,
+                )
+        except (KeyboardInterrupt, StreamAbortedError):
+            return "已中止离线上下文补全；已完成片段的摘要已保存至缓存，下次执行将自动续跑。"
+        except LLMNotConfigured as error:
+            return f"离线上下文补全未就绪：{error}"
+        except Exception as error:  # noqa: BLE001
+            return f"执行 /rag enrich 失败：{error}"
+        return (
+            f"离线上下文补全完成（目录：{root}，模型：{model_name}）："
+            f"扫描 {stats['files']} 篇文档、{stats['parents_total']} 个父块；"
+            f"新生成 {stats['enriched']} 条，复用缓存 {stats['cached_hits']} 条，跳过 {stats['skipped']} 条。"
+        )
+
+    return "用法：/rag status [目录] 或 /rag enrich [目录]"
+
+
+# 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh），不消耗模型 Token（/rag enrich 除外）
 def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> str | None:
+    head = text.split(None, 1)[0] if text.strip() else ""
     if text == "/status":
         return json.dumps(app.status(), ensure_ascii=False, indent=2)
     if text == "/memory":
@@ -96,9 +148,11 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     if text == "/refresh":
         app.reset_session_prompt(chat_id)
         return "已清空当前会话冻结的系统提示词，下一轮将重新加载最新规则与 MEMORY.md 索引。"
-    if text.startswith("/search "):
-        query = text.removeprefix("/search ").strip()
-        return app.search(query) if query else "用法：/search <关键词>"
+    if head == "/rag":
+        return _handle_rag_command(app, text, chat_id)
+    if head == "/search":
+        rest = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+        return app.search(rest) if rest else "用法：/search <关键词>"
     return None
 
 
@@ -199,7 +253,7 @@ def run_repl(
     active_app = app or build_app(llm=llm)
     try:
         tool_names = ", ".join(active_app.tools.names)
-        print(f"My Helper REPL（可用工具：{tool_names}；命令：/status /memory /search /refresh；exit 退出）")
+        print(f"My Helper REPL（可用工具：{tool_names}；命令：/status /memory /search /rag /refresh；exit 退出）")
         while True:
             try:
                 user_text = input("\n你> ").strip()
@@ -210,7 +264,11 @@ def run_repl(
                 continue
             if user_text.lower() in {"exit", "quit", "/quit"}:
                 break
-            cmd_reply = _handle_repl_command(active_app, user_text, chat_id=chat_id)
+            try:
+                cmd_reply = _handle_repl_command(active_app, user_text, chat_id=chat_id)
+            except Exception as error:  # noqa: BLE001
+                print(f"助手> 命令执行出错：{error}")
+                continue
             if cmd_reply is not None:
                 print(f"助手>\n{cmd_reply}")
                 continue
