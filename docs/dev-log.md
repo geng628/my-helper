@@ -351,6 +351,22 @@
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
 - **已知边界与下一步**：Embedding 权重微调训练本身需在有 GPU 与 `sentence-transformers` 的外部环境执行（不纳入主包运行依赖）；下一步可进入 **RAG Step 3（检索后优化：Rerank 精排、相关性门控与防中间遗忘重排）**。
 
+### [2026-11-28] RAG Step 3：检索后增强（Cross-Encoder `/v1/rerank` 精排、跨文档去重与句级上下文压缩、Lost-in-the-Middle 重排与 CRAG 相关性校验兜底）（Issue `#111`，本次提交）
+- **背景与目标**：补齐 RAG 全链路最后一块高性价比提分拼图——检索后精排与降噪：① 粗排阶段召回 Top-50 合法候选后，使用 Cross-Encoder 精排取 Top-5~10 并按 `min_rerank_score` 剪枝；② 跨文档/跨分块合并近重复片段、裁剪冗长段落无关句子并支持可选 Lost-in-the-Middle 头尾重排；③ 落地 CRAG / Self-RAG 相关性三级自检，低相关时最多触发 1 次纠错改写重查（严守同一权限/元数据过滤器），仍不足则明确清空低质噪声并触发白名单数据源切换或拒答保护，从源头压低幻觉。
+- **核心改动**：
+  - **Layer 1 标准 `/v1/rerank` 客户端与同源校验共享收口（新增 [../personal_assistant/ai/rerank.py](../personal_assistant/ai/rerank.py)，精简 [../personal_assistant/ai/providers/http.py](../personal_assistant/ai/providers/http.py) 与 [../personal_assistant/ai/embeddings.py](../personal_assistant/ai/embeddings.py)）**：将 `http_origin`/`is_local_base_url`/`same_http_origin` 抽入 `providers/http.py` 单一实现（消除 `embeddings.py` 重复）；新增 `RerankResult`、`RerankInvoker`、`OpenAIRerankClient`（兼容硅基流动 BGE-Reranker / Cohere v1-v2 / Jina / vLLM / TEI 的 `relevance_score` 与 `score` 响应字段，严格拒绝越界/重复/非有限值，透传 `AbortSignal` 并脱敏密钥）与 `from_env_reranker()`（同源回退 `LLM_API_KEY` 绝不跨主机外泄）；[../tests/test_architecture.py](../tests/test_architecture.py) 锁死 `ai/rerank.py` 依赖边界；[../plugins/models_dsl.py](../plugins/models_dsl.py) 新增顶层 `reranker <名称>` 角色编译。
+  - **单轨检索后降噪与 CRAG 引擎（新增 [../personal_assistant/assistant/rag_postprocess.py](../personal_assistant/assistant/rag_postprocess.py)）**：零反向依赖 `memory.py`，提供 `PostRetrievalConfig` 严格校验、跨文档词元 Jaccard 近重复抑制（`deduplicate_hits`）、保留 `[背景:]`/`(表头)` 与原始行号的句/行级上下文抽取压缩（`compress_hits`，纯语义零字面重叠命中平滑保留句首）、Lost-in-the-Middle 头尾重排（`reorder_lost_in_middle`：`[0, 2, 4, ..., 3, 1]`）以及 CRAG 三级相关性评估（`evaluate_retrieval_sufficiency`：`correct`/`ambiguous`/`incorrect`，切源建议严格限于白名单已启用工具）与轻量 `reasoning="off"` 一次纠错改写（`corrective_rewrite_query`）。
+  - **全链路闭环集成（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../config/tools.json](../config/tools.json)、[../personal_assistant/assistant/commands.py](../personal_assistant/assistant/commands.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../evals/cli.py](../evals/cli.py)、[../tests/conftest.py](../tests/conftest.py)）**：
+    - `RAGRetriever` 支持 `rerank_candidates=50`、`min_rerank_score` 与锁外 `_rerank_hits()`（严格在 SQLite 元数据/权限/过期前置硬过滤**之后**调用外部重排器，机密文档零外发；瞬时故障优雅回退粗排、取消信号严格穿透）；`index_status` 新增 `reranker_model` 与 `rerank_candidates`；
+    - `ToolsConfig` 新增 `build_reranker()`（无 `models.dsl` 时拒绝把对话预设名误作重排模型）与 `build_post_retrieval_config()`；`AssistantApp` 保持注入 `llm` 离线隔离并支持 `reload_llm` 热切换、`status()["reranker"]` 与 `smart_search` 端到端 CRAG 1 次纠错重查/切源/拒答保护；
+    - `builtin_tools.search_markdown` 自动应用去重、句级压缩与可选头尾重排；CLI 新增 `--reranker-model` 并在 `/rag query` 展示 `【CRAG】` 状态；`evals --mode search` 新增可选 `--reranker`。
+  - **测试覆盖**：新增 [../tests/test_rag_post_retrieval.py](../tests/test_rag_post_retrieval.py)（12 个全链路单测覆盖 `/v1/rerank` 协议/安全/取消、`models.dsl` `reranker` 角色、粗排 Top-50→Cross-Encoder 精排与机密文档零外发、去重/句级压缩/头尾重排、CRAG 三级评估与白名单切源/拒答、`smart_search` 1 次改写上限、工具去重与 `evals --reranker` 参数校验）。
+- **验证与同口径对比（`2d14fbe` → 本次提交）**：
+  - 单元测试：`267 passed → 279 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py` `597 <= 600` 行预算）；
+  - 离线检索基准（默认未配外部 `reranker` 口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（Recall `0.6716`、MRR `0.6307`、Quote `0.6066`，零退步）；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
+- **已知边界与下一步**：Cross-Encoder 重排默认需用户在 `config/models.dsl` 配置 `reranker <名称>` 或设置 `RERANK_MODEL` 激活；`lost_in_middle_reorder` 默认 `false`（保护 MRR 排序基准与直觉顺序，可在 `config/tools.json` 随时开启）。至此 RAG 全流程（索引期分块/摘要 → 检索前 Query 优化 → 检索中混合召回/前置过滤/微调闭环 → 检索后精排/压缩/CRAG 兜底）已全栈落地。
+
 ---
 
 ## 六、后续迭代追加记录模板

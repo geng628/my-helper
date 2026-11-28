@@ -27,11 +27,14 @@ from personal_assistant.ai import (
     EmbeddingInvoker,
     ModelInvoker,
     ModelsConfig,
+    RerankInvoker,
     default_registry,
     from_embedding_profile,
     from_env,
     from_env_embedder,
+    from_env_reranker,
     from_model_profile,
+    from_rerank_profile,
 )
 from personal_assistant.assistant.common import (
     REPO_ROOT,
@@ -44,6 +47,7 @@ from personal_assistant.assistant.query_optimizer import (
     QueryOptimizer,
 )
 from personal_assistant.assistant.rag_metadata import parse_allowed_access
+from personal_assistant.assistant.rag_postprocess import PostRetrievalConfig
 
 COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 PLACEHOLDER_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
@@ -338,6 +342,7 @@ class ToolsConfig:
         if not isinstance(retrieval_raw, dict):
             raise ValueError("retrieval 必须是 JSON 对象。")
         QueryOptimizationConfig.from_dict(retrieval_raw.get("query_optimization"))
+        PostRetrievalConfig.from_dict(retrieval_raw.get("post_retrieval"))
         parse_allowed_access(retrieval_raw.get("allowed_access"))
 
         telemetry_raw = raw.get("telemetry", {})
@@ -607,6 +612,55 @@ class ToolsConfig:
             if role_target:
                 return from_embedding_profile(resolved_cfg.get_profile(role_target), env=source_env)
         return from_env_embedder(source_env)
+
+    # 按「显式参数 > ModelsConfig.roles['reranker'] > 环境变量 RERANK_MODEL > None」构造可选精排客户端
+    def build_reranker(
+        self,
+        config_dir: Path | None = None,
+        *,
+        model_name: str | None = None,
+        env: Mapping[str, str] | None = None,
+        models_cfg: ModelsConfig | None = None,
+        allow_load_config: bool = True,
+    ) -> RerankInvoker | None:
+        clean_name = (model_name or "").strip() or None
+        source_env = os.environ if env is None else env
+        resolved_cfg = (
+            models_cfg
+            if models_cfg is not None
+            else (self.load_models_config(config_dir) if allow_load_config else None)
+        )
+        if clean_name is not None:
+            if resolved_cfg is not None:
+                target = clean_name
+                if target not in resolved_cfg.models:
+                    preset = self._match_preset(target)
+                    preset_id = str(preset.get("id") or "").strip() if preset is not None else ""
+                    if preset_id and preset_id in resolved_cfg.models:
+                        target = preset_id
+                return from_rerank_profile(resolved_cfg.get_profile(target), env=source_env)
+            matched_chat_preset = self._match_preset(clean_name)
+            if matched_chat_preset is not None:
+                raise ValueError(
+                    f"未找到 models.dsl；{clean_name!r} 是对话厂商预设名（默认对话模型为 "
+                    f"{matched_chat_preset.get('default_model')!r}），不能直接作为重排模型。"
+                    "请在 config/models.dsl 中定义重排模型并用 `reranker <名称>` 绑定，或直接传入具体重排模型 ID。"
+                )
+            merged = dict(source_env)
+            merged["RERANK_MODEL"] = clean_name
+            return from_env_reranker(merged)
+        if resolved_cfg is not None:
+            role_target = resolved_cfg.roles.get("reranker")
+            if role_target:
+                return from_rerank_profile(resolved_cfg.get_profile(role_target), env=source_env)
+        return from_env_reranker(source_env)
+
+    # 根据 retrieval.post_retrieval 配置构造检索后去重、上下文压缩与 CRAG 配置对象
+    def build_post_retrieval_config(self) -> PostRetrievalConfig:
+        raw_post = self.retrieval.get("post_retrieval")
+        if raw_post is not None and not isinstance(raw_post, Mapping):
+            raise ValueError("retrieval.post_retrieval 必须是 JSON 对象。")
+        return PostRetrievalConfig.from_dict(raw_post)
 
     # 返回系统级文档访问权限白名单（对应 retrieval.allowed_access，默认 ("public",)）
     @property

@@ -92,6 +92,13 @@ from personal_assistant.ai.registry import (
     stream,
     stream_simple,
 )
+from personal_assistant.ai.rerank import (
+    OpenAIRerankClient,
+    RerankInvoker,
+    RerankResult,
+    from_env_reranker,
+    from_rerank_profile,
+)
 
 register_builtin_providers(default_registry())
 
@@ -124,8 +131,11 @@ __all__ = [
     "OpenAICompletionsProvider",
     "OpenAIEmbeddingClient",
     "OpenAIReasoningProvider",
+    "OpenAIRerankClient",
     "PostJson",
     "PostStream",
+    "RerankInvoker",
+    "RerankResult",
     "StopReason",
     "StreamAbortedError",
     "StreamDone",
@@ -165,7 +175,9 @@ __all__ = [
     "from_embedding_profile",
     "from_env",
     "from_env_embedder",
+    "from_env_reranker",
     "from_model_profile",
+    "from_rerank_profile",
     "iter_sse_events",
     "normalize_vector",
     "pack_vector",

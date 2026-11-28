@@ -274,13 +274,14 @@ class ModelDecl:
     col: int
 
 
-# 顶层 DSL 程序 AST 节点（可选 default / consolidator / embedder 声明 + 全部 model 块）
+# 顶层 DSL 程序 AST 节点（可选 default / consolidator / embedder / reranker 声明 + 全部 model 块）
 @dataclass(frozen=True)
 class ModelsDSLProgram:
     default_model: tuple[str, int, int] | None
     models: tuple[ModelDecl, ...]
     consolidator_model: tuple[str, int, int] | None = None
     embedder_model: tuple[str, int, int] | None = None
+    reranker_model: tuple[str, int, int] | None = None
 
 
 # 词法分析器：支持 # 注释、单双引号字符串、免引号裸值（URL/密钥/数字）与花括号块
@@ -420,6 +421,7 @@ class _DSLParser:
         default_decl: tuple[str, int, int] | None = None
         consolidator_decl: tuple[str, int, int] | None = None
         embedder_decl: tuple[str, int, int] | None = None
+        reranker_decl: tuple[str, int, int] | None = None
         models: list[ModelDecl] = []
 
         self._skip_newlines()
@@ -427,7 +429,7 @@ class _DSLParser:
             tok = self._peek()
             if tok.kind != "WORD":
                 raise DSLCompileError(
-                    f"顶层期望 use、add、default、consolidator、embedder 或 model 声明，实际遇到 {tok.value!r}。",
+                    f"顶层期望 use、add、default、consolidator、embedder、reranker 或 model 声明，实际遇到 {tok.value!r}。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -453,6 +455,13 @@ class _DSLParser:
                     raise DSLCompileError("不允许重复声明 embedder。", source=self._source, line=tok.line, col=tok.col)
                 embedder_decl = (target.value, target.line, target.col)
                 self._expect_line_end()
+            elif tok.value == "reranker":
+                self._advance()
+                target = self._expect("WORD", "reranker 后必须指定精排重排模型名称。")
+                if reranker_decl is not None:
+                    raise DSLCompileError("不允许重复声明 reranker。", source=self._source, line=tok.line, col=tok.col)
+                reranker_decl = (target.value, target.line, target.col)
+                self._expect_line_end()
             elif tok.value in {"use", "add"}:
                 decl, is_default = self._parse_preset_line()
                 models.append(decl)
@@ -469,7 +478,7 @@ class _DSLParser:
                 models.append(self._parse_model_block())
             else:
                 raise DSLCompileError(
-                    f"未知顶层指令 {tok.value!r}（支持 use、add、default、consolidator、embedder 与 model）。",
+                    f"未知顶层指令 {tok.value!r}（支持 use、add、default、consolidator、embedder、reranker 与 model）。",
                     source=self._source,
                     line=tok.line,
                     col=tok.col,
@@ -481,6 +490,7 @@ class _DSLParser:
             models=tuple(models),
             consolidator_model=consolidator_decl,
             embedder_model=embedder_decl,
+            reranker_model=reranker_decl,
         )
 
     # 解析极简一行预设语句：`use/add <厂商> [模型名] [api_key]`，自动展开为完整 ModelDecl AST
@@ -769,6 +779,13 @@ def compile_models_dsl(text: str, source: str = "models.dsl") -> dict[str, objec
             program.embedder_model,
             emitted_models,
             directive="embedder",
+            source=source,
+        )
+    if program.reranker_model is not None:
+        roles["reranker"] = _resolve_target_model(
+            program.reranker_model,
+            emitted_models,
+            directive="reranker",
             source=source,
         )
     if roles:

@@ -16,6 +16,7 @@ from personal_assistant.assistant.query_optimizer import (
     fuse_multi_query_hits,
 )
 from personal_assistant.assistant.rag_metadata import parse_filter_string
+from personal_assistant.assistant.rag_postprocess import PostRetrievalConfig, apply_post_retrieval
 from personal_assistant.assistant.text_search import tokenize_text
 
 
@@ -46,8 +47,14 @@ class MemoryToolsetProvider(ToolsetProvider):
     # 按统一契约构建 6 个记忆与文件操作 Tool 值对象（带 risk 元数据与执行期上下文签名）
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         memory = self.memory
+        raw_post_cfg = context.get("post_retrieval_config") if context is not None else None
+        post_cfg = (
+            raw_post_cfg
+            if isinstance(raw_post_cfg, PostRetrievalConfig)
+            else PostRetrievalConfig()
+        )
 
-        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF、前置元数据硬过滤（权限由系统侧 allowed_access 锁死）与 AbortSignal
+        # 适配 search_markdown 工具：支持多子查询 RRF、前置元数据/权限硬过滤、去重上下文压缩与 AbortSignal
         def search_markdown(
             query: str,
             root: str = "data/memory",
@@ -106,43 +113,48 @@ class MemoryToolsetProvider(ToolsetProvider):
                         today=parsed_today,
                         hyde_texts=hyde_map,
                         metadata_filter=meta_filter,
+                        rerank_query=clean_query,
                         abort_signal=abort_signal,
                     )
                 )
-                return format_search_hits(hits, query="；".join(all_queries), root=root)
-            if len(all_queries) == 1:
-                return memory.search_markdown(
-                    all_queries[0],
-                    root=root,
-                    today=parsed_today,
-                    metadata_filter=meta_filter,
-                )
-
-            # 非 RAGRetriever（如 LinearRetriever）多子查询兜底：先校验目录，再按子查询隔离空词异常并 RRF 融合
-            target_dir = memory.resolve_path(root, write=False)
-            if not target_dir.is_dir():
-                raise ValueError(f"目录不存在：{root}")
-            hit_lists = []
-            last_val_err: ValueError | None = None
-            for sub_q in all_queries:
-                if abort_signal is not None and abort_signal.aborted:
-                    raise StreamAbortedError(abort_signal.reason or "检索已取消")
-                try:
-                    hit_lists.append(
-                        memory.search_hits(
-                            sub_q,
-                            root=root,
-                            limit=20,
-                            today=parsed_today,
-                            metadata_filter=meta_filter,
-                        )
+            elif len(all_queries) == 1:
+                hits = list(
+                    memory.search_hits(
+                        all_queries[0],
+                        root=root,
+                        limit=10,
+                        today=parsed_today,
+                        metadata_filter=meta_filter,
                     )
-                except ValueError as error:
-                    last_val_err = error
-            if not hit_lists and last_val_err is not None:
-                raise last_val_err
-            hits = fuse_multi_query_hits(hit_lists, limit=10)
-            return format_search_hits(hits, query="；".join(all_queries), root=root)
+                )
+            else:
+                # 非 RAGRetriever（如 LinearRetriever）多子查询兜底：先校验目录，再按子查询隔离空词异常并 RRF 融合
+                target_dir = memory.resolve_path(root, write=False)
+                if not target_dir.is_dir():
+                    raise ValueError(f"目录不存在：{root}")
+                hit_lists = []
+                last_val_err: ValueError | None = None
+                for sub_q in all_queries:
+                    if abort_signal is not None and abort_signal.aborted:
+                        raise StreamAbortedError(abort_signal.reason or "检索已取消")
+                    try:
+                        hit_lists.append(
+                            memory.search_hits(
+                                sub_q,
+                                root=root,
+                                limit=20,
+                                today=parsed_today,
+                                metadata_filter=meta_filter,
+                            )
+                        )
+                    except ValueError as error:
+                        last_val_err = error
+                if not hit_lists and last_val_err is not None:
+                    raise last_val_err
+                hits = fuse_multi_query_hits(hit_lists, limit=10)
+
+            refined = apply_post_retrieval(hits, clean_query, config=post_cfg)
+            return format_search_hits(refined, query="；".join(all_queries), root=root)
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:

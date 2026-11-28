@@ -195,6 +195,20 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
         )
         if hyde_doc:
             lines.append(f"【HyDE】{hyde_doc}")
+        crag = res.get("crag")
+        if isinstance(crag, dict):
+            verdict = str(crag.get("verdict") or "")
+            action = str(crag.get("action") or "")
+            attempts = crag.get("attempts", 1)
+            crag_extra: list[str] = [f"verdict={verdict}", f"action={action}", f"attempts={attempts}"]
+            if crag.get("rewritten_query"):
+                crag_extra.append(f"改写重查={crag['rewritten_query']}")
+            if crag.get("suggested_sources"):
+                srcs = ", ".join(str(s) for s in crag["suggested_sources"])
+                crag_extra.append(f"建议切源={srcs}")
+            if crag.get("reason"):
+                crag_extra.append(f"原因={crag['reason']}")
+            lines.append("【CRAG】" + " | ".join(crag_extra))
         if needs_ret and "docs" in routes:
             lines.append("\n【命中文档】\n" + (rendered or "（无命中结果）"))
         else:
@@ -512,6 +526,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model", default=None, help="指定 models.dsl / models.json 中定义的模型档案名称")
     parser.add_argument("--consolidator-model", default=None, help="指定后台记忆沉淀专用模型档案名称")
     parser.add_argument("--embedder-model", default=None, help="指定 RAG 向量嵌入模型档案名称")
+    parser.add_argument("--reranker-model", default=None, help="指定 RAG Cross-Encoder 精排模型档案名称")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="在终端运行最小 ReAct 对话循环")
     subparsers.add_parser("setup", help="10 秒零代码交互式向导：选厂商 + 贴密钥，自动生成模型配置")
@@ -541,6 +556,7 @@ def main(argv: list[str] | None = None) -> None:
             model_name=args.model,
             consolidator_model=args.consolidator_model,
             embedder_model=args.embedder_model,
+            reranker_model=args.reranker_model,
         )
         try:
             if isinstance(app.llm, NoopModelClient):

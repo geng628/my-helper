@@ -32,6 +32,7 @@ from personal_assistant.ai import (
     ModelInvoker,
     ModelsConfig,
     NoopModelClient,
+    RerankInvoker,
     StreamAbortedError,
     StreamDone,
     StreamError,
@@ -72,6 +73,16 @@ from personal_assistant.assistant.query_optimizer import (
     fuse_multi_query_hits,
 )
 from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_allowed_access
+from personal_assistant.assistant.rag_postprocess import (
+    CRAGAssessment,
+    PostRetrievalConfig,
+    apply_post_retrieval,
+    compress_hits,
+    corrective_rewrite_query,
+    deduplicate_hits,
+    evaluate_retrieval_sufficiency,
+    reorder_lost_in_middle,
+)
 
 MAX_SESSION_LOCKS = 256
 
@@ -292,13 +303,16 @@ class AssistantApp:
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: ModelInvoker | None = None,
         embedder: EmbeddingInvoker | None = None,
+        reranker: RerankInvoker | None = None,
         query_optimizer: QueryOptimizer | None = None,
+        post_retrieval_config: PostRetrievalConfig | None = None,
         allowed_access: Sequence[str] | None = None,
         auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
         consolidator_model: str | None = None,
         embedder_model: str | None = None,
+        reranker_model: str | None = None,
         observers: Iterable[ObserverProtocol] | None = None,
         max_turn_steps: int = 24,
         max_turn_tokens: int = 250_000,
@@ -363,11 +377,13 @@ class AssistantApp:
         cfg_dir = self.config_path.parent if self.config_path is not None else None
         clean_cons_model = (consolidator_model or "").strip() or None
         clean_embed_model = (embedder_model or "").strip() or None
-        # 与 consolidator_llm 对称：显式注入 llm 且未指定 embedder_model 时保持离线隔离，不强读磁盘 models.dsl 或环境外网 embedder
+        clean_rerank_model = (reranker_model or "").strip() or None
+        # 与 consolidator_llm 对称：显式注入 llm 且未指定外挂模型名时保持离线隔离，不强读磁盘 models.dsl 或环境外网配置
         need_models_cfg = cfg_dir is not None and (
             llm is None
             or (consolidator_llm is None and clean_cons_model is not None)
             or (embedder is None and clean_embed_model is not None)
+            or (reranker is None and clean_rerank_model is not None)
         )
         models_cfg = self.tools_config.load_models_config(cfg_dir) if need_models_cfg else None
 
@@ -389,6 +405,25 @@ class AssistantApp:
             set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)
         ):
             set_emb_fn(self.embedder)
+
+        self._reranker_model = clean_rerank_model
+        self._custom_reranker = reranker is not None
+        existing_ret_rr = getattr(self.memory.retriever, "reranker", None) if memory is not None else None
+        if reranker is not None:
+            self.reranker: RerankInvoker | None = reranker
+        elif llm is not None and clean_rerank_model is None:
+            self.reranker = existing_ret_rr if isinstance(existing_ret_rr, RerankInvoker) else None
+        else:
+            self.reranker = self.tools_config.build_reranker(
+                cfg_dir,
+                model_name=clean_rerank_model,
+                models_cfg=models_cfg,
+                allow_load_config=need_models_cfg,
+            )
+        if (reranker is not None or memory is None or clean_rerank_model is not None) and callable(
+            set_rr_fn := getattr(self.memory.retriever, "set_reranker", None)
+        ):
+            set_rr_fn(self.reranker)
 
         self.llm = (
             llm
@@ -437,6 +472,11 @@ class AssistantApp:
         self.query_optimizer = (
             query_optimizer if query_optimizer is not None else self.tools_config.build_query_optimizer()
         )
+        self.post_retrieval_config: PostRetrievalConfig = (
+            post_retrieval_config
+            if post_retrieval_config is not None
+            else self.tools_config.build_post_retrieval_config()
+        )
         self.allowed_access: tuple[str, ...] = (
             parse_allowed_access(allowed_access)
             if allowed_access is not None
@@ -475,13 +515,14 @@ class AssistantApp:
             "llm_configured": not isinstance(self.llm, NoopModelClient),
         }
 
-    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型、后台沉淀与向量嵌入客户端（单次编译，失败零污染）
+    # 按最新 models.dsl / models.json 原子热切换当前运行中的主模型、后台沉淀、向量嵌入与精排客户端（单次编译，失败零污染）
     def reload_llm(
         self,
         model_name: str | None = None,
         *,
         consolidator_model: str | None = None,
         embedder_model: str | None = None,
+        reranker_model: str | None = None,
         models_cfg: ModelsConfig | None = None,
     ) -> None:
         with self._llm_lock:
@@ -494,6 +535,11 @@ class AssistantApp:
                 self._embedder_model
                 if embedder_model is None
                 else (embedder_model.strip() or None)
+            )
+            next_rerank_model = (
+                self._reranker_model
+                if reranker_model is None
+                else (reranker_model.strip() or None)
             )
             cfg_dir = self.config_path.parent if self.config_path is not None else None
             resolved_cfg = (
@@ -525,8 +571,18 @@ class AssistantApp:
                     models_cfg=resolved_cfg,
                 )
             )
+            new_reranker = (
+                self.reranker
+                if self._custom_reranker
+                else self.tools_config.build_reranker(
+                    cfg_dir,
+                    model_name=next_rerank_model,
+                    models_cfg=resolved_cfg,
+                )
+            )
             self._consolidator_model = next_cons_model
             self._embedder_model = next_embed_model
+            self._reranker_model = next_rerank_model
             self.llm = new_llm
             if not self._custom_consolidator_llm:
                 self.consolidator.llm = new_cons_llm
@@ -534,6 +590,10 @@ class AssistantApp:
                 self.embedder = new_embedder
                 if callable(set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)):
                     set_emb_fn(self.embedder)
+            if not self._custom_reranker:
+                self.reranker = new_reranker
+                if callable(set_rr_fn := getattr(self.memory.retriever, "set_reranker", None)):
+                    set_rr_fn(self.reranker)
 
     # 零代码自动生成 models.dsl 与 models.json（0600 权限）并立即热生效，返回脱敏摘要
     def configure_model(
@@ -562,6 +622,7 @@ class AssistantApp:
                 model_name=models_cfg.default,
                 consolidator_model="",
                 embedder_model="",
+                reranker_model="",
                 models_cfg=models_cfg,
             )
             return models_cfg.redacted_dict()
@@ -614,6 +675,7 @@ class AssistantApp:
             tool_context={
                 "history_db_path": self.state.db_path,
                 "allowed_access": self.allowed_access,
+                "post_retrieval_config": self.post_retrieval_config,
             },
         )
 
@@ -1003,6 +1065,76 @@ class AssistantApp:
         raw_weight = getattr(getattr(retriever, "config", None), "vector_weight", 0.0)
         return isinstance(raw_weight, (int, float)) and not isinstance(raw_weight, bool) and float(raw_weight) > 0.0
 
+    # 判断当前检索引擎是否已激活 Cross-Encoder 精排器
+    def _has_reranker(self) -> bool:
+        ret_rr = getattr(self.memory.retriever, "reranker", None)
+        if ret_rr is None:
+            return False
+        return bool(str(getattr(ret_rr, "model_id", "") or "").strip())
+
+    # 统一执行本地知识库单/多查询检索（供 smart_search 首查与 CRAG 纠错重查复用，严守同一权限/元数据过滤器）
+    def _retrieve_docs_for_queries(
+        self,
+        queries: Sequence[str],
+        *,
+        root: str,
+        limit: int,
+        ref_day: date,
+        metadata_filter: MetadataFilter,
+        hyde_map: dict[str, str] | None = None,
+        rerank_query: str | None = None,
+        abort_signal: AbortSignal | None = None,
+    ) -> list[SearchHit]:
+        multi_fn = getattr(self.memory.retriever, "search_multi_hits", None)
+        if callable(multi_fn):
+            return list(
+                multi_fn(
+                    self.memory,
+                    queries,
+                    root=root,
+                    limit=limit,
+                    today=ref_day,
+                    hyde_texts=hyde_map,
+                    metadata_filter=metadata_filter,
+                    rerank_query=rerank_query,
+                    abort_signal=abort_signal,
+                )
+            )
+        target_dir = self.memory.resolve_path(root, write=False)
+        if not target_dir.is_dir():
+            raise ValueError(f"目录不存在：{root}")
+        if limit <= 0 or metadata_filter.is_unsatisfiable:
+            return []
+        if len(queries) == 1:
+            return self.memory.search_hits(
+                queries[0],
+                root=root,
+                limit=limit,
+                today=ref_day,
+                metadata_filter=metadata_filter,
+            )
+        per_q_limit = max(limit * 2, 10)
+        hit_lists: list[list[SearchHit]] = []
+        last_val_err: ValueError | None = None
+        for sub_q in queries:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "检索已取消")
+            try:
+                hit_lists.append(
+                    self.memory.search_hits(
+                        sub_q,
+                        root=root,
+                        limit=per_q_limit,
+                        today=ref_day,
+                        metadata_filter=metadata_filter,
+                    )
+                )
+            except ValueError as error:
+                last_val_err = error
+        if not hit_lists and last_val_err is not None:
+            raise last_val_err
+        return fuse_multi_query_hits(hit_lists, limit=limit)
+
     # 对单条用户查询执行检索前优化规划（路由 + 多轮指代改写 + 多查询扩展/拆解 + 条件 HyDE）
     def optimize_query(
         self,
@@ -1056,9 +1188,17 @@ class AssistantApp:
                 allowed={"direct", "docs"},
                 reason="access_denied",
             )
+            denied_crag = CRAGAssessment(
+                verdict="incorrect",
+                action="abstain",
+                max_score=0.0,
+                attempts=0,
+                reason="access_denied",
+            )
             return {
                 "plan": empty_plan.to_dict(),
                 "filter": active_filter.describe(),
+                "crag": denied_crag.to_dict(),
                 "hits": [],
                 "rendered": format_search_hits([], query=clean_q, root=root),
             }
@@ -1071,68 +1211,141 @@ class AssistantApp:
         ref_day = today or self._today()
         hits: list[SearchHit] = []
         rendered = ""
+        crag_assessment: CRAGAssessment | None = None
         if plan.route.needs_retrieval and "docs" in plan.route.routes:
             if abort_signal is not None and abort_signal.aborted:
                 raise StreamAbortedError(abort_signal.reason or "检索已取消")
             queries = list(plan.expansion.sub_queries) or [plan.rewritten_query]
+            base_query = plan.rewritten_query or queries[0]
             hyde_map = (
                 {q: plan.hyde_document for q in queries}
                 if (plan.hyde_document and plan.expansion.strategy != "decompose")
                 else None
             )
-            multi_fn = getattr(self.memory.retriever, "search_multi_hits", None)
-            if callable(multi_fn):
-                hits = list(
-                    multi_fn(
-                        self.memory,
-                        queries,
-                        root=root,
-                        limit=limit,
-                        today=ref_day,
-                        hyde_texts=hyde_map,
-                        metadata_filter=active_filter,
-                        abort_signal=abort_signal,
-                    )
+            hits = self._retrieve_docs_for_queries(
+                queries,
+                root=root,
+                limit=limit,
+                ref_day=ref_day,
+                metadata_filter=active_filter,
+                hyde_map=hyde_map,
+                rerank_query=base_query,
+                abort_signal=abort_signal,
+            )
+            post_cfg = self.post_retrieval_config
+            hits = deduplicate_hits(hits, similarity_threshold=post_cfg.dedup_similarity)
+
+            if post_cfg.crag_enabled:
+                has_reranker = self._has_reranker()
+                has_dense = self._has_dense_retriever()
+                with self._llm_lock:
+                    crag_llm = self.consolidator.llm
+                can_rewrite = (
+                    post_cfg.max_corrective_rewrites >= 1
+                    and not isinstance(crag_llm, NoopModelClient)
                 )
-            else:
-                target_dir = self.memory.resolve_path(root, write=False)
-                if not target_dir.is_dir():
-                    raise ValueError(f"目录不存在：{root}")
-                if limit > 0 and not active_filter.is_unsatisfiable:
-                    if len(queries) > 1:
-                        per_q_limit = max(limit * 2, 10)
-                        hit_lists: list[list[SearchHit]] = []
-                        last_val_err: ValueError | None = None
-                        for sub_q in queries:
-                            if abort_signal is not None and abort_signal.aborted:
-                                raise StreamAbortedError(abort_signal.reason or "检索已取消")
-                            try:
-                                hit_lists.append(
-                                    self.memory.search_hits(
-                                        sub_q,
-                                        root=root,
-                                        limit=per_q_limit,
-                                        today=ref_day,
-                                        metadata_filter=active_filter,
-                                    )
-                                )
-                            except ValueError as error:
-                                last_val_err = error
-                        if not hit_lists and last_val_err is not None:
-                            raise last_val_err
-                        hits = fuse_multi_query_hits(hit_lists, limit=limit)
-                    else:
-                        hits = self.memory.search_hits(
-                            queries[0],
+                crag_assessment = evaluate_retrieval_sufficiency(
+                    base_query,
+                    hits,
+                    has_reranker=has_reranker,
+                    has_dense=has_dense,
+                    config=post_cfg,
+                    available_tools=self._tool_registry.names,
+                    allow_rewrite=can_rewrite,
+                    attempts=1,
+                )
+                if crag_assessment.action == "rewrite_retry":
+                    try:
+                        rewritten = corrective_rewrite_query(
+                            base_query,
+                            hits,
+                            crag_llm,
+                            abort_signal=abort_signal,
+                        )
+                    except StreamAbortedError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        rewritten = ""
+                    prior_lower = {q.lower() for q in queries} | {base_query.lower()}
+                    if rewritten and rewritten.lower() not in prior_lower:
+                        retry_hits = self._retrieve_docs_for_queries(
+                            [rewritten],
                             root=root,
                             limit=limit,
-                            today=ref_day,
+                            ref_day=ref_day,
                             metadata_filter=active_filter,
+                            rerank_query=rewritten,
+                            abort_signal=abort_signal,
                         )
-            rendered = format_search_hits(hits, query="；".join(queries), root=root)
+                        if retry_hits:
+                            if has_reranker:
+                                max_retry = max(h.score for h in retry_hits)
+                                max_init = max((h.score for h in hits), default=0.0)
+                                if max_retry >= max_init:
+                                    merged = list(retry_hits) + [
+                                        h for h in hits if h.score >= post_cfg.crag_low_threshold
+                                    ]
+                                else:
+                                    merged = sorted(
+                                        list(retry_hits) + list(hits),
+                                        key=lambda h: (-h.score, h.path, h.start_line),
+                                    )
+                            else:
+                                merged = list(retry_hits) + list(hits)
+                            hits = deduplicate_hits(
+                                merged, similarity_threshold=post_cfg.dedup_similarity
+                            )[:limit]
+                        crag_assessment = evaluate_retrieval_sufficiency(
+                            rewritten,
+                            hits,
+                            has_reranker=has_reranker,
+                            has_dense=has_dense,
+                            config=post_cfg,
+                            available_tools=self._tool_registry.names,
+                            allow_rewrite=False,
+                            attempts=2,
+                            rewritten_query=rewritten,
+                        )
+                    else:
+                        crag_assessment = evaluate_retrieval_sufficiency(
+                            base_query,
+                            hits,
+                            has_reranker=has_reranker,
+                            has_dense=has_dense,
+                            config=post_cfg,
+                            available_tools=self._tool_registry.names,
+                            allow_rewrite=False,
+                            attempts=1,
+                        )
+
+                if crag_assessment.verdict == "incorrect" and crag_assessment.action in {
+                    "switch_source",
+                    "abstain",
+                }:
+                    hits = []
+                    empty_msg = format_search_hits([], query="；".join(queries), root=root)
+                    notice = crag_assessment.format_notice()
+                    rendered = f"{notice}\n\n{empty_msg}" if notice else empty_msg
+                else:
+                    hits = compress_hits(
+                        hits,
+                        crag_assessment.rewritten_query or base_query,
+                        max_context_chars=post_cfg.max_context_chars,
+                        max_chars_per_hit=post_cfg.max_chars_per_hit,
+                        compress_long_hits=post_cfg.compress_long_hits,
+                    )
+                    if post_cfg.lost_in_middle_reorder:
+                        hits = reorder_lost_in_middle(hits)
+                    body = format_search_hits(hits, query="；".join(queries), root=root)
+                    notice = crag_assessment.format_notice()
+                    rendered = f"{notice}\n\n{body}" if notice else body
+            else:
+                hits = apply_post_retrieval(hits, base_query, config=post_cfg)
+                rendered = format_search_hits(hits, query="；".join(queries), root=root)
         return {
             "plan": plan.to_dict(),
             "filter": active_filter.describe(),
+            "crag": crag_assessment.to_dict() if crag_assessment is not None else None,
             "hits": [
                 {
                     "path": h.path,
@@ -1185,6 +1398,7 @@ class AssistantApp:
             "plugins": list(self.tools_config.plugins),
             "retriever": self.memory.retriever.name,
             "embedder": self.embedder.model_id if self.embedder is not None else None,
+            "reranker": self.reranker.model_id if self.reranker is not None else None,
             "allowed_access": list(self.allowed_access),
             "query_optimization": self.query_optimizer.config.enabled,
             "observers": [obs.name for obs in self.observers],
@@ -1204,6 +1418,7 @@ def build_app(
     model_name: str | None = None,
     consolidator_model: str | None = None,
     embedder_model: str | None = None,
+    reranker_model: str | None = None,
     auto_consolidate: bool = True,
 ) -> AssistantApp:
     data_dir = (data_root or Path(os.getenv("MY_HELPER_DATA", "data"))).resolve()
@@ -1222,5 +1437,6 @@ def build_app(
         model_name=model_name,
         consolidator_model=consolidator_model,
         embedder_model=embedder_model,
+        reranker_model=reranker_model,
         auto_consolidate=auto_consolidate,
     )

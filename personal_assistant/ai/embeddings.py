@@ -19,43 +19,15 @@ from personal_assistant.ai.providers.http import (
     PostJson,
     default_post_json,
     format_http_error,
+    http_origin as _http_origin,
+    is_local_base_url as _is_local_base_url,
     raise_if_aborted,
     redact_error_tokens,
+    same_http_origin as _same_http_origin,
 )
 
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
-_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _FLOAT32_MAX = 3.4028234663852886e38
-
-
-# 解析 HTTP(S) URL 的规范源三元组 (scheme, host, port)，非法或非 HTTP(S) 协议返回 None
-def _http_origin(url: str) -> tuple[str, str, int] | None:
-    parsed = urlsplit(url.strip())
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"}:
-        return None
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
-        return None
-    try:
-        port = parsed.port
-    except ValueError:
-        return None
-    effective_port = port if port is not None else (443 if scheme == "https" else 80)
-    return (scheme, host, effective_port)
-
-
-# 判断 base_url 是否指向本机 HTTP(S) 回环地址（如本地 Ollama，允许免 API Key 调用）
-def _is_local_base_url(base_url: str) -> bool:
-    origin = _http_origin(base_url)
-    return origin is not None and origin[1] in _LOCAL_HOSTS
-
-
-# 判断两个 HTTP(S) URL 是否严格同源（用于限制环境变量 API Key 回退，防止跨主机泄漏凭据）
-def _same_http_origin(url_a: str, url_b: str) -> bool:
-    origin_a = _http_origin(url_a)
-    origin_b = _http_origin(url_b)
-    return origin_a is not None and origin_a == origin_b
 
 
 # 校验并 L2 单位归一化原始浮点向量（通过最大幅值缩放彻底消除 1e200 上溢与 1e-200 下溢，拒绝空/零/布尔/NaN/Inf）
