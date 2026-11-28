@@ -87,11 +87,11 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
-# 处理 /rag 快捷子命令（status 查看父子索引状态；enrich 复用轻量模型离线补全父块上下文摘要并支持 Ctrl+C 断点续跑）
+# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文摘要；embed 离线批量计算向量缓存并支持 Ctrl+C 断点续跑）
 def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
     parts = text.split()
     if len(parts) > 3:
-        return "用法：/rag status [目录] 或 /rag enrich [目录]"
+        return "用法：/rag status [目录]、/rag enrich [目录] 或 /rag embed [目录]"
     sub = parts[1].lower() if len(parts) >= 2 else "status"
     root = parts[2] if len(parts) >= 3 else "data/memory"
     retriever = app.memory.retriever
@@ -135,7 +135,34 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
             f"新生成 {stats['enriched']} 条，复用缓存 {stats['cached_hits']} 条，跳过 {stats['skipped']} 条。"
         )
 
-    return "用法：/rag status [目录] 或 /rag enrich [目录]"
+    if sub == "embed":
+        embed_fn = getattr(retriever, "embed_chunks", None)
+        if not callable(embed_fn):
+            return f"当前检索引擎（{getattr(retriever, 'name', 'unknown')}）不支持向量化预计算。"
+        active_emb = app.embedder if app.embedder is not None else getattr(retriever, "embedder", None)
+        if active_emb is None:
+            return "未配置向量嵌入模型（embedder）。请在 config/models.dsl 中添加 `embedder <模型名>` 或设置 EMBEDDING_MODEL 环境变量。"
+        try:
+            with _sigint_to_abort(app, chat_id) as abort_sig:
+                stats = embed_fn(
+                    app.memory,
+                    root=root,
+                    embedder=active_emb,
+                    abort_signal=abort_sig,
+                )
+        except (KeyboardInterrupt, StreamAbortedError):
+            return "已中止批量向量化；已完成批次的向量已保存至缓存，下次执行将自动续跑。"
+        except LLMNotConfigured as error:
+            return f"向量化未就绪：{error}"
+        except Exception as error:  # noqa: BLE001
+            return f"执行 /rag embed 失败：{error}"
+        return (
+            f"向量化完成（目录：{root}，模型：{active_emb.model_id}，维度：{stats['dims']}）："
+            f"扫描 {stats['files']} 篇文档、{stats['children_total']} 个活跃子块；"
+            f"新生成 {stats['embedded']} 条，复用缓存 {stats['cached_hits']} 条，跳过 {stats['skipped']} 条。"
+        )
+
+    return "用法：/rag status [目录]、/rag enrich [目录] 或 /rag embed [目录]"
 
 
 # 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh），不消耗模型 Token（/rag enrich 除外）

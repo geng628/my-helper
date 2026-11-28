@@ -27,6 +27,7 @@ from personal_assistant.ai import (
     AssistantMessageEvent,
     CacheMonitor,
     Context,
+    EmbeddingInvoker,
     LLMNotConfigured,
     ModelInvoker,
     ModelsConfig,
@@ -282,10 +283,12 @@ class AssistantApp:
         state: StateStore | None = None,
         consolidation_policy: ConsolidationPolicy | None = None,
         consolidator_llm: ModelInvoker | None = None,
+        embedder: EmbeddingInvoker | None = None,
         auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
         consolidator_model: str | None = None,
+        embedder_model: str | None = None,
         observers: Iterable[ObserverProtocol] | None = None,
         max_turn_steps: int = 24,
         max_turn_tokens: int = 250_000,
@@ -349,10 +352,27 @@ class AssistantApp:
         self.state = state or StateStore(self.data_root / "state" / "chat_history.sqlite3")
         cfg_dir = self.config_path.parent if self.config_path is not None else None
         clean_cons_model = (consolidator_model or "").strip() or None
+        clean_embed_model = (embedder_model or "").strip() or None
         need_models_cfg = cfg_dir is not None and (
-            llm is None or (consolidator_llm is None and clean_cons_model is not None)
+            llm is None
+            or (consolidator_llm is None and clean_cons_model is not None)
+            or embedder is None
         )
         models_cfg = self.tools_config.load_models_config(cfg_dir) if need_models_cfg else None
+
+        self._embedder_model = clean_embed_model
+        self._custom_embedder = embedder is not None
+        self.embedder: EmbeddingInvoker | None = (
+            embedder
+            if embedder is not None
+            else self.tools_config.build_embedder(
+                cfg_dir,
+                model_name=clean_embed_model,
+                models_cfg=models_cfg,
+            )
+        )
+        if callable(set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)):
+            set_emb_fn(self.embedder)
 
         self.llm = (
             llm
@@ -466,10 +486,23 @@ class AssistantApp:
                     models_cfg=resolved_cfg,
                 )
             )
+            new_embedder = (
+                self.embedder
+                if self._custom_embedder
+                else self.tools_config.build_embedder(
+                    cfg_dir,
+                    model_name=self._embedder_model,
+                    models_cfg=resolved_cfg,
+                )
+            )
             self._consolidator_model = next_cons_model
             self.llm = new_llm
             if not self._custom_consolidator_llm:
                 self.consolidator.llm = new_cons_llm
+            if not self._custom_embedder:
+                self.embedder = new_embedder
+                if callable(set_emb_fn := getattr(self.memory.retriever, "set_embedder", None)):
+                    set_emb_fn(self.embedder)
 
     # 零代码自动生成 models.dsl 与 models.json（0600 权限）并立即热生效，返回脱敏摘要
     def configure_model(
@@ -902,6 +935,7 @@ class AssistantApp:
             "tools": self._tool_registry.names,
             "plugins": list(self.tools_config.plugins),
             "retriever": self.memory.retriever.name,
+            "embedder": self.embedder.model_id if self.embedder is not None else None,
             "observers": [obs.name for obs in self.observers],
             "telemetry": self._collect_telemetry(),
             "cache": self.cache_monitor.summary(),

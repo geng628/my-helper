@@ -82,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default="data/memory", help="search 模式检索根目录")
     parser.add_argument("--limit", type=int, default=5, help="search 模式 Top-K 数量")
     parser.add_argument("--retriever", default="auto", help="search 模式检索后端：auto（按 tools.json）/ linear / 插件名如 rag")
+    parser.add_argument("--embedder", default=None, help="search 模式可选向量嵌入模型（models.dsl 档案名或环境变量；省略时默认零网络纯词面评测）")
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")
@@ -138,6 +139,11 @@ def main(argv: list[str] | None = None) -> int:
                 if loaded_cfg is not None:
                     override = None if args.retriever == "auto" else args.retriever
                     retriever = loaded_cfg.build_retriever(override_name=override)
+                    if args.embedder and callable(set_emb := getattr(retriever, "set_embedder", None)):
+                        embedder = loaded_cfg.build_embedder(tools_cfg_path.parent, model_name=args.embedder)
+                        if embedder is None:
+                            raise ValueError(f"无法加载向量嵌入模型：{args.embedder!r}")
+                        set_emb(embedder)
                 elif args.retriever != "auto":
                     raise ValueError(f"无法加载检索插件 {args.retriever!r}：未找到配置文件 {tools_cfg_path}")
             memory = MemoryStore(data_dir, create_dirs=False, retriever=retriever)

@@ -101,13 +101,13 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与直连 http.client+TLS/DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
-│   ├── rag_retriever.py               # 持久化两层父子 RAG 检索插件（RetrieverProtocol：父子表 + 整句 Overlap + FTS5 + 上下文缓存）
-│   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/reasoning/cache_retention）
+│   ├── rag_retriever.py               # 持久化两层父子混合 RAG 检索插件（RetrieverProtocol：父子表 + FTS5 + float32 向量缓存 + RRF）
+│   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/consolidator/embedder/reasoning）
 │   └── telemetry.py                   # 有界 MRU 会话耗时拆解与后台任务观测插件（ObserverProtocol）
 ├── personal_assistant/                # 纯净三层产品包（绝不反向依赖 evals/）
 │   ├── __init__.py
 │   ├── __main__.py
-│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测）：
+│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测 + 向量客户端）：
 │   │   ├── __init__.py                #   统一导出并在导入期注册四大内建原生翻译器
 │   │   ├── protocol.py                #   第二层·零内部依赖事件与契约协议层
 │   │   ├── registry.py                #   第一层·统一前台入口、ApiProviderRegistry 与 ModelClient
@@ -118,7 +118,8 @@ my_helper_v2/
 │   │   │   ├── openai_reasoning.py    #     api="openai-reasoning" 翻译器（DeepSeek Reasoner/R1 等）
 │   │   │   ├── anthropic_messages.py  #     api="anthropic-messages" 原生翻译器
 │   │   │   └── google_genai.py        #     api="google-generative-ai" 原生翻译器
-│   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
+│   │   ├── cache.py                   #   中立 Context 有界 KV Cache 观测
+│   │   └── embeddings.py              #   标准 /v1/embeddings 客户端、float32 编解码与 math.sumprod 精确余弦
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
 │                                      #          rag_contextualizer.py / prompts.py / context.py / memory.py /
@@ -154,7 +155,7 @@ data/
 │   └── study/                         # 结构化 Markdown 学习知识卡片（<slug>.md）
 └── state/
     ├── chat_history.sqlite3           # 对话历史（messages）与滚动压缩游标（session_compactions）
-    └── rag_index.db                   # 独立持久化派生 RAG 索引（父子表/指纹/FTS5 与跨重建保留的 chunk_contexts，删库可无损重建）
+    └── rag_index.db                   # 独立持久化派生 RAG 索引（父子表/FTS5 与跨重建保留的 chunk_contexts / chunk_embeddings，删库可无损重建）
 ```
 
 ---
@@ -262,7 +263,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `247 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `255 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

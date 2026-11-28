@@ -24,10 +24,13 @@ from personal_assistant.agent.tools import (
 )
 from personal_assistant.ai import (
     ApiProviderRegistry,
+    EmbeddingInvoker,
     ModelInvoker,
     ModelsConfig,
     default_registry,
+    from_embedding_profile,
     from_env,
+    from_env_embedder,
     from_model_profile,
 )
 from personal_assistant.assistant.common import (
@@ -554,6 +557,44 @@ class ToolsConfig:
                 models_cfg=None,
             )
         return fallback_llm
+
+    # 按「显式参数 > ModelsConfig.roles['embedder'] > 环境变量 EMBEDDING_MODEL > None」构造可选向量化客户端
+    def build_embedder(
+        self,
+        config_dir: Path | None = None,
+        *,
+        model_name: str | None = None,
+        env: Mapping[str, str] | None = None,
+        models_cfg: ModelsConfig | None = None,
+    ) -> EmbeddingInvoker | None:
+        clean_name = (model_name or "").strip() or None
+        source_env = os.environ if env is None else env
+        resolved_cfg = models_cfg if models_cfg is not None else self.load_models_config(config_dir)
+        if clean_name is not None:
+            if resolved_cfg is not None:
+                target = clean_name
+                if target not in resolved_cfg.models:
+                    preset = self._match_preset(target)
+                    preset_id = str(preset.get("id") or "").strip() if preset is not None else ""
+                    if preset_id and preset_id in resolved_cfg.models:
+                        target = preset_id
+                return from_embedding_profile(resolved_cfg.get_profile(target), env=source_env)
+            merged = dict(source_env)
+            preset = self._match_preset(clean_name)
+            if preset is not None:
+                merged["EMBEDDING_MODEL"] = str(preset.get("default_model") or clean_name)
+                if not merged.get("EMBEDDING_BASE_URL", "").strip() and preset.get("base_url"):
+                    merged["EMBEDDING_BASE_URL"] = str(preset["base_url"])
+                if preset.get("needs_key") is False and not merged.get("EMBEDDING_API_KEY", "").strip():
+                    merged["EMBEDDING_API_KEY"] = str(preset.get("id") or "local")
+            else:
+                merged["EMBEDDING_MODEL"] = clean_name
+            return from_env_embedder(merged)
+        if resolved_cfg is not None:
+            role_target = resolved_cfg.roles.get("embedder")
+            if role_target:
+                return from_embedding_profile(resolved_cfg.get_profile(role_target), env=source_env)
+        return from_env_embedder(source_env)
 
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
     def build_retriever(self, override_name: str | None = None) -> RetrieverProtocol | None:
