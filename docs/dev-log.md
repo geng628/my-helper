@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `262 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `267 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -95,7 +95,8 @@
 | `d96e25c` | `rag`（Step 1） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | 通过 `104/200 (52.0%)`；Recall `67.12%`，**MRR `0.6508`**，Quote `60.14%`（`single-hop` `86.0%`） |
 | `9eda1ff` | `rag`（Step 1.5 父子索引） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | **通过 `106/200 (53.0%)`**；Recall `67.16%`，MRR `0.6307`，**Quote `60.66%`**（默认 `parent=1000 / child=320 / overlap=64`） |
 | `6f87cf6` | `rag`（Step 2 混合检索底座，离线无 embedder 回退口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（零退步；接入向量后可救回零共享词同义改写） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（未配 `embedder` 零退步；支持 `--embedder` 激活 BM25+Dense RRF） |
-| Issue `#107`（本次提交） | `rag`（Step 2.5 检索前 Query 侧优化，默认离线 `query_optimization.enabled=false` 口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（默认关闭零额外延迟与零退步） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（支持 Multi-Query RRF + HyDE 向量质心融合） |
+| `f9b9343` | `rag`（Step 2.5 检索前 Query 侧优化，默认离线 `query_optimization.enabled=false` 口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（默认关闭零额外延迟与零退步） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（支持 Multi-Query RRF + HyDE 向量质心融合） |
+| Issue `#109`（本次提交） | `rag`（Step 2.8 检索中增强：前置元数据/权限硬过滤 + 领域 Embedding 微调数据闭环） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（无 Frontmatter 文档默认 `public` 零退步） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（前置元数据硬过滤在 BM25 与余弦计算前截断） |
 
 ### 2. 真实模型多轮记忆评测（区分历史 `v1` Judge 与去泄漏 `v2-neutral` Judge）
 
@@ -320,7 +321,7 @@
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`，`memory.py` `593 <= 600` 行。
 - **已知边界与下一步**：离线默认不连网，需用户在 `config/models.dsl` 配 `embedder` 或设置 `EMBEDDING_MODEL` 方可启用混合检索；下一步进入 **RAG Step 2.5**（检索前 Query 侧优化）、**Step 3**（可选 `/v1/rerank` Cross-Encoder 精排）与 **Step 4**（专用知识库与端到端实模评测）。
 
-### [2026-11-28] RAG Step 2.5：检索前 Query 侧优化（路由 Routing、多轮指代改写、多查询扩展/拆解与 HyDE 假设文档嵌入）（Issue `#107`，本次提交）
+### [2026-11-28] RAG Step 2.5：检索前 Query 侧优化（路由 Routing、多轮指代改写、多查询扩展/拆解与 HyDE 假设文档嵌入）（Issue `#107`，Commit `f9b9343`）
 - **背景与目标**：解决多轮追问中代词/省略指代不明（如“它支持退款吗”）、单次检索漏掉复合多跳或同义表述、以及纯问题句与答案文档语义空间距离远三大检索前痛点，同时避免寒暄/通用常识白跑检索、守住跨轮 `system_prompt` KV Cache 逐字节冻结、并彻底杜绝 HyDE 幻觉词污染 BM25 或泄漏为主模型事实证据。
 - **核心改动**：
   - **独立 Query 侧优化引擎（新增 [../personal_assistant/assistant/query_optimizer.py](../personal_assistant/assistant/query_optimizer.py)）**：提供 `QueryOptimizationConfig`（严格布尔与范围校验）、4 项独立原子能力（`rewrite_query` 无历史 0 成本跳过、`route_query` 按可用工具白名单约束路由 `direct`/`docs`/`chat_history`/`web`/`study` 或多源组合、`expand_and_decompose_query` 区分 `single`/`multi_query`/`decompose` 且同义扩展保留原句首位、`generate_hyde_document` 生成 2–4 句陈述式假设片段）与单次合并快路径 `QueryOptimizer.plan()`（仅 1 次轻量 JSON 调用且显式 `reasoning="off"` 一次完成路由 + 改写 + 扩展/拆解，仅在路由命中 `docs` 且系统激活稠密向量时按需追加 1 次 HyDE；非取消故障优雅降级透传且 `applied=False` 零噪声注入，`AbortSignal` 严格向上穿透）。
@@ -334,7 +335,21 @@
   - 单元测试：`256 passed → 262 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py` `593 <= 600` 行预算）；
   - 离线检索基准（默认 `query_optimization.enabled=false` 口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（零退步）；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
-- **已知边界与下一步**：在线对话默认关闭 `retrieval.query_optimization.enabled`（可在 `config/tools.json` 手动设为 `true` 启用，或随时用 `/rag query <问题>` 体验与调试）；下一步进入 **RAG Step 3**（可选 `/v1/rerank` Cross-Encoder 精排与相关性门控）及 **Step 4**（专用知识库与端到端 RAG 实模评测）。
+- **已知边界与下一步**：在线对话默认关闭 `retrieval.query_optimization.enabled`（可在 `config/tools.json` 手动设为 `true` 启用，或随时用 `/rag query <问题>` 体验与调试）；下一步进入 **RAG Step 2.8**（检索中增强：前置元数据硬过滤与领域 Embedding 微调数据闭环）。
+
+### [2026-11-28] RAG Step 2.8：检索中增强（前置元数据/权限硬过滤 + 垂直领域 Embedding 微调三元组与难负样本导出闭环）（Issue `#109`，本次提交）
+- **背景与目标**：在已有 BM25 + Dense RRF 混合检索（Step 2）基础上，补齐检索中增强的另外两项关键能力：① 在 BM25 与余弦相似度计算前按时间范围、产品线、部门、标签与系统级用户权限（`allowed_access`）执行前置硬过滤，彻底杜绝过期与越权内容进入候选池或外发至外部 Embedding 接口；② 在保持主包零第三方运行依赖的前提下，补齐垂直领域 Embedding 模型微调的数据导出（含 BM25 难负样本挖掘）、外部微调脚本模板与 `models.dsl` 一行热切对比闭环。
+- **核心改动**：
+  - **元数据解析与前置硬过滤模型（新增 [../personal_assistant/assistant/rag_metadata.py](../personal_assistant/assistant/rag_metadata.py)）**：纯标准库解析 Markdown 顶部 YAML Frontmatter（`date`/`updated_at`/`created_at`、`product`、`department`、`tags`、`access`，以等量前导空行屏蔽头部使源码行号 1:1 对齐且防止顶部 `---` 水平分割线误判）；`MetadataFilter` 提供等价的内存 `matches()` 与 SQLite 参数化 `to_sql_clause()`（标签采用 `,tag,` `INSTR` 边界精确匹配，杜绝短词子串误中）；`parse_filter_string()` 与系统侧 `allowed_access` 取交集，仅允许收窄绝不允许模型借 `filters` 越权提级。
+  - **Layer 2 协议演进与双检索器前置过滤（[../personal_assistant/agent/plugins.py](../personal_assistant/agent/plugins.py)、[../plugins/rag_retriever.py](../plugins/rag_retriever.py)、[../personal_assistant/assistant/memory.py](../personal_assistant/assistant/memory.py)）**：`RetrieverProtocol.search_hits` 演进支持可选 `metadata_filter`；`rag_index.db` 升级至 `schema_version="4"`（新增 `doc_date`/`product`/`department`/`access_level`/`tags_csv` 索引列与 `indexed_files.has_metadata`，自动重建时完整保留 `chunk_contexts` 与 `chunk_embeddings` 缓存）；在 `_query_bm25_parents`、`_query_dense_parents` 与在线 `_ensure_active_embeddings` 全部注入 SQLite `WHERE` 前置硬过滤，未授权/不匹配文档连余弦计算与在线向量外发都不会触发；`LinearRetriever` 同步按 `MetadataFilter.matches()` 保持同口径过滤。
+  - **配置、工具、应用与 CLI 接入（[../config/tools.json](../config/tools.json)、[../personal_assistant/assistant/commands.py](../personal_assistant/assistant/commands.py)、[../personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)）**：`config/tools.json` 新增 `retrieval.allowed_access`（默认 `["public"]`），`AssistantApp` 将其作为不可覆盖的系统级权限边界注入 `tool_context`；`search_markdown` 新增可选参数 `filters`；CLI `/rag query` 新增 `--filter <条件>` 并回显 `【过滤】` 摘要；`/rag status` 新增 `metadata_docs` 统计。
+  - **垂直领域 Embedding 微调数据与热切闭环（新增 [../evals/embedding_finetune.py](../evals/embedding_finetune.py)、[../scripts/finetune_embedding.py](../scripts/finetune_embedding.py)，升级 [../evals/cli.py](../evals/cli.py)）**：`uv run python -m evals --mode export-triplets` 支持有标注问答集与无标注文档库双模式，自动用纯内存 BM25 挖掘跨文件**难负样本（Hard Negatives）**导出标准 `(anchor, positive, negative)` JSONL（严格隔离过期与未授权文档，禁止写入 `--data-dir` 内）；配套独立外部 GPU 微调脚本模板 `scripts/finetune_embedding.py`（`sentence-transformers` `MultipleNegativesRankingLoss`，零主包依赖），微调后在 `models.dsl` 改一行 `embedder <名称>` 即可热切并用 `evals --mode search --retriever rag --embedder <模型>` 量化对比 Recall / MRR。
+  - **测试覆盖**：新增 [../tests/test_rag_metadata.py](../tests/test_rag_metadata.py) 覆盖 Frontmatter 行号对齐与分割线防误判、BM25/Dense 余弦计算前硬过滤计数验证、在线未授权文档零外发 Embedding、`search_markdown(filters=...)` 防越权提级、CLI `/rag query --filter`、`LinearRetriever` 同口径过滤以及 `export-triplets` 难负样本挖掘与安全隔离。
+- **验证与同口径对比（`f9b9343` → 本次提交）**：
+  - 单元测试：`262 passed → 267 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py <= 600` 行预算）；
+  - 离线检索基准（默认 `allowed_access=("public",)`）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（零退步）；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
+- **已知边界与下一步**：Embedding 权重微调训练本身需在有 GPU 与 `sentence-transformers` 的外部环境执行（不纳入主包运行依赖）；下一步可进入 **RAG Step 3（检索后优化：Rerank 精排、相关性门控与防中间遗忘重排）**。
 
 ---
 

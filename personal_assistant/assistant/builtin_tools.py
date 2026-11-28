@@ -15,6 +15,7 @@ from personal_assistant.assistant.query_optimizer import (
     format_search_hits,
     fuse_multi_query_hits,
 )
+from personal_assistant.assistant.rag_metadata import parse_filter_string
 from personal_assistant.assistant.text_search import tokenize_text
 
 
@@ -46,13 +47,15 @@ class MemoryToolsetProvider(ToolsetProvider):
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         memory = self.memory
 
-        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF、执行期作用域受控 HyDE 与全路径 AbortSignal 透传
+        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF、前置元数据硬过滤（权限由系统侧 allowed_access 锁死）与 AbortSignal
         def search_markdown(
             query: str,
             root: str = "data/memory",
             sub_queries: str = "",
+            filters: str = "",
             *,
             today: date | str | None = None,
+            allowed_access: Sequence[str] | None = None,
             hyde_text: str = "",
             hyde_anchor_queries: Sequence[str] = (),
             abort_signal: AbortSignal | None = None,
@@ -64,6 +67,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 raise ValueError("sub_queries 必须是字符串（多条子查询用分号或换行分隔）。")
             if not isinstance(query, str) or not query.strip():
                 raise ValueError("搜索关键词不能为空。")
+            meta_filter = parse_filter_string(filters, allowed_access=allowed_access)
             clean_query = query.strip()
             extras = [q.strip() for q in re.split(r"[\n;；]+", sub_queries) if q.strip()]
 
@@ -101,12 +105,18 @@ class MemoryToolsetProvider(ToolsetProvider):
                         limit=10,
                         today=parsed_today,
                         hyde_texts=hyde_map,
+                        metadata_filter=meta_filter,
                         abort_signal=abort_signal,
                     )
                 )
                 return format_search_hits(hits, query="；".join(all_queries), root=root)
             if len(all_queries) == 1:
-                return memory.search_markdown(all_queries[0], root=root, today=parsed_today)
+                return memory.search_markdown(
+                    all_queries[0],
+                    root=root,
+                    today=parsed_today,
+                    metadata_filter=meta_filter,
+                )
 
             # 非 RAGRetriever（如 LinearRetriever）多子查询兜底：先校验目录，再按子查询隔离空词异常并 RRF 融合
             target_dir = memory.resolve_path(root, write=False)
@@ -118,7 +128,15 @@ class MemoryToolsetProvider(ToolsetProvider):
                 if abort_signal is not None and abort_signal.aborted:
                     raise StreamAbortedError(abort_signal.reason or "检索已取消")
                 try:
-                    hit_lists.append(memory.search_hits(sub_q, root=root, limit=20, today=parsed_today))
+                    hit_lists.append(
+                        memory.search_hits(
+                            sub_q,
+                            root=root,
+                            limit=20,
+                            today=parsed_today,
+                            metadata_filter=meta_filter,
+                        )
+                    )
                 except ValueError as error:
                     last_val_err = error
             if not hit_lists and last_val_err is not None:
@@ -182,6 +200,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                     "query": "主搜索关键词",
                     "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs",
                     "sub_queries": "可选补充子查询（多条用分号或换行分隔，触发多查询 RRF 融合检索；单查询时请省略此字段）",
+                    "filters": "可选前置元数据硬过滤（如 product=billing;department=finance;date_from=2026-01-01;tags=退款；无需过滤时请省略）",
                 },
                 search_markdown,
                 "read",
@@ -234,6 +253,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 param_enums=enums,
                 risk=risk,
                 parallel=parallel,
+                context=context,
             )
             for name, desc, params, fn, risk, parallel, enums in specs
         ]

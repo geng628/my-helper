@@ -41,14 +41,21 @@ RetrieverFactory = Callable[[dict[str, object]], "RetrieverProtocol"]
 ObserverFactory = Callable[[dict[str, object]], "ObserverProtocol"]
 
 
-# 内层子协议 2：检索引擎极简协议（只认 search_hits 契约，不关心实现是否来自插件）
+# 内层子协议 2：检索引擎极简协议（只认 search_hits 契约，支持可选前置过滤对象，不关心实现是否来自插件）
 @runtime_checkable
 class RetrieverProtocol(Protocol):
     name: str
 
-    # 按关键词与可选逻辑日期检索匹配的文档片段列表
+    # 按关键词、可选逻辑日期与可选前置元数据过滤对象检索匹配的文档片段列表
     def search_hits(
-        self, memory: Any, query: str, root: str = "", limit: int = 10, today: Any = None
+        self,
+        memory: Any,
+        query: str,
+        root: str = "",
+        limit: int = 10,
+        today: Any = None,
+        *,
+        metadata_filter: Any = None,
     ) -> list[Any]: ...
 
 

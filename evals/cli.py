@@ -13,6 +13,7 @@ from personal_assistant.assistant.common import load_dotenv
 from personal_assistant.assistant.memory import MemoryStore
 from evals.agent_eval import evaluate_agent
 from evals.common import load_cases, resolve_eval_paths, safe_write_report
+from evals.embedding_finetune import export_embedding_triplets
 from evals.memory_eval import evaluate_memory, load_scenarios
 from evals.public_benchmarks import prepare_public_datasets
 from evals.search_eval import evaluate_search
@@ -72,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="My Helper 评测运行器（search 离线检索 / agent 单轮 / memory 多轮记忆 / download 下载公开基准）"
     )
-    parser.add_argument("--mode", choices=["search", "agent", "memory", "download"], default="search")
+    parser.add_argument(
+        "--mode",
+        choices=["search", "agent", "memory", "download", "export-triplets"],
+        default="search",
+    )
     parser.add_argument("--data-dir", default="evals/sample_data", help="评测数据目录（含 memory/、workspace/）")
     parser.add_argument(
         "--cases",
@@ -103,11 +108,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--locomo-max-convs", type=int, default=0, help="LoCoMo 多轮记忆最多导出的对话段数（0 表示全部对话）")
     parser.add_argument("--seed", type=int, default=42, help="download 模式分层抽样随机种子")
     parser.add_argument("--force", action="store_true", help="download 模式强制重新下载原始 JSON")
+    parser.add_argument("--negatives-per-pair", type=int, default=1, help="export-triplets 模式每条正例挖掘的难负样本数（默认 1）")
+    parser.add_argument("--allowed-access", default="public", help="export-triplets 模式允许导出的权限级别（逗号分隔，默认 public）")
     args = parser.parse_args(argv)
     if args.workers < 1:
         raise ValueError("--workers 必须 >= 1。")
     if args.fail_under is not None and not (0.0 <= args.fail_under <= 1.0):
         raise ValueError("--fail-under 必须在 0.0 到 1.0 之间。")
+
+    if args.mode == "export-triplets":
+        access_list = [tok.strip() for tok in str(args.allowed_access).split(",") if tok.strip()]
+        summary = export_embedding_triplets(
+            Path(args.data_dir).resolve(),
+            root=args.root,
+            cases_path=Path(args.cases).resolve() if args.cases else None,
+            output_path=Path(args.output).resolve() if args.output else None,
+            max_negatives_per_pair=args.negatives_per_pair,
+            allowed_access=access_list,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
 
     if args.mode == "download":
         summary = prepare_public_datasets(

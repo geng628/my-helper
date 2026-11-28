@@ -6,7 +6,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from datetime import date
 from pathlib import Path
@@ -71,6 +71,7 @@ from personal_assistant.assistant.query_optimizer import (
     format_search_hits,
     fuse_multi_query_hits,
 )
+from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_allowed_access
 
 MAX_SESSION_LOCKS = 256
 
@@ -292,6 +293,7 @@ class AssistantApp:
         consolidator_llm: ModelInvoker | None = None,
         embedder: EmbeddingInvoker | None = None,
         query_optimizer: QueryOptimizer | None = None,
+        allowed_access: Sequence[str] | None = None,
         auto_consolidate: bool = True,
         today_fn: Callable[[], date] | None = None,
         model_name: str | None = None,
@@ -434,6 +436,11 @@ class AssistantApp:
         )
         self.query_optimizer = (
             query_optimizer if query_optimizer is not None else self.tools_config.build_query_optimizer()
+        )
+        self.allowed_access: tuple[str, ...] = (
+            parse_allowed_access(allowed_access)
+            if allowed_access is not None
+            else self.tools_config.allowed_access
         )
         self._tool_registry = self._build_base_registry()
 
@@ -604,7 +611,10 @@ class AssistantApp:
         return self.tools_config.build_registry(
             providers=[MemoryToolsetProvider(self.memory)],
             data_root=self.data_root,
-            tool_context={"history_db_path": self.state.db_path},
+            tool_context={
+                "history_db_path": self.state.db_path,
+                "allowed_access": self.allowed_access,
+            },
         )
 
     # 返回应用常驻白名单工具注册表
@@ -758,6 +768,7 @@ class AssistantApp:
                             "untrusted_tool_seen": False,
                             "today": turn_day,
                             "history_db_path": self.state.db_path,
+                            "allowed_access": self.allowed_access,
                         }
                         system_prompt = self.get_session_system_prompt(chat_id, registry)
                         summary_text = str(compaction.get("summary") or "").strip()
@@ -1016,7 +1027,7 @@ class AssistantApp:
             abort_signal=abort_signal,
         )
 
-    # 执行完整的检索前 Query 优化 + 本地知识库多查询 RRF / HyDE 检索（供 CLI /rag query 与接口调用）
+    # 执行完整的检索前 Query 优化 + 前置元数据/权限硬过滤 + 本地知识库多查询 RRF / HyDE 检索（供 CLI /rag query 与接口调用）
     def smart_search(
         self,
         query: str,
@@ -1025,11 +1036,32 @@ class AssistantApp:
         root: str = "data/memory",
         limit: int = 10,
         today: date | None = None,
+        metadata_filter: MetadataFilter | None = None,
         force_enable: bool = True,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, object]:
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("limit 必须是整数。")
+        active_filter = (
+            metadata_filter.clamp_access(self.allowed_access)
+            if metadata_filter is not None
+            else MetadataFilter(allowed_access=self.allowed_access)
+        )
+        if active_filter.is_unsatisfiable:
+            clean_q = " ".join(query.split())
+            if not clean_q:
+                raise ValueError("待优化的查询不能为空。")
+            empty_plan = QueryOptimizer._passthrough(
+                clean_q,
+                allowed={"direct", "docs"},
+                reason="access_denied",
+            )
+            return {
+                "plan": empty_plan.to_dict(),
+                "filter": active_filter.describe(),
+                "hits": [],
+                "rendered": format_search_hits([], query=clean_q, root=root),
+            }
         plan = self.optimize_query(
             query,
             chat_id=chat_id,
@@ -1058,6 +1090,7 @@ class AssistantApp:
                         limit=limit,
                         today=ref_day,
                         hyde_texts=hyde_map,
+                        metadata_filter=active_filter,
                         abort_signal=abort_signal,
                     )
                 )
@@ -1065,7 +1098,7 @@ class AssistantApp:
                 target_dir = self.memory.resolve_path(root, write=False)
                 if not target_dir.is_dir():
                     raise ValueError(f"目录不存在：{root}")
-                if limit > 0:
+                if limit > 0 and not active_filter.is_unsatisfiable:
                     if len(queries) > 1:
                         per_q_limit = max(limit * 2, 10)
                         hit_lists: list[list[SearchHit]] = []
@@ -1075,7 +1108,13 @@ class AssistantApp:
                                 raise StreamAbortedError(abort_signal.reason or "检索已取消")
                             try:
                                 hit_lists.append(
-                                    self.memory.search_hits(sub_q, root=root, limit=per_q_limit, today=ref_day)
+                                    self.memory.search_hits(
+                                        sub_q,
+                                        root=root,
+                                        limit=per_q_limit,
+                                        today=ref_day,
+                                        metadata_filter=active_filter,
+                                    )
                                 )
                             except ValueError as error:
                                 last_val_err = error
@@ -1083,10 +1122,17 @@ class AssistantApp:
                             raise last_val_err
                         hits = fuse_multi_query_hits(hit_lists, limit=limit)
                     else:
-                        hits = self.memory.search_hits(queries[0], root=root, limit=limit, today=ref_day)
+                        hits = self.memory.search_hits(
+                            queries[0],
+                            root=root,
+                            limit=limit,
+                            today=ref_day,
+                            metadata_filter=active_filter,
+                        )
             rendered = format_search_hits(hits, query="；".join(queries), root=root)
         return {
             "plan": plan.to_dict(),
+            "filter": active_filter.describe(),
             "hits": [
                 {
                     "path": h.path,
@@ -1101,9 +1147,21 @@ class AssistantApp:
             "rendered": rendered,
         }
 
-    # 不经过模型，直接按关键词搜索本地 Markdown 文件（离线可用）
-    def search(self, query: str, root: str = "data/memory", limit: int = 10) -> str:
-        return self.memory.search_markdown(query, root=root, limit=limit)
+    # 不经过模型，直接按关键词与可选前置元数据过滤搜索本地 Markdown 文件（离线可用，严格受系统 allowed_access 钳制）
+    def search(
+        self,
+        query: str,
+        root: str = "data/memory",
+        limit: int = 10,
+        *,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> str:
+        active_filter = (
+            metadata_filter.clamp_access(self.allowed_access)
+            if metadata_filter is not None
+            else MetadataFilter(allowed_access=self.allowed_access)
+        )
+        return self.memory.search_markdown(query, root=root, limit=limit, metadata_filter=active_filter)
 
     # 汇总当前 MEMORY.md 索引、rules/ 规则与最近 facts.md 备忘，供 /memory 命令查看
     def memory_overview(self) -> str:
@@ -1127,6 +1185,7 @@ class AssistantApp:
             "plugins": list(self.tools_config.plugins),
             "retriever": self.memory.retriever.name,
             "embedder": self.embedder.model_id if self.embedder is not None else None,
+            "allowed_access": list(self.allowed_access),
             "query_optimization": self.query_optimizer.config.enabled,
             "observers": [obs.name for obs in self.observers],
             "telemetry": self._collect_telemetry(),

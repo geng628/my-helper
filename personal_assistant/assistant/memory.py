@@ -19,6 +19,7 @@ from personal_assistant.assistant.memory_lifecycle import (
     apply_topic_operations, archive_expired_topics, is_line_expired as _is_line_expired,
     prune_raw_facts_for_batch, read_topic_snapshots as _read_topic_snapshots,
 )
+from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_markdown_frontmatter
 
 _atomic_write = atomic_write_text
 MAX_SEARCH_FILE_BYTES = 1024 * 1024
@@ -61,29 +62,30 @@ class SearchHit:
 class LinearRetriever:
     name = "linear"
 
-    # 扫描允许目录下的 Markdown/文本文件并按文件名、标题与正文命中权重排序返回 SearchHit
+    # 扫描允许目录下的 Markdown/文本文件，先执行前置元数据硬过滤再按词面权重排序返回 SearchHit
     def search_hits(
-        self, memory: "MemoryStore", query: str, root: str = "data/memory", limit: int = 10, today: date | None = None
+        self, memory: "MemoryStore", query: str, root: str = "data/memory", limit: int = 10,
+        today: date | None = None, *, metadata_filter: MetadataFilter | None = None,
     ) -> list[SearchHit]:
         primary, secondary = _extract_terms(query)
         if not primary and not secondary:
             raise ValueError("搜索关键词不能为空。")
+        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter()
         ref_day = today or today_shanghai()
         searchable, _ = memory.iter_searchable_files(root)
+        if limit <= 0 or active_filter.is_unsatisfiable:
+            return []
         candidates: list[tuple[float, str, int, int, str, str]] = []
         for resolved, display_path, is_memory in searchable:
             try:
                 text = resolved.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            candidates.extend(
-                memory._score_file(display_path, text, primary, secondary, skip_expired_today=ref_day if is_memory else None)
-            )
+            doc_meta, body = parse_markdown_frontmatter(text)
+            if active_filter.matches(doc_meta):
+                candidates.extend(memory._score_file(display_path, body, primary, secondary, skip_expired_today=ref_day if is_memory else None))
         candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
-        return [
-            SearchHit(path=path, start_line=s_ln, end_line=e_ln, section=sec, snippet=snip, score=score)
-            for score, path, s_ln, e_ln, sec, snip in candidates[:limit]
-        ]
+        return [SearchHit(path=p, start_line=s, end_line=e, section=sec, snippet=sn, score=sc) for sc, p, s, e, sec, sn in candidates[:limit]]
 
 
 # 纯 Markdown 记忆与本地文件管理类：直接读写磁盘 .md/.txt 文件
@@ -329,11 +331,14 @@ class MemoryStore:
 
     # 在允许目录下检索 Markdown/文本文件并返回排序后的结构化 SearchHit 列表（统一委派 self.retriever）
     def search_hits(
-        self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
+        self, query: str, root: str = "data/memory", limit: int = 10,
+        *, today: date | None = None, metadata_filter: MetadataFilter | None = None,
     ) -> list[SearchHit]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("搜索关键词不能为空。")
         ref_day = today or today_shanghai()
+        if metadata_filter is not None:
+            return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day, metadata_filter=metadata_filter))
         return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day))
 
     # 释放底层检索引擎可能持有的派生索引连接或文件句柄
@@ -343,15 +348,14 @@ class MemoryStore:
 
     # 对外搜索接口：将 search_hits 命中结果格式化为带精确行号区间与章节面包屑的文本片段
     def search_markdown(
-        self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
+        self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None, metadata_filter: MetadataFilter | None = None,
     ) -> str:
-        hits = self.search_hits(query, root=root, limit=limit, today=today)
+        hits = self.search_hits(query, root=root, limit=limit, today=today, metadata_filter=metadata_filter)
         if not hits:
             return f"未在 {root} 下找到匹配「{query}」的 Markdown 内容。"
         return "\n\n".join(
-            f"{hit.path}:{hit.start_line if hit.start_line == hit.end_line else f'{hit.start_line}-{hit.end_line}'} "
-            f"[章节: {hit.section or '正文'}]\n{hit.snippet}"
-            for hit in hits
+            f"{h.path}:{h.start_line if h.start_line == h.end_line else f'{h.start_line}-{h.end_line}'} [章节: {h.section or '正文'}]\n{h.snippet}"
+            for h in hits
         )
 
     # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段（支持跳过已过期记忆行）

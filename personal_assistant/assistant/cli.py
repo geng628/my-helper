@@ -28,6 +28,7 @@ from personal_assistant.ai import (
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
+from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_filter_string
 
 
 # 打印单步工具执行日志与耗时
@@ -87,22 +88,67 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
-# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索前 Query 优化与检索）
+# 拆解 /rag query 后半段参数：支持 --filter <条件>、--filter=<条件> 及双引号/单引号包裹含空格过滤串
+def _split_rag_query_args(rest: str) -> tuple[str, str] | None:
+    text = rest.strip()
+    if not text:
+        return None
+    if text.startswith("--filter="):
+        after_eq = text[len("--filter=") :]
+        if not after_eq:
+            return None
+        if after_eq[0] in {'"', "'"}:
+            quote = after_eq[0]
+            end_q = after_eq.find(quote, 1)
+            if end_q == -1:
+                return None
+            return after_eq[1:end_q].strip(), after_eq[end_q + 1 :].strip()
+        f_parts = after_eq.split(None, 1)
+        if len(f_parts) < 2:
+            return None
+        return f_parts[0].strip(), f_parts[1].strip()
+    if text == "--filter" or text.startswith("--filter ") or text.startswith("--filter\t"):
+        after_flag = text[len("--filter") :].lstrip()
+        if not after_flag:
+            return None
+        if after_flag[0] in {'"', "'"}:
+            quote = after_flag[0]
+            end_q = after_flag.find(quote, 1)
+            if end_q == -1:
+                return None
+            return after_flag[1:end_q].strip(), after_flag[end_q + 1 :].strip()
+        f_parts = after_flag.split(None, 1)
+        if len(f_parts) < 2:
+            return None
+        return f_parts[0].strip(), f_parts[1].strip()
+    return "", text
+
+
+# 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索优化与前置过滤）
 def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
-    usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query <问题>"
+    usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query [--filter 条件] <问题>"
     parts = text.split()
     sub = parts[1].lower() if len(parts) >= 2 else "status"
     retriever = app.memory.retriever
 
     if sub == "query":
-        query_text = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
+        rest = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
+        parsed_q = _split_rag_query_args(rest)
+        if parsed_q is None:
+            return usage
+        raw_filter, query_text = parsed_q
         if not query_text:
             return usage
+        try:
+            meta_filter = parse_filter_string(raw_filter, allowed_access=app.allowed_access)
+        except ValueError as error:
+            return f"过滤条件不合法：{error}"
         try:
             with _sigint_to_abort(app, chat_id) as abort_sig:
                 res = app.smart_search(
                     query_text,
                     chat_id=chat_id,
+                    metadata_filter=meta_filter,
                     force_enable=True,
                     abort_signal=abort_sig,
                 )
@@ -128,12 +174,16 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
 
         lines: list[str] = []
         if not applied:
-            if reason == "fallback":
+            if reason == "access_denied":
+                lines.append("【提示】请求过滤条件超出当前会话允许访问的权限边界，已拦截本次检索。")
+            elif reason == "fallback":
                 lines.append("【提示】优化模型调用异常或未返回有效 JSON，已自动降级为原查询直通本地检索。")
             else:
                 lines.append(
                     "【提示】当前未配置可用大模型（或已关闭全部优化开关），未执行 LLM 查询优化，已按原查询直通本地检索；运行 setup 可开启完整优化。"
                 )
+        if meta_filter.has_explicit_criteria or raw_filter:
+            lines.append(f"【过滤】{meta_filter.describe()}")
         lines.extend(
             [
                 f"【路由】{', '.join(str(r) for r in routes) or 'docs'}（needs_retrieval={needs_ret}"
@@ -181,6 +231,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
                     enrich_llm,
                     root=root,
                     model_name=model_name,
+                    metadata_filter=MetadataFilter(allowed_access=app.allowed_access),
                     abort_signal=abort_sig,
                 )
         except (KeyboardInterrupt, StreamAbortedError):
@@ -210,6 +261,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
                     app.memory,
                     root=root,
                     embedder=active_emb,
+                    metadata_filter=MetadataFilter(allowed_access=app.allowed_access),
                     abort_signal=abort_sig,
                 )
         except (KeyboardInterrupt, StreamAbortedError):
