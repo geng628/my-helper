@@ -5,8 +5,12 @@ import argparse
 import getpass
 import json
 import os
-from collections.abc import Callable
+import signal
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep
 from personal_assistant.ai import (
@@ -14,6 +18,7 @@ from personal_assistant.ai import (
     ModelInvoker,
     ModelsConfig,
     NoopModelClient,
+    StreamAbortedError,
     TextDelta,
     ThinkingDelta,
     format_cache_summary,
@@ -95,6 +100,36 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     return None
 
 
+# 在主线程执行单轮对话期间临时将首次 SIGINT 转接为协同取消 abort_turn，第二次按键回退默认 KeyboardInterrupt
+@contextmanager
+def _sigint_to_abort(app: Any, chat_id: str) -> Iterator[None]:
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    prev_handler = signal.getsignal(signal.SIGINT)
+    triggered = False
+
+    # 首次 Ctrl+C 立即通知后台停算并中断阻塞 I/O，二次按下恢复默认中断避免卡死
+    def _handle_sigint(signum: int, frame: Any) -> None:
+        nonlocal triggered
+        if not triggered:
+            triggered = True
+            abort_fn = getattr(app, "abort_turn", None)
+            if callable(abort_fn):
+                if abort_fn(chat_id, reason="用户按下 Ctrl+C 中断"):
+                    return
+        if callable(prev_handler):
+            prev_handler(signum, frame)
+            return
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, prev_handler)
+
+
 # 启动交互式终端对话循环：基于 AssistantApp 持久化历史与实时流式输出
 def run_repl(
     app: AssistantApp | None = None,
@@ -123,11 +158,12 @@ def run_repl(
                 continue
             on_event, finish = _stream_printer()
             try:
-                result = active_app.chat(user_text, chat_id=chat_id, on_event=on_event)
+                with _sigint_to_abort(active_app, chat_id):
+                    result = active_app.chat(user_text, chat_id=chat_id, on_event=on_event)
             except LLMNotConfigured as error:
                 print(f"助手> {error}")
                 continue
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, StreamAbortedError):
                 print("\n助手> 已中断本轮回复。")
                 continue
             except Exception as error:  # noqa: BLE001

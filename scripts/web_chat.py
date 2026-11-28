@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from personal_assistant.ai import LLMNotConfigured
+from personal_assistant.ai import LLMNotConfigured, StreamAbortedError
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.common import load_dotenv
 
@@ -331,6 +331,9 @@ def create_web_server(
                 except LLMNotConfigured as error:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(error)})
                     return
+                except StreamAbortedError as error:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(error), "aborted": True})
+                    return
                 except Exception as error:  # noqa: BLE001
                     self._send_json(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -370,6 +373,12 @@ def create_web_server(
                         )
                     except OSError:
                         return
+                return
+
+            if parsed.path == "/api/chat/abort":
+                chat_id = str(body.get("chat_id") or "web").strip() or "web"
+                aborted = app.abort_turn(chat_id, reason="用户已停止生成")
+                self._send_json(HTTPStatus.OK, {"ok": True, "chat_id": chat_id, "aborted": aborted})
                 return
 
             if parsed.path == "/api/refresh":

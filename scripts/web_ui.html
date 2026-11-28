@@ -267,6 +267,17 @@
       gap: 10px;
       align-items: flex-end;
     }
+    button.stop {
+      background: rgba(255, 107, 107, 0.14);
+      border-color: rgba(255, 107, 107, 0.45);
+      color: var(--err);
+    }
+    button.stop:hover { background: rgba(255, 107, 107, 0.24); }
+    .aborted-note {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     textarea {
       flex: 1;
       resize: none;
@@ -354,6 +365,7 @@
   <footer>
     <div class="composer">
       <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="btnStop" class="stop" style="display:none;">停止</button>
       <button id="btnSend" class="primary">发送</button>
     </div>
   </footer>
@@ -373,6 +385,7 @@
     const emptyEl = document.getElementById("emptyState");
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("btnSend");
+    const stopBtn = document.getElementById("btnStop");
     const statusDot = document.getElementById("statusDot");
     const sessionPill = document.getElementById("sessionPill");
     const toolCount = document.getElementById("toolCount");
@@ -710,6 +723,26 @@
         if (ctx.toolState && ctx.toolState.details) ctx.toolState.details.open = false;
         renderMetaRow(ctx.wrap, ev.cache, ev.consolidation_scheduled, ev.telemetry);
         chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.type === "aborted") {
+        collapseThinking(ctx.thinkingState);
+        if (ctx.toolState && ctx.toolState.pending && ctx.toolState.pending.length > 0) {
+          for (const pending of ctx.toolState.pending) {
+            pending.item.className = "tool-item";
+            pending.item.textContent = `${pending.item.textContent} [已取消]`;
+          }
+          ctx.toolState.pending = [];
+          if (ctx.toolState.summary) ctx.toolState.summary.textContent = "🔧 工具调用已取消";
+        }
+        const noteText = `（${String(ev.reason || "已停止生成")}，本轮未写入历史）`;
+        if (ctx.replyText) {
+          const note = document.createElement("div");
+          note.className = "aborted-note";
+          note.textContent = noteText;
+          ctx.wrap.appendChild(note);
+        } else {
+          ctx.bubble.textContent = String(ev.reason || "已停止生成");
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
       } else if (ev.type === "error") {
         ctx.wrap.classList.add("error");
         ctx.bubble.textContent = String(ev.error || "流式对话失败");
@@ -741,6 +774,18 @@
     }
 
     let activeAbortController = null;
+    let activeStreamChatId = null;
+    let stopFallbackTimer = null;
+
+    function requestBackendAbort(targetChatId) {
+      if (!targetChatId) return;
+      auth_fetch("/api/chat/abort", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: targetChatId }),
+        keepalive: true,
+      }).catch(() => {});
+    }
 
     async function auth_fetch(url, options = {}) {
       const buildInit = (token) => {
@@ -814,9 +859,13 @@
       if (!text || busy) return;
       busy = true;
       sendBtn.disabled = true;
+      stopBtn.style.display = "inline-block";
+      stopBtn.disabled = false;
+      stopBtn.textContent = "停止";
       inputEl.value = "";
       inputEl.style.height = "44px";
 
+      const targetChatId = chatId;
       appendMessage("user", text);
       const wrap = appendMessage("assistant", "思考与执行工具中…");
       const bubble = wrap.querySelector(".bubble");
@@ -831,13 +880,14 @@
       let streamClosedCleanly = false;
       const controller = new AbortController();
       activeAbortController = controller;
+      activeStreamChatId = targetChatId;
 
       function handleSseBlock(block) {
         for (const rawLine of block.split("\n")) {
           const line = rawLine.trim();
           if (!line.startsWith("data:")) continue;
           const ev = JSON.parse(line.slice(5).trim());
-          if (ev.type === "done" || ev.type === "error") streamClosedCleanly = true;
+          if (ev.type === "done" || ev.type === "error" || ev.type === "aborted") streamClosedCleanly = true;
           applyStreamEvent(streamCtx, ev);
         }
       }
@@ -846,7 +896,7 @@
         const res = await auth_fetch("/api/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, chat_id: chatId }),
+          body: JSON.stringify({ message: text, chat_id: targetChatId }),
           signal: controller.signal,
         });
         if (!res.ok) {
@@ -881,19 +931,41 @@
         }
       } catch (err) {
         if (err && err.name === "AbortError") {
-          if (!streamCtx.replyText) bubble.textContent = "已切换会话，本轮输出已取消。";
+          if (!streamCtx.replyText) bubble.textContent = "已停止生成，本轮输出已取消。";
         } else {
           wrap.classList.add("error");
           bubble.textContent = `网络异常：${err}`;
         }
       } finally {
-        if (activeAbortController === controller) activeAbortController = null;
+        if (stopFallbackTimer) {
+          clearTimeout(stopFallbackTimer);
+          stopFallbackTimer = null;
+        }
+        if (activeAbortController === controller) {
+          activeAbortController = null;
+          activeStreamChatId = null;
+        }
         busy = false;
         sendBtn.disabled = false;
+        stopBtn.style.display = "none";
+        stopBtn.disabled = false;
+        stopBtn.textContent = "停止";
         inputEl.focus();
         refreshStatus();
       }
     }
+
+    stopBtn.addEventListener("click", () => {
+      if (!activeAbortController) return;
+      stopBtn.disabled = true;
+      stopBtn.textContent = "停止中…";
+      const controller = activeAbortController;
+      requestBackendAbort(activeStreamChatId || chatId);
+      if (stopFallbackTimer) clearTimeout(stopFallbackTimer);
+      stopFallbackTimer = setTimeout(() => {
+        if (activeAbortController === controller) controller.abort();
+      }, 1500);
+    });
 
     sendBtn.addEventListener("click", sendMessage);
     inputEl.addEventListener("keydown", (e) => {
@@ -1048,8 +1120,10 @@
 
     document.getElementById("btnNewSession").addEventListener("click", () => {
       if (activeAbortController) {
+        requestBackendAbort(activeStreamChatId || chatId);
         activeAbortController.abort();
         activeAbortController = null;
+        activeStreamChatId = null;
       }
       const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, "");
       const rand = Math.random().toString(36).slice(2, 6);

@@ -811,7 +811,7 @@ def test_web_ui_fetch_headers_and_allowed_targets_rules() -> None:
 
     html = (Path(__file__).resolve().parent.parent / "scripts" / "web_ui.html").read_text(encoding="utf-8")
     post_fetches = re.findall(r'fetch\([^)]+method:\s*"POST"[^}]+\}', html, flags=re.DOTALL)
-    assert len(post_fetches) == 3
+    assert len(post_fetches) == 4
     for snippet in post_fetches:
         assert "application/json" in snippet, f"POST fetch 缺少 application/json 请求头：{snippet}"
     assert "auth_fetch(" in html and "Authorization" in html

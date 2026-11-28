@@ -129,7 +129,8 @@ def test_openai_sse_text_streaming_and_tracking_client() -> None:
     captured_payloads: list[dict[str, object]] = []
 
     # 返回预设 SSE 行序列并记录请求载荷的测试桩
-    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str]) -> Iterator[str]:
+    def fake_post_stream(url: str, payload: dict[str, object], headers: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         assert url == "https://api.example.com/v1/chat/completions"
         assert headers["Authorization"] == "Bearer sk-stream"
         captured_payloads.append(dict(payload))
@@ -169,7 +170,8 @@ def test_openai_sse_tool_calls_400_fallback_and_midstream_error(monkeypatch: pyt
     call_payloads: list[dict[str, object]] = []
 
     # 模拟首请求含 stream_options 抛 400、去掉后流式返回多索引分片 tool_calls
-    def fake_urlopen(request: Request, timeout: int = 60):
+    def fake_urlopen(request: Request, timeout: int = 60, abort_signal=None):
+        del timeout, abort_signal
         body = json.loads((request.data or b"{}").decode("utf-8"))
         call_payloads.append(body)
         if "stream_options" in body:
@@ -203,7 +205,7 @@ def test_openai_sse_tool_calls_400_fallback_and_midstream_error(monkeypatch: pyt
 
         return _StreamResp(raw_sse)
 
-    monkeypatch.setattr(http_mod, "urlopen", fake_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", fake_urlopen)
     provider = OpenAICompletionsProvider()
     model = ModelProfile(name="m", api="openai-completions", base_url="https://api.example.com/v1", model="m", api_key="k")
     events = list(
@@ -223,7 +225,7 @@ def test_openai_sse_tool_calls_400_fallback_and_midstream_error(monkeypatch: pyt
 
     # 流内 error JSON 转为 StreamError，且前文 TextDelta 已正常吐出
     err_provider = OpenAICompletionsProvider(
-        post_stream=lambda *_: iter(
+        post_stream=lambda *_, **_kw: iter(
             [
                 'data: {"choices":[{"index":0,"delta":{"content":"一半"}}]}\n',
                 'data: {"error":{"message":"rate_limit"}}\n',
@@ -511,7 +513,7 @@ def test_openai_completions_provider_subclass_extension_and_thread_isolation() -
         "data: [DONE]\n",
     ]
     model = ModelProfile(name="ext", api="custom-thinking", base_url="https://api.example.com/v1", model="m-ext", api_key="sk-ext")
-    ext_provider = _ThinkingDeltaProvider(post_stream=lambda _u, _p, _h: iter(sse_lines))
+    ext_provider = _ThinkingDeltaProvider(post_stream=lambda _u, _p, _h, **_kw: iter(sse_lines))
     events = list(ext_provider.stream(model, Context(messages=(UserMessage("hi"),))))
     assert [e.text for e in events if isinstance(e, ThinkingDelta)] == ["首段", "续段"]
     assert [e.text for e in events if isinstance(e, TextDelta)] == ["正文"]
@@ -522,7 +524,7 @@ def test_openai_completions_provider_subclass_extension_and_thread_isolation() -
 
     # SSE 流式返回无参 tool_calls 且未推送 arguments 时，必须补齐合法 JSON "{}"
     empty_args_provider = OpenAICompletionsProvider(
-        post_stream=lambda _u, _p, _h: iter(
+        post_stream=lambda _u, _p, _h, **_kw: iter(
             [
                 'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c_empty","type":"function","function":{"name":"ping","arguments":""}}]}}]}\n',
                 "data: [DONE]\n",
@@ -536,7 +538,8 @@ def test_openai_completions_provider_subclass_extension_and_thread_isolation() -
     attempts_500 = 0
 
     # 模拟 500 错误验证不触发 stream_options 降级重试
-    def fail_500(url: str, _p: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+    def fail_500(url: str, _p: dict[str, object], _h: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         nonlocal attempts_500
         attempts_500 += 1
         raise HTTPError(url, 500, "server error", {}, io.BytesIO(b""))
@@ -548,7 +551,8 @@ def test_openai_completions_provider_subclass_extension_and_thread_isolation() -
     attempts_mid400 = 0
 
     # 模拟吐出首行后再抛 400，验证不重发整段请求
-    def mid_400(url: str, _p: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+    def mid_400(url: str, _p: dict[str, object], _h: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         nonlocal attempts_mid400
         attempts_mid400 += 1
         yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n'
@@ -563,7 +567,8 @@ def test_openai_completions_provider_subclass_extension_and_thread_isolation() -
     results: dict[str, int] = {}
 
     # 按请求内容返回不同 token 用量以检验 threading.local 隔离
-    def threaded_post_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+    def threaded_post_stream(_u: str, payload: dict[str, object], _h: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         tag = str(payload["messages"][0]["content"])  # type: ignore[index]
         tok = 111 if tag == "t1" else 222
         yield f'data: {json.dumps({"choices": [{"delta": {"content": tag}}]})}\n'
@@ -759,7 +764,7 @@ def test_sse_tool_calls_without_index_and_done_reason_preservation() -> None:
         'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
         "data: [DONE]\n",
     ]
-    provider = OpenAICompletionsProvider(post_stream=lambda _u, _p, _h: iter(sse_multi_in_one_frame))
+    provider = OpenAICompletionsProvider(post_stream=lambda _u, _p, _h, **_kw: iter(sse_multi_in_one_frame))
     model = ModelProfile(name="m", api="openai-completions", base_url="https://api.example.com/v1", model="m-multi", api_key="sk")
     done_multi = next(ev for ev in provider.stream(model, Context(messages=(UserMessage("go"),))) if isinstance(ev, StreamDone))
     assert done_multi.reason == "toolUse"
@@ -785,11 +790,12 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     )
 
     # 模拟上游返回 context_length_exceeded 400 错误
-    def fail_ctx_urlopen(request: Request, timeout: int = 60):
+    def fail_ctx_urlopen(request: Request, timeout: int = 60, abort_signal=None):
+        del timeout, abort_signal
         stream_calls.append(json.loads((request.data or b"{}").decode("utf-8")))
         raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(secret_body))
 
-    monkeypatch.setattr(http_mod, "urlopen", fail_ctx_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", fail_ctx_urlopen)
     model = ModelProfile(name="m", api="openai-completions", base_url="https://api.example.com/v1", model="m-err", api_key="sk-live")
     provider = OpenAICompletionsProvider()
     evs = list(provider.stream(model, Context(messages=(UserMessage("x"),))))
@@ -806,7 +812,8 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     unrelated_calls = 0
 
     # 模拟无关参数的非空 400 错误
-    def fail_unrelated(request: Request, timeout: int = 60):
+    def fail_unrelated(request: Request, timeout: int = 60, abort_signal=None):
+        del timeout, abort_signal
         nonlocal unrelated_calls
         unrelated_calls += 1
         raise HTTPError(
@@ -817,7 +824,7 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
             io.BytesIO(b'{"error":{"message":"invalid image_url payload"}}'),
         )
 
-    monkeypatch.setattr(http_mod, "urlopen", fail_unrelated)
+    monkeypatch.setattr(http_mod, "open_http_request", fail_unrelated)
     evs2 = list(provider.stream(model, Context(messages=(UserMessage("x"),))))
     assert unrelated_calls == 1
     assert isinstance(evs2[-1], StreamError) and "invalid image_url payload" in evs2[-1].error_message
@@ -826,7 +833,8 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     incompat_payloads: list[dict[str, object]] = []
 
     # 模拟 stream_options 不兼容返回 400 后去掉参数重试成功
-    def compat_fallback_stream(_u: str, payload: dict[str, object], _h: dict[str, str]) -> Iterator[str]:
+    def compat_fallback_stream(_u: str, payload: dict[str, object], _h: dict[str, str], *, abort_signal=None) -> Iterator[str]:
+        del abort_signal
         incompat_payloads.append(dict(payload))
         if "stream_options" in payload:
             raise HTTPError(
@@ -849,12 +857,13 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     sync_calls = 0
 
     # 模拟同步调用收到超大错误体
-    def fail_oversized(request: Request, timeout: int = 60):
+    def fail_oversized(request: Request, timeout: int = 60, abort_signal=None):
+        del timeout, abort_signal
         nonlocal sync_calls
         sync_calls += 1
         raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(oversized_body))
 
-    monkeypatch.setattr(http_mod, "urlopen", fail_oversized)
+    monkeypatch.setattr(http_mod, "open_http_request", fail_oversized)
     with pytest.raises(HTTPError) as oversized_exc:
         http_mod.default_post_json("https://api.example.com/v1", {"a": 1}, {})
     assert sync_calls == 1
@@ -865,7 +874,8 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
     attempt_429 = 0
 
     # 模拟连续两次 429 分别带 3.5 与超大 60 Retry-After，第三次返回成功 JSON
-    def retry_429_urlopen(request: Request, timeout: int = 60):
+    def retry_429_urlopen(request: Request, timeout: int = 60, abort_signal=None):
+        del timeout, abort_signal
         nonlocal attempt_429
         attempt_429 += 1
         if attempt_429 == 1:
@@ -886,7 +896,7 @@ def test_http_error_body_redaction_stream_options_400_precision_and_429_retry_af
 
         return _OkResp(json.dumps({"ok": "recovered"}).encode("utf-8"))
 
-    monkeypatch.setattr(http_mod, "urlopen", retry_429_urlopen)
+    monkeypatch.setattr(http_mod, "open_http_request", retry_429_urlopen)
     assert http_mod.default_post_json("https://api.example.com/v1", {"a": 1}, {}) == {"ok": "recovered"}
     assert sleeps == [3.5, 10.0]
 

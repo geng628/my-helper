@@ -6,11 +6,14 @@ from personal_assistant.ai.providers.google_genai import GoogleGenAIProvider
 from personal_assistant.ai.providers.http import (
     PostJson,
     PostStream,
+    build_stream_error,
     default_post_json,
     default_post_stream,
     format_http_error,
     iter_sse_events,
+    open_http_request,
     parse_retry_after_seconds,
+    raise_if_aborted,
     redact_error_tokens,
 )
 from personal_assistant.ai.providers.openai_completions import (
@@ -36,12 +39,15 @@ __all__ = [
     "OpenAIReasoningProvider",
     "PostJson",
     "PostStream",
+    "build_stream_error",
     "default_post_json",
     "default_post_stream",
     "extract_openai_usage",
     "format_http_error",
     "iter_sse_events",
+    "open_http_request",
     "parse_retry_after_seconds",
+    "raise_if_aborted",
     "redact_error_tokens",
     "register_builtin_providers",
 ]

@@ -211,7 +211,11 @@ def test_static_system_prompt_and_cross_midnight_append_cache_hit(tmp_path: Path
 
         r1 = app.chat("第一天提问", chat_id="cross-day")
         assert r1["reply"] == "第一天回复"
-        assert llm.options_seen[0] == StreamOptions(session_id="cross-day")
+        opt0 = llm.options_seen[0]
+        assert opt0 is not None
+        assert opt0.session_id == "cross-day"
+        assert opt0.abort_signal is not None
+        assert opt0.abort_signal.aborted is False
         req1 = llm.requests[0]
         assert "2026-11-26" not in req1.system_prompt
         assert isinstance(req1.messages[-1], UserMessage)

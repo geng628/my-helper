@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterator, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
@@ -170,6 +171,94 @@ class Context:
     tools: Sequence[ToolSchema] = ()
 
 
+# 协同取消只读观察信号（对标 Web/Pi AbortSignal）：下游仅可观察状态、可中断等待与订阅回调，不可反向触发取消
+class AbortSignal:
+    # 初始化底层同步事件、互斥锁、原因文本与回调订阅表
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._reason = ""
+        self._listeners: list[tuple[int, Callable[[], None]]] = []
+        self._next_id = 0
+
+    # 返回当前信号是否已被触发取消
+    @property
+    def aborted(self) -> bool:
+        return self._event.is_set()
+
+    # 返回首次触发取消时记录的原因文本（未取消或未提供时返回空串）
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    # 可中断等待取消信号：信号触发返回 True，等待超时返回 False
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    # 注册取消回调并返回幂等退订函数；若注册时已处于取消态则在锁外立即同步调用一次
+    def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        with self._lock:
+            if self._event.is_set():
+                run_now = True
+                token = -1
+            else:
+                run_now = False
+                token = self._next_id
+                self._next_id += 1
+                self._listeners.append((token, callback))
+        if run_now:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                pass
+
+            # 已触发信号的空退订句柄
+            def _noop() -> None:
+                return None
+
+            return _noop
+
+        # 从监听表移除当前回调，防止长生命周期信号残留对象引用
+        def _unsubscribe() -> None:
+            with self._lock:
+                self._listeners = [(tid, cb) for tid, cb in self._listeners if tid != token]
+
+        return _unsubscribe
+
+    # 内部幂等触发入口（仅由 AbortController 调用）：首次触发记录原因并在锁外安全通知所有订阅者
+    def _trigger(self, reason: str = "") -> bool:
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self._reason = str(reason or "").strip()
+            self._event.set()
+            callbacks = [cb for _, cb in self._listeners]
+            self._listeners.clear()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+
+# 协同取消控制器（对标 Web/Pi AbortController）：持有唯一触发权并向下游分发只读 AbortSignal
+class AbortController:
+    # 创建一对绑定的控制器与只读取消信号
+    def __init__(self) -> None:
+        self._signal = AbortSignal()
+
+    # 返回可安全透传给下游模型、引擎与工具的只读取消信号
+    @property
+    def signal(self) -> AbortSignal:
+        return self._signal
+
+    # 幂等触发取消并广播给全部订阅者；首次触发返回 True，重复调用返回 False
+    def abort(self, reason: str = "") -> bool:
+        return self._signal._trigger(reason)
+
+
 # 统一模型流式调用选项（各字段默认 None 表示沿用 ModelProfile 配置，显式传值即可单次覆写）
 @dataclass(frozen=True)
 class StreamOptions:
@@ -178,6 +267,7 @@ class StreamOptions:
     reasoning: ThinkingLevel | None = None
     cache_retention: CacheRetention | None = None
     session_id: str | None = None
+    abort_signal: AbortSignal | None = None
 
 
 # 流式事件 1：流开始
@@ -295,6 +385,11 @@ AssistantMessageEvent = (
 # 当未配置有效模型或缺少 API Key 时抛出的异常
 class LLMNotConfigured(RuntimeError):
     """未配置大模型参数时抛出。"""
+
+
+# 当模型流式请求、ReAct 循环或底层传输被协同取消时抛出的结构化异常
+class StreamAbortedError(RuntimeError):
+    """流式调用或回合被协同取消时抛出。"""
 
 
 # 解析并校验可选正整数 max_tokens 字段（严格拒绝布尔值、浮点数与非正数）

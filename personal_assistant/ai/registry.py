@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 
 from personal_assistant.ai.protocol import (
     THINKING_BUDGETS,
+    AbortSignal,
     ApiProvider,
     AssistantMessage,
     AssistantMessageEvent,
@@ -15,6 +16,7 @@ from personal_assistant.ai.protocol import (
     LLMNotConfigured,
     ModelInvoker,
     ModelProfile,
+    StreamAbortedError,
     StreamDone,
     StreamError,
     StreamOptions,
@@ -138,12 +140,14 @@ def _merge_stream_options(
         reasoning = model.reasoning
         cache_retention = model.cache_retention
         session_id: str | None = None
+        abort_signal: AbortSignal | None = None
     else:
         temperature = options.temperature if options.temperature is not None else model.temperature
         max_tokens = options.max_tokens if options.max_tokens is not None else model.max_tokens
         reasoning = options.reasoning if options.reasoning is not None else model.reasoning
         cache_retention = options.cache_retention if options.cache_retention is not None else model.cache_retention
         session_id = options.session_id
+        abort_signal = options.abort_signal
 
     if reasoning != "off" and max_tokens is None:
         max_tokens = THINKING_BUDGETS[reasoning] + 4096
@@ -154,6 +158,7 @@ def _merge_stream_options(
         reasoning=reasoning,
         cache_retention=cache_retention,
         session_id=session_id,
+        abort_signal=abort_signal,
     )
 
 
@@ -183,6 +188,8 @@ def complete(
     try:
         for event in event_iter:
             if isinstance(event, StreamError):
+                if event.reason == "aborted":
+                    raise StreamAbortedError(event.error_message or "请求已取消")
                 raise RuntimeError(event.error_message)
             if isinstance(event, StreamDone):
                 return event.message
@@ -259,6 +266,8 @@ class ModelClient:
         try:
             for event in event_iter:
                 if isinstance(event, StreamError):
+                    if event.reason == "aborted":
+                        raise StreamAbortedError(event.error_message or "请求已取消")
                     raise RuntimeError(event.error_message)
                 if isinstance(event, StreamDone):
                     return event.message
