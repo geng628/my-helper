@@ -238,8 +238,9 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - **即时落盘项**：回合中已执行的 `write_file` 与 `save_study_card` 属于即时工作区文件操作，不参与跨文件事务回滚；覆盖写入依靠 `data/workspace/.backups/` 自动时间戳备份提供恢复手段。
 3. **外层装饰器预算与内核循环解耦**：
    - 步数、Token、墙钟与重复调用熔断放在 Layer 3 `_GuardedTurnLLM` 而非 Layer 2 `agent/react.py`，使 `react.py` 维持无业务策略的最小事件循环；若未来其他宿主直接复用 Layer 2 `run_react()`，需自行提供外层超时或预算包装。
-4. **纯词面回退与混合检索的边界**：
-   - 未配置向量嵌入模型（`embedder`）时，`RAGRetriever` 自动以零网络开销走纯词面双语 FTS5 BM25（单跳精确事实与显式时间线延迟仅数毫秒），但面对零共享词同义改写与跨会话隐式多跳仍受词面上限约束；在 `config/models.dsl` 配置 `embedder`（或设置 `EMBEDDING_MODEL`）后自动启用持久化 `chunk_embeddings` + `math.sumprod` 精确余弦 + BM25 加权 RRF 混合检索。
+4. **纯词面回退、混合检索与 Query 侧优化的边界**：
+   - 未配置向量嵌入模型（`embedder`）时，`RAGRetriever` 自动以零网络开销走纯词面双语 FTS5 BM25（单跳精确事实与显式时间线延迟仅数毫秒），但面对零共享词同义改写与跨会话隐式多跳仍受词面上限约束；在 `config/models.dsl` 配置 `embedder`（或设置 `EMBEDDING_MODEL`）后自动启用持久化 `chunk_embeddings` + `math.sumprod` 精确余弦 + BM25 加权 RRF 混合检索；
+   - `retrieval.query_optimization.enabled` 默认关闭（`false`），保障离线基准零额外调用与最大跨轮历史缓存复用；显式开启后，规划建议仅通过 `<system-reminder>` 注入当前轮用户消息而落库保存纯净原话——`system_prompt` 与更早历史前缀保持逐字节冻结，但紧邻上一轮的 `UserMessage` 在下一轮不再包含已消费的规划提示（`CacheMonitor` 会据此记录 `message[k]:user`），且 HyDE 仅作用于首次 `data/memory` 检索批次（单次消费后自动回收）以杜绝跨步或跨目录污染。
 
 ---
 
@@ -266,7 +267,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `261 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `262 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

@@ -118,6 +118,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
         expansion = plan.get("expansion") if isinstance(plan.get("expansion"), dict) else {}
         routes = route.get("routes") if isinstance(route.get("routes"), list) else []
         sub_queries = expansion.get("sub_queries") if isinstance(expansion.get("sub_queries"), list) else []
+        applied = bool(plan.get("applied", True))
         needs_ret = bool(route.get("needs_retrieval", True))
         reason = str(route.get("reason") or "")
         rewritten = str(plan.get("rewritten_query") or query_text)
@@ -125,13 +126,23 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
         hyde_doc = str(plan.get("hyde_document") or "")
         rendered = str(res.get("rendered") or "")
 
-        lines = [
-            f"【路由】{', '.join(str(r) for r in routes) or 'docs'}（needs_retrieval={needs_ret}"
-            + (f"，原因：{reason}" if reason else "")
-            + "）",
-            f"【改写】{rewritten}",
-            f"【扩展】strategy={strategy} | 子查询：{' ； '.join(str(q) for q in sub_queries)}",
-        ]
+        lines: list[str] = []
+        if not applied:
+            if reason == "fallback":
+                lines.append("【提示】优化模型调用异常或未返回有效 JSON，已自动降级为原查询直通本地检索。")
+            else:
+                lines.append(
+                    "【提示】当前未配置可用大模型（或已关闭全部优化开关），未执行 LLM 查询优化，已按原查询直通本地检索；运行 setup 可开启完整优化。"
+                )
+        lines.extend(
+            [
+                f"【路由】{', '.join(str(r) for r in routes) or 'docs'}（needs_retrieval={needs_ret}"
+                + (f"，原因：{reason}" if reason else "")
+                + "）",
+                f"【改写】{rewritten}",
+                f"【扩展】strategy={strategy} | 子查询：{' ； '.join(str(q) for q in sub_queries)}",
+            ]
+        )
         if hyde_doc:
             lines.append(f"【HyDE】{hyde_doc}")
         if needs_ret and "docs" in routes:
@@ -217,7 +228,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
     return usage
 
 
-# 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh），不消耗模型 Token（/rag enrich 除外）
+# 处理终端本地快捷命令（/status、/memory、/search、/rag、/refresh）；仅 /rag enrich|embed|query 会按需调用模型或向量接口
 def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> str | None:
     head = text.split(None, 1)[0] if text.strip() else ""
     if text == "/status":

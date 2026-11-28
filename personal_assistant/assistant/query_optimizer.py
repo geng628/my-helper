@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, TypeVar
@@ -140,6 +141,7 @@ class QueryPlan:
     expansion: QueryExpansion
     hyde_document: str = ""
     applied: bool = True
+    routing_applied: bool = True
 
     # 导出 JSON 友好字典（供 /rag query 调试与接口返回）
     def to_dict(self) -> dict[str, object]:
@@ -150,20 +152,22 @@ class QueryPlan:
             "expansion": self.expansion.to_dict(),
             "hyde_document": self.hyde_document,
             "applied": self.applied,
+            "routing_applied": self.routing_applied,
         }
 
-    # 生成注入当前轮用户消息的紧凑检索建议（透传/降级计划返回空串；绝不包含 HyDE 假设正文，杜绝把假设文本误当真实证据）
+    # 生成注入当前轮用户消息的紧凑检索建议（透传/降级返回空串；关闭路由时不伪造默认路由行；绝不包含 HyDE 假设正文）
     def format_agent_hint(self) -> str:
         if not self.applied:
             return ""
         lines: list[str] = []
-        routes_label = "、".join(self.route.routes)
-        if not self.route.needs_retrieval:
+        if self.routing_applied:
+            routes_label = "、".join(self.route.routes)
             reason_part = f"（{self.route.reason}）" if self.route.reason else ""
-            lines.append(f"- 检索路由建议：{routes_label} — 无需检索，可直接回答{reason_part}")
-        else:
-            reason_part = f"（{self.route.reason}）" if self.route.reason else ""
-            lines.append(f"- 检索路由建议：{routes_label}{reason_part}")
+            if not self.route.needs_retrieval:
+                lines.append(f"- 检索路由建议：{routes_label} — 无需检索，可直接回答{reason_part}")
+            else:
+                lines.append(f"- 检索路由建议：{routes_label}{reason_part}")
+        if self.route.needs_retrieval:
             if self.rewritten_query != self.original_query:
                 lines.append(f"- 指代补全后的独立查询：{self.rewritten_query}")
             if len(self.expansion.sub_queries) > 1:
@@ -191,11 +195,11 @@ def _allowed_routes_for_tools(available_tools: Sequence[str] | None) -> set[Rout
     return allowed
 
 
-# 从模型可能带围栏或前后说明文字的回复中稳健提取首个 JSON 对象
-def _extract_json_object(raw_text: str) -> dict[str, object] | None:
-    text = raw_text.strip()
-    if not text:
-        return None
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+
+
+# 从任意文本中按 raw_decode 扫描提取首个合法 JSON 字典对象
+def _scan_first_json_dict(text: str) -> dict[str, object] | None:
     decoder = json.JSONDecoder()
     pos = 0
     length = len(text)
@@ -212,6 +216,18 @@ def _extract_json_object(raw_text: str) -> dict[str, object] | None:
             return parsed
         pos = brace + 1
     return None
+
+
+# 从模型可能带围栏或前后说明文字的回复中稳健提取 JSON 对象（优先解析 ```json 围栏块，防止前文出现 {} 示例误导）
+def _extract_json_object(raw_text: str) -> dict[str, object] | None:
+    text = raw_text.strip()
+    if not text:
+        return None
+    for match in _FENCED_JSON_RE.finditer(text):
+        fenced = _scan_first_json_dict(match.group(1))
+        if fenced is not None:
+            return fenced
+    return _scan_first_json_dict(text)
 
 
 # 清洗原始用户查询输入（仅折叠空白并限长，绝不剥离引号以免纯符号消息被洗空）
@@ -261,13 +277,16 @@ def fuse_multi_query_hits(
     limit: int = 10,
     rrf_k: int = 60,
 ) -> list[_THit]:
+    k = require_positive_int(rrf_k, "rrf_k")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit 必须是整数。")
     if limit <= 0:
         return []
     fused: dict[tuple[str, int, int], tuple[float, float, _THit]] = {}
     for hits in hit_lists:
         for rank, hit in enumerate(hits, start=1):
             key = (hit.path, hit.start_line, hit.end_line)
-            contrib = 1.0 / (rrf_k + rank)
+            contrib = 1.0 / (k + rank)
             prev = fused.get(key)
             if prev is None:
                 fused[key] = (contrib, hit.score, hit)
@@ -277,10 +296,17 @@ def fuse_multi_query_hits(
         fused.values(),
         key=lambda item: (-round(item[0], 6), -item[1], item[2].path, item[2].start_line, item[2].end_line),
     )
-    return [
-        replace(hit, score=round(rrf_val, 6))  # noqa: PERF401
-        for rrf_val, _, hit in ordered[:limit]
-    ]
+    deduped: list[_THit] = []
+    used_spans_by_file: dict[str, list[tuple[int, int]]] = {}
+    for rrf_val, _, hit in ordered:
+        prev_spans = used_spans_by_file.setdefault(hit.path, [])
+        if any(hit.start_line <= p_end and hit.end_line >= p_start for p_start, p_end in prev_spans):
+            continue
+        prev_spans.append((hit.start_line, hit.end_line))
+        deduped.append(replace(hit, score=round(rrf_val, 6)))
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 # 将近期对话历史格式化为有界紧凑文本（仅保留最近若干轮 user/assistant，无可用历史返回空串）
@@ -356,7 +382,8 @@ def _normalize_route_decision(
             reason="默认路由",
         )
 
-    reason = _clean_single_line(str(parsed.get("reason") or ""), max_chars=160)
+    raw_reason = parsed.get("reason")
+    reason = _clean_single_line(raw_reason, max_chars=160) if isinstance(raw_reason, str) else ""
     raw_needs = parsed.get("needs_retrieval")
     raw_routes = parsed.get("routes")
     picked: list[RouteTarget] = []
@@ -425,10 +452,11 @@ def _normalize_expansion(
         final_strategy: ExpansionStrategy = "multi_query" if len(final_list) > 1 else "single"
         return QueryExpansion(original=base_query, sub_queries=tuple(final_list), strategy=final_strategy)
 
-    # decompose：保留拆分后的独立子问题（上限 max_sub_queries）
+    # decompose：仅在确实拆出 >=2 条独立子问题时采纳；若只返回 1 条则回退完整原句，防止丢弃复合问题的后半部分
     trimmed = cleaned_list[:max_sub_queries]
-    final_dec_strategy: ExpansionStrategy = "decompose" if len(trimmed) > 1 else "single"
-    return QueryExpansion(original=base_query, sub_queries=tuple(trimmed), strategy=final_dec_strategy)
+    if len(trimmed) <= 1:
+        return QueryExpansion(original=base_query, sub_queries=(base_query,), strategy="single")
+    return QueryExpansion(original=base_query, sub_queries=tuple(trimmed), strategy="decompose")
 
 
 # 原子能力 1（Query Rewriting）：结合近期多轮对话历史，将省略与代词指代补全为独立完整的检索句（无历史零调用）
@@ -580,6 +608,7 @@ class QueryOptimizer:
             expansion=QueryExpansion(original=query, sub_queries=(query,), strategy="single"),
             hyde_document="",
             applied=False,
+            routing_applied=False,
         )
 
     # 执行完整检索前优化计划（单次合并 JSON 调用降低延迟；AbortSignal 必穿透，其余瞬时故障优雅回退透传）
@@ -612,8 +641,11 @@ class QueryOptimizer:
         rewritten = clean_q
         route_dec = _normalize_route_decision(None, allowed=allowed)
         expansion = QueryExpansion(original=clean_q, sub_queries=(clean_q,), strategy="single")
+        plan_called = False
+        routing_applied = False
 
         if do_routing or do_rewrite or do_expand:
+            plan_called = True
             route_menu = "\n".join(f'- "{r}": {_ROUTE_DESCRIPTIONS[r]}' for r in VALID_ROUTES if r in allowed)
             tasks: list[str] = []
             schema_fields: list[str] = []
@@ -657,9 +689,12 @@ class QueryOptimizer:
                 return self._passthrough(clean_q, allowed=allowed, reason="fallback")
 
             parsed = _extract_json_object(raw)
+            if parsed is None:
+                return self._passthrough(clean_q, allowed=allowed, reason="fallback")
             if do_routing:
                 route_dec = _normalize_route_decision(parsed, allowed=allowed)
-            if do_rewrite and parsed is not None and isinstance(parsed.get("rewritten_query"), str):
+                routing_applied = True
+            if do_rewrite and isinstance(parsed.get("rewritten_query"), str):
                 cand = _clean_single_line(str(parsed["rewritten_query"]), max_chars=MAX_REWRITTEN_QUERY_CHARS)
                 if cand:
                     rewritten = cand
@@ -670,9 +705,15 @@ class QueryOptimizer:
             else:
                 expansion = QueryExpansion(original=rewritten, sub_queries=(rewritten,), strategy="single")
 
-        # 仅在路由命中 docs、配置开启 hyde 且系统已配置向量模型时生成 HyDE，避免无向量时白花 Token
+        # 仅在路由命中 docs、配置开启 hyde、系统激活稠密向量且非复合拆解（避免单一混合 HyDE 稀释各独立子问题）时生成 HyDE
         hyde_doc = ""
-        if self.config.hyde and has_embedder and route_dec.needs_retrieval and "docs" in route_dec.routes:
+        if (
+            self.config.hyde
+            and has_embedder
+            and route_dec.needs_retrieval
+            and "docs" in route_dec.routes
+            and expansion.strategy != "decompose"
+        ):
             try:
                 hyde_doc = generate_hyde_document(rewritten, llm, abort_signal=abort_signal)
             except StreamAbortedError:
@@ -680,10 +721,15 @@ class QueryOptimizer:
             except Exception:  # noqa: BLE001
                 hyde_doc = ""
 
+        if not plan_called and not hyde_doc:
+            return self._passthrough(clean_q, allowed=allowed, reason="passthrough")
+
         return QueryPlan(
             original_query=clean_q,
             rewritten_query=rewritten,
             route=route_dec,
             expansion=expansion,
             hyde_document=hyde_doc,
+            applied=True,
+            routing_applied=routing_applied,
         )

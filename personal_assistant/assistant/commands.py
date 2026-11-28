@@ -609,8 +609,9 @@ class ToolsConfig:
     # 根据 retrieval.query_optimization 配置构造检索前 Query 优化器（默认关闭，保持零额外 LLM 调用）
     def build_query_optimizer(self) -> QueryOptimizer:
         raw_opt = self.retrieval.get("query_optimization")
-        cfg = QueryOptimizationConfig.from_dict(raw_opt if isinstance(raw_opt, Mapping) else raw_opt)
-        return QueryOptimizer(cfg)
+        if raw_opt is not None and not isinstance(raw_opt, Mapping):
+            raise ValueError("retrieval.query_optimization 必须是 JSON 对象。")
+        return QueryOptimizer(QueryOptimizationConfig.from_dict(raw_opt))
 
     # 根据 retrieval 配置或显式名称实例化对应的检索插件；未启用或设为 linear 时返回 None
     def build_retriever(self, override_name: str | None = None) -> RetrieverProtocol | None:

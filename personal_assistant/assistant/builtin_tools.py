@@ -1,19 +1,39 @@
 """内核内置工具提供方（记忆读写、工作区落盘与行为规则工具集，零反向依赖 memory.py）。"""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
+from pathlib import Path
 import re
 from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
-from personal_assistant.ai import AbortSignal
+from personal_assistant.ai import AbortSignal, StreamAbortedError
 from personal_assistant.assistant.common import parse_iso_date
 from personal_assistant.assistant.query_optimizer import (
     MAX_ALLOWED_SUB_QUERIES,
     format_search_hits,
     fuse_multi_query_hits,
 )
+from personal_assistant.assistant.text_search import tokenize_text
+
+
+# 判断当前检索词是否与本轮 Query 优化锚点主题相关（防止同轮切换无关主题时沿用旧问题的 HyDE 污染向量）
+def _query_matches_hyde_anchors(query: str, anchors: Sequence[str]) -> bool:
+    clean_anchors = [a.strip() for a in anchors if isinstance(a, str) and a.strip()]
+    if not clean_anchors:
+        return True
+    q_low = query.strip().lower()
+    if not q_low:
+        return False
+    q_tokens = set(tokenize_text(q_low, for_query=True))
+    for anchor in clean_anchors:
+        a_low = anchor.lower()
+        if q_low in a_low or a_low in q_low:
+            return True
+        if q_tokens and (q_tokens & set(tokenize_text(a_low, for_query=True))):
+            return True
+    return False
 
 
 # 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 产出 6 个纯净 Tool 实例
@@ -26,7 +46,7 @@ class MemoryToolsetProvider(ToolsetProvider):
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         memory = self.memory
 
-        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF 并行召回与执行期隐藏 HyDE/AbortSignal 注入
+        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF、执行期作用域受控 HyDE 与全路径 AbortSignal 透传
         def search_markdown(
             query: str,
             root: str = "data/memory",
@@ -34,27 +54,43 @@ class MemoryToolsetProvider(ToolsetProvider):
             *,
             today: date | str | None = None,
             hyde_text: str = "",
+            hyde_anchor_queries: Sequence[str] = (),
             abort_signal: AbortSignal | None = None,
         ) -> str:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "检索已取消")
             parsed_today = parse_iso_date(today)
             if not isinstance(sub_queries, str):
                 raise ValueError("sub_queries 必须是字符串（多条子查询用分号或换行分隔）。")
-            extras = [q.strip() for q in re.split(r"[\n;；]+", sub_queries) if q.strip()]
-            clean_hyde = hyde_text.strip() if isinstance(hyde_text, str) else ""
-            if not extras and not clean_hyde:
-                return memory.search_markdown(query, root=root, today=parsed_today)
             if not isinstance(query, str) or not query.strip():
                 raise ValueError("搜索关键词不能为空。")
+            clean_query = query.strip()
+            extras = [q.strip() for q in re.split(r"[\n;；]+", sub_queries) if q.strip()]
+
+            # HyDE 严格限于默认知识库目录 data/memory 且当前查询与本轮规划锚点相关，严禁跨目录（docs/archive/tool_outputs）或跨主题污染
+            norm_root = Path(root.strip().replace("\\", "/")).as_posix().rstrip("/") if isinstance(root, str) and root.strip() else ""
+            raw_hyde = hyde_text.strip() if isinstance(hyde_text, str) else ""
+            effective_hyde = (
+                raw_hyde
+                if (
+                    raw_hyde
+                    and norm_root == "data/memory"
+                    and _query_matches_hyde_anchors(clean_query, hyde_anchor_queries)
+                )
+                else ""
+            )
+
             all_queries: list[str] = []
             seen_low: set[str] = set()
-            for item in (query.strip(), *extras):
+            for item in (clean_query, *extras):
                 low = item.lower()
                 if low not in seen_low:
                     seen_low.add(low)
                     all_queries.append(item)
                 if len(all_queries) >= MAX_ALLOWED_SUB_QUERIES:
                     break
-            hyde_map = {q: clean_hyde for q in all_queries} if clean_hyde else None
+
+            hyde_map = {q: effective_hyde for q in all_queries} if effective_hyde else None
             multi_fn = getattr(memory.retriever, "search_multi_hits", None)
             if callable(multi_fn):
                 hits = list(
@@ -68,16 +104,26 @@ class MemoryToolsetProvider(ToolsetProvider):
                         abort_signal=abort_signal,
                     )
                 )
-            elif len(all_queries) == 1:
+                return format_search_hits(hits, query="；".join(all_queries), root=root)
+            if len(all_queries) == 1:
                 return memory.search_markdown(all_queries[0], root=root, today=parsed_today)
-            else:
-                hits = fuse_multi_query_hits(
-                    [
-                        memory.search_hits(sub_q, root=root, limit=10, today=parsed_today)
-                        for sub_q in all_queries
-                    ],
-                    limit=10,
-                )
+
+            # 非 RAGRetriever（如 LinearRetriever）多子查询兜底：先校验目录，再按子查询隔离空词异常并 RRF 融合
+            target_dir = memory.resolve_path(root, write=False)
+            if not target_dir.is_dir():
+                raise ValueError(f"目录不存在：{root}")
+            hit_lists = []
+            last_val_err: ValueError | None = None
+            for sub_q in all_queries:
+                if abort_signal is not None and abort_signal.aborted:
+                    raise StreamAbortedError(abort_signal.reason or "检索已取消")
+                try:
+                    hit_lists.append(memory.search_hits(sub_q, root=root, limit=20, today=parsed_today))
+                except ValueError as error:
+                    last_val_err = error
+            if not hit_lists and last_val_err is not None:
+                raise last_val_err
+            hits = fuse_multi_query_hits(hit_lists, limit=10)
             return format_search_hits(hits, query="；".join(all_queries), root=root)
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
@@ -135,7 +181,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 {
                     "query": "主搜索关键词",
                     "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs",
-                    "sub_queries": "可选补充子查询（多条用分号或换行分隔，触发多查询 RRF 融合检索，默认留空）",
+                    "sub_queries": "可选补充子查询（多条用分号或换行分隔，触发多查询 RRF 融合检索；单查询时请省略此字段）",
                 },
                 search_markdown,
                 "read",

@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `261 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `262 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -331,7 +331,7 @@
     - `search_markdown` 工具新增可选参数 `sub_queries` 触发多查询 RRF（`LinearRetriever` 下走通用 `fuse_multi_query_hits` 兜底）；`AssistantApp` 新增 `optimize_query()`、`smart_search()` 与 `status()["query_optimization"]`；CLI 新增 `/rag query <问题>` 可视化路由、改写、子查询、HyDE 与最终命中文档。
   - **测试覆盖**：新增 [../tests/test_query_optimizer.py](../tests/test_query_optimizer.py) 覆盖 4 项原子能力、配置校验、单次合并快路径与 HyDE 门控、Multi-Query RRF 多跳召回、HyDE 仅向量质心生效且 BM25 零污染、对话 KV Cache 冻结与防 `<system-reminder>` 围栏逃逸、在线对话 HyDE 隐藏注入、规划阶段取消零脏写、`LinearRetriever` 兜底与 CLI `/rag query` 容错。
 - **验证与同口径对比（`6f87cf6` → 本次提交）**：
-  - 单元测试：`256 passed → 261 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py` `593 <= 600` 行预算）；
+  - 单元测试：`256 passed → 262 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py` `593 <= 600` 行预算）；
   - 离线检索基准（默认 `query_optimization.enabled=false` 口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（零退步）；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
 - **已知边界与下一步**：在线对话默认关闭 `retrieval.query_optimization.enabled`（可在 `config/tools.json` 手动设为 `true` 启用，或随时用 `/rag query <问题>` 体验与调试）；下一步进入 **RAG Step 3**（可选 `/v1/rerank` Cross-Encoder 精排与相关性门控）及 **Step 4**（专用知识库与端到端 RAG 实模评测）。

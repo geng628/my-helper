@@ -65,6 +65,7 @@ from personal_assistant.assistant.db import StateStore
 from personal_assistant.assistant.files_policy import FilesPolicy
 from personal_assistant.assistant.memory import MemoryStore, SearchHit
 from personal_assistant.assistant.query_optimizer import (
+    MAX_HISTORY_TURNS_FOR_REWRITE,
     QueryOptimizer,
     QueryPlan,
     format_search_hits,
@@ -778,6 +779,11 @@ class AssistantApp:
                                     query_hint = plan.format_agent_hint()
                                     if plan.hyde_document:
                                         turn_ctx["hyde_text"] = plan.hyde_document
+                                        turn_ctx["hyde_anchor_queries"] = tuple(
+                                            dict.fromkeys(
+                                                [plan.original_query, plan.rewritten_query, *plan.expansion.sub_queries]
+                                            )
+                                        )
                                 except StreamAbortedError as error:
                                     opt_aborted_reason = (
                                         str(error) or turn_controller.signal.reason or "请求已取消"
@@ -866,6 +872,10 @@ class AssistantApp:
                                     elif isinstance(event, TextDelta) and event.text:
                                         yield {"type": "text_delta", "text": event.text}
                                     elif isinstance(event, ToolStep):
+                                        if event.tool == "search_markdown":
+                                            # 首个检索批次完成后立即消费并回收 HyDE，防止同轮后续步跨主题追查被初始 HyDE 污染
+                                            turn_ctx.pop("hyde_text", None)
+                                            turn_ctx.pop("hyde_anchor_queries", None)
                                         step_dict: dict[str, object] = {
                                             "tool": event.tool,
                                             "arguments": event.arguments,
@@ -968,15 +978,18 @@ class AssistantApp:
                     result = {k: v for k, v in frame.items() if k != "type"}
         return result
 
-    # 判断当前检索引擎是否已激活稠密向量通道（用于精确门控 HyDE 生成，避免纯 BM25 模式空耗 Token）
+    # 判断当前检索引擎是否已真实激活稠密向量通道（以当前检索器绑定的非空 model_id embedder 与正向量权重为准）
     def _has_dense_retriever(self) -> bool:
-        with self._llm_lock:
-            active_emb = self.embedder
-        if active_emb is None:
-            active_emb = getattr(self.memory.retriever, "embedder", None)
-        if active_emb is None:
+        retriever = self.memory.retriever
+        if not hasattr(retriever, "embedder"):
             return False
-        raw_weight = getattr(getattr(self.memory.retriever, "config", None), "vector_weight", 1.0)
+        ret_emb = getattr(retriever, "embedder", None)
+        if ret_emb is None:
+            return False
+        model_id = str(getattr(ret_emb, "model_id", "") or "").strip()
+        if not model_id:
+            return False
+        raw_weight = getattr(getattr(retriever, "config", None), "vector_weight", 0.0)
         return isinstance(raw_weight, (int, float)) and not isinstance(raw_weight, bool) and float(raw_weight) > 0.0
 
     # 对单条用户查询执行检索前优化规划（路由 + 多轮指代改写 + 多查询扩展/拆解 + 条件 HyDE）
@@ -990,8 +1003,7 @@ class AssistantApp:
     ) -> QueryPlan:
         history: list[dict[str, object]] | None = None
         if chat_id is not None:
-            _, active_all = self.state.get_context_snapshot(chat_id)
-            history = active_all
+            history = self.state.active_messages(chat_id, limit=MAX_HISTORY_TURNS_FOR_REWRITE)
         with self._llm_lock:
             opt_llm = self.consolidator.llm
         return self.query_optimizer.plan(
@@ -1016,6 +1028,8 @@ class AssistantApp:
         force_enable: bool = True,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, object]:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("limit 必须是整数。")
         plan = self.optimize_query(
             query,
             chat_id=chat_id,
@@ -1026,8 +1040,14 @@ class AssistantApp:
         hits: list[SearchHit] = []
         rendered = ""
         if plan.route.needs_retrieval and "docs" in plan.route.routes:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "检索已取消")
             queries = list(plan.expansion.sub_queries) or [plan.rewritten_query]
-            hyde_map = {q: plan.hyde_document for q in queries} if plan.hyde_document else None
+            hyde_map = (
+                {q: plan.hyde_document for q in queries}
+                if (plan.hyde_document and plan.expansion.strategy != "decompose")
+                else None
+            )
             multi_fn = getattr(self.memory.retriever, "search_multi_hits", None)
             if callable(multi_fn):
                 hits = list(
@@ -1041,16 +1061,29 @@ class AssistantApp:
                         abort_signal=abort_signal,
                     )
                 )
-            elif len(queries) > 1:
-                hits = fuse_multi_query_hits(
-                    [
-                        self.memory.search_hits(sub_q, root=root, limit=limit, today=ref_day)
-                        for sub_q in queries
-                    ],
-                    limit=limit,
-                )
             else:
-                hits = self.memory.search_hits(queries[0], root=root, limit=limit, today=ref_day)
+                target_dir = self.memory.resolve_path(root, write=False)
+                if not target_dir.is_dir():
+                    raise ValueError(f"目录不存在：{root}")
+                if limit > 0:
+                    if len(queries) > 1:
+                        per_q_limit = max(limit * 2, 10)
+                        hit_lists: list[list[SearchHit]] = []
+                        last_val_err: ValueError | None = None
+                        for sub_q in queries:
+                            if abort_signal is not None and abort_signal.aborted:
+                                raise StreamAbortedError(abort_signal.reason or "检索已取消")
+                            try:
+                                hit_lists.append(
+                                    self.memory.search_hits(sub_q, root=root, limit=per_q_limit, today=ref_day)
+                                )
+                            except ValueError as error:
+                                last_val_err = error
+                        if not hit_lists and last_val_err is not None:
+                            raise last_val_err
+                        hits = fuse_multi_query_hits(hit_lists, limit=limit)
+                    else:
+                        hits = self.memory.search_hits(queries[0], root=root, limit=limit, today=ref_day)
             rendered = format_search_hits(hits, query="；".join(queries), root=root)
         return {
             "plan": plan.to_dict(),
