@@ -696,7 +696,8 @@ def _run_subprocess_limited(
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
     overflow, wake = threading.Event(), threading.Event()
-    unsub = abort_signal.subscribe(wake.set) if abort_signal is not None else None
+    unsub: object = None
+    threads: tuple[threading.Thread, ...] = ()
 
     # 等待子进程退出并唤醒主线程
     def _wait_proc() -> None:
@@ -705,15 +706,16 @@ def _run_subprocess_limited(
         finally:
             wake.set()
 
-    threads = (
-        threading.Thread(target=_read_pipe_limited, args=(proc.stdout, max_capture_bytes, out_chunks, overflow, wake), daemon=True),
-        threading.Thread(target=_read_pipe_limited, args=(proc.stderr, max_capture_bytes, err_chunks, overflow, wake), daemon=True),
-        threading.Thread(target=_wait_proc, daemon=True),
-    )
-    for th in threads:
-        th.start()
-
     try:
+        unsub = abort_signal.subscribe(wake.set) if abort_signal is not None else None
+        threads = (
+            threading.Thread(target=_read_pipe_limited, args=(proc.stdout, max_capture_bytes, out_chunks, overflow, wake), daemon=True),
+            threading.Thread(target=_read_pipe_limited, args=(proc.stderr, max_capture_bytes, err_chunks, overflow, wake), daemon=True),
+            threading.Thread(target=_wait_proc, daemon=True),
+        )
+        for th in threads:
+            th.start()
+
         waited = wake.wait(timeout=timeout)
         if abort_signal is not None and abort_signal.aborted:
             _kill_process_group(proc)
@@ -742,9 +744,17 @@ def _run_subprocess_limited(
             b"".join(err_chunks).decode("utf-8", errors="replace"),
             None,
         )
+    except BaseException:
+        _kill_process_group(proc)
+        for th in threads:
+            if th.is_alive():
+                th.join(timeout=1.0)
+        raise
     finally:
-        if unsub is not None:
+        if callable(unsub):
             unsub()
+        if proc.poll() is None:
+            _kill_process_group(proc)
 
 
 # 在安全策略护栏内执行单条受控命令（shell=False、隔离 HOME、进程组限长、协同取消与输出卸载）

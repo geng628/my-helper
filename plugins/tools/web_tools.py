@@ -245,13 +245,14 @@ def _raise_if_web_aborted(abort_signal: AbortSignal | None) -> None:
         raise StreamAbortedError(abort_signal.reason or "请求已取消")
 
 
-# 取消回调：立即关停阻塞中的底层连接套接字并关闭 HTTPConnection
+# 取消回调：仅关停阻塞中的底层套接字以唤醒读线程（fd 关闭留给持有线程 finally，无 socket 时回退关连接）
 def _abort_http_connection(sock: Any, conn: Any) -> None:
     if sock is not None:
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        return
     try:
         conn.close()
     except OSError:
@@ -656,6 +657,7 @@ def execute_web_search(
                 {},
                 policy.timeout,
             )
+            _raise_if_web_aborted(abort_signal)
             items = _extract_json_items(data.get("results"), "content", policy.max_results)
             return _format_search_results(clean_query, "tavily", items, policy.max_output_bytes)
 
@@ -664,6 +666,7 @@ def execute_web_search(
             _, _, raw = getter(
                 url, {"Accept": "application/json", "X-Subscription-Token": brave_key}, policy.timeout, policy.max_download_bytes
             )
+            _raise_if_web_aborted(abort_signal)
             data = json.loads(raw.decode("utf-8", errors="replace"))
             items = _extract_json_items((data.get("web") or {}).get("results"), "description", policy.max_results)
             return _format_search_results(clean_query, "brave", items, policy.max_output_bytes)

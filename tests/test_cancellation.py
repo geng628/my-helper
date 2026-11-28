@@ -1,12 +1,16 @@
 """全链路协同取消（AbortController / AbortSignal）端到端 TDD 验收测试。"""
 from __future__ import annotations
 
+import io
 import json
+import os
+import signal
 import socket
 import sys
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import closing
 from email.message import Message as EmailMessage
 from pathlib import Path
 from typing import Any
@@ -248,8 +252,9 @@ def test_http_transport_aborts_retry_backoff_and_blocking_socket_immediately(
         ttfb_thread.join(timeout=2.0)
     assert (time.monotonic() - t0) < 1.0
 
-    # 2d) 真实 TCP 服务端发送首帧 SSE 后中途挂起，取消后立即退出且已读出首帧
+    # 2d) 真实 TCP 服务端发送首帧 SSE 后挂起：读线程真正阻塞在下一行 readline()，由另一线程触发取消，双方均无 C 锁卡顿
     sse_connected = threading.Event()
+    first_frame_read = threading.Event()
     sse_head = (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/event-stream\r\n"
@@ -262,9 +267,21 @@ def test_http_transport_aborts_retry_backoff_and_blocking_socket_immediately(
     )
     sse_ctrl = AbortController()
     received: list[str] = []
+    abort_call_elapsed: list[float] = []
+
+    # 等待读线程消费完首帧及空行、进入下一次阻塞 readline() 后再从独立线程触发取消
+    def _abort_mid_sse_from_other_thread() -> None:
+        assert first_frame_read.wait(timeout=2.0)
+        time.sleep(0.05)
+        t_ab = time.monotonic()
+        sse_ctrl.abort("SSE 跨线程中途取消")
+        abort_call_elapsed.append(time.monotonic() - t_ab)
+
+    t_sse_abort = threading.Thread(target=_abort_mid_sse_from_other_thread, daemon=True)
+    t_sse_abort.start()
     t0 = time.monotonic()
     try:
-        with pytest.raises(StreamAbortedError, match="SSE 中途取消"):
+        with pytest.raises(StreamAbortedError, match="SSE 跨线程中途取消"):
             for line in http_mod.default_post_stream(
                 f"http://127.0.0.1:{sse_port}/v1/chat/completions",
                 {"messages": []},
@@ -273,13 +290,33 @@ def test_http_transport_aborts_retry_backoff_and_blocking_socket_immediately(
                 abort_signal=sse_ctrl.signal,
             ):
                 received.append(line)
-                if "hello" in line:
-                    sse_ctrl.abort("SSE 中途取消")
+                if len(received) >= 2:
+                    first_frame_read.set()
     finally:
         sse_release.set()
+        t_sse_abort.join(timeout=1.0)
         sse_thread.join(timeout=2.0)
     assert any("hello" in line for line in received)
     assert (time.monotonic() - t0) < 1.0
+    assert len(abort_call_elapsed) == 1 and abort_call_elapsed[0] < 0.2
+
+    # 2e) open_http_request 绝不能把 BaseException（如 KeyboardInterrupt / SystemExit）吞成 StreamAbortedError
+    kb_ctrl = AbortController()
+
+    # 模拟 opener.open 在已取消状态下收到 KeyboardInterrupt
+    class _RaisingOpener:
+        # 先触发取消再抛出 KeyboardInterrupt
+        def open(self, req: Request, timeout: float = 60) -> object:
+            del req, timeout
+            kb_ctrl.abort("已取消")
+            raise KeyboardInterrupt("forced second ctrl-c")
+
+    monkeypatch.setattr(http_mod, "build_opener", lambda *args, **kwargs: _RaisingOpener())
+    with pytest.raises(KeyboardInterrupt, match="forced second ctrl-c"):
+        http_mod.open_http_request(
+            Request("http://127.0.0.1:9/v1", method="POST"),
+            abort_signal=kb_ctrl.signal,
+        )
 
 
 # 测试 3：四大内建协议翻译器均响应 pre-abort 与 mid-stream/EOF-race abort，且不污染 CacheMonitor
@@ -388,6 +425,37 @@ def test_all_four_providers_emit_stream_error_aborted_cleanly() -> None:
         with pytest.raises(StreamAbortedError) as exc_info:
             complete(model, ctx, StreamOptions(abort_signal=pre_ctrl.signal), registry=reg)
         assert isinstance(exc_info.value, RuntimeError)
+
+    # 3d) OpenAI stream_options 400 降级路径在取消态绝不发起第二次重试，且确定性关闭未关闭的 HTTPError 响应流
+    oa_ctrl = AbortController()
+    err_fp = io.BytesIO(b'{"error":{"message":"Unknown parameter: stream_options"}}')
+    fallback_attempts = 0
+
+    # 首次抛带 stream_options 不兼容文案的 400 并同时触发取消
+    def _abort_on_400(
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        *,
+        abort_signal: AbortSignal | None = None,
+    ) -> Iterator[str]:
+        nonlocal fallback_attempts
+        del payload, headers, abort_signal
+        fallback_attempts += 1
+        oa_ctrl.abort("400 降级前取消")
+        raise HTTPError(url, 400, "Bad Request", EmailMessage(), err_fp)
+
+    oa_model = ModelProfile(name="m", api="openai-completions", base_url="http://x.invalid/v1", model="m", api_key="sk-test")
+    oa_evs = list(
+        OpenAICompletionsProvider(post_stream=_abort_on_400).stream(
+            oa_model,
+            ctx,
+            StreamOptions(abort_signal=oa_ctrl.signal),
+        )
+    )
+    assert fallback_attempts == 1
+    assert err_fp.closed is True
+    assert isinstance(oa_evs[-1], StreamError) and oa_evs[-1].reason == "aborted"
 
 
 # 测试 4：Layer 2 iter_react / run_react 协同取消（预取消、并行批唤醒、未启动排队工具跳过与原上下文零变异）
@@ -719,9 +787,61 @@ def test_app_abort_turn_rolls_back_facts_telemetry_and_releases_lock_plus_cli(tm
         assert len(g_evs) == 1 and isinstance(g_evs[0], StreamError) and g_evs[0].reason == "aborted"
         assert guarded.breach is None
 
-        # CLI _sigint_to_abort 上下文正常恢复处理器，且 run_repl 捕获 StreamAbortedError 后保持 REPL 可继续运行
-        with _sigint_to_abort(app, "s1"):
-            pass
+        # 6b) 客户端中途关闭生成器（GeneratorExit）：回滚 facts.md、清遥测、零写 SQLite 并立即释放会话锁
+        round2_entered.clear()
+        round2_unblocked.clear()
+        app.llm = _BlockingAppLLM()
+        with closing(app.stream_chat("中途断连测试", chat_id="s-drop")) as drop_gen:
+            for frame in drop_gen:
+                if frame.get("type") == "text_delta":
+                    break
+        assert app.state.count_messages("s-drop") == 0
+        if facts_file.exists():
+            assert "应被回滚的暂存事实" not in facts_file.read_text(encoding="utf-8")
+        assert "s-drop" not in observer._in_flight
+        # 锁已释放，立即发起后续正常请求不卡死
+        app.llm = _BlockingAppLLM()
+        app.llm.calls = 2
+        assert app.chat("断连后继续", chat_id="s-drop")["reply"] == "恢复后正常回复"
+
+        # 6c) AssistantApp.close() 会主动中止在途前台回合，防止关服挂死
+        close_entered = threading.Event()
+
+        # 阻塞等待取消信号的关服测试模型桩
+        class _CloseBlockingLLM:
+            last_usage = None
+
+            # 进入后等待取消信号触发
+            def stream(self, context: Context, options: StreamOptions | None = None) -> Iterator[object]:
+                del context
+                sig = options.abort_signal if options is not None else None
+                close_entered.set()
+                assert sig is not None
+                sig.wait(timeout=5.0)
+                yield StreamError(
+                    reason="aborted",
+                    message=AssistantMessage(stop_reason="aborted", error_message=sig.reason or "关闭"),
+                    error_message=sig.reason or "关闭",
+                )
+
+            # 同步占位
+            def complete(self, context: Context, options: StreamOptions | None = None) -> AssistantMessage:
+                raise NotImplementedError
+
+        close_app = AssistantApp(tmp_path / "data_close", llm=_CloseBlockingLLM(), auto_consolidate=False)
+        close_frames: list[dict[str, object]] = []
+        t_close = threading.Thread(
+            target=lambda: close_frames.extend(close_app.stream_chat("关服测试", chat_id="s-close")),
+            daemon=True,
+        )
+        t_close.start()
+        assert close_entered.wait(timeout=2.0)
+        t0 = time.monotonic()
+        close_app.close()
+        t_close.join(timeout=2.0)
+        assert not t_close.is_alive()
+        assert (time.monotonic() - t0) < 1.0
+        assert close_frames[-1]["type"] == "aborted"
 
         # 始终抛出 StreamAbortedError 的最小替身应用
         class _AbortingCliApp:
@@ -752,6 +872,82 @@ def test_app_abort_turn_rolls_back_facts_telemetry_and_releases_lock_plus_cli(tm
         finally:
             mp.undo()
         assert any("已中断本轮回复" in line for line in printed)
+    finally:
+        app.close()
+
+
+# 测试 8：CLI _sigint_to_abort 真实 SIGINT 无主线程锁自死锁、打断真实阻塞 SSE 无 BufferedReader 重入、二次按键回退及非主线程守卫
+def test_sigint_to_abort_real_signal_no_deadlock_and_second_sigint(tmp_path: Path) -> None:
+    app = AssistantApp(tmp_path / "data_sig", auto_consolidate=False)
+    orig_handler = signal.getsignal(signal.SIGINT)
+    try:
+        # 8a) 持有 app._abort_lock 期间主线程收到真实 SIGINT 绝不自死锁，释放锁后后台线程即刻完成取消
+        with _sigint_to_abort(app, "sig-lock") as sig:
+            assert sig is not None
+            with app._abort_lock:
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.03)
+            assert sig.wait(timeout=1.0) is True
+            assert sig.aborted is True
+        assert signal.getsignal(signal.SIGINT) is orig_handler
+
+        # 8b) 主线程阻塞于真实 HTTP SSE readline() 时触发真实 SIGINT，毫秒级中断且零 BufferedReader 重入异常
+        sse_connected = threading.Event()
+        sse_head = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Connection: close\r\n\r\n"
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        )
+        port, srv_thread, release = _start_stalling_tcp_server(
+            send_before_stall=sse_head,
+            on_connected=sse_connected,
+        )
+        t_sig = threading.Timer(0.12, lambda: os.kill(os.getpid(), signal.SIGINT))
+        t_sig.start()
+        t0 = time.monotonic()
+        try:
+            with _sigint_to_abort(app, "sig-sse") as sse_sig:
+                assert sse_sig is not None
+                with pytest.raises(StreamAbortedError, match="Ctrl\\+C"):
+                    list(
+                        http_mod.default_post_stream(
+                            f"http://127.0.0.1:{port}/v1/chat/completions",
+                            {"messages": []},
+                            {},
+                            max_retries=0,
+                            abort_signal=sse_sig,
+                        )
+                    )
+        finally:
+            t_sig.cancel()
+            release.set()
+            srv_thread.join(timeout=2.0)
+        assert (time.monotonic() - t0) < 1.5
+        assert signal.getsignal(signal.SIGINT) is orig_handler
+
+        # 8c) 第二次 SIGINT 必须回退既有处理器（触发 KeyboardInterrupt），退出后恢复原处理器
+        with pytest.raises(KeyboardInterrupt):
+            with _sigint_to_abort(app, "sig-twice") as sig2:
+                assert sig2 is not None
+                os.kill(os.getpid(), signal.SIGINT)
+                assert sig2.wait(timeout=1.0) is True
+                os.kill(os.getpid(), signal.SIGINT)
+        assert signal.getsignal(signal.SIGINT) is orig_handler
+
+        # 8d) 非主线程进入 _sigint_to_abort 应安全透传 None 且不改动进程信号表
+        worker_out: list[object] = []
+
+        # 子线程内验证上下文管理器直接产出 None
+        def _worker() -> None:
+            with _sigint_to_abort(app, "sig-worker") as wsig:
+                worker_out.append(wsig)
+
+        wt = threading.Thread(target=_worker, daemon=True)
+        wt.start()
+        wt.join(timeout=1.0)
+        assert worker_out == [None]
+        assert signal.getsignal(signal.SIGINT) is orig_handler
     finally:
         app.close()
 

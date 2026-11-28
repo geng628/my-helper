@@ -14,6 +14,8 @@ from typing import Any
 
 from personal_assistant.agent.react import AgentEvent, ToolStart, ToolStep
 from personal_assistant.ai import (
+    AbortController,
+    AbortSignal,
     LLMNotConfigured,
     ModelInvoker,
     ModelsConfig,
@@ -100,34 +102,90 @@ def _handle_repl_command(app: AssistantApp, text: str, chat_id: str = "cli") -> 
     return None
 
 
-# 在主线程执行单轮对话期间临时将首次 SIGINT 转接为协同取消 abort_turn，第二次按键回退默认 KeyboardInterrupt
+# 在主线程执行单轮对话期间通过异步信号安全管道将首次 SIGINT 转交后台线程触发协同取消，避免主线程锁自死锁与流重入
 @contextmanager
-def _sigint_to_abort(app: Any, chat_id: str) -> Iterator[None]:
+def _sigint_to_abort(app: Any, chat_id: str) -> Iterator[AbortSignal | None]:
     if threading.current_thread() is not threading.main_thread():
-        yield
+        yield None
         return
-    prev_handler = signal.getsignal(signal.SIGINT)
-    triggered = False
 
-    # 首次 Ctrl+C 立即通知后台停算并中断阻塞 I/O，二次按下恢复默认中断避免卡死
+    controller = AbortController()
+    read_fd, write_fd = os.pipe()
+    prev_handler = signal.getsignal(signal.SIGINT)
+    handler_installed = False
+    triggered = False
+    helper: threading.Thread | None = None
+    read_closed_by_helper = False
+
+    # 监听管道字节：收到取消标记后在独立工作线程触发取消信号与 abort_turn，彻底规避主线程重入锁与 BufferedReader 冲突
+    def _dispatch_abort() -> None:
+        nonlocal read_closed_by_helper
+        try:
+            while True:
+                try:
+                    chunk = os.read(read_fd, 16)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+                if not chunk or b"Q" in chunk:
+                    break
+                if b"A" in chunk:
+                    controller.abort("用户按下 Ctrl+C 中断")
+                    abort_fn = getattr(app, "abort_turn", None)
+                    if callable(abort_fn):
+                        try:
+                            abort_fn(chat_id, reason="用户按下 Ctrl+C 中断")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    break
+        finally:
+            read_closed_by_helper = True
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+
+    # 首次 Ctrl+C 仅执行异步信号安全非阻塞管道写入唤醒后台线程；二次按下立即回退既有处理器（KeyboardInterrupt）
     def _handle_sigint(signum: int, frame: Any) -> None:
         nonlocal triggered
         if not triggered:
             triggered = True
-            abort_fn = getattr(app, "abort_turn", None)
-            if callable(abort_fn):
-                if abort_fn(chat_id, reason="用户按下 Ctrl+C 中断"):
-                    return
+            try:
+                os.write(write_fd, b"A")
+                return
+            except OSError:
+                pass
         if callable(prev_handler):
             prev_handler(signum, frame)
             return
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGINT, _handle_sigint)
     try:
-        yield
+        os.set_blocking(write_fd, False)
+        helper = threading.Thread(target=_dispatch_abort, name=f"sigint-abort-{chat_id}", daemon=True)
+        helper.start()
+        signal.signal(signal.SIGINT, _handle_sigint)
+        handler_installed = True
+        yield controller.signal
     finally:
-        signal.signal(signal.SIGINT, prev_handler)
+        if handler_installed:
+            signal.signal(signal.SIGINT, prev_handler)
+        try:
+            os.write(write_fd, b"Q")
+        except OSError:
+            pass
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+        if helper is not None:
+            helper.join(timeout=2.0)
+        if not read_closed_by_helper:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
 
 
 # 启动交互式终端对话循环：基于 AssistantApp 持久化历史与实时流式输出
@@ -158,8 +216,13 @@ def run_repl(
                 continue
             on_event, finish = _stream_printer()
             try:
-                with _sigint_to_abort(active_app, chat_id):
-                    result = active_app.chat(user_text, chat_id=chat_id, on_event=on_event)
+                with _sigint_to_abort(active_app, chat_id) as abort_sig:
+                    result = active_app.chat(
+                        user_text,
+                        chat_id=chat_id,
+                        on_event=on_event,
+                        abort_signal=abort_sig,
+                    )
             except LLMNotConfigured as error:
                 print(f"助手> {error}")
                 continue

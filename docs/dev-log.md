@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `232 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `233 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -261,10 +261,10 @@
   - **Layer 1（[../personal_assistant/ai/protocol.py](../personal_assistant/ai/protocol.py)、[../personal_assistant/ai/registry.py](../personal_assistant/ai/registry.py)、[../personal_assistant/ai/providers/http.py](../personal_assistant/ai/providers/http.py) 及四大翻译器）**：新增只读观察端 `AbortSignal`、触发端 `AbortController` 与 `StreamAbortedError(RuntimeError)`，`StreamOptions` 新增 `abort_signal`；`providers/http.py` 按 Pi ch04 `providers/ → protocol.py` 单轨依赖 `protocol.py`，统一收口 `open_http_request()`（自定义 `_AbortableHTTPHandler`/`_AbortableHTTPSHandler` 保留代理并建连后跟踪 socket，取消时 `shutdown(SHUT_RDWR)` 毫秒级打断阻塞）、可中断退避 `abort_signal.wait(delay)`、单轨 `PostStream(url, payload, headers, *, abort_signal=None)` 协议与统一 `build_stream_error()` 收口；四大原生翻译器在请求前、每帧 SSE 与发 `StreamDone` 前校验取消态，统一产出 `StreamError(reason="aborted")` 且不污染 `CacheMonitor`。
   - **Layer 2（[../personal_assistant/agent/react.py](../personal_assistant/agent/react.py)）**：轮间、流中与工具批次前后校验 `options.abort_signal`，通过 `collections.ChainMap` 将只读 `abort_signal` 零拷贝零变异透传给工具层（`tools.py` 0 行改动），并行批取消时跳过未启动排队 Future 并安全等待在途线程收口，绝不产出 `TurnEnd`；`run_react()` 遇取消抛 `StreamAbortedError`。
   - **慢 I/O 插件与 Layer 3 / CLI / Web（[../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)、[../plugins/tools/web_tools.py](../plugins/tools/web_tools.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../scripts/web_chat.py](../scripts/web_chat.py)、[../scripts/web_ui.html](../scripts/web_ui.html)）**：`run_command` 取消即唤醒并 `SIGKILL` 整个子进程组；`web_search` / `fetch_webpage` 取消即断 socket（DDG 取消绝不回退 Bing RSS）；`_GuardedTurnLLM` 取消优先于预算兜底；`AssistantApp` 提供 `abort_turn(chat_id)`（零写 SQLite、回滚 `(turn#)` 暂存事实、发 `turn_aborted` 清遥测、释放会话锁并在 `close()` 中止在途回合）；CLI `run_repl()` 临时将首次 `SIGINT` 转接为 `abort_turn`；Web 新增受同源/Bearer 保护的 `POST /api/chat/abort` 与前端「停止」按钮（切「新会话」同步通知后端停算）。
-  - **测试与守卫**：新增 [../tests/test_cancellation.py](../tests/test_cancellation.py)（7 大端到端与真 TCP Socket 毫秒级取消验收测试），全仓同步迁移 9 个既有测试文件至单轨 `PostStream`/`open_http_request` 契约与 `test_architecture.py` 依赖规则。
+  - **测试与守卫**：新增 [../tests/test_cancellation.py](../tests/test_cancellation.py)（8 大端到端测试，涵盖真 TCP Socket 跨线程毫秒级打断、`BaseException` 穿透保护、真实 `SIGINT` 异步信号安全管道无自死锁与二次按键回退、`GeneratorExit` 断连回滚、`close()` 中止在途与 Web `/api/chat/abort` 安全边界），全仓同步迁移 9 个既有测试文件至单轨 `PostStream`/`open_http_request` 契约与 `test_architecture.py` 依赖规则。
 - **验证与同口径对比（`760b54c` → 本次提交）**：
-  - 单元测试：`225 passed → 232 passed`（100% 通过，12.83s）；
-  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`，负例干净度 `100%`；`scripts/demo.py` 通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`（1,362 处全覆盖），文档相对链接断链为 `0`；
+  - 单元测试：`225 passed → 233 passed`（100% 通过）；
+  - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`，负例干净度 `100%`；`scripts/demo.py` 通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测口径：本次为运行时协同取消架构改造，未改动正常完成路径的提示词、检索或记忆语义，沿用 `9a9d000` / `1b421d2` 实模基线。
 - **已知边界与下一步**：客户端若仅物理断开 SSE TCP 连接且上游未吐新帧，需配合 `/api/chat/abort`（前端「停止」与「新会话」已自动触发）方可在静默思考期毫秒级唤醒；后续如继续演进，可考虑 Pi 风格 Append-only 树状会话（`/undo`/`/fork`）或多模态 `ImageBlock`。
 

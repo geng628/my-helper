@@ -271,8 +271,14 @@ class OpenAICompletionsProvider:
                     if callable(close_fn):
                         close_fn()
         except HTTPError as error:
-            raise_if_aborted(abort_signal)
+            if abort_signal is not None and abort_signal.aborted:
+                try:
+                    error.close()
+                except (OSError, ValueError, AttributeError):
+                    pass
+                raise_if_aborted(abort_signal)
             formatted_error, error_text = format_http_error(error)
+            raise_if_aborted(abort_signal)
             if (
                 error.code != 400
                 or yielded_any
@@ -297,7 +303,12 @@ class OpenAICompletionsProvider:
                         if callable(close_fn2):
                             close_fn2()
             except HTTPError as retry_error:
-                raise_if_aborted(abort_signal)
+                if abort_signal is not None and abort_signal.aborted:
+                    try:
+                        retry_error.close()
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                    raise_if_aborted(abort_signal)
                 formatted_retry, _ = format_http_error(retry_error)
                 if formatted_retry is retry_error:
                     raise

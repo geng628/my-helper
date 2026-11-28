@@ -135,6 +135,8 @@ def build_stream_error(
         abort_signal is not None and abort_signal.aborted
     )
     if is_aborted:
+        if isinstance(exc, HTTPError):
+            _close_quietly(exc)
         reason: ErrorReason = "aborted"
         raw_msg = (
             (abort_signal.reason if abort_signal is not None and abort_signal.reason else "")
@@ -184,7 +186,7 @@ def parse_retry_after_seconds(headers: Any) -> float | None:
     return max(0.1, min(10.0, parsed))
 
 
-# 安全中断并关闭底层阻塞套接字，用于毫秒级唤醒卡在 TTFB 或流读取上的阻塞线程
+# 安全关停底层阻塞套接字读写通道（仅执行 shutdown 唤醒阻塞线程，由持有线程负责 close fd 防复用竞态）
 def _shutdown_socket(sock: object) -> None:
     if sock is None:
         return
@@ -194,22 +196,25 @@ def _shutdown_socket(sock: object) -> None:
             shutdown_fn(socket.SHUT_RDWR)
         except OSError:
             pass
-    close_fn = getattr(sock, "close", None)
-    if callable(close_fn):
-        try:
-            close_fn()
-        except OSError:
-            pass
 
 
-# 静默关闭响应或流对象，忽略重复关闭异常
+# 静默关闭响应或流对象，忽略重复关闭或重入异常
 def _close_quietly(obj: object) -> None:
     close_fn = getattr(obj, "close", None)
     if callable(close_fn):
         try:
             close_fn()
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, RuntimeError):
             pass
+
+
+# 取消回调：优先仅关停响应底层 socket 以零锁唤醒阻塞读线程；仅无 socket 替身对象回退直接关流
+def _abort_response(response: object) -> None:
+    sock = _extract_response_socket(response)
+    if sock is not None:
+        _shutdown_socket(sock)
+        return
+    _close_quietly(response)
 
 
 # 从 urllib/http.client 响应对象提取底层 socket 引用（不存在时返回 None）
@@ -222,12 +227,13 @@ def _extract_response_socket(response: object) -> object | None:
     return getattr(raw, "_sock", None)
 
 
-# 受控 HTTP 响应包装器：在退出上下文或关闭流时幂等退订全部取消监听器并关闭底层响应，零猴子补丁
+# 受控 HTTP 响应包装器：在退出上下文或关闭流时线程安全且幂等地退订全部取消监听器并关闭底层响应，零猴子补丁
 class _ManagedHTTPResponse:
     # 绑定原始响应对象与取消监听清理回调
     def __init__(self, inner: Any, on_close: Callable[[], None]) -> None:
         self._inner = inner
         self._on_close = on_close
+        self._close_lock = threading.Lock()
         self._closed = False
 
     # 进入 with 上下文返回自身
@@ -249,11 +255,12 @@ class _ManagedHTTPResponse:
     def read(self, amt: int | None = None) -> bytes:
         return self._inner.read() if amt is None else self._inner.read(amt)
 
-    # 幂等释放所有取消回调并关闭底层响应
+    # 线程安全幂等释放所有取消回调并关闭底层响应
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
             self._on_close()
         finally:
@@ -336,10 +343,13 @@ def open_http_request(
     opener = build_opener(_AbortableHTTPHandler(), _AbortableHTTPSHandler())
     try:
         response = opener.open(request, timeout=timeout)
-    except BaseException:
+    except Exception:
         _release_unsubs()
         if abort_signal is not None and abort_signal.aborted:
             raise StreamAbortedError(abort_signal.reason or "请求已取消") from None
+        raise
+    except BaseException:
+        _release_unsubs()
         raise
     if abort_signal is not None and abort_signal.aborted:
         _release_unsubs()
@@ -409,9 +419,7 @@ def _post_with_retry(
 # 完整读取 HTTP 响应字节流并按 UTF-8 解码，支持读取阶段即时协同取消
 def _read_utf8_body(response: Any, abort_signal: AbortSignal | None = None) -> str:
     unsub = (
-        abort_signal.subscribe(
-            lambda: (_shutdown_socket(_extract_response_socket(response)), _close_quietly(response))
-        )
+        abort_signal.subscribe(lambda: _abort_response(response))
         if abort_signal is not None
         else None
     )
@@ -470,9 +478,7 @@ def default_post_stream(
         operation=lambda resp: resp,
     )
     unsub = (
-        abort_signal.subscribe(
-            lambda: (_shutdown_socket(_extract_response_socket(response)), _close_quietly(response))
-        )
+        abort_signal.subscribe(lambda: _abort_response(response))
         if abort_signal is not None
         else None
     )

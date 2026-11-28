@@ -170,7 +170,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
    - **双核心协议宪法**：`ApiProvider`（第三层翻译器入职契约，仅需声明 `api: str` 与 `stream(model, context, options)`）与 `ModelInvoker`（上层消费的统一前台句柄契约，提供 `stream()`、`complete()` 与线程局部 `last_usage`）。
 2. **第一层·统一前台与通讯录注册表（[../personal_assistant/ai/registry.py](../personal_assistant/ai/registry.py)，仅依赖 `protocol.py`）**：
    - `ApiProviderRegistry`：线程安全的协议翻译器通讯录，按小写归一化 `api` 路由分发，支持 `copy()`（供 `ToolsConfig.build_provider_registry()` 构造应用级隔离副本）、`snapshot()` / `restore()`（供测试夹具原子隔离现场）。
-   - 统一前台函数：`stream()`（同步校验 API Key 缺失即抛 `LLMNotConfigured` 并按 `model.api` 分派翻译器）、`stream_simple()`（合并 `ModelProfile` 默认值与显式 `StreamOptions`，开启思考且未指定 `max_tokens` 时自动补足 `THINKING_BUDGETS[reasoning] + 4096`）与 `complete()`（确定性消费并关闭流，遇 `StreamError` 抛 `RuntimeError`）。
+   - 统一前台函数：`stream()`（同步校验 API Key 缺失即抛 `LLMNotConfigured` 并按 `model.api` 分派翻译器）、`stream_simple()`（合并 `ModelProfile` 默认值与显式 `StreamOptions`，开启思考且未指定 `max_tokens` 时自动补足 `THINKING_BUDGETS[reasoning] + 4096`）与 `complete()`（确定性消费并关闭流，遇取消抛 `StreamAbortedError`，其余 `StreamError` 抛 `RuntimeError`）。
    - 轻量句柄与直通工厂：`ModelClient`（持有 `ModelProfile` 与可选局部 `registry`，线程局部记录 `last_usage`，多线程共享零串台）、`NoopModelClient`、`from_model_profile(profile, registry=...)` 与 `from_env(env, registry=...)`（复用 `ModelProfile.from_dict` 单点校验，支持 `LLM_API`/`LLM_MAX_TOKENS`/`LLM_REASONING`/`LLM_CACHE_RETENTION`）。
 3. **第三层·原生协议翻译器与共享传输底座（[../personal_assistant/ai/providers/](../personal_assistant/ai/providers/)）**：
    - **共享传输底座（`providers/http.py`，仅依赖 `protocol.py`）**：单轨 `open_http_request()` 通过自定义 `_AbortableHTTPHandler`/`_AbortableHTTPSHandler` 保留代理/重定向能力并在建连后即刻挂接 socket 取消回调（取消时 `shutdown(SHUT_RDWR)` 毫秒级打断 TTFB 与 SSE 阻塞，退出即全量退订），`_post_with_retry` 对瞬时网络/TLS 异常及 HTTP `429`（合法 `Retry-After` 夹紧 `[0.1, 10.0]` 秒）/`5xx` 执行最多 2 次可中断退避重试（`abort_signal.wait(delay)`）；`PostStream` 统一升级为 `(url, payload, headers, *, abort_signal=None)` 单轨协议，`build_stream_error()` 统一将异常与协同取消收敛为规范 `StreamError`；`format_http_error` 与 `redact_error_tokens` 读取最多 1024 字节上游错误体、确定性关流并全量脱敏各类凭据；通用 `iter_sse_events` 同时兼容标准空行分隔、多行 `data:` 拼接、紧凑无空行流与提前中断关流。
@@ -260,7 +260,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `232 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `233 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：

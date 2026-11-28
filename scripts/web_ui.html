@@ -931,7 +931,9 @@
         }
       } catch (err) {
         if (err && err.name === "AbortError") {
-          if (!streamCtx.replyText) bubble.textContent = "已停止生成，本轮输出已取消。";
+          if (!streamClosedCleanly) {
+            applyStreamEvent(streamCtx, { type: "aborted", reason: "已停止生成" });
+          }
         } else {
           wrap.classList.add("error");
           bubble.textContent = `网络异常：${err}`;
