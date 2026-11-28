@@ -9,7 +9,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
@@ -21,6 +21,7 @@ from personal_assistant.ai import (
     EmbeddingInvoker,
     LLMNotConfigured,
     ModelInvoker,
+    RerankInvoker,
     StreamAbortedError,
     cosine_similarity,
     normalize_vector,
@@ -55,6 +56,8 @@ RETRIEVER_NAME = "rag"
 _SCHEMA_VERSION = "4"
 _CHUNKER_VERSION = "2"
 _MAX_SNIPPET_CHARS = 4000
+_MAX_RERANK_DOC_CHARS = 2400
+_MAX_RERANK_CANDIDATES = 200
 _MAX_VECTOR_CACHE_ITEMS = 20_000
 _SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _REQUIRED_TABLES = frozenset(
@@ -173,6 +176,14 @@ def _clean_embedder_model(embedder: EmbeddingInvoker | None) -> str | None:
     if embedder is None:
         return None
     clean = str(embedder.model_id).strip()
+    return clean or None
+
+
+# 统一提取并去空白重排客户端的规范模型标识（未配置或为空时返回 None）
+def _clean_reranker_model(reranker: RerankInvoker | None) -> str | None:
+    if reranker is None:
+        return None
+    clean = str(reranker.model_id).strip()
     return clean or None
 
 
@@ -917,8 +928,10 @@ class RAGConfig:
     rrf_k: int = 60
     bm25_weight: float = 1.0
     vector_weight: float = 1.0
+    rerank_candidates: int = 50
+    min_rerank_score: float = 0.0
 
-    # 校验覆盖率、BM25 下限、父子分块、Overlap、混合 RRF 权重、抗噪余弦阈值及派生索引相对路径边界
+    # 校验覆盖率、BM25 下限、父子分块、Overlap、混合 RRF 权重、抗噪余弦/重排阈值及派生索引相对路径边界
     def __post_init__(self) -> None:
         validate_retrieval_thresholds(self.min_term_coverage, self.min_bm25_score)
         require_positive_int(self.max_hits_per_file, "retrieval.max_hits_per_file")
@@ -933,6 +946,10 @@ class RAGConfig:
         w_vec = _require_bounded_float(self.vector_weight, "retrieval.vector_weight", low=0.0)
         if w_bm25 <= 0.0 and w_vec <= 0.0:
             raise ValueError("retrieval.bm25_weight 与 retrieval.vector_weight 不能同时为 0。")
+        rr_cands = require_positive_int(self.rerank_candidates, "retrieval.rerank_candidates")
+        if rr_cands > _MAX_RERANK_CANDIDATES:
+            raise ValueError(f"retrieval.rerank_candidates 不能超过 {_MAX_RERANK_CANDIDATES}。")
+        _require_bounded_float(self.min_rerank_score, "retrieval.min_rerank_score", low=0.0, high=1.0)
         if self.index_path is not None:
             if not isinstance(self.index_path, str) or not self.index_path.strip() or "\x00" in self.index_path:
                 raise ValueError("retrieval.index_path 必须是非空相对路径字符串或省略。")
@@ -988,6 +1005,8 @@ class RAGConfig:
         rrf_k = _parse_int("rrf_k", 60)
         bm25_w = _parse_float("bm25_weight", 1.0)
         vec_w = _parse_float("vector_weight", 1.0)
+        rerank_cands = _parse_int("rerank_candidates", 50)
+        min_rerank = _parse_float("min_rerank_score", 0.0)
 
         raw_index_path = cfg.get("index_path")
         if raw_index_path is not None and not isinstance(raw_index_path, str):
@@ -1014,22 +1033,26 @@ class RAGConfig:
             rrf_k=rrf_k,
             bm25_weight=bm25_w,
             vector_weight=vec_w,
+            rerank_candidates=rerank_cands,
+            min_rerank_score=min_rerank,
         )
 
 
-# 持久化两层父子混合 RAG 检索引擎（实现 RetrieverProtocol，线程安全，未配 embedder 时零开销走纯 BM25，配置后自动激活 BM25+Dense RRF）
+# 持久化两层父子混合 RAG 检索引擎（实现 RetrieverProtocol，线程安全，支持 BM25+Dense RRF 与可选 Cross-Encoder 精排）
 class RAGRetriever:
     name = RETRIEVER_NAME
 
-    # 初始化检索配置、可选向量客户端、线程锁与按数据根目录隔离的派生 SQLite 索引句柄缓存
+    # 初始化检索配置、可选向量/重排客户端、线程锁与按数据根目录隔离的派生 SQLite 索引句柄缓存
     def __init__(
         self,
         config: RAGConfig | None = None,
         *,
         embedder: EmbeddingInvoker | None = None,
+        reranker: RerankInvoker | None = None,
     ) -> None:
         self.config = config or RAGConfig()
         self._embedder: EmbeddingInvoker | None = embedder
+        self._reranker: RerankInvoker | None = reranker
         self._lock = threading.RLock()
         self._indices: dict[Path, _DerivedRAGIndex] = {}
 
@@ -1043,6 +1066,17 @@ class RAGRetriever:
     def set_embedder(self, embedder: EmbeddingInvoker | None) -> None:
         with self._lock:
             self._embedder = embedder
+
+    # 线程安全读取当前绑定的可选 Cross-Encoder 重排客户端
+    @property
+    def reranker(self) -> RerankInvoker | None:
+        with self._lock:
+            return self._reranker
+
+    # 线程安全热切换可选 Cross-Encoder 重排客户端（传入 None 即关闭精排阶段）
+    def set_reranker(self, reranker: RerankInvoker | None) -> None:
+        with self._lock:
+            self._reranker = reranker
 
     # 解析当前 MemoryStore 对应的派生索引路径：只读模式恒返回 None 零写盘，读写模式严格收口于 data_root 内
     def _resolve_db_path(self, memory: "MemoryStore") -> Path | None:
@@ -1738,7 +1772,11 @@ class RAGRetriever:
         if not query_terms and query_vec is None:
             return []
 
-        return self._with_index_recovery(
+        active_reranker = self.reranker
+        rerank_enabled = _clean_reranker_model(active_reranker) is not None
+        coarse_limit = max(limit, self.config.rerank_candidates) if rerank_enabled else limit
+
+        coarse_hits = self._with_index_recovery(
             memory,
             lambda index: self._sync_and_query(
                 index,
@@ -1747,14 +1785,82 @@ class RAGRetriever:
                 searching_archive=searching_archive,
                 query_terms=query_terms,
                 ref_day_iso=ref_day_iso,
-                limit=limit,
+                limit=coarse_limit,
                 metadata_filter=active_filter,
                 query_vec=query_vec,
                 embedder_model=embedder_model,
             ),
         )
+        return self._rerank_hits(
+            clean_query,
+            coarse_hits,
+            limit=limit,
+            reranker=active_reranker,
+            abort_signal=abort_signal,
+        )
 
-    # 多子查询联合检索：单次扫盘、单次去重批量向量化与单快照前置过滤后执行 Multi-Query RRF 与重叠区间去重融合
+    # 在锁外对已通过前置权限与元数据过滤的粗排候选执行 Cross-Encoder 精排与阈值剪枝（遇瞬时故障优雅退回粗排，绝不吞取消）
+    def _rerank_hits(
+        self,
+        query: str,
+        candidates: list[SearchHit],
+        *,
+        limit: int,
+        reranker: RerankInvoker | None,
+        abort_signal: AbortSignal | None = None,
+    ) -> list[SearchHit]:
+        if not candidates or limit <= 0 or _clean_reranker_model(reranker) is None or reranker is None:
+            return candidates[:limit]
+        if abort_signal is not None and abort_signal.aborted:
+            raise StreamAbortedError(abort_signal.reason or "精排已取消")
+        clean_q = query.strip()
+        if not clean_q:
+            return candidates[:limit]
+
+        docs = [
+            f"[{hit.path} | {hit.section or '正文'}]\n{hit.snippet}"[:_MAX_RERANK_DOC_CHARS]
+            for hit in candidates
+        ]
+        try:
+            ranked = reranker.rerank(
+                clean_q,
+                docs,
+                top_n=min(limit, len(candidates)),
+                abort_signal=abort_signal,
+            )
+        except StreamAbortedError:
+            raise
+        except (OSError, RuntimeError, ValueError, TypeError, LLMNotConfigured):
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "精排已取消")
+            return candidates[:limit]
+
+        min_score = self.config.min_rerank_score
+        seen_idx: set[int] = set()
+        scored_pairs: list[tuple[float, int]] = []
+        for item in ranked:
+            idx = getattr(item, "index", None)
+            score = getattr(item, "score", None)
+            if (
+                isinstance(idx, bool)
+                or not isinstance(idx, int)
+                or not (0 <= idx < len(candidates))
+                or idx in seen_idx
+            ):
+                continue
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                continue
+            seen_idx.add(idx)
+            score_val = float(score)
+            if score_val >= min_score:
+                scored_pairs.append((score_val, idx))
+        scored_pairs.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [
+            replace(candidates[idx], score=round(score_val, 6))
+            for score_val, idx in scored_pairs[:limit]
+        ]
+
+    # 多子查询联合检索：单次扫盘、单次去重批量向量化、单快照前置过滤 Multi-Query RRF，并按需在锁外执行 Cross-Encoder 精排
     def search_multi_hits(
         self,
         memory: "MemoryStore",
@@ -1765,6 +1871,7 @@ class RAGRetriever:
         today: date | None = None,
         hyde_texts: Mapping[str, str] | None = None,
         metadata_filter: MetadataFilter | None = None,
+        rerank_query: str | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> list[SearchHit]:
         if abort_signal is not None and abort_signal.aborted:
@@ -1884,7 +1991,10 @@ class RAGRetriever:
         if not effective_queries:
             return []
 
-        per_query_limit = max(limit * 2, 10)
+        active_reranker = self.reranker
+        rerank_enabled = _clean_reranker_model(active_reranker) is not None
+        coarse_limit = max(limit, self.config.rerank_candidates) if rerank_enabled else limit
+        per_query_limit = max(coarse_limit, limit * 2, 10)
         k = self.config.rrf_k
 
         # 单次同步快照内依次执行全部子查询并汇总 Multi-Query RRF，确保跨子查询视图完全一致
@@ -1946,9 +2056,17 @@ class RAGRetriever:
                     per_file[hit.path] = cnt + 1
                 else:
                     overflow.append(merged_hit)
-            return (primary + overflow)[:limit]
+            return (primary + overflow)[:coarse_limit]
 
-        return self._with_index_recovery(memory, _run_multi_on_snapshot)
+        coarse_hits = self._with_index_recovery(memory, _run_multi_on_snapshot)
+        effective_rerank_q = (rerank_query or "").strip() or clean_queries[0]
+        return self._rerank_hits(
+            effective_rerank_q,
+            coarse_hits,
+            limit=limit,
+            reranker=active_reranker,
+            abort_signal=abort_signal,
+        )
 
     # 离线批量为目标根目录的活跃子块计算并持久化向量缓存（默认仅处理 public 权限防止机密文档外发；管理员可传 allowed_access=('*',)）
     def embed_chunks(
@@ -2003,6 +2121,7 @@ class RAGRetriever:
         active_emb = self.embedder
         active_model = _clean_embedder_model(active_emb)
         target_dims = _embedder_target_dims(active_emb)
+        active_reranker_model = _clean_reranker_model(self.reranker)
 
         # 同步后汇总目标根目录下的文件数、父子块数、上下文摘要及活跃子块向量覆盖情况
         def _collect(index: _DerivedRAGIndex) -> dict[str, object]:
@@ -2098,6 +2217,8 @@ class RAGRetriever:
                 "embedder_model": active_model,
                 "embedded_children": embedded_children,
                 "cached_embeddings": cached_embeddings,
+                "reranker_model": active_reranker_model,
+                "rerank_candidates": self.config.rerank_candidates,
             }
 
         return self._with_index_recovery(memory, _collect)

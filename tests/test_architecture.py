@@ -127,6 +127,11 @@ def test_dependency_funnel_has_no_upward_or_cyclic_imports() -> None:
                     "personal_assistant.ai.protocol",
                     "personal_assistant.ai.providers.http",
                 }, f"ai/embeddings.py 仅允许依赖 ai.protocol 与 providers.http，实际：{deps}"
+            elif mod == "personal_assistant.ai.rerank":
+                assert deps <= {
+                    "personal_assistant.ai.protocol",
+                    "personal_assistant.ai.providers.http",
+                }, f"ai/rerank.py 仅允许依赖 ai.protocol 与 providers.http，实际：{deps}"
             elif mod == "personal_assistant.ai.providers.http":
                 assert deps <= {"personal_assistant.ai.protocol"}, (
                     f"ai/providers/http.py 仅允许依赖 ai.protocol，实际：{deps}"

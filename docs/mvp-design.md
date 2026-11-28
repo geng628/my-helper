@@ -9,7 +9,7 @@
 1. **零第三方运行依赖**：
    - 生产代码仅使用 Python 3.12+ 标准库（`urllib`、`http.client`、`sqlite3`、`threading`、`http.server`、`shlex`、`ipaddress`、`unicodedata` 等）；`pytest` 仅作为开发测试依赖。
 2. **三层单向依赖漏斗（`ai ← agent ← assistant`）与 Layer 1 三层解耦**：
-   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`openai_reasoning`/`anthropic_messages`/`google_genai` 四大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）+ `embeddings.py`（标准 `/v1/embeddings` 客户端、小端 `float32` 编解码与 `math.sumprod` 精确余弦）；
+   - `personal_assistant/ai/`（Layer 1）：零向上依赖，内部严格遵循 **Pi ch04 三层模型调用翻译架构**：`protocol.py`（第二层·中立事件与契约协议，零内部依赖）← `registry.py`（第一层·统一前台 `stream`/`stream_simple`/`complete` 与通讯录注册表 `ApiProviderRegistry`，零感知具体翻译器）← `providers/`（第三层·共享 `http.py` 传输底座与 `openai_completions`/`openai_reasoning`/`anthropic_messages`/`google_genai` 四大原生翻译器）+ `cache.py`（中立 `Context` 有界 KV Cache 观测）+ `embeddings.py`（标准 `/v1/embeddings` 客户端、小端 `float32` 编解码与 `math.sumprod` 精确余弦）+ `rerank.py`（标准 `/v1/rerank` Cross-Encoder 精排客户端）；
    - `personal_assistant/agent/`（Layer 2）：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`）；包含中立 `Context` 驱动的通用 ReAct 循环、纯值对象工具递进扩展（`ToolSchema → Tool` + `bind_tool_context`）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 宪法）；
    - `personal_assistant/assistant/`（Layer 3）：个人与学习助手业务编排（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 会话存储、外层回合预算、后台压缩与 CLI/Web 接入）；
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级，产品包绝不反向导入 `evals/`，由 [../tests/test_architecture.py](../tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言扫描、子进程 `sys.modules` 断层隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 硬守卫强制保障。
@@ -95,7 +95,7 @@ flowchart TD
 my_helper_v2/
 ├── config/
 │   ├── tools.json                     # 工具白名单、插件入口与 retrieval/telemetry/web/shell/files/commands 段配置
-│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / api）
+│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / reranker / api）
 ├── plugins/
 │   ├── tools/
 │   │   ├── plugin.py                  # ToolsPlugin(Plugin)：统一扫描本命名空间目录 @tool 模块
@@ -104,29 +104,30 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与直连 http.client+TLS/DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
-│   ├── rag_retriever.py               # 持久化两层父子混合 RAG 检索插件（RetrieverProtocol：父子表 + FTS5 + float32 向量缓存 + RRF）
-│   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/consolidator/embedder/reasoning）
+│   ├── rag_retriever.py               # 持久化两层父子混合 RAG 检索插件（RetrieverProtocol：父子表 + FTS5 + 向量缓存 + RRF + 精排）
+│   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/consolidator/embedder/reranker/reasoning）
 │   └── telemetry.py                   # 有界 MRU 会话耗时拆解与后台任务观测插件（ObserverProtocol）
 ├── personal_assistant/                # 纯净三层产品包（绝不反向依赖 evals/）
 │   ├── __init__.py
 │   ├── __main__.py
-│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测 + 向量客户端）：
+│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测 + 向量/重排客户端）：
 │   │   ├── __init__.py                #   统一导出并在导入期注册四大内建原生翻译器
 │   │   ├── protocol.py                #   第二层·零内部依赖事件与契约协议层
 │   │   ├── registry.py                #   第一层·统一前台入口、ApiProviderRegistry 与 ModelClient
 │   │   ├── providers/                 #   第三层·原生协议翻译器子包：
 │   │   │   ├── __init__.py            #     register_builtin_providers 汇总导出
-│   │   │   ├── http.py                #     共享标准库重试/429 Retry-After/脱敏/通用 SSE 底座
+│   │   │   ├── http.py                #     共享标准库重试/429 Retry-After/脱敏/同源校验/通用 SSE 底座
 │   │   │   ├── openai_completions.py  #     api="openai-completions" 翻译器（OpenAI/DeepSeek Chat 等）
 │   │   │   ├── openai_reasoning.py    #     api="openai-reasoning" 翻译器（DeepSeek Reasoner/R1 等）
 │   │   │   ├── anthropic_messages.py  #     api="anthropic-messages" 原生翻译器
 │   │   │   └── google_genai.py        #     api="google-generative-ai" 原生翻译器
 │   │   ├── cache.py                   #   中立 Context 有界 KV Cache 观测
-│   │   └── embeddings.py              #   标准 /v1/embeddings 客户端、float32 编解码与 math.sumprod 精确余弦
+│   │   ├── embeddings.py              #   标准 /v1/embeddings 客户端、float32 编解码与 math.sumprod 精确余弦
+│   │   └── rerank.py                  #   标准 /v1/rerank Cross-Encoder 重排客户端（BGE-Reranker/Cohere/Jina/vLLM）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
 │                                      #          rag_metadata.py / rag_contextualizer.py / query_optimizer.py /
-│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
+│                                      #          rag_postprocess.py / prompts.py / context.py / memory.py / builtin_tools.py /
 │                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本

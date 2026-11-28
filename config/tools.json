@@ -27,7 +27,20 @@
     "rrf_k": 60,
     "bm25_weight": 1.0,
     "vector_weight": 1.0,
+    "rerank_candidates": 50,
+    "min_rerank_score": 0.15,
     "allowed_access": ["public"],
+    "post_retrieval": {
+      "dedup_similarity": 0.82,
+      "max_context_chars": 6000,
+      "max_chars_per_hit": 1200,
+      "compress_long_hits": true,
+      "lost_in_middle_reorder": false,
+      "crag_enabled": true,
+      "crag_high_threshold": 0.65,
+      "crag_low_threshold": 0.25,
+      "max_corrective_rewrites": 1
+    },
     "query_optimization": {
       "enabled": false,
       "routing": true,

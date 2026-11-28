@@ -13,7 +13,7 @@
      - **第二层·事件与契约协议层**（[personal_assistant/ai/protocol.py](personal_assistant/ai/protocol.py)）：零内部依赖，定义厂商中立的 `Context` / `Message`（`UserMessage`、`AssistantMessage`、`ToolResultMessage`）/ `ToolSchema` / `ToolCall`、12 种统一流式事件（`StreamStart`、`TextStart/Delta/End`、`ThinkingStart/Delta/End`、`ToolCallStart/Delta/End`、`StreamDone`、`StreamError`）、协同取消原语（只读 `AbortSignal`、触发端 `AbortController` 与 `StreamAbortedError`）、语义思考级别 `ThinkingLevel` 与缓存保留策略 `CacheRetention`、单一路由键 `api` 的 `ModelProfile`、通用命名角色表 `ModelsConfig.roles`、翻译器入职宪法 `ApiProvider` 与前台句柄协议 `ModelInvoker`。
      - **第一层·统一前台与通讯录**（[personal_assistant/ai/registry.py](personal_assistant/ai/registry.py)）：仅依赖 `protocol.py` 零感知具体翻译器，提供 `stream()` / `stream_simple()` / `complete()` 统一入口、线程安全可隔离拷贝的 `ApiProviderRegistry` 通讯录、`ModelClient` / `NoopModelClient` 与直通工厂 `from_model_profile()` / `from_env()`。
      - **第三层·原生协议翻译器**（[personal_assistant/ai/providers/](personal_assistant/ai/providers/)）：共享标准库可中断连接/重试/脱敏/错误收口与通用 SSE 底座 `http.py`（依赖 `protocol.py`，支持 `AbortSignal` 毫秒级打断 TTFB/SSE 套接字与退避睡眠），内置四大原生翻译器——`openai_completions.py`（`openai-completions`，覆盖 OpenAI / DeepSeek Chat / 通义千问 / Kimi / GLM / Ollama 并兼容 `prompt_cache_hit_tokens`）、`openai_reasoning.py`（`openai-reasoning`，覆盖 DeepSeek Reasoner / R1 等 `reasoning_content` 推理方言，支持轮内续传与跨轮剥离）、`anthropic_messages.py`（`anthropic-messages`，支持 Prompt Caching 断点与带签名 Extended Thinking）、`google_genai.py`（`google-generative-ai`，支持 `systemInstruction`/`functionDeclarations`/`thinkingConfig`）；接入任意全新模型厂商或私有协议只需编写 **1 个 `ApiProvider` 翻译器 + 注册到通讯录（或 Slot 4 插件）+ 在 `models.dsl` 配 `api`**，上层零改动。
-     - **中立 KV Cache 观测与标准向量客户端**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)、[personal_assistant/ai/embeddings.py](personal_assistant/ai/embeddings.py)）：基于中立 `Context` 序列化统计服务端真实命中率与失配段归因；并内置零第三方依赖的标准 `/v1/embeddings` 客户端（`OpenAIEmbeddingClient` / `EmbeddingInvoker`，兼容 OpenAI / 硅基流动 / 通义千问 / 本地 Ollama，支持分批、`index` 对齐、L2 归一化、小端 `float32` BLOB 编解码与 Python 3.12 `math.sumprod` 精确余弦）。
+     - **中立 KV Cache 观测、标准向量与重排客户端**（[personal_assistant/ai/cache.py](personal_assistant/ai/cache.py)、[personal_assistant/ai/embeddings.py](personal_assistant/ai/embeddings.py)、[personal_assistant/ai/rerank.py](personal_assistant/ai/rerank.py)）：基于中立 `Context` 序列化统计服务端真实命中率与失配段归因；并内置零第三方依赖的标准 `/v1/embeddings`（`OpenAIEmbeddingClient` / `EmbeddingInvoker`，兼容 OpenAI / 硅基流动 / 通义千问 / 本地 Ollama，支持分批、`index` 对齐、L2 归一化、小端 `float32` BLOB 编解码与 Python 3.12 `math.sumprod` 精确余弦）与标准 `/v1/rerank` Cross-Encoder 重排客户端（`OpenAIRerankClient` / `RerankInvoker`，兼容硅基流动 BGE-Reranker / Cohere v1-v2 / Jina / vLLM / TEI）。
    - **Layer 2 `personal_assistant/agent/`**：仅依赖 `ai/`，彻底清除 OpenAI 字典渗透（无 `to_openai_schema` / `to_openai_dict` / `extract_tool_calls`）；包含中立 `Context` 驱动的单层 ReAct 循环、纯值对象递进扩展（`ToolSchema → Tool` + `bind_tool_context`，`ToolRegistry.schemas()` 仅导出中立签名）与零业务字段 `PluginContext` 统一插件主板（Slot 4 直接复刻 Layer 1 `ApiProvider` 协议）。
    - **Layer 3 `personal_assistant/assistant/`**：个人与学习助手业务层（零内部依赖底座 `common.py`/`text_search.py`/`files_policy.py`、Markdown 记忆与内置 `LinearRetriever` 兜底、SQLite 对话历史、外层回合预算、后台压缩沉淀与 CLI/Web 接入），全程面向中立 `Context` / `Message` / `ModelInvoker` 编排。
    - 顶层评测包 `evals/` 与 `plugins/`、`tests/` 平级；[tests/test_architecture.py](tests/test_architecture.py) 通过 AST 依赖图（含 `ai/` 内部三层解耦边界）、业务字面量与零 OpenAI 方言符号扫描、子进程 `sys.modules` 隔离测试与四棵目录树（`personal_assistant/`、`plugins/`、`scripts/`、`evals/`）零 `# type: ignore` 静态硬守卫锁死架构纯度。
@@ -32,7 +32,7 @@
 ### 1. 五大插件主板插槽与单次初始化生命周期
 - 外层基类 `Plugin(ABC)` 在启动期执行一次 `initialize()` 向零业务字段的 `PluginContext` 注册五类强类型子协议（业务配置与运行时绑定统一由 Layer 3 `_build_plugin_bindings()` 注入 `context.bindings`），关闭时经 `AssistantApp.close()` 触发 `terminate_all()`：
   1. **工具插槽 `Tool(ToolSchema)`**：[plugins/tools/plugin.py](plugins/tools/plugin.py) 自动扫描 `plugins/tools/*.py` 命名空间子包中的 `@tool` 函数，受 `config/tools.json` 白名单管控；`shell_tools.py`/`web_tools.py`/`study_tools.py` 单轨消费主板注入的配置与 `data_root`，无旧配置文件回退或隐式 CWD 落盘。
-  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供两层父子结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)：中英文句界切分、超长表格续片保表头与可配整句 Overlap）、基于同文档 Prompt Caching 前缀的离线上下文摘要器（[personal_assistant/assistant/rag_contextualizer.py](personal_assistant/assistant/rag_contextualizer.py)）、文档 YAML Frontmatter 解析与前置硬过滤模型（[personal_assistant/assistant/rag_metadata.py](personal_assistant/assistant/rag_metadata.py)：在 BM25 与余弦相似度计算前按时间范围/产品线/部门/标签/系统级权限边界 `allowed_access` 硬过滤，杜绝过期或越权召回与向量外发）、检索前 Query 侧优化引擎（[personal_assistant/assistant/query_optimizer.py](personal_assistant/assistant/query_optimizer.py)：单次合并快路径完成多源路由 Routing、多轮指代改写、多查询扩展/拆解与按需 HyDE 假设文档生成，不击穿系统前缀 KV Cache 且严格隔离 HyDE 与 BM25）、独立持久化派生库 `data/state/rag_index.db`（`parent_chunks` + `child_chunks` + `child_chunks_fts` + 跨重建保留的 `chunk_contexts` 与 `chunk_embeddings`）、基于 Python 3.12 `math.sumprod` 的精确余弦向量召回与 **BM25 + Dense 加权 RRF / Multi-Query RRF + HyDE 质心融合**（CLI `/rag status`、`/rag enrich`、`/rag embed`、`/rag query [--filter 条件] <问题>`；未配置 `embedder` 时自动零开销退回纯词面 BM25），以及配套的垂直领域 Embedding 微调三元组与 BM25 难负样本导出器（`evals --mode export-triplets` + [scripts/finetune_embedding.py](scripts/finetune_embedding.py)）；未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever`（同口径支持前置元数据硬过滤）自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
+  2. **检索插槽 `RetrieverProtocol`**：[plugins/rag_retriever.py](plugins/rag_retriever.py)（`rag`）提供两层父子结构化分块（[personal_assistant/assistant/chunker.py](personal_assistant/assistant/chunker.py)：中英文句界切分、超长表格续片保表头与可配整句 Overlap）、基于同文档 Prompt Caching 前缀的离线上下文摘要器（[personal_assistant/assistant/rag_contextualizer.py](personal_assistant/assistant/rag_contextualizer.py)）、文档 YAML Frontmatter 解析与前置硬过滤模型（[personal_assistant/assistant/rag_metadata.py](personal_assistant/assistant/rag_metadata.py)：在 BM25 与余弦相似度计算前按时间范围/产品线/部门/标签/系统级权限边界 `allowed_access` 硬过滤，杜绝过期或越权召回与外部模型外发）、检索前 Query 侧优化引擎（[personal_assistant/assistant/query_optimizer.py](personal_assistant/assistant/query_optimizer.py)：单次合并快路径完成多源路由 Routing、多轮指代改写、多查询扩展/拆解与按需 HyDE 假设文档生成，不击穿系统前缀 KV Cache 且严格隔离 HyDE 与 BM25）、独立持久化派生库 `data/state/rag_index.db`（`parent_chunks` + `child_chunks` + `child_chunks_fts` + 跨重建保留的 `chunk_contexts` 与 `chunk_embeddings`）、基于 Python 3.12 `math.sumprod` 的精确余弦向量召回与 **BM25 + Dense 加权 RRF / Multi-Query RRF + HyDE 质心融合**、以及完整的**检索后增强管线**（粗排 Top-50 → Cross-Encoder `/v1/rerank` 精排与 `min_rerank_score` 剪枝 + [personal_assistant/assistant/rag_postprocess.py](personal_assistant/assistant/rag_postprocess.py) 跨文档 Jaccard 近重复去重、句/行级上下文压缩、可选 Lost-in-the-Middle 头尾重排与 CRAG 三级相关性自检 / 一次纠错改写重查 / 白名单切源或拒答兜底；CLI `/rag status`、`/rag enrich`、`/rag embed`、`/rag query [--filter 条件] <问题>`），以及配套的垂直领域 Embedding 微调三元组与 BM25 难负样本导出器（`evals --mode export-triplets` + [scripts/finetune_embedding.py](scripts/finetune_embedding.py)）；未启用插件时由 `MemoryStore` 内置零索引 `LinearRetriever`（同口径支持前置元数据硬过滤）自动兜底；与 `history_tools.py` 正交共享零内部依赖底座 [personal_assistant/assistant/text_search.py](personal_assistant/assistant/text_search.py) 的双语分词与检索阈值校验。
   3. **配置编译插槽 `ConfigCompilerProtocol`**：[plugins/models_dsl.py](plugins/models_dsl.py)，手写词法与递归下降解析器，将精简 DSL（支持 `api`、`reasoning`、`max_tokens`、`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设）编译为含通用 `roles` 映射的 `ModelsConfig` 标准字典，`ConfigCompilerProtocol.render` 与 `ModelsDSLCompiler.render` 均采用显式强类型具名参数（插件按需以带默认值参数扩展 `consolidator`/`reasoning`/`max_tokens`/`cache_retention`，不向 Layer 2 泄漏业务角色名）。
   4. **协议翻译器插槽 `ApiProvider`**：直接复用 Layer 1 `ApiProvider` 宪法，支持外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动接入新厂商（`ToolsConfig.build_provider_registry()` 将插件翻译器与内建四大翻译器合并为应用级隔离副本，不污染进程全局注册表）。
   5. **运行观测插槽 `ObserverProtocol`**：[plugins/telemetry.py](plugins/telemetry.py)，以显式字段累加与有界 MRU 会话账本（`max_sessions`）统计分阶段耗时（`total_ms` / `ttft_ms` / `llm_ms` / `tool_ms`）与后台沉淀事件，遇 `StreamError` 或 `turn_aborted` 自动清理在途状态防止跨轮污染。
@@ -60,7 +60,7 @@
 # 1. 安装虚拟环境（仅含开发测试依赖 pytest）
 uv sync
 
-# 2. 运行确定性单元测试与架构/安全/跨协议守卫（267 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
+# 2. 运行确定性单元测试与架构/安全/跨协议守卫（279 passed，自动隔离宿主机 .env 与模型配置，零 API 调用）
 uv run pytest -v
 
 # 3. 运行离线检索基准（支持 --fail-under 门禁）
@@ -168,7 +168,7 @@ uv run python -m evals --mode memory \
 my_helper_v2/
 ├── config/
 │   ├── tools.json                     # 工具白名单、插件路径与各模块安全策略配置
-│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / api）
+│   └── models.example.dsl             # 模型配置 DSL 示例（支持 use / add / default / consolidator / embedder / reranker / api）
 ├── plugins/
 │   ├── tools/                         # Tool(ToolSchema) 工具子包（由 ToolsPlugin 扫描加载）
 │   │   ├── plugin.py                  # ToolsPlugin(Plugin)
@@ -177,25 +177,26 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与 DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 SQLite FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习卡片与间隔复习插件（save_study_card / list_due_reviews）
-│   ├── rag_retriever.py               # RetrieverProtocol：两层父子混合索引 + 向量/摘要持久化缓存 + BM25/Dense RRF 融合
-│   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/consolidator/embedder/reasoning）
+│   ├── rag_retriever.py               # RetrieverProtocol：两层父子混合索引 + 向量/摘要缓存 + RRF 融合 + Cross-Encoder 精排
+│   ├── models_dsl.py                  # ConfigCompilerProtocol：模型配置 DSL 编译器（支持 api/consolidator/embedder/reranker/reasoning）
 │   └── telemetry.py                   # ObserverProtocol：有界 MRU 会话耗时拆解与后台任务观测
 ├── personal_assistant/                # 三层单向依赖产品包（ai ← agent ← assistant）
-│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测 + 向量客户端）：
+│   ├── ai/                            # Layer 1（Pi ch04 三层翻译架构 + 缓存观测 + 向量/重排客户端）：
 │   │   ├── protocol.py                #   第二层·事件与契约协议（Context/Message/12 事件/ApiProvider）
 │   │   ├── registry.py                #   第一层·统一前台（stream/stream_simple/complete）与通讯录注册表
 │   │   ├── providers/                 #   第三层·原生协议翻译器：
-│   │   │   ├── http.py                #     共享标准库重试/脱敏/通用 SSE 传输底座
+│   │   │   ├── http.py                #     共享标准库重试/脱敏/同源校验/通用 SSE 传输底座
 │   │   │   ├── openai_completions.py  #     openai-completions 翻译器（OpenAI/DeepSeek Chat 等）
 │   │   │   ├── openai_reasoning.py    #     openai-reasoning 翻译器（DeepSeek Reasoner/R1 等）
 │   │   │   ├── anthropic_messages.py  #     anthropic-messages 原生翻译器（缓存断点/扩展思考）
 │   │   │   └── google_genai.py        #     google-generative-ai 原生翻译器（思考/函数调用）
 │   │   ├── cache.py                   #   中立 Context 有界 KV Cache 观测（CacheMonitor/TrackingModelClient）
-│   │   └── embeddings.py              #   标准 /v1/embeddings 纯标准库客户端、float32 编解码与 math.sumprod 余弦
+│   │   ├── embeddings.py              #   标准 /v1/embeddings 纯标准库客户端、float32 编解码与 math.sumprod 余弦
+│   │   └── rerank.py                  #   标准 /v1/rerank Cross-Encoder 重排客户端（BGE-Reranker/Cohere/Jina/vLLM）
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py（零 OpenAI 方言渗透）
 │   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
 │                                      #          rag_metadata.py / rag_contextualizer.py / query_optimizer.py /
-│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
+│                                      #          rag_postprocess.py / prompts.py / context.py / memory.py / builtin_tools.py /
 │                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 零配置离线 ReAct 演示脚本

@@ -19,3 +19,11 @@ use deepseek sk-替换为你的真实密钥
 # 或使用本地免密钥 Ollama：
 # add ollama bge-m3
 # embedder ollama
+#
+# 可选：接入标准 /v1/rerank Cross-Encoder 重排模型开启粗排 Top-50 -> 精排 Top-K（支持硅基流动 BGE-Reranker / Cohere / Jina / vLLM）：
+# model bge_rerank {
+#   base_url https://api.siliconflow.cn/v1
+#   model    BAAI/bge-reranker-v2-m3
+#   api_key  sk-你的硅基流动密钥
+# }
+# reranker bge_rerank
