@@ -46,11 +46,12 @@ def _extract_terms(query: str) -> tuple[list[str], list[str]]:
     return primary, secondary
 
 
-# 单条 Markdown 搜索命中结果（路径、行号、所属章节、上下文片段与得分）
+# 单条 Markdown/文档搜索命中结果（路径、精确起止行号区间、所属章节面包屑、上下文片段与得分）
 @dataclass(frozen=True)
 class SearchHit:
     path: str
-    line: int
+    start_line: int
+    end_line: int
     section: str
     snippet: str
     score: float
@@ -69,7 +70,7 @@ class LinearRetriever:
             raise ValueError("搜索关键词不能为空。")
         ref_day = today or today_shanghai()
         searchable, _ = memory.iter_searchable_files(root)
-        candidates: list[tuple[float, str, int, str, str]] = []
+        candidates: list[tuple[float, str, int, int, str, str]] = []
         for resolved, display_path, is_memory in searchable:
             try:
                 text = resolved.read_text(encoding="utf-8")
@@ -78,10 +79,10 @@ class LinearRetriever:
             candidates.extend(
                 memory._score_file(display_path, text, primary, secondary, skip_expired_today=ref_day if is_memory else None)
             )
-        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
         return [
-            SearchHit(path=path, line=line_no, section=section, snippet=snippet, score=score)
-            for score, path, line_no, section, snippet in candidates[:limit]
+            SearchHit(path=path, start_line=s_ln, end_line=e_ln, section=sec, snippet=snip, score=score)
+            for score, path, s_ln, e_ln, sec, snip in candidates[:limit]
         ]
 
 
@@ -97,6 +98,7 @@ class MemoryStore:
         retriever: RetrieverProtocol | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
+        self.read_only: bool = not create_dirs
         self.retriever: RetrieverProtocol = retriever if retriever is not None else LinearRetriever()
         self._write_lock = threading.RLock()
         if policy is None:
@@ -334,7 +336,12 @@ class MemoryStore:
         ref_day = today or today_shanghai()
         return list(self.retriever.search_hits(self, query, root=root, limit=limit, today=ref_day))
 
-    # 对外搜索接口：将 search_hits 命中结果格式化为带路径、行号与章节的文本片段
+    # 释放底层检索引擎可能持有的派生索引连接或文件句柄
+    def close(self) -> None:
+        if callable(close_fn := getattr(self.retriever, "close", None)):
+            close_fn()
+
+    # 对外搜索接口：将 search_hits 命中结果格式化为带精确行号区间与章节面包屑的文本片段
     def search_markdown(
         self, query: str, root: str = "data/memory", limit: int = 10, *, today: date | None = None
     ) -> str:
@@ -342,14 +349,16 @@ class MemoryStore:
         if not hits:
             return f"未在 {root} 下找到匹配「{query}」的 Markdown 内容。"
         return "\n\n".join(
-            f"{hit.path}:{hit.line} [章节: {hit.section or '正文'}]\n{hit.snippet}" for hit in hits
+            f"{hit.path}:{hit.start_line if hit.start_line == hit.end_line else f'{hit.start_line}-{hit.end_line}'} "
+            f"[章节: {hit.section or '正文'}]\n{hit.snippet}"
+            for hit in hits
         )
 
     # 对单篇笔记按文件名、章节标题与正文行打分，并提取不重叠的上下文片段（支持跳过已过期记忆行）
     def _score_file(
         self, display_path: str, text: str, primary: list[str], secondary: list[str],
         *, skip_expired_today: date | None = None,
-    ) -> list[tuple[float, str, int, str, str]]:
+    ) -> list[tuple[float, str, int, int, str, str]]:
         lines = text.splitlines()
         if not lines:
             return []
@@ -384,18 +393,16 @@ class MemoryStore:
             hits.append((path_bonus, 1, ""))
         hits.sort(key=lambda item: (-item[0], item[1]))
 
-        picked: list[tuple[float, str, int, str, str]] = []
+        picked: list[tuple[float, str, int, int, str, str]] = []
         used: list[int] = []
         for score, line_no, sec in hits:
             if any(abs(line_no - prev) <= 4 for prev in used):
                 continue
             used.append(line_no)
-            snippet = "\n".join(
-                f"  {n}: {lines[n - 1]}"
-                for n in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1)
-                if not expired_flags[n - 1]
-            )
-            picked.append((score, display_path, line_no, sec, snippet))
+            visible = [n for n in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1) if not expired_flags[n - 1]]
+            s_ln, e_ln = (visible[0], visible[-1]) if visible else (line_no, line_no)
+            snippet = "\n".join(f"  {n}: {lines[n - 1]}" for n in visible)
+            picked.append((score, display_path, s_ln, e_ln, sec, snippet))
             if len(picked) >= 3:
                 break
         return picked
@@ -517,28 +524,14 @@ class MemoryStore:
 
     # 对指定主题记忆文件执行 add / merge / replace / remove 操作，写入期直接消解冲突、软退休旧事实并登记 MEMORY.md 索引
     def apply_memory_operations(
-        self,
-        topic: str,
-        title: str,
-        index_summary: str,
-        operations: list[dict[str, object]],
-        *,
-        today: date | None = None,
-        applied_texts: list[str] | None = None,
+        self, topic: str, title: str, index_summary: str, operations: list[dict[str, object]],
+        *, today: date | None = None, applied_texts: list[str] | None = None,
     ) -> str | None:
         with self._write_lock:
             return apply_topic_operations(
-                self.memory_dir,
-                topic=topic,
-                title=title,
-                index_summary=index_summary,
-                operations=operations,
-                write_fn=_atomic_write,
-                ensure_index_fn=self._ensure_index_entry,
-                audit_fn=self.record_audit,
-                archive_dir=self.archive_dir,
-                today=today,
-                applied_texts=applied_texts,
+                self.memory_dir, topic=topic, title=title, index_summary=index_summary, operations=operations,
+                write_fn=_atomic_write, ensure_index_fn=self._ensure_index_entry, audit_fn=self.record_audit,
+                archive_dir=self.archive_dir, today=today, applied_texts=applied_texts,
             )
 
     # 扫描活跃主题记忆文件，将 (until: YYYY-MM-DD) 已过期的条目原子归档至 data/memory/archive/YYYY-MM.md

@@ -16,10 +16,11 @@
   ],
   "plugins": ["plugins"],
   "retrieval": {
-    "plugin": "fts5_bm25",
+    "plugin": "rag",
     "min_term_coverage": 0.22,
     "min_bm25_score": 0.1,
-    "max_hits_per_file": 2
+    "max_hits_per_file": 2,
+    "chunk_max_chars": 500
   },
   "telemetry": {
     "enabled": true,

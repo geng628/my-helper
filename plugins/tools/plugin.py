@@ -6,7 +6,7 @@ from pathlib import Path
 from personal_assistant.agent.plugins import Plugin
 
 
-# 工具扩展主板插件（与 FTS5RetrieverPlugin、ModelsDSLPlugin 同级，唯一负责内层 Tool 协议插槽）
+# 工具扩展主板插件（与 RAGRetrieverPlugin、ModelsDSLPlugin 同级，唯一负责内层 Tool 协议插槽）
 class ToolsPlugin(Plugin):
     plugin_id = "tools"
 

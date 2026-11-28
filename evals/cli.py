@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", default="data/memory", help="search 模式检索根目录")
     parser.add_argument("--limit", type=int, default=5, help="search 模式 Top-K 数量")
-    parser.add_argument("--retriever", default="auto", help="search 模式检索后端：auto（按 tools.json）/ linear / 插件名如 fts5_bm25")
+    parser.add_argument("--retriever", default="auto", help="search 模式检索后端：auto（按 tools.json）/ linear / 插件名如 rag")
     parser.add_argument("--category", default=None, help="仅运行指定 category 分类的案例/场景")
     parser.add_argument("--max-cases", type=int, default=None, help="最多运行的案例/场景条数（便于抽样快测）")
     parser.add_argument("--no-judge", action="store_true", help="memory 模式关闭 LLM-as-a-Judge，改用离线词面兜底评分")

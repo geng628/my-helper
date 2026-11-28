@@ -334,12 +334,12 @@ def test_consolidator_cleans_up_raw_remember_fact_ghost_without_losing_unrelated
 
 
 # 测试 op=replace / op=remove 软退休至 archive/YYYY-MM.md 并记录 superseded_by 替代链（同时保持热记忆纯净与 MEMORY.md 幂等）
-def test_replace_and_remove_soft_retire_with_superseded_chain_and_fts5_traceability(
+def test_replace_and_remove_soft_retire_with_superseded_chain_and_rag_traceability(
     tmp_path: Path,
 ) -> None:
-    from plugins.fts5_retriever import FTS5Retriever
+    from plugins.rag_retriever import RAGRetriever
 
-    retriever = FTS5Retriever()
+    retriever = RAGRetriever()
     memory = MemoryStore(tmp_path / "data", retriever=retriever)
     day1 = date(2023, 5, 10)
     day2 = date(2023, 10, 24)

@@ -76,7 +76,7 @@ def test_history_plugin_discovery_allowlist_and_readonly_schema(tmp_path: Path) 
     manager = PluginManager.from_entries(["plugins"], REPO_ROOT)
     assert len(manager.plugins) == 4
     assert all(isinstance(p, Plugin) for p in manager.plugins)
-    assert {p.plugin_id for p in manager.plugins} == {"tools", "fts5_bm25", "models_dsl", "telemetry"}
+    assert {p.plugin_id for p in manager.plugins} == {"tools", "rag", "models_dsl", "telemetry"}
     assert "search_chat_history" in {t.name for t in manager.build_tools()}
 
     cfg = ToolsConfig.load(REPO_ROOT / "config" / "tools.json", project_root=REPO_ROOT)
@@ -471,7 +471,7 @@ def test_history_truncation_and_retrieval_config_forwarding(tmp_path: Path) -> N
             {
                 "enabled_tools": ["search_chat_history"],
                 "plugins": ["plugins"],
-                "retrieval": {"plugin": "fts5_bm25", "min_term_coverage": 0.99},
+                "retrieval": {"plugin": "rag", "min_term_coverage": 0.99},
                 "commands": [],
             }
         ),
@@ -686,13 +686,13 @@ def test_plugins_ast_orthogonal_no_cross_plugin_imports() -> None:
     assert not violations, f"检测到跨插件耦合导入：{violations}"
 
 
-# 物理删除 fts5_retriever.py 的隔离测试：仅保留 plugins/tools/ 仍可正常加载并检索历史对话，且 HistorySearchConfig 校验生效
-def test_history_plugin_isolated_without_fts5_retriever(
+# 物理删除 rag_retriever.py 的隔离测试：仅保留 plugins/tools/ 仍可正常加载并检索历史对话，且 HistorySearchConfig 校验生效
+def test_history_plugin_isolated_without_rag_retriever(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from personal_assistant.agent.tools import ToolRegistry
 
-    # 1. 构造物理隔离目录：只复制 plugins/tools/，确保不存在 fts5_retriever.py
+    # 1. 构造物理隔离目录：只复制 plugins/tools/，确保不存在 rag_retriever.py
     isolated_plugins = tmp_path / "plugins"
     isolated_plugins.mkdir()
     shutil.copytree(
@@ -700,10 +700,10 @@ def test_history_plugin_isolated_without_fts5_retriever(
         isolated_plugins / "tools",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    assert not (isolated_plugins / "fts5_retriever.py").exists()
+    assert not (isolated_plugins / "rag_retriever.py").exists()
 
-    # 即使 sys.path 包含仓库根目录，也禁止加载 plugins.fts5_retriever
-    monkeypatch.setitem(sys.modules, "plugins.fts5_retriever", None)
+    # 即使 sys.path 包含仓库根目录，也禁止加载 plugins.rag_retriever
+    monkeypatch.setitem(sys.modules, "plugins.rag_retriever", None)
 
     db_path = tmp_path / "data" / "state" / "chat_history.sqlite3"
     state = StateStore(db_path)

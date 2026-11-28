@@ -63,7 +63,7 @@ flowchart TD
 
     subgraph Plugins["外围可插拔生态 (plugins/)"]
         PTools["Slot 1 工具插槽: ToolsPlugin (plugins/tools/*.py)"]
-        PRet["Slot 2 检索插槽: FTS5RetrieverPlugin (plugins/fts5_retriever.py)"]
+        PRet["Slot 2 检索插槽: RAGRetrieverPlugin (plugins/rag_retriever.py)"]
         PDSL["Slot 3 编译插槽: ModelsDSLPlugin (plugins/models_dsl.py)"]
         PR1["Slot 4 翻译器插槽: 外部/私有协议 Plugin (ApiProvider)"]
         PObs["Slot 5 观测插槽: TelemetryPlugin (plugins/telemetry.py)"]
@@ -101,7 +101,7 @@ my_helper_v2/
 │   │   ├── web_tools.py               # 联网搜索与直连 http.client+TLS/DNS Pinning 抓网页（web_search / fetch_webpage）
 │   │   ├── history_tools.py           # 只读增量 FTS5 跨会话历史检索（search_chat_history）
 │   │   └── study_tools.py             # 学习助手卡片与间隔重复调度（save_study_card / list_due_reviews）
-│   ├── fts5_retriever.py              # SQLite FTS5 + BM25 双语检索插件（RetrieverProtocol）
+│   ├── rag_retriever.py               # 持久化结构化 RAG 检索插件（RetrieverProtocol：分块 + 派生库 + BM25/Small-to-Big）
 │   ├── models_dsl.py                  # 模型配置 DSL 编译器插件（ConfigCompilerProtocol：支持 api/reasoning/cache_retention）
 │   └── telemetry.py                   # 有界 MRU 会话耗时拆解与后台任务观测插件（ObserverProtocol）
 ├── personal_assistant/                # 纯净三层产品包（绝不反向依赖 evals/）
@@ -120,9 +120,9 @@ my_helper_v2/
 │   │   │   └── google_genai.py        #     api="google-generative-ai" 原生翻译器
 │   │   └── cache.py                   #   中立 Context 有界 KV Cache 观测
 │   ├── agent/                         # Layer 2：tools.py / react.py / plugins.py
-│   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / prompts.py /
-│                                      #          context.py / memory.py / builtin_tools.py / memory_lifecycle.py /
-│                                      #          db.py / consolidator.py / commands.py / app.py / cli.py
+│   └── assistant/                     # Layer 3：common.py / text_search.py / files_policy.py / chunker.py /
+│                                      #          prompts.py / context.py / memory.py / builtin_tools.py /
+│                                      #          memory_lifecycle.py / db.py / consolidator.py / commands.py / app.py / cli.py
 ├── scripts/
 │   ├── demo.py                        # 离线演示与单句实测脚本
 │   ├── web_chat.py                    # 零依赖本地 HTTP/SSE 服务（ThreadingHTTPServer）
@@ -152,7 +152,8 @@ data/
 │   ├── tool_outputs/                  # TOAST 超长工具输出按行落盘目录（上限 1 MB，保留最近 20 个 / 24h TTL）
 │   └── study/                         # 结构化 Markdown 学习知识卡片（<slug>.md）
 └── state/
-    └── chat_history.sqlite3           # 对话历史（messages）与滚动压缩游标（session_compactions）
+    ├── chat_history.sqlite3           # 对话历史（messages）与滚动压缩游标（session_compactions）
+    └── rag_index.db                   # 独立持久化派生 RAG 索引（分块/指纹/FTS5，与权威源解耦，删库可无损重建）
 ```
 
 ---
@@ -203,7 +204,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 
 1. **零内部依赖底座（`common.py`、`text_search.py`、`files_policy.py`）**：
    - `common.py` 沉淀全仓共享的基础工具：`now_shanghai` / `today_shanghai` / `parse_iso_date`、`require_positive_int`、`atomic_write_text`、`format_date_with_weekday`、`load_dotenv` 与 `truncate_or_offload()`（超长工具输出按 1 MB 上限落盘至 `data/workspace/tool_outputs/` 并返回带行号的 `head` / `head_tail` 预览），供 `assistant/` 与 `plugins/tools/study_tools.py` 等外围插件统一复用；
-   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `fts5_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；
+   - `text_search.py` 提供中英双语分词 `tokenize_text` 及统一检索阈值校验 `validate_retrieval_thresholds` / `parse_retrieval_thresholds`，由 `rag_retriever.py` 与 `history_tools.py` 正交共享，消除插件间横向导入与重复解析逻辑；`chunker.py` 提供 Markdown 结构化分块（多级标题面包屑、围栏代码块/表格保护、`(until: ...)` 时效条目独立隔离与 SHA-256 `content_hash`）；
    - `files_policy.py` 保持零内部依赖，提供 `normalize_segment`（剥离 Unicode `Cf` 格式控制符 + `NFKC` + `casefold()`）、`is_sensitive_segment`、`FilesPolicy.protected_inodes(data_root)` 轻量受保护文件 `(st_dev, st_ino)` Inode 采集与 `FilesPolicy` 读写路径白名单，供 `MemoryStore`（含 `list_files` 与检索遍历）与 `shell_tools.py` 共享同一套路径防线。
 2. **Markdown 记忆生命周期、内置兜底检索与内置工具（`memory.py`、`builtin_tools.py`、`memory_lifecycle.py`）**：
    - `MemoryStore` 内置零索引 `LinearRetriever`（实现 `RetrieverProtocol`）作为未挂载外部检索插件时的默认兜底；使用可重入写锁 `_write_lock` 保护磁盘写入与 `audit.jsonl`；`remember_user_statement` 在流式轮内先写入 `(turn#<tag>)` 暂存标记，回合落库成功后经 `finalize_turn_fact` 升级为 `(msg#<id>)`，中断或 `StreamError` 时回滚清理；
@@ -241,7 +242,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 
 1. **APFS Unicode 折叠与 Inode 路径防线（`files_policy.py`、`memory.py`）**：
    - 所有路径段校验统一先剥离 Unicode `Cf` 零宽/格式控制符，再执行 `NFKC` 与 `.casefold()`，拦截 macOS APFS 大小写折叠等价字符（如长 s `ſ` U+017F 折叠为 `s` 绕过 `data/state` 或 `config/models.json`）及 `.env.*` / `.tmp-*` 原子暂存文件变体（仅精确放行 `.env.example`）；
-   - 同时通过 `FilesPolicy.protected_inodes(data_root)` 采集受保护敏感文件与目录直属项的 `(st_dev, st_ino)`，在文件读写、`list_files` 列举与 `iter_searchable_files`（覆盖 `LinearRetriever` 与 `FTS5Retriever`）全链路阻断指向敏感文件的硬链接或符号链接。
+   - 同时通过 `FilesPolicy.protected_inodes(data_root)` 采集受保护敏感文件与目录直属项的 `(st_dev, st_ino)`，在文件读写、`list_files` 列举与 `iter_searchable_files`（覆盖 `LinearRetriever` 与 `RAGRetriever`）全链路阻断指向敏感文件的硬链接或符号链接；派生索引 `data/state/rag_index.db` 额外校验路径与父目录无符号链接。
 2. **受控白名单 Shell 沙箱与进程组回收（[../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)）**：
    - 仅允许白名单可执行名，以 `shell=False`、新进程会话（`start_new_session=True`）与隔离空 `HOME`（叠加 `GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`）执行；
    - `find` 使用独立 `_validate_find_args` 只读原语白名单（含括号分组），绝不因 `--` 跳过 `-exec`/`-delete` 拦截，并禁止 `-L`/`-H` 符号链接解引用；`ls` 禁 `-L`/`-H`/`--dereference*`；`wc` 改用标志白名单防止 `--f=` 前缀缩写；`rg` 敏感路径排除改用大小写不敏感 `--iglob`；

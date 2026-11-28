@@ -19,7 +19,7 @@
    - 顶层 `evals/` 与 `plugins/`、`tests/` 平级，双向隔离守卫、`ai/` 内部三层解耦守卫、上层零 OpenAI 方言符号守卫及 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树零 `# type: ignore` 静态硬守卫由 [../tests/test_architecture.py](../tests/test_architecture.py) 强制执行。
 3. **五大主板插件插槽与生命周期**：
    - Slot 1 `Tool`（`plugins/tools/plugin.py` 扫描命名空间子包 `custom_tools`、`shell_tools`、`web_tools`、`history_tools`、`study_tools`，单轨消费主板注入的配置与 `data_root`）；
-   - Slot 2 `RetrieverProtocol`（`plugins/fts5_retriever.py`，未挂载时由 `LinearRetriever` 兜底）；
+   - Slot 2 `RetrieverProtocol`（`plugins/rag_retriever.py` 持久化结构分块 + FTS5 BM25 + Small-to-Big，未挂载时由 `LinearRetriever` 兜底）；
    - Slot 3 `ConfigCompilerProtocol`（`plugins/models_dsl.py`，支持 `api`/`reasoning`/`max_tokens`/`cache_retention` 及 `anthropic`/`gemini`/`deepseek-reasoner` 等内置预设，`render` 采用显式强类型具名参数，核心参数对齐纯通用协议、扩展参数收敛于插件侧）；
    - Slot 4 `ApiProvider`（直接复用 Layer 1 宪法，供外部/私有协议插件通过 `PluginContext.register_provider()` 零核心改动扩展，由 `ToolsConfig.build_provider_registry()` 与内建四大翻译器合并为应用级隔离副本）；
    - Slot 5 `ObserverProtocol`（`plugins/telemetry.py`，显式字段累加与有界 MRU 会话账本，遇 `StreamError` 或 `turn_aborted` 自动清理在途态）；
@@ -202,7 +202,7 @@
      - [../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)：新增独立 `_validate_find_args` 只读原语白名单（含括号分组），阻断 `--` 绕过 `-exec`/`-delete` 并禁 `-L`/`-H`；加固 `ls`/`wc`/`rg`（`--iglob`）；
      - [../personal_assistant/assistant/files_policy.py](../personal_assistant/assistant/files_policy.py) 与 [../personal_assistant/assistant/memory.py](../personal_assistant/assistant/memory.py)：暴露 `FilesPolicy.protected_inodes(data_root)` 并在 `list_files` 与 `iter_searchable_files` 全链路阻断敏感硬链接/软链接；
      - [../plugins/tools/web_tools.py](../plugins/tools/web_tools.py)：修复 DuckDuckGo 备用解析解包反转，支持非 ASCII URL 百分号编码与 IDNA 主机名，每次 `getresponse` 与阻塞读前刷新 socket 剩余截止超时；
-     - [../scripts/web_chat.py](../scripts/web_chat.py)、[../scripts/web_ui.html](../scripts/web_ui.html)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../plugins/fts5_retriever.py](../plugins/fts5_retriever.py) 与 [../plugins/telemetry.py](../plugins/telemetry.py)：补齐静态壳免头 + `/api/*` Bearer 鉴权、前端 `AbortController` 切流、CLI `finally: app.close()` 与 REPL 异常容错、FTS5 高频词 `coverage >= 0.6` 正值托底、`configure_model` 纳锁与异常中止广播 `turn_aborted` 清理在途遥测。
+     - [../scripts/web_chat.py](../scripts/web_chat.py)、[../scripts/web_ui.html](../scripts/web_ui.html)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、`plugins/fts5_retriever.py`（后由 [../plugins/rag_retriever.py](../plugins/rag_retriever.py) 单轨替代）与 [../plugins/telemetry.py](../plugins/telemetry.py)：补齐静态壳免头 + `/api/*` Bearer 鉴权、前端 `AbortController` 切流、CLI `finally: app.close()` 与 REPL 异常容错、FTS5 高频词 `coverage >= 0.6` 正值托底、`configure_model` 纳锁与异常中止广播 `turn_aborted` 清理在途遥测。
   2. **Pi ch04 三层模型调用翻译架构零兼容重构（Issue `#89` / PR `#90`，`d833400`）**：
      - 删除旧版 `ai/types.py` 与 `ai/client.py`，新建 [../personal_assistant/ai/protocol.py](../personal_assistant/ai/protocol.py)（中立 `Context`/`Message`/`ToolSchema` + 12 种规范流事件 + `ThinkingLevel`/`CacheRetention` + `ModelProfile(api=...)` + `ApiProvider`/`ModelInvoker`）、[../personal_assistant/ai/registry.py](../personal_assistant/ai/registry.py)（`stream`/`stream_simple`/`complete`、`ApiProviderRegistry`、`ModelClient`/`NoopModelClient`、`from_model_profile`/`from_env`）与 [../personal_assistant/ai/providers/](../personal_assistant/ai/providers/)（`http.py` + `openai_completions.py` + `anthropic_messages.py` + `google_genai.py`），重写 [../personal_assistant/ai/cache.py](../personal_assistant/ai/cache.py) 面向中立 `Context` 计算缓存指标；
      - Layer 2 `agent/tools.py`、`agent/react.py`、`agent/plugins.py` 与 Layer 3 `assistant/` 全面切换至中立 `Context` / `Message` / `ModelInvoker`，彻底清除 `to_openai_schema`/`to_openai_dict`/`extract_tool_calls`，Slot 4 直接复刻 `ApiProvider`；
@@ -266,7 +266,23 @@
   - 单元测试：`225 passed → 233 passed`（100% 通过）；
   - 离线检索（`fts5_bm25`）：保持 `38/40 (95.0%)`，负例干净度 `100%`；`scripts/demo.py` 通过；四树 `# type: ignore` 为 `0`，AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`；
   - 实模评测口径：本次为运行时协同取消架构改造，未改动正常完成路径的提示词、检索或记忆语义，沿用 `9a9d000` / `1b421d2` 实模基线。
-- **已知边界与下一步**：客户端若仅物理断开 SSE TCP 连接且上游未吐新帧，需配合 `/api/chat/abort`（前端「停止」与「新会话」已自动触发）方可在静默思考期毫秒级唤醒；后续如继续演进，可考虑 Pi 风格 Append-only 树状会话（`/undo`/`/fork`）或多模态 `ImageBlock`。
+- **已知边界与下一步**：客户端若仅物理断开 SSE TCP 连接且上游未吐新帧，需配合 `/api/chat/abort`（前端「停止」与「新会话」已自动触发）方可在静默思考期毫秒级唤醒；下一步转向 RAG 演进路线（Step 1 结构分块与持久化派生索引）。
+
+### [2026-11-28] RAG Step 1：Markdown 结构化分块、持久化派生索引库与区间溯源 `SearchHit`（Issue `#101`，本次提交）
+- **背景与目标**：按“最小可用、零兼容壳、零第三方依赖、小步迭代”路线夯实 RAG 底座：解决旧版 `plugins/fts5_retriever.py` 逐行切分 + 5 行定长窗割裂长文档代码块/表格与纯内存冷启动全量重扫的问题，并为后续 Step 2 接入稠密向量 + RRF 预留 `content_hash` 与独立派生 SQLite 索引结构。
+- **核心改动**：
+  - **结构化 Markdown 分块器（新增 [../personal_assistant/assistant/chunker.py](../personal_assistant/assistant/chunker.py)）**：维护真实多级标题栈（`H1 > H2 > H3` 面包屑，代码块内 `#` 注释绝不误判为标题）；完整保护围栏代码块（```` ``` ```` / `~~~`）与 GFM Markdown 表格；`track_expiry=True` 时含 `(until: YYYY-MM-DD)` 的时效条目严格独立成块；每块生成精确 `start_line..end_line` 与 `sha256(contextual_text)` 供 Step 2 向量缓存去重。
+  - **统一持久化 RAG 检索插件（新增 [../plugins/rag_retriever.py](../plugins/rag_retriever.py)，单轨删除替换 `plugins/fts5_retriever.py`）**：
+    - 借鉴派生库与权威源物理隔离原则：读写模式下将文件指纹、结构分块与 FTS5 倒排落盘到独立的 `data/state/rag_index.db`（WAL + NORMAL，校验符号链接防越界写盘、支持 Schema/分块参数变更自动重建与磁盘损坏自愈、删库即从权威 Markdown 无损重建）；只读模式（`MemoryStore(..., create_dirs=False)` 且未指定 `index_path`）自动使用 `:memory:` 零写盘；`RAGRetrieverPlugin.terminate()` 经 `WeakSet` 统一关闭 SQLite 连接；
+    - 结合低权边界 `context_tokens` 与 **Small-to-Big 同章节相邻块上下文扩展**（仅通过 `join_prev` 证明同章节、无过期行阻隔且中间仅隔空行时向左右扩展，并跳过同文件已展示行区间防止重复行），在零重叠冗余分块下显著提升长对话/长文档上下文完整度。
+  - **单轨升级 `SearchHit` 与全仓调用点**：[../personal_assistant/assistant/memory.py](../personal_assistant/assistant/memory.py) 直接将 `SearchHit` 升级为 `(path, start_line, end_line, section, snippet, score)`（`search_markdown` 输出 `path:start-end`），新增 `MemoryStore.read_only` 与 `MemoryStore.close()`（并在 `AssistantApp.close()` 调用）；同步更新 [../config/tools.json](../config/tools.json)、[../.github/workflows/test.yml](../.github/workflows/test.yml)、[../evals/cli.py](../evals/cli.py) 与全仓测试，新增 [../tests/test_chunker.py](../tests/test_chunker.py) 与 [../tests/test_rag_plugin.py](../tests/test_rag_plugin.py)（替换 `tests/test_fts5_plugin.py`）。
+- **踩坑根因与修复**：初版纯结构分块无相邻上下文时，40 题 MRR 虽升至 `0.9655`，但 LoCoMo 200 题因对话问答跨块边界被切裂导致 `quote_coverage` 由 `0.6017` 跌至 `0.5018`（通过率 `43.0%`）；引入零冗余分块的 `join_prev` 精确校验 + Small-to-Big 同章节相邻块扩展与防重行去重后，LoCoMo 恢复至 `104/200 (52.0%)` 且 MRR 进一步提升至 `0.6508`（`single-hop` 升至 `86.0%`，`multi-hop` MRR 由 `0.4923` 升至 `0.5523`）。
+- **验证与同口径对比（`8b19d97` → 本次提交）**：
+  - 单元测试：`233 passed → 239 passed`（全绿，含 `tests/test_architecture.py`、`memory.py <= 600` 行预算与插件隔离守卫）；
+  - 仓库内 40 题离线检索（`sample_cases.jsonl`）：`38/40 (95.0%)` 持平，Recall `0.9483`、Quote `0.9483`、负例干净度 `100%`，**MRR `0.9483 → 0.9655`**（`exact` 类 MRR `0.95 → 1.00`）；
+  - 外部公开 `LoCoMo Search`（200 题 / 272 篇 `.md`）：`105/200 (52.5%) → 104/200 (52.0%)`（Recall `0.6851 → 0.6712`，Quote `0.6017 → 0.6014`，**MRR `0.6221 → 0.6508`**，`single-hop` `82% → 86%`）；1 题净差源自词面长块 BM25 长度归一化权衡，待 Step 2 稠密向量 + RRF 正面突破词面上限；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
+- **已知边界与下一步**：当前 Step 1 仅激活词面 BM25 通道，零词面重叠同义改写与隐式多跳仍受词面上限约束；下一步进入 **RAG Step 2**：接入单轨标准 `/v1/embeddings` 客户端、`rag_index.db` 的 `(content_hash, model_id)` 向量缓存表与 Python 3.12 `math.sumprod` 精确余弦 + RRF 混合检索。
 
 ---
 
