@@ -8,16 +8,21 @@ from datetime import date
 
 from personal_assistant.assistant.common import parse_iso_date
 
-MAX_FRONTMATTER_LINES = 64
-_KEY_VAL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$")
-_LIST_ITEM_RE = re.compile(r"^[ \t]*-[ \t]+(.+)$")
+MAX_FRONTMATTER_LINES = 256
+_RESTRICTED_FALLBACK_ACCESS = "__restricted__"
+_KEY_VAL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$")
+_LIST_ITEM_RE = re.compile(r"^[ \t]*-[ \t]*(.*)$")
 _FILTER_SPLIT_RE = re.compile(r"[\n;；]+")
 _ALLOWED_FILTER_KEYS = frozenset({"date_from", "date_to", "product", "department", "tags", "access"})
+_ACCESS_KEYS = ("access", "permission", "visibility")
 
 
-# 规范化单个标量元数据值（剥离首尾空白与装饰引号并转小写）
+# 规范化单个标量元数据值（剥离首尾空白与成对装饰引号并转小写）
 def _norm_scalar(raw: str) -> str:
-    return raw.strip().strip("\"'").strip().lower()
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    return text.strip().lower()
 
 
 # 解析单个 YAML 列表项或逗号分隔字符串为去重排序后的小写标签元组（剔除逗号确保 CSV 边界匹配无歧义）
@@ -25,7 +30,7 @@ def _norm_tags(items: Sequence[str]) -> tuple[str, ...]:
     cleaned: set[str] = set()
     for raw in items:
         for part in str(raw).split(","):
-            tok = part.strip().strip("\"'").strip().lower().replace(",", "")
+            tok = _norm_scalar(part).replace(",", "")
             if tok:
                 cleaned.add(tok)
     return tuple(sorted(cleaned))
@@ -33,7 +38,9 @@ def _norm_tags(items: Sequence[str]) -> tuple[str, ...]:
 
 # 将 YYYY-MM-DD 或 ISO 时间戳前缀解析为标准 ISO 日期串；空串返回 ""，非法格式返回 ""（文档容错）或抛 ValueError（过滤严格校验）
 def _parse_date_field(raw: str, *, strict: bool) -> str:
-    text = raw.strip().strip("\"'").strip()
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
     if not text:
         return ""
     candidate = text[:10] if len(text) >= 10 else text
@@ -47,12 +54,12 @@ def _parse_date_field(raw: str, *, strict: bool) -> str:
     return parsed.isoformat()
 
 
-# 校验并归一化允许访问权限集合（默认 ("public",)，拒绝布尔值与非字符串项）
+# 校验并归一化允许访问权限集合（默认 ("public",)，允许空列表 [] 表示全拒绝，拒绝布尔值与非字符串项）
 def parse_allowed_access(raw: object) -> tuple[str, ...]:
     if raw is None:
         return ("public",)
     if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
-        raise ValueError("allowed_access 必须是非空字符串列表（如 ['public']）。")
+        raise ValueError("allowed_access 必须是字符串列表（如 ['public']）。")
     picked: list[str] = []
     for item in raw:
         if not isinstance(item, str) or not item.strip():
@@ -61,6 +68,35 @@ def parse_allowed_access(raw: object) -> tuple[str, ...]:
         if norm not in picked:
             picked.append(norm)
     return tuple(picked)
+
+
+# 从解析出的 Frontmatter 标量与列表字典中按 Fail-Closed 原则提取访问权限（显式声明非空/列表/空权限绝不静默降级为 public）
+def _extract_access_level(scalars: dict[str, str], lists: dict[str, list[str]]) -> str:
+    declared_any = False
+    for key in _ACCESS_KEYS:
+        if key in scalars:
+            declared_any = True
+            val = _norm_scalar(scalars[key])
+            if val:
+                return val
+        if key in lists:
+            declared_any = True
+            vals = _norm_tags(lists[key])
+            if len(vals) == 1:
+                return vals[0]
+            if len(vals) > 1:
+                return _RESTRICTED_FALLBACK_ACCESS
+    return _RESTRICTED_FALLBACK_ACCESS if declared_any else "public"
+
+
+# 将单行或跨行方括号列表片段拆分为条目列表（返回 (条目列表, 是否已闭合)）
+def _parse_bracket_list_segment(segment: str) -> tuple[list[str], bool]:
+    text = segment.strip()
+    closed = text.endswith("]")
+    if closed:
+        text = text[:-1].strip()
+    items = [item.strip() for item in text.split(",") if item.strip()]
+    return items, closed
 
 
 # 单篇 Markdown 文档顶部提取出的结构化元数据（默认 access='public'，确保无头部旧文档零破坏）
@@ -84,7 +120,7 @@ class DocumentMetadata:
         return bool(self.doc_date or self.product or self.department or self.tags or self.access != "public")
 
 
-# 解析 Markdown 顶部 YAML Frontmatter 并返回 (DocumentMetadata, 等行号屏蔽正文)；非 Frontmatter（如顶部分割线）原样返回
+# 解析 Markdown 顶部 YAML Frontmatter 并返回 (DocumentMetadata, 等行号屏蔽正文)；支持嵌套/块标量/多行列表并对权限声明严格 Fail-Closed
 def parse_markdown_frontmatter(text: str) -> tuple[DocumentMetadata, str]:
     lines = text.splitlines()
     if len(lines) < 2:
@@ -96,41 +132,111 @@ def parse_markdown_frontmatter(text: str) -> tuple[DocumentMetadata, str]:
     closing_idx = -1
     limit = min(len(lines), MAX_FRONTMATTER_LINES + 1)
     for idx in range(1, limit):
-        stripped = lines[idx].strip()
-        if stripped in {"---", "..."}:
+        if lines[idx].strip() in {"---", "..."}:
             closing_idx = idx
             break
+
+    # 若未在扫描上限内找到闭合符，检查是否属于超长未闭合 Frontmatter 且声明了受限权限（Fail-Closed，绝不降级 public）
     if closing_idx == -1:
+        saw_first_kv = False
+        unclosed_scalars: dict[str, str] = {}
+        unclosed_lists: dict[str, list[str]] = {}
+        cur_k: str | None = None
+        for raw_line in lines[1:limit]:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not saw_first_kv:
+                kv0 = _KEY_VAL_RE.match(raw_line)
+                if kv0 is None:
+                    return DocumentMetadata(), text
+                saw_first_kv = True
+            if raw_line[0] in {" ", "\t"}:
+                lm = _LIST_ITEM_RE.match(raw_line)
+                if lm is not None and cur_k in _ACCESS_KEYS and lm.group(1).strip():
+                    unclosed_lists.setdefault(cur_k, []).append(lm.group(1).strip())
+                continue
+            kv = _KEY_VAL_RE.match(raw_line)
+            if kv is None:
+                continue
+            cur_k = kv.group(1).strip().lower()
+            if cur_k in _ACCESS_KEYS:
+                val = kv.group(2).strip()
+                if val.startswith("["):
+                    items, _ = _parse_bracket_list_segment(val[1:])
+                    unclosed_lists.setdefault(cur_k, []).extend(items)
+                elif not val:
+                    unclosed_lists.setdefault(cur_k, [])
+                else:
+                    unclosed_scalars[cur_k] = val
+        extracted = _extract_access_level(unclosed_scalars, unclosed_lists)
+        if extracted != "public":
+            return DocumentMetadata(access=extracted), text
         return DocumentMetadata(), text
 
     scalars: dict[str, str] = {}
     lists: dict[str, list[str]] = {}
-    current_list_key: str | None = None
+    saw_key = False
+    current_key: str | None = None
+    in_block_scalar = False
+    multiline_bracket_key: str | None = None
 
     for raw_line in lines[1:closing_idx]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        list_m = _LIST_ITEM_RE.match(raw_line)
-        if list_m is not None and current_list_key is not None:
-            lists.setdefault(current_list_key, []).append(list_m.group(1).strip())
+        if multiline_bracket_key is not None:
+            items, closed = _parse_bracket_list_segment(stripped)
+            lists.setdefault(multiline_bracket_key, []).extend(items)
+            if closed:
+                multiline_bracket_key = None
             continue
+        if raw_line[0] in {" ", "\t"}:
+            if not saw_key:
+                return DocumentMetadata(), text
+            if in_block_scalar:
+                continue
+            list_m = _LIST_ITEM_RE.match(raw_line)
+            if list_m is not None and current_key is not None:
+                item_val = list_m.group(1).strip()
+                if item_val:
+                    lists.setdefault(current_key, []).append(item_val)
+            # 其余缩进行属于嵌套 YAML 映射（如 meta:\n  owner: hr），安全跳过而不丢弃已解析权限
+            continue
+
+        in_block_scalar = False
+        zero_list = _LIST_ITEM_RE.match(raw_line)
+        if zero_list is not None and current_key is not None:
+            item_val = zero_list.group(1).strip()
+            if item_val:
+                lists.setdefault(current_key, []).append(item_val)
+            continue
+
         kv_m = _KEY_VAL_RE.match(raw_line)
         if kv_m is None:
-            # 出现非 YAML 键值行的普通正文，说明顶部 `---` 仅为水平分割线，安全回退为无 Frontmatter
-            return DocumentMetadata(), text
+            # 若尚未解析出任何合法 YAML 键，判定为顶部 `---` 水平分割线并原样返回；若已解析出键值，禁止 Fail-Open 丢弃已有权限
+            if not saw_key:
+                return DocumentMetadata(), text
+            continue
+
+        saw_key = True
         key = kv_m.group(1).strip().lower()
         val = kv_m.group(2).strip()
-        if not val:
-            current_list_key = key
+        current_key = key
+        if val in {"|", ">", "|-", ">-", "|+", ">+"}:
+            in_block_scalar = True
+        elif not val:
             lists.setdefault(key, [])
+        elif val.startswith("["):
+            items, closed = _parse_bracket_list_segment(val[1:])
+            lists.setdefault(key, []).extend(items)
+            if not closed:
+                multiline_bracket_key = key
         else:
-            current_list_key = None
-            if val.startswith("[") and val.endswith("]"):
-                inner = val[1:-1].strip()
-                lists[key] = [item.strip() for item in inner.split(",") if item.strip()]
-            else:
-                scalars[key] = val
+            scalars[key] = val
+
+    if not saw_key:
+        return DocumentMetadata(), text
 
     doc_date = ""
     for date_key in ("date", "updated_at", "created_at"):
@@ -141,8 +247,7 @@ def parse_markdown_frontmatter(text: str) -> tuple[DocumentMetadata, str]:
 
     product = _norm_scalar(scalars.get("product", ""))
     department = _norm_scalar(scalars.get("department", ""))
-    raw_access = scalars.get("access") or scalars.get("permission") or scalars.get("visibility") or "public"
-    access = _norm_scalar(raw_access) or "public"
+    access = _extract_access_level(scalars, lists)
 
     raw_tags: list[str] = list(lists.get("tags", []))
     if "tags" in scalars:
@@ -193,6 +298,25 @@ class MetadataFilter:
         object.__setattr__(self, "department", norm_dept)
         object.__setattr__(self, "tags", norm_tags)
         object.__setattr__(self, "allowed_access", norm_acc)
+
+    # 按系统级权限上限钳制当前过滤器的 allowed_access（严格取交集，杜绝显式入参越权突破应用权限边界）
+    def clamp_access(self, ceiling: Sequence[str] | None) -> "MetadataFilter":
+        norm_ceiling = parse_allowed_access(ceiling)
+        if "*" in norm_ceiling:
+            return self
+        if self.allows_all_access:
+            clamped = norm_ceiling
+        else:
+            ceiling_set = set(norm_ceiling)
+            clamped = tuple(acc for acc in self.allowed_access if acc in ceiling_set)
+        return MetadataFilter(
+            date_from=self.date_from,
+            date_to=self.date_to,
+            product=self.product,
+            department=self.department,
+            tags=self.tags,
+            allowed_access=clamped,
+        )
 
     # 判断权限集合是否为空（不可满足时直接短路返回空结果，零 SQL 与零向量开销）
     @property
@@ -293,6 +417,7 @@ def parse_filter_string(
     department = ""
     tags_raw: list[str] = []
     requested_access: list[str] = []
+    seen_scalar_keys: set[str] = set()
 
     for token in _FILTER_SPLIT_RE.split(text):
         piece = token.strip()
@@ -306,7 +431,11 @@ def parse_filter_string(
         if key not in _ALLOWED_FILTER_KEYS:
             allowed_list = ", ".join(sorted(_ALLOWED_FILTER_KEYS))
             raise ValueError(f"不支持的过滤字段 {key!r}，仅支持：{allowed_list}。")
-        if not val:
+        if key in {"date_from", "date_to", "product", "department"}:
+            if key in seen_scalar_keys:
+                raise ValueError(f"过滤字段 {key!r} 不能重复指定。")
+            seen_scalar_keys.add(key)
+        if not _norm_scalar(val):
             raise ValueError(f"过滤字段 {key!r} 的值不能为空。")
         if key == "date_from":
             date_from = val
@@ -317,30 +446,28 @@ def parse_filter_string(
         elif key == "department":
             department = val
         elif key == "tags":
-            tags_raw.append(val)
+            parsed_tags = _norm_tags([val])
+            if not parsed_tags:
+                raise ValueError("过滤字段 'tags' 至少需要一个非空标签。")
+            tags_raw.extend(parsed_tags)
         elif key == "access":
+            part_added = False
             for acc_part in val.split(","):
-                acc = acc_part.strip().lower()
+                acc = _norm_scalar(acc_part)
                 if not acc or acc == "*":
                     raise ValueError("过滤条件中的 access 不允许为空或通配符 '*'。")
+                part_added = True
                 if acc not in requested_access:
                     requested_access.append(acc)
+            if not part_added:
+                raise ValueError("过滤条件中的 access 不能为空。")
 
-    # 权限取交集：仅允许在系统授予的 allowed_access 范围内收窄，绝对杜绝模型或用户借 filters 越权提级
-    if requested_access:
-        if "*" in ceiling:
-            effective_access = tuple(requested_access)
-        else:
-            ceiling_set = set(ceiling)
-            effective_access = tuple(acc for acc in requested_access if acc in ceiling_set)
-    else:
-        effective_access = ceiling
-
-    return MetadataFilter(
+    base = MetadataFilter(
         date_from=date_from,
         date_to=date_to,
         product=product,
         department=department,
-        tags=_norm_tags(tags_raw),
-        allowed_access=effective_access,
+        tags=tuple(tags_raw),
+        allowed_access=tuple(requested_access) if requested_access else ("*",),
     )
+    return base.clamp_access(ceiling)

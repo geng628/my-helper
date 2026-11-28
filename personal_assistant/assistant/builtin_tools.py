@@ -253,6 +253,7 @@ class MemoryToolsetProvider(ToolsetProvider):
                 param_enums=enums,
                 risk=risk,
                 parallel=parallel,
+                context=context,
             )
             for name, desc, params, fn, risk, parallel, enums in specs
         ]

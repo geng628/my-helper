@@ -192,8 +192,11 @@ def test_rag_and_linear_prefiltering_before_bm25_and_dense_scoring(
         sent_texts = [txt for batch in emb.calls for txt in batch]
         assert all("年底双薪加期权" not in txt for txt in sent_texts)
 
-        # 2. 离线管理员预计算全部向量缓存后，再监控 cosine_similarity 调用次数证明前置过滤在余弦计算前截断！
+        # 2. 默认 embed_chunks（仅 public）绝不外发 hr_salary.md；管理员显式传 allowed_access=('*',) 预热全库后再测余弦计数！
+        emb.calls.clear()
         ret.embed_chunks(mem, root="data/memory", embedder=emb)
+        assert all("年底双薪加期权" not in txt for batch in emb.calls for txt in batch)
+        ret.embed_chunks(mem, root="data/memory", embedder=emb, metadata_filter=MetadataFilter(allowed_access=("*",)))
         cosine_calls = 0
         orig_cosine = rag_mod.cosine_similarity
 
@@ -401,6 +404,9 @@ def test_embedding_finetune_triplet_export_hard_negatives_and_security(tmp_path:
     assert rows[0]["anchor"] == "极客会员年卡支持无理由退款吗？"
     assert "7 天内支持无理由原路退回" in rows[0]["positive"]
     assert "纸质图书" in rows[0]["negative"]
+    # 校验 BM25 难负样本与正样本严格同分布（绝不带 `"  <行号>: "` 渲染前缀防对比学习捷径污染）
+    assert not rows[0]["negative"].lstrip().startswith(("1:", "2:", "3:", "4:", "5:", "6:", "7:", "8:", "9:"))
+    assert not rows[0]["negative"].startswith("  ")
     assert "高管" not in rows[0]["negative"] and "双十一" not in rows[0]["positive"]
 
     # 2. 无标注自监督模式（直接扫文档库）：产出跨文档难负样本，且绝不泄露 confidential 或已过期行
@@ -453,3 +459,159 @@ def test_embedding_finetune_triplet_export_hard_negatives_and_security(tmp_path:
         timeout=10,
     )
     assert "--triplets" in help_proc.stdout and "--base-model" in help_proc.stdout
+
+
+# 对抗审查回归测试（B1-B4 与 Nit 1-7）：Frontmatter Fail-Closed、预绑定权限、离线 enrich/embed 零泄露、CLI 引号过滤与钳制
+def test_review_regressions_frontmatter_fail_closed_prebound_access_and_offline_isolation(tmp_path: Path) -> None:
+    import re
+    from plugins.rag_retriever import RAGConfig, RAGRetriever
+
+    # 1. B1: 列表权限、嵌套 YAML、块标量、多行列表、带点键名、引号空串遮蔽与超长未闭合 Frontmatter 均严格 Fail-Closed
+    for bad_md, expected_access in (
+        ("---\naccess: [confidential]\n---\n正文\n", "confidential"),
+        ("---\naccess:\n  - hr\n---\n正文\n", "hr"),
+        (
+            "---\naccess: confidential\nmeta:\n  owner: hr\ndescription: |\n  多行说明\ntags: [\n  a,\n  b\n]\ndoc.id: 123\n---\n正文\n",
+            "confidential",
+        ),
+        ("---\naccess: \"\"\npermission: confidential\n---\n正文\n", "confidential"),
+        ("---\naccess: \"\"\n---\n正文\n", "__restricted__"),
+        ("---\naccess: [hr, finance]\n---\n正文\n", "__restricted__"),
+        ("---\naccess: confidential\n" + ("tag_pad: x\n" * 270) + "---\n正文\n", "confidential"),
+    ):
+        m, _ = parse_markdown_frontmatter(bad_md)
+        assert m.access == expected_access and m.access != "public"
+
+    # Nit 5: parse_filter_string 引号权限、空值/重复单值键校验
+    assert parse_filter_string('access="public"', allowed_access=("public",)).allowed_access == ("public",)
+    for bad_f in ('product=""', "tags=,,,", "product=a;product=b", "access=*"):
+        with pytest.raises(ValueError):
+            parse_filter_string(bad_f, allowed_access=("public",))
+
+    # 2. B2 + B3 + Nit 1 + Nit 2: 预绑定 allowed_access 生效（不传 context）、app 级钳制、/rag enrich|embed 零泄露机密与 --filter= 语法
+    repo_root = Path(__file__).resolve().parent.parent
+    data_dir = tmp_path / "sec_app"
+    (data_dir / "memory").mkdir(parents=True)
+    (data_dir / "memory" / "pub.md").write_text(
+        "---\ndate: 2026-06-10\nproduct: billing\naccess: public\n---\n# 计费\n公开退款说明：7天无理由。\n",
+        encoding="utf-8",
+    )
+    (data_dir / "memory" / "sec.md").write_text(
+        "---\ndate: 2026-06-10\nproduct: billing\naccess: confidential\n---\n# 机密\n高管内部定价底线：1折特批。\n",
+        encoding="utf-8",
+    )
+
+    # 录制全部被发送至外部 LLM 的 Prompt，验证 /rag enrich 绝不发送机密文档
+    class _SpyEnrichLLM:
+        last_usage: TokenUsage | None = None
+
+        # 初始化提示词日志
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        # 流式返回简短摘要
+        def stream(self, context: Context, options: StreamOptions | None = None):
+            msg = self.complete(context, options)
+            yield StreamDone(reason="stop", message=msg)
+
+        # 同步记录系统与用户提示词并返回摘要
+        def complete(self, context: Context, options: StreamOptions | None = None) -> AssistantMessage:
+            self.prompts.append(context.system_prompt + "\n" + "\n".join(str(m.content) for m in context.messages))
+            return AssistantMessage.from_text("公开计费文档背景摘要。", stop_reason="stop")
+
+    spy_llm = _SpyEnrichLLM()
+    spy_emb = _ScopedEmbedder()
+
+    # 2a. allowed_access=()（全拒绝）：不传 context 直接 execute 必须返回无结果，且 app.search / smart_search 严格钳制
+    app_deny = AssistantApp(
+        data_root=data_dir,
+        config_path=repo_root / "config" / "tools.json",
+        project_root=repo_root,
+        llm=_DummyLLM(),
+        consolidator_llm=spy_llm,
+        allowed_access=(),
+        auto_consolidate=False,
+    )
+    try:
+        out_deny = app_deny.tools.execute("search_markdown", '{"query": "7天无理由"}')
+        assert "公开退款说明" not in out_deny
+        assert "公开退款说明" not in app_deny.search("7天无理由", metadata_filter=MetadataFilter(allowed_access=("public",)))
+        res_deny = app_deny.smart_search("7天无理由", metadata_filter=MetadataFilter(allowed_access=("public",)))
+        assert res_deny["hits"] == [] and spy_llm.prompts == []
+    finally:
+        app_deny.close()
+
+    # 2b. allowed_access=("public",)：/rag enrich 与 /rag embed 绝不把 confidential 文档外发；--filter= 与引号过滤生效
+    app_pub = AssistantApp(
+        data_root=data_dir,
+        config_path=repo_root / "config" / "tools.json",
+        project_root=repo_root,
+        llm=_DummyLLM(),
+        consolidator_llm=spy_llm,
+        embedder=spy_emb,
+        allowed_access=("public",),
+        auto_consolidate=False,
+    )
+    try:
+        _handle_repl_command(app_pub, "/rag enrich data/memory")
+        assert spy_llm.prompts and all("1折特批" not in p for p in spy_llm.prompts)
+        _handle_repl_command(app_pub, "/rag embed data/memory")
+        assert spy_emb.calls and all("1折特批" not in txt for batch in spy_emb.calls for txt in batch)
+
+        # Nit 2: app.search / smart_search 传入越权 metadata_filter 仍被钳制为 0 命中
+        assert "1折特批" not in app_pub.search("高管内部定价底线", metadata_filter=MetadataFilter(allowed_access=("confidential",)))
+        assert app_pub.smart_search("高管内部定价底线", metadata_filter=MetadataFilter(allowed_access=("confidential",)))["hits"] == []
+
+        # Nit 1: --filter= 与引号含空格过滤
+        out_eq = _handle_repl_command(app_pub, "/rag query --filter=product=billing 7天无理由")
+        assert out_eq is not None and "公开退款说明" in out_eq and "【过滤】" in out_eq
+        out_q = _handle_repl_command(app_pub, '/rag query --filter "product=billing; date_from=2026-06-01" 7天无理由')
+        assert out_q is not None and "公开退款说明" in out_q and "【过滤】" in out_q
+    finally:
+        app_pub.close()
+
+    # 2c. allowed_access=("public", "confidential")：不传 context 直接 execute 应保留预绑定机密权限
+    app_priv = AssistantApp(
+        data_root=data_dir,
+        config_path=repo_root / "config" / "tools.json",
+        project_root=repo_root,
+        llm=_DummyLLM(),
+        allowed_access=("public", "confidential"),
+        auto_consolidate=False,
+    )
+    try:
+        out_priv = app_priv.tools.execute("search_markdown", '{"query": "高管内部定价底线"}')
+        assert "1折特批" in out_priv
+    finally:
+        app_priv.close()
+
+    # 3. Nit 7: scripts/finetune_embedding.py 拒绝非法超参与非 JSON 对象行
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text('["not_a_dict"]\n', encoding="utf-8")
+    from scripts.finetune_embedding import load_triplets, main as ft_main
+
+    with pytest.raises(ValueError):
+        load_triplets(bad_jsonl)
+    with pytest.raises(ValueError):
+        ft_main(["--triplets", str(bad_jsonl), "--output-dir", str(tmp_path / "out"), "--epochs", "0"])
+
+    # 4. Nit 3: 大量其他产品线含高频词干扰块时，极小过滤子集（<10 块）的 BM25 检索绝不被全表 COUNT(*) 误杀
+    skew_dir = tmp_path / "skew"
+    (skew_dir / "memory").mkdir(parents=True)
+    for i in range(12):
+        (skew_dir / "memory" / f"other_{i}.md").write_text(
+            f"---\nproduct: noise\naccess: public\n---\n# 干扰 {i}\n平台通用配置说明项 {i}。\n",
+            encoding="utf-8",
+        )
+    (skew_dir / "memory" / "target.md").write_text(
+        "---\nproduct: billing\naccess: public\n---\n# 目标\n平台通用配置说明：年卡计费。\n",
+        encoding="utf-8",
+    )
+    skew_mem = MemoryStore(skew_dir, create_dirs=True, retriever=RAGRetriever(RAGConfig()))
+    try:
+        hits = skew_mem.search_hits("平台通用配置说明", metadata_filter=MetadataFilter(product="billing"))
+        assert len(hits) == 1 and hits[0].path == "data/memory/target.md"
+        assert not re.match(r"^\s*\d+:\s", "")
+    finally:
+        skew_mem.close()
+

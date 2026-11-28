@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -27,6 +28,8 @@ def load_triplets(path: Path) -> list[tuple[str, str, str]]:
         if not text:
             continue
         row = json.loads(text)
+        if not isinstance(row, dict):
+            raise ValueError(f"{path.name}:{line_no} 必须是 JSON 对象。")
         anchor = str(row.get("anchor") or "").strip()
         positive = str(row.get("positive") or "").strip()
         negative = str(row.get("negative") or "").strip()
@@ -50,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=32, help="批大小（默认 32）")
     parser.add_argument("--lr", type=float, default=2e-5, help="学习率（默认 2e-5）")
     args = parser.parse_args(argv)
+    if args.epochs < 1:
+        raise ValueError("--epochs 必须是正整数。")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size 必须是正整数。")
+    if not math.isfinite(args.lr) or args.lr <= 0.0:
+        raise ValueError("--lr 必须是有限正浮点数。")
 
     triplets = load_triplets(Path(args.triplets).resolve())
     try:

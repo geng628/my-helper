@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `266 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `267 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -346,7 +346,7 @@
   - **垂直领域 Embedding 微调数据与热切闭环（新增 [../evals/embedding_finetune.py](../evals/embedding_finetune.py)、[../scripts/finetune_embedding.py](../scripts/finetune_embedding.py)，升级 [../evals/cli.py](../evals/cli.py)）**：`uv run python -m evals --mode export-triplets` 支持有标注问答集与无标注文档库双模式，自动用纯内存 BM25 挖掘跨文件**难负样本（Hard Negatives）**导出标准 `(anchor, positive, negative)` JSONL（严格隔离过期与未授权文档，禁止写入 `--data-dir` 内）；配套独立外部 GPU 微调脚本模板 `scripts/finetune_embedding.py`（`sentence-transformers` `MultipleNegativesRankingLoss`，零主包依赖），微调后在 `models.dsl` 改一行 `embedder <名称>` 即可热切并用 `evals --mode search --retriever rag --embedder <模型>` 量化对比 Recall / MRR。
   - **测试覆盖**：新增 [../tests/test_rag_metadata.py](../tests/test_rag_metadata.py) 覆盖 Frontmatter 行号对齐与分割线防误判、BM25/Dense 余弦计算前硬过滤计数验证、在线未授权文档零外发 Embedding、`search_markdown(filters=...)` 防越权提级、CLI `/rag query --filter`、`LinearRetriever` 同口径过滤以及 `export-triplets` 难负样本挖掘与安全隔离。
 - **验证与同口径对比（`f9b9343` → 本次提交）**：
-  - 单元测试：`262 passed → 266 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py <= 600` 行预算）；
+  - 单元测试：`262 passed → 267 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py <= 600` 行预算）；
   - 离线检索基准（默认 `allowed_access=("public",)`）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（零退步）；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
 - **已知边界与下一步**：Embedding 权重微调训练本身需在有 GPU 与 `sentence-transformers` 的外部环境执行（不纳入主包运行依赖）；下一步可进入 **RAG Step 3（检索后优化：Rerank 精排、相关性门控与防中间遗忘重排）**。

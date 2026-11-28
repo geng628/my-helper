@@ -28,7 +28,7 @@ from personal_assistant.ai import (
 from personal_assistant.assistant.app import AssistantApp, build_app
 from personal_assistant.assistant.commands import ToolsConfig
 from personal_assistant.assistant.common import REPO_ROOT, load_dotenv
-from personal_assistant.assistant.rag_metadata import parse_filter_string
+from personal_assistant.assistant.rag_metadata import MetadataFilter, parse_filter_string
 
 
 # 打印单步工具执行日志与耗时
@@ -88,6 +88,42 @@ def _stream_printer() -> tuple[Callable[[AgentEvent], None], Callable[[str], Non
     return on_event, finish
 
 
+# 拆解 /rag query 后半段参数：支持 --filter <条件>、--filter=<条件> 及双引号/单引号包裹含空格过滤串
+def _split_rag_query_args(rest: str) -> tuple[str, str] | None:
+    text = rest.strip()
+    if not text:
+        return None
+    if text.startswith("--filter="):
+        after_eq = text[len("--filter=") :]
+        if not after_eq:
+            return None
+        if after_eq[0] in {'"', "'"}:
+            quote = after_eq[0]
+            end_q = after_eq.find(quote, 1)
+            if end_q == -1:
+                return None
+            return after_eq[1:end_q].strip(), after_eq[end_q + 1 :].strip()
+        f_parts = after_eq.split(None, 1)
+        if len(f_parts) < 2:
+            return None
+        return f_parts[0].strip(), f_parts[1].strip()
+    if text == "--filter" or text.startswith("--filter ") or text.startswith("--filter\t"):
+        after_flag = text[len("--filter") :].lstrip()
+        if not after_flag:
+            return None
+        if after_flag[0] in {'"', "'"}:
+            quote = after_flag[0]
+            end_q = after_flag.find(quote, 1)
+            if end_q == -1:
+                return None
+            return after_flag[1:end_q].strip(), after_flag[end_q + 1 :].strip()
+        f_parts = after_flag.split(None, 1)
+        if len(f_parts) < 2:
+            return None
+        return f_parts[0].strip(), f_parts[1].strip()
+    return "", text
+
+
 # 处理 /rag 快捷子命令（status 查看状态；enrich 离线补全上下文；embed 离线预计算向量；query 试跑检索优化与前置过滤）
 def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
     usage = "用法：/rag status [目录]、/rag enrich [目录]、/rag embed [目录] 或 /rag query [--filter 条件] <问题>"
@@ -97,14 +133,10 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
 
     if sub == "query":
         rest = text.split(None, 2)[2].strip() if len(parts) >= 3 else ""
-        raw_filter = ""
-        query_text = rest
-        if rest.startswith("--filter"):
-            f_parts = rest.split(None, 2)
-            if f_parts[0] == "--filter":
-                if len(f_parts) < 3:
-                    return usage
-                raw_filter, query_text = f_parts[1].strip(), f_parts[2].strip()
+        parsed_q = _split_rag_query_args(rest)
+        if parsed_q is None:
+            return usage
+        raw_filter, query_text = parsed_q
         if not query_text:
             return usage
         try:
@@ -197,6 +229,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
                     enrich_llm,
                     root=root,
                     model_name=model_name,
+                    metadata_filter=MetadataFilter(allowed_access=app.allowed_access),
                     abort_signal=abort_sig,
                 )
         except (KeyboardInterrupt, StreamAbortedError):
@@ -226,6 +259,7 @@ def _handle_rag_command(app: AssistantApp, text: str, chat_id: str) -> str:
                     app.memory,
                     root=root,
                     embedder=active_emb,
+                    metadata_filter=MetadataFilter(allowed_access=app.allowed_access),
                     abort_signal=abort_sig,
                 )
         except (KeyboardInterrupt, StreamAbortedError):

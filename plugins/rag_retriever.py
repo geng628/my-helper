@@ -1185,8 +1185,15 @@ class RAGRetriever:
 
         total_children = int(
             index.conn.execute(
-                "SELECT COUNT(*) FROM child_chunks WHERE root_key = ?",
-                (root_key,),
+                f"""
+                SELECT COUNT(*)
+                FROM child_chunks AS c
+                WHERE c.root_key = ?
+                  AND (? = 1 OR c.is_archive = 0)
+                  AND (c.until_date = '' OR c.until_date >= ?)
+                  AND ({meta_sql})
+                """,
+                (root_key, 1 if searching_archive else 0, ref_day_iso, *meta_params),
             ).fetchone()[0]
         )
 
@@ -1943,7 +1950,7 @@ class RAGRetriever:
 
         return self._with_index_recovery(memory, _run_multi_on_snapshot)
 
-    # 离线批量为目标根目录的活跃子块计算并持久化向量缓存（供 /rag embed 调用，支持 AbortSignal 断点续跑且暴露真实错误）
+    # 离线批量为目标根目录的活跃子块计算并持久化向量缓存（默认仅处理 public 权限防止机密文档外发；管理员可传 allowed_access=('*',)）
     def embed_chunks(
         self,
         memory: "MemoryStore",
@@ -1952,6 +1959,7 @@ class RAGRetriever:
         embedder: EmbeddingInvoker | None = None,
         batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE,
         today: date | None = None,
+        metadata_filter: MetadataFilter | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, int]:
         if memory.read_only:
@@ -1961,6 +1969,7 @@ class RAGRetriever:
         if active is None:
             raise ValueError("未配置向量嵌入模型（embedder），请先在 config/models.dsl 中添加 embedder 或设置 EMBEDDING_MODEL。")
 
+        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter()
         ref_day_iso = (today or today_shanghai()).isoformat()
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
@@ -1975,6 +1984,7 @@ class RAGRetriever:
             ref_day_iso=ref_day_iso,
             batch_size=batch_size,
             expected_dims=_embedder_target_dims(active),
+            metadata_filter=active_filter,
             abort_signal=abort_signal,
         )
 
@@ -2092,7 +2102,7 @@ class RAGRetriever:
 
         return self._with_index_recovery(memory, _collect)
 
-    # 离线为目标根目录的常驻父块生成 Prompt-Caching 背景摘要，逐条立即落盘并支持 AbortSignal 断点续跑
+    # 离线为目标根目录的常驻父块生成 Prompt-Caching 背景摘要（默认仅处理 public 权限防止机密文档外发至外部 LLM，支持 AbortSignal 断点续跑）
     def enrich_contexts(
         self,
         memory: "MemoryStore",
@@ -2101,6 +2111,7 @@ class RAGRetriever:
         root: str = "data/memory",
         model_name: str = "default",
         min_doc_chars: int = 0,
+        metadata_filter: MetadataFilter | None = None,
         abort_signal: AbortSignal | None = None,
     ) -> dict[str, int]:
         if memory.read_only:
@@ -2109,6 +2120,7 @@ class RAGRetriever:
             raise ValueError("model_name 必须是非空字符串。")
         clean_model = model_name.strip()
         min_chars = _require_non_negative_int(min_doc_chars, "min_doc_chars")
+        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter()
 
         target_dir = memory.resolve_path(root, write=False)
         searchable, searching_archive = memory.iter_searchable_files(root)
@@ -2126,6 +2138,8 @@ class RAGRetriever:
             "cached_hits": 0,
             "skipped": 0,
         }
+        if active_filter.is_unsatisfiable:
+            return stats
         archive_flag = 1 if searching_archive else 0
 
         for resolved, display_path, is_memory in searchable:
@@ -2144,6 +2158,10 @@ class RAGRetriever:
                     st_after = resolved.stat()
             except (OSError, UnicodeDecodeError):
                 continue
+            doc_meta, body_without_fm = parse_markdown_frontmatter(raw_text)
+            if not active_filter.matches(doc_meta):
+                continue
+            clean_body = body_without_fm.lstrip("\n")
             fp = (st_after.st_mtime_ns, st_after.st_size, st_after.st_ino, archive_flag)
 
             # 在持锁状态下同步当前文件快照（抵御损坏重建与并发修改失步）并读取缺失父块与重复哈希计数
@@ -2152,6 +2170,7 @@ class RAGRetriever:
                 *,
                 d_path: str = display_path,
                 doc_text: str = raw_text,
+                body_len: int = len(clean_body),
                 file_fp: tuple[int, int, int, int] = fp,
                 mem_flag: bool = is_memory,
             ) -> tuple[list[ParentChunk], dict[str, int], int, int, int]:
@@ -2166,7 +2185,7 @@ class RAGRetriever:
                 total_parents = len(parent_rows)
                 if not parent_rows:
                     return [], {}, 0, 0, 0
-                if len(doc_text) < min_chars:
+                if body_len < min_chars:
                     return [], {}, 0, total_parents, total_parents
                 missing: list[ParentChunk] = []
                 missing_counts: dict[str, int] = {}
@@ -2204,9 +2223,8 @@ class RAGRetriever:
             if not missing_parents:
                 continue
 
-            # 送入 <document> 前剥离顶部 Frontmatter 与全部带 (until: ...) 的过期块，杜绝元数据头或过期敏感内容外发
-            _, body_without_fm = parse_markdown_frontmatter(raw_text)
-            safe_doc_text = strip_expiring_lines(body_without_fm) if is_memory else body_without_fm
+            # 送入 <document> 前剥离顶部 Frontmatter、前导空行与全部带 (until: ...) 的过期块，杜绝元数据头或过期敏感内容外发
+            safe_doc_text = strip_expiring_lines(clean_body) if is_memory else clean_body
 
             # 在锁外流式调用模型生成背景摘要，每产出 1 条立即持锁原子提交至 chunk_contexts 与 FTS5
             produced_hashes: set[str] = set()

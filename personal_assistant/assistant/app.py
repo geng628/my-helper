@@ -1042,7 +1042,26 @@ class AssistantApp:
     ) -> dict[str, object]:
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("limit 必须是整数。")
-        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter(allowed_access=self.allowed_access)
+        active_filter = (
+            metadata_filter.clamp_access(self.allowed_access)
+            if metadata_filter is not None
+            else MetadataFilter(allowed_access=self.allowed_access)
+        )
+        if active_filter.is_unsatisfiable:
+            clean_q = " ".join(query.split())
+            if not clean_q:
+                raise ValueError("待优化的查询不能为空。")
+            empty_plan = QueryOptimizer._passthrough(
+                clean_q,
+                allowed={"direct", "docs"},
+                reason="access_denied",
+            )
+            return {
+                "plan": empty_plan.to_dict(),
+                "filter": active_filter.describe(),
+                "hits": [],
+                "rendered": format_search_hits([], query=clean_q, root=root),
+            }
         plan = self.optimize_query(
             query,
             chat_id=chat_id,
@@ -1128,7 +1147,7 @@ class AssistantApp:
             "rendered": rendered,
         }
 
-    # 不经过模型，直接按关键词与可选前置元数据过滤搜索本地 Markdown 文件（离线可用）
+    # 不经过模型，直接按关键词与可选前置元数据过滤搜索本地 Markdown 文件（离线可用，严格受系统 allowed_access 钳制）
     def search(
         self,
         query: str,
@@ -1137,7 +1156,11 @@ class AssistantApp:
         *,
         metadata_filter: MetadataFilter | None = None,
     ) -> str:
-        active_filter = metadata_filter if metadata_filter is not None else MetadataFilter(allowed_access=self.allowed_access)
+        active_filter = (
+            metadata_filter.clamp_access(self.allowed_access)
+            if metadata_filter is not None
+            else MetadataFilter(allowed_access=self.allowed_access)
+        )
         return self.memory.search_markdown(query, root=root, limit=limit, metadata_filter=active_filter)
 
     # 汇总当前 MEMORY.md 索引、rules/ 规则与最近 facts.md 备忘，供 /memory 命令查看

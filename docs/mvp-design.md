@@ -249,7 +249,8 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 
 1. **APFS Unicode 折叠与 Inode 路径防线（`files_policy.py`、`memory.py`）**：
    - 所有路径段校验统一先剥离 Unicode `Cf` 零宽/格式控制符，再执行 `NFKC` 与 `.casefold()`，拦截 macOS APFS 大小写折叠等价字符（如长 s `ſ` U+017F 折叠为 `s` 绕过 `data/state` 或 `config/models.json`）及 `.env.*` / `.tmp-*` 原子暂存文件变体（仅精确放行 `.env.example`）；
-   - 同时通过 `FilesPolicy.protected_inodes(data_root)` 采集受保护敏感文件与目录直属项的 `(st_dev, st_ino)`，在文件读写、`list_files` 列举与 `iter_searchable_files`（覆盖 `LinearRetriever` 与 `RAGRetriever`）全链路阻断指向敏感文件的硬链接或符号链接；派生索引 `data/state/rag_index.db` 额外校验路径与父目录无符号链接。
+   - 同时通过 `FilesPolicy.protected_inodes(data_root)` 采集受保护敏感文件与目录直属项的 `(st_dev, st_ino)`，在文件读写、`list_files` 列举与 `iter_searchable_files`（覆盖 `LinearRetriever` 与 `RAGRetriever`）全链路阻断指向敏感文件的硬链接或符号链接；派生索引 `data/state/rag_index.db` 额外校验路径与父目录无符号链接；
+   - **检索权限与文件边界分工**：`retrieval.allowed_access` 覆盖全部 RAG 检索、在线/离线向量化（`embed_chunks`）、离线上下文摘要（`enrich_contexts`）与微调三元组导出通道；直接文件读取工具（`list_files`/`read_markdown`/`run_command`）继续由 `FilesPolicy` 目录与 Inode 白名单管控（多权限隔离部署时需同步配合独立目录或只读根隔离）。
 2. **受控白名单 Shell 沙箱与进程组回收（[../plugins/tools/shell_tools.py](../plugins/tools/shell_tools.py)）**：
    - 仅允许白名单可执行名，以 `shell=False`、新进程会话（`start_new_session=True`）与隔离空 `HOME`（叠加 `GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`）执行；
    - `find` 使用独立 `_validate_find_args` 只读原语白名单（含括号分组），绝不因 `--` 跳过 `-exec`/`-delete` 拦截，并禁止 `-L`/`-H` 符号链接解引用；`ls` 禁 `-L`/`-H`/`--dereference*`；`wc` 改用标志白名单防止 `--f=` 前缀缩写；`rg` 敏感路径排除改用大小写不敏感 `--iglob`；
@@ -268,7 +269,7 @@ Layer 1 内部按 Pi ch04 拆分为严格解耦的三层加缓存观测模块（
 ## 6. 可复现评测与测试隔离架构（`evals/` 与 `tests/`）
 
 1. **单测宿主环境隔离、跨协议契约与架构守卫（[../tests/conftest.py](../tests/conftest.py)、[../tests/test_architecture.py](../tests/test_architecture.py)、[../tests/test_providers.py](../tests/test_providers.py)）**：
-   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `266 passed`）；
+   - 全局 `autouse` fixture 默认屏蔽仓库 `.env` 自动加载、清空宿主机 `LLM_*` / `EMBEDDING_*` / 搜索 API 环境变量、隔离默认 `config/models.*` 路径并快照恢复 `default_registry()`（`ApiProviderRegistry`），确保单测在无网或任意宿主配置下均确定性可复现（当前 `267 passed`）；
    - `tests/test_architecture.py` 对 `personal_assistant/`、`plugins/`、`scripts/`、`evals/` 四棵目录树强制执行零 `# type: ignore` 静态硬守卫，锁死三层依赖漏斗、`ai/` 内部 Pi ch04 三层解耦边界（`protocol.py` 零内部依赖、`registry.py` 仅依 `protocol.py`、`providers/http.py` 仅依 `protocol.py`）、`agent/`/`assistant/` 零旧 OpenAI 方言符号残留、零业务字面量与子进程断层独立运行；
    - `tests/test_providers.py` 与 `tests/test_reasoning_provider.py` 覆盖协议契约、四大内建原生翻译器线协议边界、同一条对话轨迹跨 4 种异构协议热切换端到端测试（`anthropic-messages` → `openai-completions` → `google-generative-ai` → `openai-reasoning` → `anthropic-messages`），以及新增第 5 套虚构私有协议（`custom-acme-rpc`）仅靠 1 个 Slot 4 插件与 `models.dsl` 零核心改动跑通全链路的单点扩展契约测试。
 2. **统一 `AssistantApp` 评测装配与防泄漏边界（`evals/`）**：
