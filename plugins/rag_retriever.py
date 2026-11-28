@@ -1569,7 +1569,7 @@ class RAGRetriever:
             "dims": final_dims,
         }
 
-    # 对外检索入口：未配 embedder 或 vector_weight=0 时直通纯 BM25；否则先编码 query 获取真实维度再对齐向量缓存并执行 RRF
+    # 对外检索入口：未配 embedder 或 vector_weight=0 时直通纯 BM25；支持可选 hyde_text（仅参与向量通道质心融合，绝不污染 BM25）与 AbortSignal
     def search_hits(
         self,
         memory: "MemoryStore",
@@ -1577,8 +1577,14 @@ class RAGRetriever:
         root: str = "data/memory",
         limit: int = 10,
         today: date | None = None,
+        *,
+        hyde_text: str | None = None,
+        abort_signal: AbortSignal | None = None,
     ) -> list[SearchHit]:
+        if abort_signal is not None and abort_signal.aborted:
+            raise StreamAbortedError(abort_signal.reason or "检索已取消")
         clean_query = query.strip() if isinstance(query, str) else ""
+        # 词面分词严格仅基于真实原问题，绝不混入 HyDE 假设文本防止幻觉词污染 BM25
         query_terms = list(dict.fromkeys(tokenize_text(clean_query, for_query=True)))
         active_embedder = self.embedder
         active_model = _clean_embedder_model(active_embedder)
@@ -1594,13 +1600,25 @@ class RAGRetriever:
 
         query_vec: tuple[float, ...] | None = None
         embedder_model: str | None = None
+        clean_hyde = hyde_text.strip() if isinstance(hyde_text, str) else ""
         if dense_enabled and active_embedder is not None and active_model is not None and searchable:
             try:
-                # 先编码 query 获取真实 q_dims，确保维度变更时 _ensure_active_embeddings 精确按 (hash, model, q_dims) 补齐
-                q_vecs = active_embedder.embed([clean_query])
-                if len(q_vecs) != 1:
-                    raise ValueError(f"查询向量返回数量异常：期望 1，实际 {len(q_vecs)}。")
-                norm_q = normalize_vector(q_vecs[0])
+                # 若提供 HyDE 假设文档，单批次同时编码 [query, hyde_text] 并求单位质心向量（减少 1 次往返且锚定原问题语义）
+                if clean_hyde:
+                    q_vecs = active_embedder.embed([clean_query, clean_hyde], abort_signal=abort_signal)
+                    if len(q_vecs) != 2:
+                        raise ValueError(f"HyDE 查询向量返回数量异常：期望 2，实际 {len(q_vecs)}。")
+                    u_q = normalize_vector(q_vecs[0])
+                    u_h = normalize_vector(q_vecs[1])
+                    if len(u_q) != len(u_h):
+                        raise ValueError("查询向量与 HyDE 向量维度不一致。")
+                    summed = [a + b for a, b in zip(u_q, u_h)]
+                    norm_q = normalize_vector(summed) if any(abs(v) > 1e-9 for v in summed) else u_q
+                else:
+                    q_vecs = active_embedder.embed([clean_query], abort_signal=abort_signal)
+                    if len(q_vecs) != 1:
+                        raise ValueError(f"查询向量返回数量异常：期望 1，实际 {len(q_vecs)}。")
+                    norm_q = normalize_vector(q_vecs[0])
                 q_dims = len(norm_q)
                 self._ensure_active_embeddings(
                     memory,
@@ -1611,6 +1629,7 @@ class RAGRetriever:
                     ref_day_iso=ref_day_iso,
                     batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
                     expected_dims=q_dims,
+                    abort_signal=abort_signal,
                 )
                 query_vec = norm_q
                 embedder_model = active_model
@@ -1638,6 +1657,116 @@ class RAGRetriever:
                 embedder_model=embedder_model,
             ),
         )
+
+    # 多子查询联合检索：对扩展/拆解后的多条子查询分别召回并通过 Multi-Query RRF 去重融合，解决复合多跳与同义改写
+    def search_multi_hits(
+        self,
+        memory: "MemoryStore",
+        queries: Sequence[str],
+        *,
+        root: str = "data/memory",
+        limit: int = 10,
+        today: date | None = None,
+        hyde_texts: Mapping[str, str] | None = None,
+        abort_signal: AbortSignal | None = None,
+    ) -> list[SearchHit]:
+        if abort_signal is not None and abort_signal.aborted:
+            raise StreamAbortedError(abort_signal.reason or "检索已取消")
+        if isinstance(queries, (str, bytes, bytearray)):
+            raise TypeError("queries 必须是字符串序列，不能是单个字符串或字节串。")
+        clean_queries: list[str] = []
+        seen_low: set[str] = set()
+        for raw_q in queries:
+            if not isinstance(raw_q, str):
+                continue
+            q = raw_q.strip()
+            if q and q.lower() not in seen_low:
+                seen_low.add(q.lower())
+                clean_queries.append(q)
+        if not clean_queries:
+            raise ValueError("搜索关键词不能为空。")
+
+        # 先校验目标目录合法性，确保非法或不存在目录在进入子查询循环前立即快速失败
+        target_dir = memory.resolve_path(root, write=False)
+        if not target_dir.is_dir():
+            raise ValueError(f"目录不存在：{root}")
+        if limit <= 0:
+            return []
+
+        hyde_map = hyde_texts or {}
+        if len(clean_queries) == 1:
+            only_q = clean_queries[0]
+            return self.search_hits(
+                memory,
+                only_q,
+                root=root,
+                limit=limit,
+                today=today,
+                hyde_text=hyde_map.get(only_q),
+                abort_signal=abort_signal,
+            )
+
+        per_query_limit = max(limit * 2, 10)
+        k = self.config.rrf_k
+        fused: dict[tuple[str, int, int], tuple[float, float, SearchHit]] = {}
+        valid_runs = 0
+        last_val_err: ValueError | None = None
+
+        for sub_q in clean_queries:
+            if abort_signal is not None and abort_signal.aborted:
+                raise StreamAbortedError(abort_signal.reason or "检索已取消")
+            try:
+                hits = self.search_hits(
+                    memory,
+                    sub_q,
+                    root=root,
+                    limit=per_query_limit,
+                    today=today,
+                    hyde_text=hyde_map.get(sub_q),
+                    abort_signal=abort_signal,
+                )
+            except ValueError as error:
+                last_val_err = error
+                continue
+            valid_runs += 1
+            for rank, hit in enumerate(hits, start=1):
+                key = (hit.path, hit.start_line, hit.end_line)
+                contrib = 1.0 / (k + rank)
+                prev = fused.get(key)
+                if prev is None:
+                    fused[key] = (contrib, hit.score, hit)
+                else:
+                    fused[key] = (prev[0] + contrib, max(prev[1], hit.score), prev[2])
+
+        if valid_runs == 0 and last_val_err is not None:
+            raise last_val_err
+
+        ordered = sorted(
+            fused.values(),
+            key=lambda item: (-round(item[0], 6), -item[1], item[2].path, item[2].start_line, item[2].end_line),
+        )
+
+        # 按单文件上限 max_hits_per_file 保持多文档多样性，优先覆盖复合多跳的不同来源文件（不足时再由 overflow 补齐）
+        primary: list[SearchHit] = []
+        overflow: list[SearchHit] = []
+        per_file: dict[str, int] = {}
+        cap = self.config.max_hits_per_file
+        for rrf_val, _, hit in ordered:
+            merged_hit = SearchHit(
+                path=hit.path,
+                start_line=hit.start_line,
+                end_line=hit.end_line,
+                section=hit.section,
+                snippet=hit.snippet,
+                score=round(rrf_val, 6),
+            )
+            cnt = per_file.get(hit.path, 0)
+            if cnt < cap:
+                primary.append(merged_hit)
+                per_file[hit.path] = cnt + 1
+            else:
+                overflow.append(merged_hit)
+        return (primary + overflow)[:limit]
 
     # 离线批量为目标根目录的活跃子块计算并持久化向量缓存（供 /rag embed 调用，支持 AbortSignal 断点续跑且暴露真实错误）
     def embed_chunks(

@@ -3,10 +3,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import date
+import re
 from typing import Any
 
 from personal_assistant.agent.tools import Tool, ToolsetProvider, build_tool
+from personal_assistant.ai import AbortSignal
 from personal_assistant.assistant.common import parse_iso_date
+from personal_assistant.assistant.query_optimizer import (
+    MAX_ALLOWED_SUB_QUERIES,
+    format_search_hits,
+    fuse_multi_query_hits,
+)
 
 
 # 记忆与文件内核工具集提供方（ToolsetProvider 子类）：统一调用 build_tool 产出 6 个纯净 Tool 实例
@@ -19,14 +26,59 @@ class MemoryToolsetProvider(ToolsetProvider):
     def build_tools(self, context: Mapping[str, object] | None = None) -> list[Tool]:
         memory = self.memory
 
-        # 适配 search_markdown 工具：将执行期可选注入的 today 参数归一化为标准 date 对象
+        # 适配 search_markdown 工具：支持可选 sub_queries 多子查询 RRF 并行召回与执行期隐藏 HyDE/AbortSignal 注入
         def search_markdown(
             query: str,
             root: str = "data/memory",
+            sub_queries: str = "",
             *,
             today: date | str | None = None,
+            hyde_text: str = "",
+            abort_signal: AbortSignal | None = None,
         ) -> str:
-            return memory.search_markdown(query, root=root, today=parse_iso_date(today))
+            parsed_today = parse_iso_date(today)
+            if not isinstance(sub_queries, str):
+                raise ValueError("sub_queries 必须是字符串（多条子查询用分号或换行分隔）。")
+            extras = [q.strip() for q in re.split(r"[\n;；]+", sub_queries) if q.strip()]
+            clean_hyde = hyde_text.strip() if isinstance(hyde_text, str) else ""
+            if not extras and not clean_hyde:
+                return memory.search_markdown(query, root=root, today=parsed_today)
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("搜索关键词不能为空。")
+            all_queries: list[str] = []
+            seen_low: set[str] = set()
+            for item in (query.strip(), *extras):
+                low = item.lower()
+                if low not in seen_low:
+                    seen_low.add(low)
+                    all_queries.append(item)
+                if len(all_queries) >= MAX_ALLOWED_SUB_QUERIES:
+                    break
+            hyde_map = {q: clean_hyde for q in all_queries} if clean_hyde else None
+            multi_fn = getattr(memory.retriever, "search_multi_hits", None)
+            if callable(multi_fn):
+                hits = list(
+                    multi_fn(
+                        memory,
+                        all_queries,
+                        root=root,
+                        limit=10,
+                        today=parsed_today,
+                        hyde_texts=hyde_map,
+                        abort_signal=abort_signal,
+                    )
+                )
+            elif len(all_queries) == 1:
+                return memory.search_markdown(all_queries[0], root=root, today=parsed_today)
+            else:
+                hits = fuse_multi_query_hits(
+                    [
+                        memory.search_hits(sub_q, root=root, limit=10, today=parsed_today)
+                        for sub_q in all_queries
+                    ],
+                    limit=10,
+                )
+            return format_search_hits(hits, query="；".join(all_queries), root=root)
 
         # 适配 read_markdown 工具参数（支持默认行号 1..120，拒绝布尔值并将字符串行号转为整数）
         def read_markdown(path: str, start_line: str = "1", end_line: str = "120") -> str:
@@ -79,8 +131,12 @@ class MemoryToolsetProvider(ToolsetProvider):
             ),
             (
                 "search_markdown",
-                "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文。",
-                {"query": "搜索关键词", "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs"},
+                "按关键词搜索允许目录内 Markdown 文件名、标题与正文上下文；复合或同义查询可通过 sub_queries 合并多路 RRF 召回。",
+                {
+                    "query": "主搜索关键词",
+                    "root": "搜索目录，如 data/memory（当前活跃记忆）、data/memory/archive（历史归档与变更账本）、data/workspace、docs",
+                    "sub_queries": "可选补充子查询（多条用分号或换行分隔，触发多查询 RRF 融合检索，默认留空）",
+                },
                 search_markdown,
                 "read",
                 True,

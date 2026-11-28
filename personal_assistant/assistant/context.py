@@ -27,6 +27,7 @@ from personal_assistant.assistant.common import (
 from personal_assistant.assistant.memory import MemoryStore
 from personal_assistant.assistant.prompts import (
     format_compaction_summary,
+    format_query_plan_hint,
     format_system_prompt,
     format_user_envelope,
 )
@@ -379,7 +380,7 @@ class ContextAssembler:
                 self._history_trim_floors[chat_id] = new_floor
             return selected
 
-    # 按变化频率分层组装中立 Context：静态 system 前缀 -> <system-reminder> 隔离前情摘要 + 稳定历史 -> 带日期信封的当前提问
+    # 按变化频率分层组装中立 Context：静态 system 前缀 -> <system-reminder> 隔离前情摘要 + 稳定历史 -> 带日期信封（及可选检索建议）的当前提问
     def assemble(
         self,
         *,
@@ -389,6 +390,7 @@ class ContextAssembler:
         user_text: str,
         registry: ToolRegistry,
         today: date | None = None,
+        query_hint: str = "",
     ) -> Context:
         messages: list[Message] = []
         rendered_summary = format_compaction_summary(summary_text)
@@ -397,6 +399,9 @@ class ContextAssembler:
         for msg in build_history_messages(history):
             append_alternating_message(messages, msg)
         envelope = format_user_envelope(user_text, today=today or today_shanghai())
+        rendered_hint = format_query_plan_hint(query_hint)
+        if rendered_hint:
+            envelope = f"{envelope}\n\n{rendered_hint}"
         append_alternating_message(messages, UserMessage(content=envelope))
         return Context(
             system_prompt=system_prompt,

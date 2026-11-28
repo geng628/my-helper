@@ -78,6 +78,20 @@ def format_compaction_summary(summary_text: str) -> str:
     )
 
 
+# 为检索前 Query 优化建议包裹 <system-reminder> 信源隔离围栏（严禁逃逸标签，仅作为非权威检索导航提示）
+def format_query_plan_hint(hint_text: str) -> str:
+    clean = hint_text.strip()
+    if not clean:
+        return ""
+    safe_body = _sanitize_reminder_body(clean)
+    return (
+        "<system-reminder>\n"
+        "【检索前查询规划建议（仅作工具路由与检索词参考，请结合实际工具观察作答，不得编造未观测事实）】\n"
+        f"{safe_body}\n"
+        "</system-reminder>"
+    )
+
+
 # 为单条用户消息包裹逻辑日期信封（动态日期随消息定格，跨自然日不击穿前缀缓存）
 def format_user_envelope(text: str, *, today: date | None = None) -> str:
     ref_day = today or today_shanghai()

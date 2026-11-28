@@ -28,7 +28,7 @@
    - 文件层：零内部依赖的 `files_policy.py` 执行 `NFKC + casefold()` + 零宽格式符剥离 + `protected_inodes(data_root)` 敏感目标 `(st_dev, st_ino)` Inode 校验（统一覆盖读写、`list_files` 与检索遍历），写权限严格收敛于 `data/workspace/`；
    - Shell 层：`shell=False`、隔离空 `HOME`、`find` 独立只读表达式白名单（不因 `--` 绕过且禁 `-L`/`-H`）、`ls`/`wc`/`rg` 边界加固、语法级逐子命令只读 `git` 白名单、`pytest` 强制限定 `tests/` 与 `--ignore=data`、1 MB 流式管道上限与 `os.killpg` 进程组强杀；
    - 网络与防注入层：直连 `http.client` + `socket.create_connection((pinned_ip, port))` + TLS SNI/证书校验防 DNS Rebinding（支持非 ASCII URL/IDNA 编码与每次阻塞读前刷新 socket 剩余截止超时，天然不读环境代理）、`allow_fake_ip` 默认关闭、同轮触发 `risk="network"` 工具后硬性锁死 `save_rule`；
-   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `256 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
+   - 单测与静态守卫层：[../tests/conftest.py](../tests/conftest.py) 全局 `autouse` fixture 默认隔离宿主机 `.env`、`LLM_*` / `EMBEDDING_*` 环境变量、`config/models.*` 与 `default_registry()`（当前确定性单测 `261 passed`，四棵非测试目录树 `# type: ignore` 均为 `0`）。
 
 ---
 
@@ -94,7 +94,8 @@
 | `d2e20e3` ~ `1b421d2` | `fts5_bm25` | 通过 `38/40 (95.0%)`；Recall `94.83%`，MRR `0.9483`，Quote `94.83%`，负例干净度 `100%` | 通过 `105/200 (52.5%)`；Recall `68.51%`（`single-hop` `94.0%` / `temporal` `92.0%` / `open-domain` `44.2%` / `multi-hop` `43.9%`），MRR `0.6221`，Quote `60.17%` |
 | `d96e25c` | `rag`（Step 1） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | 通过 `104/200 (52.0%)`；Recall `67.12%`，**MRR `0.6508`**，Quote `60.14%`（`single-hop` `86.0%`） |
 | `9eda1ff` | `rag`（Step 1.5 父子索引） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%` | **通过 `106/200 (53.0%)`**；Recall `67.16%`，MRR `0.6307`，**Quote `60.66%`**（默认 `parent=1000 / child=320 / overlap=64`） |
-| Issue `#105`（本次提交） | `rag`（Step 2 混合检索底座，离线无 embedder 回退口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（零退步；接入向量后可救回零共享词同义改写） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（未配 `embedder` 零退步；支持 `--embedder` 激活 BM25+Dense RRF） |
+| `6f87cf6` | `rag`（Step 2 混合检索底座，离线无 embedder 回退口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（零退步；接入向量后可救回零共享词同义改写） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（未配 `embedder` 零退步；支持 `--embedder` 激活 BM25+Dense RRF） |
+| Issue `#107`（本次提交） | `rag`（Step 2.5 检索前 Query 侧优化，默认离线 `query_optimization.enabled=false` 口径） | 通过 `38/40 (95.0%)`；Recall `94.83%`，**MRR `0.9655`**，Quote `94.83%`，负例干净度 `100%`（默认关闭零额外延迟与零退步） | 通过 `106/200 (53.0%)`；Recall `67.16%`，MRR `0.6307`，Quote `60.66%`（支持 Multi-Query RRF + HyDE 向量质心融合） |
 
 ### 2. 真实模型多轮记忆评测（区分历史 `v1` Judge 与去泄漏 `v2-neutral` Judge）
 
@@ -305,7 +306,7 @@
     | `120`（37.5%） | `38/40 (95.0%)`, MRR `0.9655`, 负例 `100%` | `107/200 (53.5%)`, **Recall `0.6764`**, MRR `0.6211`, Quote `0.6089` | `3,909`（`+7.3%`） | `open-domain` Recall 升至 `0.475`，但子块膨胀 `+7.3%` 且 BM25 重复文档频次轻度稀释 IDF 导致 MRR 回落 |
 - **已知边界与下一步**：离线上下文摘要默认按需通过 `/rag enrich` 触发，不阻塞在线提问；纯词面通道对零共享词同义改写与跨文档多跳仍有上限，下一步进入 **RAG Step 2**：接入单轨标准 `/v1/embeddings` HTTP 客户端、`chunk_embeddings` 向量缓存表与 Python 3.12 `math.sumprod` 精确余弦 + RRF 混合检索。
 
-### [2026-11-28] RAG Step 2：标准 `/v1/embeddings` 客户端、持久化向量缓存与 BM25+Dense RRF 混合检索（Issue `#105`，本次提交）
+### [2026-11-28] RAG Step 2：标准 `/v1/embeddings` 客户端、持久化向量缓存与 BM25+Dense RRF 混合检索（Issue `#105`，Commit `6f87cf6`）
 - **背景与目标**：在零第三方运行依赖的前提下补齐 RAG 语义向量化与混合检索闭环，突破纯词面 BM25 在零共享词同义改写与跨语种检索上的召回上限，同时保证未配置向量模型时零开销平滑退回纯 BM25、已过期记忆绝不外发至外部 Embedding 接口、在线接口瞬时异常不影响前台对话。
 - **核心改动**：
   - **Layer 1 标准向量客户端（新增 [../personal_assistant/ai/embeddings.py](../personal_assistant/ai/embeddings.py)）**：定义 `EmbeddingInvoker` 协议与 `OpenAIEmbeddingClient`（复用 `providers/http.py` 可中断连接/重试/密钥脱敏，兼容 OpenAI / 硅基流动 SiliconFlow / 通义千问 DashScope / 本地免密钥 Ollama `/v1/embeddings`），支持分批发送、乱序 `index` 对齐、有限实数与 L2 单位归一化、小端 `float32` BLOB 编解码（`pack_vector`/`unpack_vector`）、Python 3.12 `math.sumprod` 精确余弦相似度（`cosine_similarity`）、`AbortSignal` 批次取消与环境变量工厂 `from_env_embedder()`；[../tests/test_architecture.py](../tests/test_architecture.py) 锁定其仅依赖 `ai.protocol` 与 `ai.providers.http`。
@@ -317,7 +318,23 @@
   - 离线检索基准（零网络未配 `embedder` 回退口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（Recall `0.6716`、MRR `0.6307`、Quote `0.6066`），纯词面零退步；
   - 性能实测：纯 Python 3.12 标准库 `math.sumprod` 遍历 `4,000 × 1024` 维 `float32` 向量精确余弦仅需 `~41.6 ms`；
   - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`，`memory.py` `593 <= 600` 行。
-- **已知边界与下一步**：离线默认不连网，需用户在 `config/models.dsl` 配 `embedder` 或设置 `EMBEDDING_MODEL` 方可启用混合检索；下一步进入 **RAG Step 3**：接入可选 `/v1/rerank` Cross-Encoder 精排与相关性门控，以及 **Step 4** 专用知识库 `data/knowledge/` 与端到端 RAG 实模评测。
+- **已知边界与下一步**：离线默认不连网，需用户在 `config/models.dsl` 配 `embedder` 或设置 `EMBEDDING_MODEL` 方可启用混合检索；下一步进入 **RAG Step 2.5**（检索前 Query 侧优化）、**Step 3**（可选 `/v1/rerank` Cross-Encoder 精排）与 **Step 4**（专用知识库与端到端实模评测）。
+
+### [2026-11-28] RAG Step 2.5：检索前 Query 侧优化（路由 Routing、多轮指代改写、多查询扩展/拆解与 HyDE 假设文档嵌入）（Issue `#107`，本次提交）
+- **背景与目标**：解决多轮追问中代词/省略指代不明（如“它支持退款吗”）、单次检索漏掉复合多跳或同义表述、以及纯问题句与答案文档语义空间距离远三大检索前痛点，同时避免寒暄/通用常识白跑检索、守住跨轮 `system_prompt` KV Cache 逐字节冻结、并彻底杜绝 HyDE 幻觉词污染 BM25 或泄漏为主模型事实证据。
+- **核心改动**：
+  - **独立 Query 侧优化引擎（新增 [../personal_assistant/assistant/query_optimizer.py](../personal_assistant/assistant/query_optimizer.py)）**：提供 `QueryOptimizationConfig`（严格布尔与范围校验）、4 项独立原子能力（`rewrite_query` 无历史 0 成本跳过、`route_query` 按可用工具白名单约束路由 `direct`/`docs`/`chat_history`/`web`/`study` 或多源组合、`expand_and_decompose_query` 区分 `single`/`multi_query`/`decompose` 且同义扩展保留原句首位、`generate_hyde_document` 生成 2–4 句陈述式假设片段）与单次合并快路径 `QueryOptimizer.plan()`（仅 1 次轻量 JSON 调用且显式 `reasoning="off"` 一次完成路由 + 改写 + 扩展/拆解，仅在路由命中 `docs` 且系统激活稠密向量时按需追加 1 次 HyDE；非取消故障优雅降级透传且 `applied=False` 零噪声注入，`AbortSignal` 严格向上穿透）。
+  - **检索引擎 HyDE 向量质心融合与 Multi-Query RRF（[../plugins/rag_retriever.py](../plugins/rag_retriever.py)）**：`RAGRetriever.search_hits()` 新增 `hyde_text` 与 `abort_signal`——词面 BM25 分词严格仅使用真实原问题（零幻觉词污染），稠密向量通道在同一次 batch 调用中联合编码 `[query, hyde_text]` 并求单位质心 `normalize(vec(query) + vec(hyde))` 对齐答案语义空间；新增 `search_multi_hits()` 对多条子查询分别召回后按 Multi-Query RRF 去重融合并按 `max_hits_per_file` 保障多跳多文档多样性，前置校验目标目录与取消信号。
+  - **Agent / 工具 / 配置 / CLI 全链路闭环（[../personal_assistant/assistant/prompts.py](../personal_assistant/assistant/prompts.py)、[../personal_assistant/assistant/context.py](../personal_assistant/assistant/context.py)、[../personal_assistant/assistant/builtin_tools.py](../personal_assistant/assistant/builtin_tools.py)、[../personal_assistant/assistant/commands.py](../personal_assistant/assistant/commands.py)、[../personal_assistant/assistant/app.py](../personal_assistant/assistant/app.py)、[../personal_assistant/assistant/cli.py](../personal_assistant/assistant/cli.py)、[../config/tools.json](../config/tools.json)）**：
+    - `config/tools.json` 的 `retrieval` 段新增 `query_optimization` 细粒度开关（默认 `enabled: false`，离线单测与基准零额外延迟）；
+    - 开启后 `AssistantApp._run_stream_turn()` 将规划建议经 `prompts.format_query_plan_hint()` 消毒并包裹 `<system-reminder>` 注入**当前轮用户消息**（`system_prompt` 逐字节冻结且 `StateStore` 落库保持纯净原话），同时将 `plan.hyde_document` 仅经执行期隐藏 `turn_ctx` 传给 `search_markdown`（绝不泄漏进主 LLM Prompt）；规划阶段被取消零脏写 SQLite；
+    - `search_markdown` 工具新增可选参数 `sub_queries` 触发多查询 RRF（`LinearRetriever` 下走通用 `fuse_multi_query_hits` 兜底）；`AssistantApp` 新增 `optimize_query()`、`smart_search()` 与 `status()["query_optimization"]`；CLI 新增 `/rag query <问题>` 可视化路由、改写、子查询、HyDE 与最终命中文档。
+  - **测试覆盖**：新增 [../tests/test_query_optimizer.py](../tests/test_query_optimizer.py) 覆盖 4 项原子能力、配置校验、单次合并快路径与 HyDE 门控、Multi-Query RRF 多跳召回、HyDE 仅向量质心生效且 BM25 零污染、对话 KV Cache 冻结与防 `<system-reminder>` 围栏逃逸、在线对话 HyDE 隐藏注入、规划阶段取消零脏写、`LinearRetriever` 兜底与 CLI `/rag query` 容错。
+- **验证与同口径对比（`6f87cf6` → 本次提交）**：
+  - 单元测试：`256 passed → 261 passed`（全绿，含 `tests/test_architecture.py` 与 `memory.py` `593 <= 600` 行预算）；
+  - 离线检索基准（默认 `query_optimization.enabled=false` 口径）：`sample_cases.jsonl` 保持 `38/40 (95.0%)`（MRR `0.9655`、负例 `100%`）；`LoCoMo Search` 保持 `106/200 (53.0%)`（零退步）；
+  - 静态守卫：`scripts/demo.py` 通过，四树 `# type: ignore` 为 `0`，全仓 AST 中文 `#` 注释缺失为 `0`，文档相对链接断链为 `0`。
+- **已知边界与下一步**：在线对话默认关闭 `retrieval.query_optimization.enabled`（可在 `config/tools.json` 手动设为 `true` 启用，或随时用 `/rag query <问题>` 体验与调试）；下一步进入 **RAG Step 3**（可选 `/v1/rerank` Cross-Encoder 精排与相关性门控）及 **Step 4**（专用知识库与端到端 RAG 实模评测）。
 
 ---
 
